@@ -671,6 +671,39 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
 
 
 @dsl_user_op
+def exp2_spline_n2_op(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    # Implementation of Spline N=2 Deg=2
+    # Coefficients from EVOLVED_H2_HARDCODED_2_DEG2:
+    # Degree 2: 0x3BFF (0.99951171875)
+    # Degree 1: 0x39CA (0.7236328125)
+    # Degree 0: 0x3BFF (0.99951171875)
+
+    # 1. Floor (Range reduction)
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    # 2. Polynomial Evaluation (N=2 Deg=2)
+    # Coeffs are constant across intervals for this specific evolved function.
+    c2 = 0.99951171875
+    c1 = 0.7236328125
+    c0 = 0.99951171875
+    
+    poly_coeffs = (c0, c1, c2) 
+    
+    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_coeffs, loc=loc, ip=ip)
+    
+    # 3. Reconstruction
+    x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
 def domain_offset_aligned(
     coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
 ) -> cute.Tensor:

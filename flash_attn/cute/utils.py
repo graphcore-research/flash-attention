@@ -581,6 +581,11 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
 
 
 @dsl_user_op
+def exp2f_identity_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    return x, y
+
+
+@dsl_user_op
 def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     out_f32x2 = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),

@@ -9,7 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op, select_
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
@@ -80,9 +80,138 @@ def create_softcap_scoremod(softcap_val):
     inv_softcap = 1.0 / softcap_val
 
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         scores = acc_S_SSA * inv_softcap
         return scores * cute.math.tanh(scores, fastmath=True)
+
+    return scoremod_premask_fn
+
+
+# =============================================================================
+# Spline tanh emulation — FMA-only, no SFU
+# ODD polynomial: tanh(x) = sign(x) * |x| * poly(|x|)
+# D5 fit on [0, 3.0], max abs error < 0.00053
+# =============================================================================
+
+@dsl_user_op
+def fmin(a: float | Float32, b: float | Float32, *, loc=None, ip=None) -> Float32:
+    """f32 min using PTX min.ftz.f32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "min.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def fabs_f32(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    """f32 absolute value using PTX abs.ftz.f32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "abs.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def copysign_f32(mag: float | Float32, sign_val: float | Float32, *, loc=None, ip=None) -> Float32:
+    """f32 copysign: returns mag with the sign of sign_val, using PTX."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(mag).ir_value(loc=loc, ip=ip),
+                Float32(sign_val).ir_value(loc=loc, ip=ip),
+            ],
+            "copysign.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def tanh_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Scalar f32 spline tanh: tanh(x) ≈ x*poly(|x|) for |x|<3, ±1 otherwise."""
+    poly_tanh_d6 = (
+        0.997647159384134,
+        0.041596082787069,
+        -0.511077124276488,
+        0.299924163208482,
+        -0.073001013149114,
+        0.006683678319012,
+    )
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    t = fmin(abs_x, clamp, loc=loc, ip=ip)
+    h = evaluate_polynomial(t, poly_tanh_d6, loc=loc, ip=ip)
+    poly_result = x * h
+    # For |x| >= clamp, return ±1 instead of x*h (which diverges)
+    saturated = copysign_f32(1.0, x, loc=loc, ip=ip)
+    return select_(abs_x < clamp, poly_result, saturated)
+
+
+@dsl_user_op
+def tanh_emulation_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 spline tanh for ILP — processes 2 values simultaneously."""
+    poly_tanh_d6 = (
+        0.997647159384134,
+        0.041596082787069,
+        -0.511077124276488,
+        0.299924163208482,
+        -0.073001013149114,
+        0.006683678319012,
+    )
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    hx, hy = evaluate_polynomial_2(tx, ty, poly_tanh_d6, loc=loc, ip=ip)
+    poly_x = x * hx
+    poly_y = y * hy
+    sat_x = copysign_f32(1.0, x, loc=loc, ip=ip)
+    sat_y = copysign_f32(1.0, y, loc=loc, ip=ip)
+    return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+
+
+@cute.jit
+def tanh_emulationf(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    """tanh emulation for both vector and scalar, matching exp2f API."""
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_emulation_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        return tanh_emulation(x)
+
+
+def create_softcap_scoremod_spline(softcap_val):
+    """Softcapping scoremod using spline tanh (FMA-only, no SFU)."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return scores * tanh_emulationf(scores)
 
     return scoremod_premask_fn
 
@@ -663,6 +792,59 @@ def exp2_spline_n2_op(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Flo
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
     return x_out, y_out
+
+
+@dsl_user_op
+def exp2_spline_n2_custom(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    # Port of evolved_pow2_h2_hardcoded_2 (Linear Spline N=2) from C++ benchmark.
+    # Coefficients:
+    # Degree 1: 0x39CA (0.7236328125)
+    # Degree 0: 0x3BFF (0.99951171875)
+
+    # 1. Floor (Range reduction)
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    # 2. Interval Selection
+    # Interval 0: [0, 0.5) -> xy_frac < 0.5
+    # Interval 1: [0.5, 1.0) -> xy_frac >= 0.5
+    
+    # Unpack frac to scalar for selection
+    # Using DSL indexing which should be supported for packed types
+    frac_0 = xy_frac[0]
+    frac_1 = xy_frac[1]
+    
+    # Define Coefficients (Identical for now, but distinct paths)
+    c1_0 = 0.7236328125
+    c0_0 = 0.99951171875
+    c1_1 = 0.7236328125
+    c0_1 = 0.99951171875
+    
+    # Select Coeffs for 0
+    # Note: DSL comparison returns i1 (bool), select_ handles it.
+    mask_0 = frac_0 >= 0.5
+    c1_val_0 = select_(mask_0, c1_1, c1_0)
+    c0_val_0 = select_(mask_0, c0_1, c0_0)
+    
+    # Select Coeffs for 1
+    mask_1 = frac_1 >= 0.5
+    c1_val_1 = select_(mask_1, c1_1, c1_0)
+    c0_val_1 = select_(mask_1, c0_1, c0_0)
+    
+    # Scalar FMA via operators (DSL should lower to FMA)
+    res_0 = frac_0 * c1_val_0 + c0_val_0
+    res_1 = frac_1 * c1_val_1 + c0_val_1
+    
+    # 3. Reconstruction
+    x_out = combine_int_frac_ex2(xy_rounded[0], res_0, loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], res_1, loc=loc, ip=ip)
+    return x_out, y_out
+    
 
 
 @dsl_user_op

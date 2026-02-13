@@ -240,6 +240,38 @@ def tanh_emulationf(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
         return tanh_emulation(x)
 
 
+@dsl_user_op
+def sigmoid_emulation_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 spline sigmoid for ILP — processes 2 values simultaneously.
+
+    D3 minimax polynomial on [0,6] with odd symmetry:
+      h(t) = t * (c1 + t*(c2 + c3*t))
+      sigmoid(x) = 0.5 + copysign(h(min(|x|,6)), x)
+    """
+    # D3 minimax polynomial for h(x) = sigmoid(x) - 0.5 (odd function).
+    # h(x) = x * poly(|x|) — sign comes from x, like tanh (avoids broken copysign).
+    c0 = 0.281005859375
+    c1 = -0.0533447265625
+    c2 = 0.0033893585205078125
+    clamp = 6.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    # Horner: poly(t) = (c2*t + c1)*t + c0
+    px, py = fma_packed_f32x2((c2, c2), (tx, ty), (c1, c1), loc=loc, ip=ip)
+    px, py = fma_packed_f32x2((px, py), (tx, ty), (c0, c0), loc=loc, ip=ip)
+    # h(x) = x * poly(|x|) — sign from x, like tanh
+    poly_x = Float32(0.5) + x * px
+    poly_y = Float32(0.5) + y * py
+    # Saturate: for |x| >= clamp, sigmoid → 0 or 1
+    sat_x = select_(x > Float32(0.0), Float32(1.0), Float32(0.0))
+    sat_y = select_(y > Float32(0.0), Float32(1.0), Float32(0.0))
+    return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+
+
 def create_softcap_scoremod_spline(softcap_val):
     """Softcapping scoremod using spline tanh (FMA-only, no SFU)."""
     inv_softcap = 1.0 / softcap_val
@@ -749,6 +781,48 @@ def ex2_emulation_2(
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """exp2 via 2-interval linear spline — single FMA per value.
+
+    Same range reduction as ex2_emulation_2 but replaces the deg-3 Horner
+    chain (3 dependent FMAs) with one FMA + one select per value.
+    Max relative error ~1.15% vs 0.019% for deg-3.
+    """
+    # Linear spline coefficients for 2^frac, fitted on f32:
+    #   interval [0.0, 0.5):  c1 = 0.826759108576946,  c0 = 0.988477885884221
+    #   interval [0.5, 1.0):  c1 = 1.169213944165023,  c0 = 0.813311860240843
+    c1_lo = 0.826759108576946
+    c0_lo = 0.988477885884221
+    c1_hi = 1.169213944165023
+    c0_hi = 0.813311860240843
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    # Select coefficients based on interval: frac >= 0.5
+    fx, fy = xy_frac
+    mask_x = fx >= 0.5
+    mask_y = fy >= 0.5
+    c1_x = select_(mask_x, c1_hi, c1_lo)
+    c0_x = select_(mask_x, c0_hi, c0_lo)
+    c1_y = select_(mask_y, c1_hi, c1_lo)
+    c0_y = select_(mask_y, c0_hi, c0_lo)
+
+    # Single FMA per value: 2^frac ≈ c1*frac + c0
+    frac_ex2_x = fx * c1_x + c0_x
+    frac_ex2_y = fy * c1_y + c0_y
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2_x, loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2_y, loc=loc, ip=ip)
     return x_out, y_out
 
 

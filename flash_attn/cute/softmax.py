@@ -162,12 +162,19 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    # Routing: every cycle of `sigmoid_sfu_freq` pairs, the last `sigmoid_sfu_res` use SFU.
+    # freq=16, res=0 → all FMA (default). freq=16, res=16 → all SFU.
+    # freq=4, res=2 → 50% SFU. freq=4, res=1 → 25% SFU.
+    sigmoid_sfu_freq: cutlass.Constexpr[int] = 16
+    sigmoid_sfu_res: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        sigmoid_sfu_freq: cutlass.Constexpr[int] = 16,
+        sigmoid_sfu_res: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
         arch = 100
@@ -181,6 +188,8 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            sigmoid_sfu_freq=sigmoid_sfu_freq,
+            sigmoid_sfu_res=sigmoid_sfu_res,
         )
 
     @cute.jit
@@ -282,8 +291,11 @@ class SoftmaxSm100(Softmax):
     ):
         """Apply sigmoid activation and convert to output dtype.
 
-        For sigmoid attention: scales by softmax_scale (not scale_log2),
-        then applies spline sigmoid polynomial (FMA-only, no SFU).
+        Routing between polynomial (FMA) and SFU (exp2+rcp) is controlled by
+        sigmoid_sfu_freq and sigmoid_sfu_res (same pattern as e2e in apply_exp2_convert):
+          k % freq < freq - res  → polynomial (FMA)
+          k % freq >= freq - res → SFU (exp2 + rcp_approx)
+        Default: freq=16, res=0 → all polynomial.
         """
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -299,7 +311,14 @@ class SoftmaxSm100(Softmax):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 s0 = acc_S_row_frg[k, j] * sm_scale
                 s1 = acc_S_row_frg[k + 1, j] * sm_scale
-                acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_emulation_2(s0, s1)
+                if cutlass.const_expr(
+                    k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
+                ):
+                    # Polynomial (FMA) path
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_emulation_2(s0, s1)
+                else:
+                    # SFU path (exp2 + rcp_approx)
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_native_2(s0, s1)
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )

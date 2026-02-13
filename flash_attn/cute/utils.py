@@ -272,6 +272,21 @@ def sigmoid_emulation_2(
     return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
 
 
+def sigmoid_native_2(x, y):
+    """SFU-based sigmoid: sigmoid(x) = rcp(1 + exp2(-x * log2(e))).
+
+    Uses hardware SFU units (exp2 + rcp_approx). Exact but causes
+    SFU contention when used inside attention (competes with softmax exp2).
+    """
+    LOG2_E = 1.4426950408889634
+    neg_x_log2e = x * Float32(-LOG2_E)
+    neg_y_log2e = y * Float32(-LOG2_E)
+    exp_x = cute.arch.exp2(neg_x_log2e)
+    exp_y = cute.arch.exp2(neg_y_log2e)
+    sx = cute.arch.rcp_approx(Float32(1.0) + exp_x)
+    sy = cute.arch.rcp_approx(Float32(1.0) + exp_y)
+    return sx, sy
+
 def create_softcap_scoremod_spline(softcap_val):
     """Softcapping scoremod using spline tanh (FMA-only, no SFU)."""
     inv_softcap = 1.0 / softcap_val

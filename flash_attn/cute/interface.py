@@ -129,6 +129,9 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    sigmoid_attention: bool = False,
+    sigmoid_sfu_freq: int = 16,
+    sigmoid_sfu_res: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -407,6 +410,9 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        sigmoid_attention,
+        sigmoid_sfu_freq,
+        sigmoid_sfu_res,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -506,7 +512,13 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
+                sigmoid_attention=sigmoid_attention,
+                sigmoid_sfu_freq=sigmoid_sfu_freq,
+                sigmoid_sfu_res=sigmoid_sfu_res,
                 use_2cta_instrs=use_2cta_instrs,
+                sigmoid_attention=sigmoid_attention,
+                sigmoid_sfu_freq=sigmoid_sfu_freq,
+                sigmoid_sfu_res=sigmoid_sfu_res,
             )
         else:
             raise ValueError(

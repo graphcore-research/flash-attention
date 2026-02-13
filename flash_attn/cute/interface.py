@@ -124,6 +124,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    sigmoid_attention: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -398,6 +399,7 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        sigmoid_attention,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -484,6 +486,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
+                sigmoid_attention=sigmoid_attention,
             )
         else:
             raise ValueError(
@@ -1267,6 +1270,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
+        sigmoid_attention: bool = False,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1291,7 +1295,8 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            block_sparse_tensors=block_sparse_tensors,
+            sigmoid_attention=sigmoid_attention,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1424,6 +1429,7 @@ def flash_attn_func(
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
+    sigmoid_attention: bool = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1443,6 +1449,7 @@ def flash_attn_func(
         mask_block_cnt,
         mask_block_idx,
         block_size,
+        sigmoid_attention,
     )
 
 

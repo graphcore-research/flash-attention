@@ -88,7 +88,9 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        sigmoid_attention: bool = False,
     ):
+        self.sigmoid_attention = sigmoid_attention
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -1781,11 +1783,11 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    sScale[tidx + stage * self.m_block_size] = Float32(1.0) if const_expr(self.sigmoid_attention) else softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
                             tidx + stage * self.m_block_size + self.m_block_size * 2
-                        ] = softmax.row_max[0]
+                        ] = Float32(0.0) if const_expr(self.sigmoid_attention) else softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
@@ -1850,11 +1852,11 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    sScale[tidx + stage * self.m_block_size] = Float32(1.0) if const_expr(self.sigmoid_attention) else softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
                             tidx + stage * self.m_block_size + self.m_block_size * 2
-                        ] = softmax.row_max[0]
+                        ] = Float32(0.0) if const_expr(self.sigmoid_attention) else softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
             # # Write LSE to gmem
@@ -1952,61 +1954,95 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
-        if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
-            # tSrScale_r2t[0] = acc_scale
-            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-            # cute.arch.fence_view_async_tmem_store()
-            thread_idx = thr_tmem_load.thr_idx
-            sScale[thread_idx + stage * self.m_block_size] = acc_scale
-            # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
-        # Notify correction wg that row_max is ready
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
+        if const_expr(self.sigmoid_attention):
+            # ── SIGMOID ATTENTION PATH ──
+            # No row_max tracking, no row_sum, no O rescaling.
+            # acc_scale = 1.0 always → correction warp is a no-op.
+            acc_scale = Float32(1.0)
+            if const_expr(not is_first):
+                thread_idx = thr_tmem_load.thr_idx
+                sScale[thread_idx + stage * self.m_block_size] = acc_scale
+            # Must still signal correction warp (it waits on this barrier)
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
-        # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        # print(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
-        # Sequence barrier wait
-        if const_expr(self.s0_s1_barrier):
-            cute.arch.mbarrier_wait(
-                mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
+            # No scale_subtract_rowmax — sigmoid handles scaling internally
+
+            # Sequence barrier wait (unchanged)
+            if const_expr(self.s0_s1_barrier):
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
+                )
+            tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+            tSrP_r2t = cute.make_tensor(
+                cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
+                tSrS_t2r.layout,
             )
-        tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
-        tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
-            tSrS_t2r.layout,
-        )
-        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
-            e2e_freq=self.e2e_freq,
-        )
-        # Sequence barrier arrive
-        if const_expr(self.s0_s1_barrier):
-            cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
-        # print(tSrP_r2t_f32, tStP_r2t)
-        # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that P is ready
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-        for i in cutlass.range_constexpr(
-            cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
-        ):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
-        # Notify mma warp that the 2nd half of P is ready
-        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
-        cute.arch.mbarrier_wait(
-            mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
-        )
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-        # acc_scale = cute.arch.exp2(acc_scale_)
+            # Apply sigmoid (spline polynomial, FMA-only, no SFU)
+            softmax.apply_sigmoid_convert(tSrS_t2r, tSrP_r2t)
+
+            # Sequence barrier arrive
+            if const_expr(self.s0_s1_barrier):
+                cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
+            # Store P to TMEM (same as softmax path)
+            for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+            for i in cutlass.range_constexpr(
+                cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
+            ):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
+            )
+            # No update_row_sum — sigmoid doesn't normalize
+        else:
+            # ── ORIGINAL SOFTMAX PATH (unchanged) ──
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+
+            if const_expr(not is_first):
+                thread_idx = thr_tmem_load.thr_idx
+                sScale[thread_idx + stage * self.m_block_size] = acc_scale
+            # Notify correction wg that row_max is ready
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
+
+            softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+            # Sequence barrier wait
+            if const_expr(self.s0_s1_barrier):
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
+                )
+            tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+            tSrP_r2t = cute.make_tensor(
+                cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
+                tSrS_t2r.layout,
+            )
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                e2e=mask_fn is None and self.head_dim_padded <= 128,
+                e2e_freq=self.e2e_freq,
+            )
+            # Sequence barrier arrive
+            if const_expr(self.s0_s1_barrier):
+                cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
+            for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+            for i in cutlass.range_constexpr(
+                cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
+            ):
+                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+            cute.arch.mbarrier_wait(
+                mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
+            )
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
     @cute.jit

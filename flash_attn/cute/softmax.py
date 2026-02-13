@@ -233,6 +233,7 @@ class SoftmaxSm100(Softmax):
         acc_S_row: cute.Tensor,
         acc_S_row_converted: cute.Tensor,
         e2e: cutlass.Constexpr[bool] = False,
+        e2e_linear: cutlass.Constexpr[bool] = False,
         e2e_freq: cutlass.Constexpr[int] = 16,
         e2e_res: cutlass.Constexpr[int] = 4,
         e2e_frg_limit: cutlass.Constexpr[int] = 1,
@@ -250,7 +251,12 @@ class SoftmaxSm100(Softmax):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
                 # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
-                if cutlass.const_expr(not e2e):
+                if cutlass.const_expr(e2e_linear):
+                    # Linear spline — single FMA, completely SFU-free
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2_linear(
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                    )
+                elif cutlass.const_expr(not e2e):
                     acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
                     acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                 else:
@@ -264,6 +270,36 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+    @cute.jit
+    def apply_sigmoid_convert(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: cute.Tensor,
+    ):
+        """Apply sigmoid activation and convert to output dtype.
+
+        For sigmoid attention: scales by softmax_scale (not scale_log2),
+        then applies spline sigmoid polynomial (FMA-only, no SFU).
+        """
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = 32
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        sm_scale = self.scale_log2 * 0.6931471805599453  # scale_log2 * ln(2) = softmax_scale
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
+                s0 = acc_S_row_frg[k, j] * sm_scale
+                s1 = acc_S_row_frg[k + 1, j] * sm_scale
+                acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_emulation_2(s0, s1)
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )

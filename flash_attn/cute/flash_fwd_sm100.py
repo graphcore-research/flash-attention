@@ -93,7 +93,13 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        sigmoid_attention: bool = False,
+        sigmoid_sfu_freq: int = 16,
+        sigmoid_sfu_res: int = 0,
     ):
+        self.sigmoid_attention = sigmoid_attention
+        self.sigmoid_sfu_freq = sigmoid_sfu_freq
+        self.sigmoid_sfu_res = sigmoid_sfu_res
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -1694,6 +1700,8 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2,
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                 softmax_scale=softmax_scale,
+                sigmoid_sfu_freq=self.sigmoid_sfu_freq,
+                sigmoid_sfu_res=self.sigmoid_sfu_res,
             )
             softmax.reset()
 

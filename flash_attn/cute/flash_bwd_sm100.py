@@ -65,6 +65,8 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        sigmoid_attention: bool = False,
+        sigmoid_bias: float | None = None,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -124,6 +126,8 @@ class FlashAttentionBackwardSm100:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
+        self.sigmoid_attention = sigmoid_attention
+        self.sigmoid_bias = sigmoid_bias
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3091,35 +3095,55 @@ class FlashAttentionBackwardSm100:
                 )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
-                #### P = exp(S - LSE)
+                #### P = exp(S - LSE)   [softmax]
+                #### P = sigmoid(S * scale + bias)  [sigmoid]
                 # ---------------------------------------------
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
-                    if const_expr(not self.shuffle_LSE):
-                        if const_expr(stage > 0 or not prefetch_LSE):
-                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
-                        tSrLSE = tSrLSE_s2r
-                    else:
-                        tSrLSE = tSsLSE_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                        if const_expr(not self.shuffle_LSE):
-                            lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                    if const_expr(self.sigmoid_attention):
+                        # Sigmoid: P = sigmoid(S * softmax_scale + bias)
+                        LN2 = 0.6931471805599453
+                        LOG2_E = 1.4426950408889634
+                        sm_scale = softmax_scale_log2 * LN2  # = softmax_scale
+                        if const_expr(self.sigmoid_bias is not None):
+                            sig_bias = Float32(self.sigmoid_bias)
                         else:
-                            lse_pair = (
-                                utils.shuffle_sync(tSrLSE, offset=2 * v),
-                                utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            sig_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
+                        for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                            s0 = tSrS_cur[2 * v] * sm_scale + sig_bias
+                            s1 = tSrS_cur[2 * v + 1] * sm_scale + sig_bias
+                            # sigmoid via SFU: 1 / (1 + exp2(-x * log2e))
+                            e0 = cute.math.exp2(-s0 * LOG2_E, fastmath=True)
+                            e1 = cute.math.exp2(-s1 * LOG2_E, fastmath=True)
+                            tSrS_cur[2 * v] = 1.0 / (1.0 + e0)
+                            tSrS_cur[2 * v + 1] = 1.0 / (1.0 + e1)
+                    else:
+                        # Softmax: P = exp2(S * scale_log2 - LSE)
+                        tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
+                        if const_expr(not self.shuffle_LSE):
+                            if const_expr(stage > 0 or not prefetch_LSE):
+                                cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                            tSrLSE = tSrLSE_s2r
+                        else:
+                            tSrLSE = tSsLSE_cur[lane_idx]
+                        for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                            if const_expr(not self.shuffle_LSE):
+                                lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            else:
+                                lse_pair = (
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v),
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                                )
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.fma_packed_f32x2(
+                                ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
+                                (softmax_scale_log2, softmax_scale_log2),
+                                (-lse_pair[0], -lse_pair[1]),
                             )
-                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
-                            ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
-                            (softmax_scale_log2, softmax_scale_log2),
-                            (-lse_pair[0], -lse_pair[1]),
-                        )
-                        tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
-                        tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                            tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                            tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()
@@ -3151,7 +3175,8 @@ class FlashAttentionBackwardSm100:
                 # consumer_state_S_P_dP.advance()
                 # consumer_phase_S_P_dP ^= 1
 
-                ##### dS.T = P.T * (dP.T - Psum)
+                ##### dS.T = P.T * (dP.T - Psum)   [softmax]
+                ##### dS.T = P.T * (1 - P.T) * dP.T  [sigmoid]
                 for stage in cutlass.range_constexpr(num_stages):
                     tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
@@ -3159,29 +3184,38 @@ class FlashAttentionBackwardSm100:
                     self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
-                    if const_expr(not self.shuffle_dPsum):
-                        tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
-                        cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
+                    if const_expr(self.sigmoid_attention):
+                        # Sigmoid backward: dS = P * (1 - P) * dP
+                        # tSrS_cur holds P values from the P computation above
+                        for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                            p0 = tSrS_cur[2 * v]
+                            p1 = tSrS_cur[2 * v + 1]
+                            # dS = P * (1 - P) * dP
+                            tdPrdP_cur[2 * v] = p0 * (1.0 - p0) * tdPrdP_cur[2 * v]
+                            tdPrdP_cur[2 * v + 1] = p1 * (1.0 - p1) * tdPrdP_cur[2 * v + 1]
                     else:
-                        tSrdPsum = tSsdPsum_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                        # Softmax backward: dS = P * (dP - Di)
+                        tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
                         if const_expr(not self.shuffle_dPsum):
-                            dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                            tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
+                            cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                         else:
-                            dPsum_pair = (
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v),
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
-                            )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
+                            tSrdPsum = tSsdPsum_cur[lane_idx]
+                        for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                            if const_expr(not self.shuffle_dPsum):
+                                dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                            else:
+                                dPsum_pair = (
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v),
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
+                                )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = utils.sub_packed_f32x2(
                                 (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                             )
-                        )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
-                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
-                        )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = utils.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            )
 
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]

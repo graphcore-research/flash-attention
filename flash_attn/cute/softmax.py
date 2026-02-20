@@ -174,6 +174,8 @@ class SoftmaxSm100(Softmax):
     # freq=4, res=2 → 50% SFU. freq=4, res=1 → 25% SFU.
     sigmoid_sfu_freq: cutlass.Constexpr[int] = 16
     sigmoid_sfu_res: cutlass.Constexpr[int] = 0
+    # Sigmoid attention bias: b = -log(n) per FlashSigmoid paper (2409.04431)
+    sigmoid_bias: Float32 = Float32(0.0)
 
     @staticmethod
     def create(
@@ -182,6 +184,7 @@ class SoftmaxSm100(Softmax):
         softmax_scale: Float32 | None = None,
         sigmoid_sfu_freq: cutlass.Constexpr[int] = 16,
         sigmoid_sfu_res: cutlass.Constexpr[int] = 0,
+        sigmoid_bias: Float32 = Float32(0.0),
     ):
         num_rows = 1
         arch = 100
@@ -197,6 +200,7 @@ class SoftmaxSm100(Softmax):
             rescale_threshold=rescale_threshold,
             sigmoid_sfu_freq=sigmoid_sfu_freq,
             sigmoid_sfu_res=sigmoid_sfu_res,
+            sigmoid_bias=sigmoid_bias,
         )
 
     @cute.jit
@@ -310,10 +314,11 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted, cute.make_layout(frg_tile)
         )
         sm_scale = self.scale_log2 * 0.6931471805599453  # scale_log2 * ln(2) = softmax_scale
+        bias = self.sigmoid_bias  # -log(n) per FlashSigmoid paper
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                s0 = acc_S_row_frg[k, j] * sm_scale
-                s1 = acc_S_row_frg[k + 1, j] * sm_scale
+                s0 = acc_S_row_frg[k, j] * sm_scale + bias
+                s1 = acc_S_row_frg[k + 1, j] * sm_scale + bias
                 if cutlass.const_expr(
                     k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                 ):

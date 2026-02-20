@@ -1696,12 +1696,20 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
+            # Compute sigmoid bias: b = -log(n) per FlashSigmoid paper
+            if const_expr(self.sigmoid_attention):
+                LN2 = 0.6931471805599453
+                sigmoid_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
+            else:
+                sigmoid_bias = Float32(0.0)
+
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                 softmax_scale=softmax_scale,
                 sigmoid_sfu_freq=self.sigmoid_sfu_freq,
                 sigmoid_sfu_res=self.sigmoid_sfu_res,
+                sigmoid_bias=sigmoid_bias,
             )
             softmax.reset()
 

@@ -91,10 +91,12 @@ class FlashAttentionForwardSm100:
         sigmoid_attention: bool = False,
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
+        sigmoid_bias: float | None = None,
     ):
         self.sigmoid_attention = sigmoid_attention
         self.sigmoid_sfu_freq = sigmoid_sfu_freq
         self.sigmoid_sfu_res = sigmoid_sfu_res
+        self.sigmoid_bias = sigmoid_bias
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -1700,9 +1702,13 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = None
 
             # Compute sigmoid bias: b = -log(n) per FlashSigmoid paper
+            # If user provided sigmoid_bias, use that; otherwise auto-compute
             if const_expr(self.sigmoid_attention):
-                LN2 = 0.6931471805599453
-                sigmoid_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
+                if const_expr(self.sigmoid_bias is not None):
+                    sigmoid_bias = Float32(self.sigmoid_bias)
+                else:
+                    LN2 = 0.6931471805599453
+                    sigmoid_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
             else:
                 sigmoid_bias = Float32(0.0)
 

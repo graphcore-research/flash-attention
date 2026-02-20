@@ -127,6 +127,7 @@ def _flash_attn_fwd(
     sigmoid_attention: bool = False,
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
+    sigmoid_bias: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -404,6 +405,7 @@ def _flash_attn_fwd(
         sigmoid_attention,
         sigmoid_sfu_freq,
         sigmoid_sfu_res,
+        sigmoid_bias,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -493,6 +495,7 @@ def _flash_attn_fwd(
                 sigmoid_attention=sigmoid_attention,
                 sigmoid_sfu_freq=sigmoid_sfu_freq,
                 sigmoid_sfu_res=sigmoid_sfu_res,
+                sigmoid_bias=sigmoid_bias,
             )
         else:
             raise ValueError(
@@ -1282,6 +1285,9 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         sigmoid_attention: bool = False,
+        sigmoid_sfu_freq: int = 16,
+        sigmoid_sfu_res: int = 0,
+        sigmoid_bias: float | None = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1308,6 +1314,9 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             sigmoid_attention=sigmoid_attention,
+            sigmoid_sfu_freq=sigmoid_sfu_freq,
+            sigmoid_sfu_res=sigmoid_sfu_res,
+            sigmoid_bias=sigmoid_bias,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1441,6 +1450,9 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     sigmoid_attention: bool = False,
+    sigmoid_sfu_freq: int = 16,
+    sigmoid_sfu_res: int = 0,
+    sigmoid_bias: float | None = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1461,6 +1473,9 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         sigmoid_attention,
+        sigmoid_sfu_freq,
+        sigmoid_sfu_res,
+        sigmoid_bias,
     )
 
 

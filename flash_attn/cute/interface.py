@@ -727,6 +727,11 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
+    elif softcap != 0.0:
+        # Native softcap: auto-create score_mod + score_mod_bwd using SFU tanh
+        score_mod = utils.create_softcap_scoremod(softcap)
+        score_mod_bwd = utils.create_softcap_scoremod_bwd_native(softcap)
+        softcap = 0.0  # score_mod handles it now
 
     device = q.device
     out_torch_dtype = q.dtype

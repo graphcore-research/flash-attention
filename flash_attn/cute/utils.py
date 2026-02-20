@@ -76,9 +76,39 @@ def create_softcap_scoremod(softcap_val):
     @cute.jit
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         scores = acc_S_SSA * inv_softcap
-        return scores * cute.math.tanh(scores, fastmath=True)
+        return softcap_val * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd_native(softcap_val):
+    """Backward for native softcap using SFU tanh: grad * (1 - tanh²(x))."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        t = cute.math.tanh(scores, fastmath=True)
+        # tanh'(x) = 1 - tanh²(x)
+        derivative = Float32(1.0) - t * t
+        return grad * derivative
+
+    return scoremod_bwd_fn
+
+
+def create_softcap_scoremod_bwd_ste(softcap_val=None):
+    """STE backward for softcap — passes grad through unchanged.
+
+    Straight-Through Estimator: forward applies softcap * tanh(x/softcap),
+    backward ignores the tanh derivative and just returns grad.
+    This eliminates the expensive backward tanh computation (~300µs savings).
+    """
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        return grad
+
+    return scoremod_bwd_fn
 
 
 # =============================================================================
@@ -142,20 +172,21 @@ def copysign_f32(mag: float | Float32, sign_val: float | Float32, *, loc=None, i
 def tanh_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
     """Scalar f32 spline tanh: tanh(x) ≈ x*poly(|x|) for |x|<3, ±1 otherwise."""
     poly_tanh_d6 = (
-        0.997647159384134,
-        0.041596082787069,
-        -0.511077124276488,
-        0.299924163208482,
-        -0.073001013149114,
-        0.006683678319012,
+        0.9999999999996861,
+        0.018184368627828466,
+        -0.44364107914224865,
+        0.21709437130752046,
+        -0.023897373260303105,
+        -0.0071969181772045645,
+        0.0015005805508435293,
     )
     clamp = 3.0
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     t = fmin(abs_x, clamp, loc=loc, ip=ip)
     h = evaluate_polynomial(t, poly_tanh_d6, loc=loc, ip=ip)
     poly_result = x * h
-    # For |x| >= clamp, return ±1 instead of x*h (which diverges)
-    saturated = copysign_f32(1.0, x, loc=loc, ip=ip)
+    # For |x| >= clamp, return ±tanh(3.0) ~ 0.995 instead of ±1 to keep gradients alive
+    saturated = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
     return select_(abs_x < clamp, poly_result, saturated)
 
 
@@ -165,12 +196,13 @@ def tanh_emulation_2(
 ) -> Tuple[Float32, Float32]:
     """Paired f32x2 spline tanh for ILP — processes 2 values simultaneously."""
     poly_tanh_d6 = (
-        0.997647159384134,
-        0.041596082787069,
-        -0.511077124276488,
-        0.299924163208482,
-        -0.073001013149114,
-        0.006683678319012,
+        0.9999999999996861,
+        0.018184368627828466,
+        -0.44364107914224865,
+        0.21709437130752046,
+        -0.023897373260303105,
+        -0.0071969181772045645,
+        0.0015005805508435293,
     )
     clamp = 3.0
     abs_x = fabs_f32(x, loc=loc, ip=ip)
@@ -180,8 +212,9 @@ def tanh_emulation_2(
     hx, hy = evaluate_polynomial_2(tx, ty, poly_tanh_d6, loc=loc, ip=ip)
     poly_x = x * hx
     poly_y = y * hy
-    sat_x = copysign_f32(1.0, x, loc=loc, ip=ip)
-    sat_y = copysign_f32(1.0, y, loc=loc, ip=ip)
+    poly_y = y * hy
+    sat_x = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
+    sat_y = copysign_f32(0.9950547536867305, y, loc=loc, ip=ip)
     return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
 
 
@@ -196,6 +229,161 @@ def tanh_emulationf(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
         return res.load()
     else:
         return tanh_emulation(x)
+
+
+# =============================================================================
+# D3 Tanh — LIGHTWEIGHT (2 FMA + 1 mul), matches SPLINE_TANH_FWD_D3 CUDA kernel
+# ODD polynomial: tanh(x) = sign(x) * |x| * poly(|x|), domain [0,3]
+# Coefficients: c1=1.124, c2=-0.427, c3=0.054, max_abs_error ≈ 0.011
+# =============================================================================
+
+@dsl_user_op
+def tanh_emulation_d3(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Scalar f32 D3 spline tanh: tanh(x) ≈ x*poly(|x|) for |x|<3, ±1 otherwise.
+    Only 2 FMAs + 1 mul vs D6's 6 FMAs + 1 mul."""
+    c1 = 1.1240234375
+    c2 = -0.4267578125
+    c3 = 0.054229736328125
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    t = fmin(abs_x, clamp, loc=loc, ip=ip)
+    # Horner: h(t) = t * (c1 + t*(c2 + c3*t))  — just 2 FMA + 1 mul
+    h = t * Float32(c3) + Float32(c2)       # c3*t + c2
+    h = t * h + Float32(c1)                 # t*(c3*t+c2) + c1
+    poly_result = t * h                     # t * (c1 + t*(c2 + c3*t))
+    # Restore sign via copysign on the result (tanh is odd)
+    poly_result = copysign_f32(poly_result, x, loc=loc, ip=ip)
+    # Saturate: |x| >= 3 → ±tanh(3) ≈ ±0.995
+    saturated = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
+    return select_(abs_x < clamp, poly_result, saturated)
+
+
+@dsl_user_op
+def tanh_emulation_d3_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 D3 spline tanh — 2 FMA + 1 mul per element for ILP."""
+    c1 = 1.1240234375
+    c2 = -0.4267578125
+    c3 = 0.054229736328125
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    # Horner 2-wide: h(t) = t*(c1 + t*(c2 + c3*t))
+    hx, hy = fma_packed_f32x2((Float32(c3), Float32(c3)), (tx, ty), (Float32(c2), Float32(c2)), loc=loc, ip=ip)
+    hx, hy = fma_packed_f32x2((tx, ty), (hx, hy), (Float32(c1), Float32(c1)), loc=loc, ip=ip)
+    poly_x = tx * hx
+    poly_y = ty * hy
+    # Restore sign (tanh is odd)
+    poly_x = copysign_f32(poly_x, x, loc=loc, ip=ip)
+    poly_y = copysign_f32(poly_y, y, loc=loc, ip=ip)
+    sat_x = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
+    sat_y = copysign_f32(0.9950547536867305, y, loc=loc, ip=ip)
+    return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+
+
+@cute.jit
+def tanh_emulationf_d3(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    """D3 tanh emulation for both vector and scalar."""
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_emulation_d3_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        return tanh_emulation_d3(x)
+
+
+# =============================================================================
+# D4 Tanh gradient — for backward pass of D3 tanh softcap
+# tanh'(x) = 1 - tanh(x)^2, symmetric (even function on |x|)
+# Coefficients from SPLINE_TANH_GRAD_D4: c0=1.0, c1=-0.164, c2=-0.770, c3=0.445, c4=-0.069
+# Domain [0,3], 4 FMA Horner
+# =============================================================================
+
+@dsl_user_op
+def tanh_grad_d4_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 D4 tanh gradient — even function, no sign restore needed."""
+    c0 = 1.0
+    c1 = -0.163723089
+    c2 = -0.769918975
+    c3 = 0.444966726
+    c4 = -0.068935747
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    # Horner: ((((c4*t + c3)*t + c2)*t + c1)*t + c0
+    hx, hy = fma_packed_f32x2((Float32(c4), Float32(c4)), (tx, ty), (Float32(c3), Float32(c3)), loc=loc, ip=ip)
+    hx, hy = fma_packed_f32x2((tx, ty), (hx, hy), (Float32(c2), Float32(c2)), loc=loc, ip=ip)
+    hx, hy = fma_packed_f32x2((tx, ty), (hx, hy), (Float32(c1), Float32(c1)), loc=loc, ip=ip)
+    hx, hy = fma_packed_f32x2((tx, ty), (hx, hy), (Float32(c0), Float32(c0)), loc=loc, ip=ip)
+    # Saturate: |x| >= 3 → tanh'(3) ≈ 0 (use small epsilon to keep alive)
+    sat = Float32(0.0)
+    return select_(abs_x < clamp, hx, sat), select_(abs_y < clamp, hy, sat)
+
+
+@cute.jit
+def tanh_gradf_d4(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    """D4 tanh gradient for both vector and scalar."""
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_grad_d4_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        # Scalar fallback: just use 1 - tanh_d3(x)^2
+        t = tanh_emulation_d3(x)
+        return Float32(1.0) - t * t
+
+
+# D3 softcap score_mod — lightweight, matches CUDA kernel performance
+def create_softcap_scoremod_spline_d3(softcap_val):
+    """Softcapping scoremod using D3 spline tanh (2 FMA+1 mul, no SFU)."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_emulationf_d3(scores)
+
+    return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd_spline_d3(softcap_val):
+    """Softcapping scoremod gradient using D4 tanh gradient spline."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        # tanh'(x) directly via D4 polynomial — no need to compute tanh then square
+        derivative = tanh_gradf_d4(scores)
+        return grad * derivative
+
+    return scoremod_bwd_fn
+
+
+def create_softcap_scoremod_bwd_spline_d3_1mt2(softcap_val):
+    """Softcapping scoremod gradient using D3 tanh + 1-tanh² (same pattern as D6)."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        t = tanh_emulationf_d3(scores)
+        derivative = Float32(1.0) - t * t
+        return grad * derivative
+
+    return scoremod_bwd_fn
+
 
 
 @dsl_user_op
@@ -245,6 +433,81 @@ def sigmoid_native_2(x, y):
     sy = cute.arch.rcp_approx(Float32(1.0) + exp_y)
     return sx, sy
 
+
+def tanh_native_2(x, y):
+    """SFU-based tanh: tanh(x) = 2*sigmoid(2x) - 1.
+
+    Uses hardware SFU units (exp2 + rcp_approx): 2 SFU ops + 3 ALU ops per element.
+    """
+    LOG2_E = 1.4426950408889634
+    # tanh(x) = 2*sigmoid(2x) - 1 = 2*rcp(1 + exp2(-2x*log2e)) - 1
+    neg_2x_log2e = x * Float32(-2.0 * LOG2_E)
+    neg_2y_log2e = y * Float32(-2.0 * LOG2_E)
+    exp_x = cute.arch.exp2(neg_2x_log2e)
+    exp_y = cute.arch.exp2(neg_2y_log2e)
+    rx = cute.arch.rcp_approx(Float32(1.0) + exp_x)
+    ry = cute.arch.rcp_approx(Float32(1.0) + exp_y)
+    tx = Float32(2.0) * rx - Float32(1.0)
+    ty = Float32(2.0) * ry - Float32(1.0)
+    return tx, ty
+
+
+@cute.jit
+def tanh_emulationf_hybrid(
+    x: cute.TensorSSA | Float32,
+    sfu_freq: cutlass.Constexpr[int] = 4,
+    sfu_res: cutlass.Constexpr[int] = 1,
+) -> cute.TensorSSA | Float32:
+    """Hybrid tanh: routes pairs between D3 polynomial (ALU) and SFU tanh.
+
+    sfu_freq / sfu_res control the routing (same convention as sigmoid/exp2):
+      pair_idx % sfu_freq < sfu_freq - sfu_res → ALU (D3 polynomial)
+      pair_idx % sfu_freq >= sfu_freq - sfu_res → SFU (exp2 + rcp)
+    Default freq=4, res=1 → 75% ALU, 25% SFU.
+    """
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            pair_idx = cutlass.const_expr(i // 2)
+            if cutlass.const_expr(pair_idx % sfu_freq < sfu_freq - sfu_res):
+                # ALU path: D3 polynomial
+                res[i], res[i + 1] = tanh_emulation_d3_2(res[i], res[i + 1])
+            else:
+                # SFU path: exp2 + rcp hardware
+                res[i], res[i + 1] = tanh_native_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        return tanh_emulation_d3(x)
+
+
+# ---- Hybrid softcap score_mods ----
+
+def create_softcap_scoremod_hybrid(softcap_val, sfu_freq=4, sfu_res=1):
+    """Softcapping scoremod using hybrid ALU/SFU tanh routing."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_emulationf_hybrid(scores, sfu_freq=sfu_freq, sfu_res=sfu_res)
+
+    return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd_hybrid(softcap_val, sfu_freq=4, sfu_res=1):
+    """Softcapping scoremod backward using hybrid tanh + 1-t² routing."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        t = tanh_emulationf_hybrid(scores, sfu_freq=sfu_freq, sfu_res=sfu_res)
+        derivative = Float32(1.0) - t * t
+        return grad * derivative
+
+    return scoremod_bwd_fn
+
 def create_softcap_scoremod_spline(softcap_val):
     """Softcapping scoremod using spline tanh (FMA-only, no SFU)."""
     inv_softcap = 1.0 / softcap_val
@@ -252,9 +515,23 @@ def create_softcap_scoremod_spline(softcap_val):
     @cute.jit
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         scores = acc_S_SSA * inv_softcap
-        return scores * tanh_emulationf(scores)
+        return softcap_val * tanh_emulationf(scores)
 
     return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd_spline(softcap_val):
+    """Softcapping scoremod gradient using spline tanh."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        t = tanh_emulationf(scores)
+        derivative = Float32(1.0) - t * t
+        return grad * derivative
+
+    return scoremod_bwd_fn
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:

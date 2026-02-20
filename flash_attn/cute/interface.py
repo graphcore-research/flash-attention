@@ -603,6 +603,8 @@ def _flash_attn_bwd(
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    sigmoid_attention: bool = False,
+    sigmoid_bias: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
@@ -998,6 +1000,8 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_q is None,
             seqused_k is None,
+            sigmoid_attention,
+            sigmoid_bias,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1082,6 +1086,8 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                sigmoid_attention=sigmoid_attention,
+                sigmoid_bias=sigmoid_bias,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1352,6 +1358,8 @@ class FlashAttnFunc(torch.autograd.Function):
         # LSE gradient is not supported yet
         if lse is not None:
             ctx.mark_non_differentiable(lse)
+        ctx.sigmoid_attention = sigmoid_attention
+        ctx.sigmoid_bias = sigmoid_bias
         return out, lse
 
     @staticmethod
@@ -1370,6 +1378,8 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            sigmoid_attention=ctx.sigmoid_attention,
+            sigmoid_bias=ctx.sigmoid_bias,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 

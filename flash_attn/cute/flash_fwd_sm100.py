@@ -2162,20 +2162,15 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                             softmax_corr_consumer_phase,
                         )
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
-                        if should_rescale:
-                            self.correction_rescale(
-                                thr_mma_pv, tOtOs[stage], tidx, scale
-                            )
+                        if const_expr(not self.sigmoid_attention):
+                            # Softmax: read scale, vote_ballot, conditional rescale
+                            scale = sScale[tidx + stage * self.m_block_size]
+                            should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                            if should_rescale:
+                                self.correction_rescale(
+                                    thr_mma_pv, tOtOs[stage], tidx, scale
+                                )
+                        # Sigmoid: acc_scale is always 1.0 — skip scale read, vote, rescale
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                         if const_expr(self.q_stage == 2):
                             cute.arch.mbarrier_arrive(
@@ -2210,30 +2205,31 @@ class FlashAttentionForwardSm100:
                         mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                         softmax_corr_consumer_phase,
                     )
-                    # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                    # cute.arch.fence_view_async_tmem_load()
-                    # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                    if const_expr(self.sigmoid_attention):
+                        # Sigmoid: no normalization needed
+                        scale = Float32(1.0)
                     else:
-                        row_max = None
+                        row_sum = sScale[tidx + stage * self.m_block_size]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            row_max = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                        else:
+                            row_max = None
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
-                    if const_expr(learnable_sink is not None):
-                        LOG2_E = math.log2(math.e)
-                        sink_val = learnable_sink_val[stage]
-                        if const_expr(not self.is_split_kv) or split_idx == 0:
-                            if row_max == -Float32.inf:
-                                # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2)
-                                row_sum = Float32(1.0)
-                            else:
-                                row_sum += utils.exp2f(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2
-                                )
-                    acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                    stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    if const_expr(not self.sigmoid_attention):
+                        if const_expr(learnable_sink is not None):
+                            LOG2_E = math.log2(math.e)
+                            sink_val = learnable_sink_val[stage]
+                            if const_expr(not self.is_split_kv) or split_idx == 0:
+                                if row_max == -Float32.inf:
+                                    row_max = sink_val * (LOG2_E / softmax_scale_log2)
+                                    row_sum = Float32(1.0)
+                                else:
+                                    row_sum += utils.exp2f(
+                                        sink_val * LOG2_E - row_max * softmax_scale_log2
+                                    )
+                        acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                        stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                        scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )

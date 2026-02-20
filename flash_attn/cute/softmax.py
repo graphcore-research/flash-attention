@@ -314,13 +314,17 @@ class SoftmaxSm100(Softmax):
         bias = self.sigmoid_bias  # -log(n) per FlashSigmoid paper
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                s0 = acc_S_row_frg[k, j] * sm_scale + bias
-                s1 = acc_S_row_frg[k + 1, j] * sm_scale + bias
+                # Pack S * scale + bias as fma_packed_f32x2
+                s0, s1 = utils.fma_packed_f32x2(
+                    (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                    (sm_scale, sm_scale),
+                    (bias, bias),
+                )
                 if cutlass.const_expr(
                     k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                 ):
-                    # Polynomial (FMA) path
-                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_emulation_2(s0, s1)
+                    # Lean polynomial (FMA) path — 5 ops per pair
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_fast_2(s0, s1)
                 else:
                     # SFU path (exp2 + rcp_approx)
                     acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_native_2(s0, s1)

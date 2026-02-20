@@ -424,6 +424,41 @@ def sigmoid_emulation_2(
     return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
 
 
+@dsl_user_op
+def sigmoid_fast_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Lean paired sigmoid — 5 ops per pair.
+
+    Uses 2-sided clamp on signed input (like SIGMOID_N2_D3_BITWISE):
+      t = clamp(x, -6, 6), then sigmoid(t) ≈ c0 + t*(c1 + |t|*(c2 + c3*|t|))
+
+    But simpler: since h(t) is odd and we need |t| for the even-degree terms,
+    we use: sigmoid(x) = 0.5 + t * poly(|t|) where t = clamp(x, -6, 6).
+    The clamp ensures t stays bounded, so t * poly(|t|) can't diverge.
+
+    Ops: 2 fmax + 2 fmin + 2 fabs + 3 FMA pairs = 9 paired ops
+    (fabs is free - just clears sign bit)
+    """
+    c1 = 0.281005859375
+    c2 = -0.0533447265625
+    c3 = 0.0033893585205078125
+    pos_clamp = Float32(6.0)
+    neg_clamp = Float32(-6.0)
+    # 2-sided clamp: t = max(min(x, 6), -6)
+    tx = fmax(fmin(x, pos_clamp, loc=loc, ip=ip), neg_clamp, loc=loc, ip=ip)
+    ty = fmax(fmin(y, pos_clamp, loc=loc, ip=ip), neg_clamp, loc=loc, ip=ip)
+    # |t| for even-degree terms
+    atx = fabs_f32(tx, loc=loc, ip=ip)
+    aty = fabs_f32(ty, loc=loc, ip=ip)
+    # Horner on |t|: poly(|t|) = (c3*|t| + c2)*|t| + c1
+    px, py = fma_packed_f32x2((c3, c3), (atx, aty), (c2, c2), loc=loc, ip=ip)
+    px, py = fma_packed_f32x2((px, py), (atx, aty), (c1, c1), loc=loc, ip=ip)
+    # sigmoid = 0.5 + t * poly(|t|) — t is clamped, so this is bounded
+    rx, ry = fma_packed_f32x2((tx, ty), (px, py), (Float32(0.5), Float32(0.5)), loc=loc, ip=ip)
+    return rx, ry
+
+
 def sigmoid_native_2(x, y):
     """SFU-based sigmoid: sigmoid(x) = rcp(1 + exp2(-x * log2(e))).
 

@@ -605,6 +605,8 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     sigmoid_attention: bool = False,
     sigmoid_bias: float | None = None,
+    sigmoid_sfu_freq: int = 16,
+    sigmoid_sfu_res: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
@@ -1002,6 +1004,8 @@ def _flash_attn_bwd(
             seqused_k is None,
             sigmoid_attention,
             sigmoid_bias,
+            sigmoid_sfu_freq,
+            sigmoid_sfu_res,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1088,6 +1092,8 @@ def _flash_attn_bwd(
                 subtile_factor=subtile_factor,
                 sigmoid_attention=sigmoid_attention,
                 sigmoid_bias=sigmoid_bias,
+                sigmoid_sfu_freq=sigmoid_sfu_freq,
+                sigmoid_sfu_res=sigmoid_sfu_res,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).

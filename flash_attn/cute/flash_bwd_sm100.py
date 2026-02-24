@@ -67,6 +67,8 @@ class FlashAttentionBackwardSm100:
         subtile_factor: cutlass.Constexpr[int] = 1,
         sigmoid_attention: bool = False,
         sigmoid_bias: float | None = None,
+        sigmoid_sfu_freq: int = 16,
+        sigmoid_sfu_res: int = 0,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -128,6 +130,8 @@ class FlashAttentionBackwardSm100:
         self.subtile_factor = subtile_factor
         self.sigmoid_attention = sigmoid_attention
         self.sigmoid_bias = sigmoid_bias
+        self.sigmoid_sfu_freq = sigmoid_sfu_freq
+        self.sigmoid_sfu_res = sigmoid_sfu_res
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3053,13 +3057,20 @@ class FlashAttentionBackwardSm100:
                         else:
                             sig_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
                         for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                            s0 = tSrS_cur[2 * v] * sm_scale + sig_bias
-                            s1 = tSrS_cur[2 * v + 1] * sm_scale + sig_bias
-                            # sigmoid via SFU: 1 / (1 + exp2(-x * log2e))
-                            e0 = cute.math.exp2(-s0 * LOG2_E, fastmath=True)
-                            e1 = cute.math.exp2(-s1 * LOG2_E, fastmath=True)
-                            tSrS_cur[2 * v] = 1.0 / (1.0 + e0)
-                            tSrS_cur[2 * v + 1] = 1.0 / (1.0 + e1)
+                            # Pack S * scale + bias via FMA
+                            s0, s1 = utils.fma_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (sm_scale, sm_scale),
+                                (sig_bias, sig_bias),
+                            )
+                            if const_expr(
+                                v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
+                            ):
+                                # Polynomial (FMA) path
+                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.sigmoid_fast_2(s0, s1)
+                            else:
+                                # SFU path (exp2 + rcp_approx)
+                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.sigmoid_native_2(s0, s1)
                     else:
                         # Softmax: P = exp2(S * scale_log2 - LSE)
                         tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3128,7 +3139,6 @@ class FlashAttentionBackwardSm100:
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     if const_expr(self.sigmoid_attention):
                         # Sigmoid backward: dS = P * (1 - P) * dP
-                        # tSrS_cur holds P values from the P computation above
                         for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                             p0 = tSrS_cur[2 * v]
                             p1 = tSrS_cur[2 * v + 1]

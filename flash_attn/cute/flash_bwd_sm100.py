@@ -3117,12 +3117,8 @@ class FlashAttentionBackwardSm100:
                         else:
                             sig_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
                         for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                            # Pack S * scale + bias via FMA
-                            s0, s1 = utils.fma_packed_f32x2(
-                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
-                                (sm_scale, sm_scale),
-                                (sig_bias, sig_bias),
-                            )
+                            s0 = tSrS_cur[2 * v] * sm_scale + sig_bias
+                            s1 = tSrS_cur[2 * v + 1] * sm_scale + sig_bias
                             if const_expr(
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):

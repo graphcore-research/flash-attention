@@ -1337,6 +1337,8 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sigmoid_attention = sigmoid_attention
+        ctx.sigmoid_sfu_freq = sigmoid_sfu_freq
+        ctx.sigmoid_sfu_res = sigmoid_sfu_res
         ctx.sigmoid_bias = sigmoid_bias
         return out, lse
 
@@ -1357,6 +1359,8 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
             sigmoid_attention=ctx.sigmoid_attention,
+            sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+            sigmoid_sfu_res=ctx.sigmoid_sfu_res,
             sigmoid_bias=ctx.sigmoid_bias,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine

@@ -55,6 +55,19 @@ POLY_EX2 = {
 }
 
 
+def fma_packed_f32x2(a, b, c, *, loc=None, ip=None):
+    """Compatibility wrapper for packed f32x2 FMA primitive."""
+    return cute.arch.fma_packed_f32x2(a, b, c, loc=loc, ip=ip)
+
+
+def mul_packed_f32x2(a, b, *, loc=None, ip=None):
+    return cute.arch.mul_packed_f32x2(a, b, loc=loc, ip=ip)
+
+
+def sub_packed_f32x2(a, b, *, loc=None, ip=None):
+    return cute.arch.add_packed_f32x2(a, (-b[0], -b[1]), loc=loc, ip=ip)
+
+
 def _compute_base_hash(func: Callable) -> str:
     """Compute hash from source code or bytecode and closure values."""
     try:

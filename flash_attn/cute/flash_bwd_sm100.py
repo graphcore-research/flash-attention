@@ -3115,7 +3115,7 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.sigmoid_bias is not None):
                             sig_bias = Float32(self.sigmoid_bias)
                         else:
-                            sig_bias = -utils.log2f(Float32(seqlen.seqlen_k)) * LN2
+                            sig_bias = -cute.math.log2(Float32(seqlen.seqlen_k), fastmath=True) * LN2
                         for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
                             s0 = tSrS_cur[2 * v] * sm_scale + sig_bias
                             s1 = tSrS_cur[2 * v + 1] * sm_scale + sig_bias

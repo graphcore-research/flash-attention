@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 import os
+import hashlib
 import pathlib
 from typing import Tuple
 from functools import partial, lru_cache
@@ -17,6 +18,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
+from cutlass.cutlass_dsl.cutlass import CutlassBaseDSL
 from cutlass.cute.runtime import from_dlpack
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
@@ -31,6 +33,40 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+
+@lru_cache(maxsize=1)
+def _cutlass_version_hash_from_disk():
+    dsl_path = pathlib.Path(cutlass.cutlass_dsl.cutlass.__file__).resolve().parent.parent
+    version_hash = hashlib.sha256()
+
+    for src in sorted(dsl_path.rglob("*.py")):
+        version_hash.update(src.relative_to(dsl_path).as_posix().encode())
+        with src.open("rb") as f:
+            version_hash.update(f.read())
+
+    mlir_lib_dir = dsl_path / "_mlir" / "_mlir_libs"
+    giant_dso = next(mlir_lib_dir.glob("_cutlass_ir.cpython*"), None)
+    if giant_dso is None:
+        raise RuntimeError(f"Failed to locate CUTLASS DSL shared library under {mlir_lib_dir}")
+    with giant_dso.open("rb") as f:
+        while True:
+            chunk = f.read(1024**2)
+            if not chunk:
+                break
+            version_hash.update(chunk)
+
+    return version_hash
+
+
+def _cutlass_get_version_patched(self):
+    # Newer CUTLASS wheels import every `cutlass.*` package while hashing their
+    # own version, which trips `cutlass.cute.experimental` on CUDA 13.0.
+    # Hash the on-disk sources directly instead of importing the package tree.
+    return _cutlass_version_hash_from_disk().copy()
+
+
+CutlassBaseDSL.get_version = _cutlass_get_version_patched
 
 
 @lru_cache

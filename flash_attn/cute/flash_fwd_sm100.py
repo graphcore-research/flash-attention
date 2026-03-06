@@ -117,11 +117,13 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
+        output_gate_use_spline: bool = False,
         sigmoid_attention: bool = False,
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
         sigmoid_bias: float | None = None,
     ):
+        self.output_gate_use_spline = output_gate_use_spline
         self.sigmoid_attention = sigmoid_attention
         self.sigmoid_sfu_freq = sigmoid_sfu_freq
         self.sigmoid_sfu_res = sigmoid_sfu_res
@@ -328,6 +330,7 @@ class FlashAttentionForwardSm100:
         mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        mGateAct: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
         stream: cuda.CUstream,
@@ -361,6 +364,8 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        if const_expr(mGateAct is not None):
+            mGateAct = assume_tensor_aligned(mGateAct)
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -378,6 +383,11 @@ class FlashAttentionForwardSm100:
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             num_splits = Int32(1)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+        mGateAct = (
+            cute.make_tensor(mGateAct.iterator, cute.select(mGateAct.layout, mode=O_layout_transpose))
+            if const_expr(mGateAct is not None)
+            else None
+        )
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if const_expr(mLSE is not None)
@@ -393,7 +403,12 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = (
+            self.arch >= Arch.sm_90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and mGateAct is None
+        )
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
@@ -727,6 +742,7 @@ class FlashAttentionForwardSm100:
             mK,
             mV,
             mO,
+            mGateAct,
             mLSE,
             mCuSeqlensQ,
             mCuSeqlensK,
@@ -772,6 +788,7 @@ class FlashAttentionForwardSm100:
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
         mO: cute.Tensor,
+        mGateAct: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -1126,6 +1143,7 @@ class FlashAttentionForwardSm100:
                 _setmaxregister_decrease(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
+                    mGateAct,
                     sO,
                     gmem_tiled_copy_O,
                     tma_atom_O,
@@ -1198,6 +1216,7 @@ class FlashAttentionForwardSm100:
                 tOtO,
                 sScale,
                 mO,
+                mGateAct,
                 mLSE,
                 sO,
                 pipeline_s_p_o,
@@ -2221,6 +2240,7 @@ class FlashAttentionForwardSm100:
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
         mO: cute.Tensor,
+        mGateAct: Optional[cute.Tensor],
         mLSE: cute.Tensor,
         sO: cute.Tensor,
         pipeline_s_p_o: pipeline.PipelineAsync,
@@ -2283,6 +2303,17 @@ class FlashAttentionForwardSm100:
                 cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
             )  # (128, 128, 2)
             gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+            if const_expr(mGateAct is not None):
+                mGateAct_cur = seqlen.offset_batch_Q(mGateAct, batch_idx, dim=3)[None, None, head_idx]
+                gGateAct = cute.local_tile(mGateAct_cur, tiler_gO, (m_block, 0))
+                gGateAct = layout_utils.select(
+                    cute.flat_divide(gGateAct, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
+                )
+                gGateAct = cute.flat_divide(
+                    gGateAct, (self.mma_tiler_pv[0] // self.cta_group_size,)
+                )[None, mma_tile_coord_v, None, None]
+            else:
+                gGateAct = None
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2394,6 +2425,7 @@ class FlashAttentionForwardSm100:
                         sO[None, None, stage],
                         mO_cur,
                         gO[None, None, stage],
+                        gGateAct[None, None, stage] if const_expr(gGateAct is not None) else None,
                         gmem_tiled_copy_O,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
@@ -2555,6 +2587,7 @@ class FlashAttentionForwardSm100:
         sO: cute.Tensor,
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
+        gGateAct: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
@@ -2628,7 +2661,7 @@ class FlashAttentionForwardSm100:
             mma_tile_coord_v = thr_mma.thr_idx
             m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
             self._store_O_to_gmem(
-                sO, gO, mO_cur, gmem_tiled_copy_O, tidx, seqlen_q, m_tile_idx
+                sO, gO, gGateAct, mO_cur, gmem_tiled_copy_O, tidx, seqlen_q, m_tile_idx
             )
 
     @cute.jit
@@ -2636,6 +2669,7 @@ class FlashAttentionForwardSm100:
         self,
         sO_stage: cute.Tensor,
         gO: cute.Tensor,
+        gGateAct: Optional[cute.Tensor],
         mO_cur: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
         tidx: Int32,
@@ -2660,6 +2694,30 @@ class FlashAttentionForwardSm100:
         # load acc O from smem to rmem for wider vectorization
         tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
         cute.autovec_copy(tOsO, tOrO)
+        if const_expr(gGateAct is not None):
+            tOgGateAct = gmem_thr_copy_O.partition_S(gGateAct)
+            tOrGateRaw = cute.make_fragment_like(tOgGateAct, self.o_dtype)
+            tOrGateAct = cute.make_fragment_like(tOgGateAct, Float32)
+            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                if (
+                    t0OcO[0, rest_m, 0][0] < seqlen_q - m_tile_idx * self.m_block_size - tOcO[0][0]
+                ):
+                    cute.copy(
+                        gmem_thr_copy_O,
+                        tOgGateAct[None, rest_m, None],
+                        tOrGateRaw[None, rest_m, None],
+                        pred=tOpO[None, rest_m, None]
+                        if const_expr(self.check_hdim_v_oob)
+                        else None,
+                    )
+            for j in cutlass.range(0, cute.size(tOrGateAct), 2, unroll_full=True):
+                g0 = Float32(tOrGateRaw[j])
+                g1 = Float32(tOrGateRaw[j + 1])
+                if const_expr(self.output_gate_use_spline):
+                    tOrGateAct[j], tOrGateAct[j + 1] = utils.sigmoid_fast_2(g0, g1)
+                else:
+                    tOrGateAct[j], tOrGateAct[j + 1] = utils.sigmoid_native_2(g0, g1)
+            tOrO.store((tOrO.load().to(Float32) * tOrGateAct.load().to(Float32)).to(self.o_dtype))
         # copy acc O from rmem to gmem
         if const_expr(not self.pack_gqa):
             for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
@@ -2683,6 +2741,7 @@ class FlashAttentionForwardSm100:
     def epilogue_s2g(
         self,
         mO: cute.Tensor,
+        mGateAct: Optional[cute.Tensor],
         sO: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
@@ -2712,6 +2771,17 @@ class FlashAttentionForwardSm100:
                     cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
                 )  # (128, 128, 2)
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+                if const_expr(mGateAct is not None):
+                    mGateAct_cur = seqlen.offset_batch_Q(mGateAct, batch_idx, dim=3)[None, None, head_idx]
+                    gGateAct = cute.local_tile(mGateAct_cur, tiler_gO, (m_block, 0))
+                    gGateAct = layout_utils.select(
+                        cute.flat_divide(gGateAct, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
+                    )
+                    gGateAct = cute.flat_divide(
+                        gGateAct, (self.mma_tiler_pv[0] // self.cta_group_size,)
+                    )[None, mma_tile_coord_v, None, None]
+                else:
+                    gGateAct = None
 
                 if const_expr(self.use_tma_O):
                     store_O, _, _ = copy_utils.tma_get_copy_fn(
@@ -2739,7 +2809,11 @@ class FlashAttentionForwardSm100:
                         # 2. copy O0 / O1 to gmem
                         m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                         self._store_O_to_gmem(
-                            sO[None, None, stage], gO[None, None, stage], mO_cur, gmem_tiled_copy_O,
+                            sO[None, None, stage],
+                            gO[None, None, stage],
+                            gGateAct[None, None, stage] if const_expr(gGateAct is not None) else None,
+                            mO_cur,
+                            gmem_tiled_copy_O,
                             tidx, seqlen.seqlen_q, m_tile_idx,
                         )
                         pipeline_o_epi.consumer_release_w_index(stage)

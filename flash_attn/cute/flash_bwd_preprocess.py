@@ -33,6 +33,7 @@ class FlashAttentionBackwardPreprocess:
         arch: Literal[80, 90, 100],
         m_block_size: int = 128,
         num_threads: int = 128,
+        output_gate_use_spline: bool = False,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -54,6 +55,7 @@ class FlashAttentionBackwardPreprocess:
         self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
+        self.output_gate_use_spline = output_gate_use_spline
 
     @staticmethod
     def can_implement(dtype, head_dim, m_block_size, num_threads) -> bool:
@@ -116,6 +118,9 @@ class FlashAttentionBackwardPreprocess:
         self,
         mO: cute.Tensor,
         mdO: cute.Tensor,
+        mGateAct: Optional[cute.Tensor],
+        mdOAttn: Optional[cute.Tensor],
+        mdGate: Optional[cute.Tensor],
         mdPsum: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mLSElog2: Optional[cute.Tensor],
@@ -127,6 +132,12 @@ class FlashAttentionBackwardPreprocess:
         # Get the data type and check if it is fp16 or bf16
         if cutlass.const_expr(not (mO.element_type == mdO.element_type)):
             raise TypeError("All tensors must have the same data type")
+        if cutlass.const_expr(mGateAct is not None and mGateAct.element_type != mO.element_type):
+            raise TypeError("mGateAct must have the same type as mO")
+        if cutlass.const_expr(mdOAttn is not None and mdOAttn.element_type != mO.element_type):
+            raise TypeError("mdOAttn must have the same type as mO")
+        if cutlass.const_expr(mdGate is not None and mdGate.element_type != mO.element_type):
+            raise TypeError("mdGate must have the same type as mO")
         if cutlass.const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if cutlass.const_expr(mdPsum.element_type not in [Float32]):
@@ -142,6 +153,12 @@ class FlashAttentionBackwardPreprocess:
                 raise TypeError("LSElog2 tensor must be Float32")
 
         mO, mdO, mdQaccum = [assume_tensor_aligned(t) for t in (mO, mdO, mdQaccum)]
+        if cutlass.const_expr(mGateAct is not None):
+            mGateAct = assume_tensor_aligned(mGateAct)
+        if cutlass.const_expr(mdOAttn is not None):
+            mdOAttn = assume_tensor_aligned(mdOAttn)
+        if cutlass.const_expr(mdGate is not None):
+            mdGate = assume_tensor_aligned(mdGate)
 
         self._setup_attributes()
 
@@ -174,6 +191,9 @@ class FlashAttentionBackwardPreprocess:
         self.kernel(
             mO,
             mdO,
+            mGateAct,
+            mdOAttn,
+            mdGate,
             mdPsum,
             mLSE,
             mLSElog2,
@@ -195,6 +215,9 @@ class FlashAttentionBackwardPreprocess:
         self,
         mO: cute.Tensor,
         mdO: cute.Tensor,
+        mGateAct: Optional[cute.Tensor],
+        mdOAttn: Optional[cute.Tensor],
+        mdGate: Optional[cute.Tensor],
         mdPsum: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mLSElog2: Optional[cute.Tensor],
@@ -230,11 +253,41 @@ class FlashAttentionBackwardPreprocess:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
                 mO_cur = mO[batch_idx, None, head_idx, None]
                 mdO_cur = mdO[batch_idx, None, head_idx, None]
+                mGateAct_cur = (
+                    mGateAct[batch_idx, None, head_idx, None]
+                    if cutlass.const_expr(mGateAct is not None)
+                    else None
+                )
+                mdOAttn_cur = (
+                    mdOAttn[batch_idx, None, head_idx, None]
+                    if cutlass.const_expr(mdOAttn is not None)
+                    else None
+                )
+                mdGate_cur = (
+                    mdGate[batch_idx, None, head_idx, None]
+                    if cutlass.const_expr(mdGate is not None)
+                    else None
+                )
                 mdPsum_cur = mdPsum[batch_idx, head_idx, None]
                 headdim_v = mO.shape[3]
             else:
                 mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, head_idx, None])
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
+                mGateAct_cur = (
+                    cute.domain_offset((seqlen.offset_q, 0), mGateAct[None, head_idx, None])
+                    if cutlass.const_expr(mGateAct is not None)
+                    else None
+                )
+                mdOAttn_cur = (
+                    cute.domain_offset((seqlen.offset_q, 0), mdOAttn[None, head_idx, None])
+                    if cutlass.const_expr(mdOAttn is not None)
+                    else None
+                )
+                mdGate_cur = (
+                    cute.domain_offset((seqlen.offset_q, 0), mdGate[None, head_idx, None])
+                    if cutlass.const_expr(mdGate is not None)
+                    else None
+                )
 
                 padded_offset_q = seqlen.offset_q + batch_idx * self.m_block_size
                 if cutlass.const_expr(self.arch >= 90):
@@ -246,11 +299,41 @@ class FlashAttentionBackwardPreprocess:
             # (m_block_size, head_dim_v)
             gO = cute.local_tile(mO_cur, blkOdO_shape, (m_block, 0))
             gdO = cute.local_tile(mdO_cur, blkOdO_shape, (m_block, 0))
+            gGateAct = (
+                cute.local_tile(mGateAct_cur, blkOdO_shape, (m_block, 0))
+                if cutlass.const_expr(mGateAct_cur is not None)
+                else None
+            )
+            gdOAttn = (
+                cute.local_tile(mdOAttn_cur, blkOdO_shape, (m_block, 0))
+                if cutlass.const_expr(mdOAttn_cur is not None)
+                else None
+            )
+            gdGate = (
+                cute.local_tile(mdGate_cur, blkOdO_shape, (m_block, 0))
+                if cutlass.const_expr(mdGate_cur is not None)
+                else None
+            )
 
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             # (CPY_Atom, CPY_M, CPY_K)
             tOgO = gmem_thr_copy_O.partition_S(gO)
             tOgdO = gmem_thr_copy_O.partition_S(gdO)
+            tOgGateAct = (
+                gmem_thr_copy_O.partition_S(gGateAct)
+                if cutlass.const_expr(gGateAct is not None)
+                else None
+            )
+            tOgdOAttn = (
+                gmem_thr_copy_O.partition_D(gdOAttn)
+                if cutlass.const_expr(gdOAttn is not None)
+                else None
+            )
+            tOgdGate = (
+                gmem_thr_copy_O.partition_D(gdGate)
+                if cutlass.const_expr(gdGate is not None)
+                else None
+            )
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
@@ -279,6 +362,16 @@ class FlashAttentionBackwardPreprocess:
 
             tOrO = cute.make_fragment_like(tOgO)
             tOrdO = cute.make_fragment_like(tOgdO)
+            tOrGateRaw = (
+                cute.make_fragment_like(tOgGateAct)
+                if cutlass.const_expr(tOgGateAct is not None)
+                else None
+            )
+            tOrGateAct = (
+                cute.make_fragment_like(tOgGateAct, Float32)
+                if cutlass.const_expr(tOgGateAct is not None)
+                else None
+            )
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
             assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
             assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
@@ -302,15 +395,67 @@ class FlashAttentionBackwardPreprocess:
                         if cutlass.const_expr(self.check_hdim_v_oob)
                         else None,
                     )
+                    if cutlass.const_expr(tOgGateAct is not None):
+                        cute.copy(
+                            gmem_thr_copy_O,
+                            tOgGateAct[None, m, None],
+                            tOrGateRaw[None, m, None],
+                            pred=tOpO[None, m, None]
+                            if cutlass.const_expr(self.check_hdim_v_oob)
+                            else None,
+                        )
+            if cutlass.const_expr(tOgGateAct is not None):
+                for i in cutlass.range(0, cute.size(tOrGateAct), 2, unroll_full=True):
+                    g0 = Float32(tOrGateRaw[i])
+                    g1 = Float32(tOrGateRaw[i + 1])
+                    if cutlass.const_expr(self.output_gate_use_spline):
+                        tOrGateAct[i], tOrGateAct[i + 1] = utils.sigmoid_fast_2(g0, g1)
+                    else:
+                        tOrGateAct[i], tOrGateAct[i + 1] = utils.sigmoid_native_2(g0, g1)
             # Sum across the "k" dimension
             dpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
                 cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
             )
+            out_vals = tOrO.load().to(Float32)
+            dout_vals = tOrdO.load().to(Float32)
+            if cutlass.const_expr(tOgdOAttn is not None):
+                dout_attn = (dout_vals * tOrGateAct.load().to(Float32)).to(mO.element_type)
+                tOrdO.store(dout_attn)
+            if cutlass.const_expr(tOgdGate is not None):
+                dgate = (
+                    dout_vals
+                    * out_vals
+                    * (Float32(1.0) - tOrGateAct.load().to(Float32))
+                ).to(mO.element_type)
+                tOrO.store(dgate)
             threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
             assert cute.arch.WARP_SIZE % threads_per_row == 0
             dpsum = utils.warp_reduce(dpsum, operator.add, width=threads_per_row)
             dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), Float32)
             dP_sum.store(dpsum)
+
+            if cutlass.const_expr(tOgdOAttn is not None):
+                for m in cutlass.range(cute.size(tOrdO.shape[1]), unroll_full=True):
+                    if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
+                        cute.copy(
+                            gmem_tiled_copy_O,
+                            tOrdO[None, m, None],
+                            tOgdOAttn[None, m, None],
+                            pred=tOpdO[None, m, None]
+                            if cutlass.const_expr(self.check_hdim_v_oob)
+                            else None,
+                        )
+            if cutlass.const_expr(tOgdGate is not None):
+                for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                    if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
+                        cute.copy(
+                            gmem_tiled_copy_O,
+                            tOrO[None, m, None],
+                            tOgdGate[None, m, None],
+                            pred=tOpO[None, m, None]
+                            if cutlass.const_expr(self.check_hdim_v_oob)
+                            else None,
+                        )
 
             # Write dPsum from rmem -> gmem
             gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (m_block,))

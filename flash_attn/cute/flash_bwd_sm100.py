@@ -44,6 +44,23 @@ from flash_attn.cute.block_sparse_utils import (
 )
 
 
+def _get_max_tmem_alloc_cols() -> int:
+    """Compatibility with older cutlass-dsl builds lacking get_max_tmem_alloc_cols."""
+    if hasattr(cute.arch, "get_max_tmem_alloc_cols"):
+        return cute.arch.get_max_tmem_alloc_cols("sm_100")
+    return int(cute.arch.SM100_TMEM_CAPACITY_COLUMNS)
+
+
+def _setmaxregister_decrease(regs: int) -> None:
+    if hasattr(cute.arch, "setmaxregister_decrease"):
+        cute.arch.setmaxregister_decrease(regs)
+
+
+def _setmaxregister_increase(regs: int) -> None:
+    if hasattr(cute.arch, "setmaxregister_increase"):
+        cute.arch.setmaxregister_increase(regs)
+
+
 class FlashAttentionBackwardSm100:
     arch = 100
 
@@ -177,7 +194,7 @@ class FlashAttentionBackwardSm100:
             num_threads=len(self.reduce_warp_ids) * cute.arch.WARP_SIZE,
         )
         # TMEM setup
-        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        self.tmem_alloc_cols = _get_max_tmem_alloc_cols()
         # self.tmem_dK_offset = 0
         # self.tmem_dV_offset = self.tmem_dK_offset + self.tile_hdim
         # self.tmem_dQ_offset = self.tmem_dV_offset + self.tile_hdimv
@@ -1431,12 +1448,12 @@ class FlashAttentionBackwardSm100:
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_empty)
+            _setmaxregister_decrease(self.num_regs_empty)
 
         #  RELAY
         # (14)
         if warp_idx == self.relay_warp_id:
-            cute.arch.setmaxregister_decrease(
+            _setmaxregister_decrease(
                 self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
             )
             if const_expr(self.use_2cta_instrs):
@@ -1453,7 +1470,7 @@ class FlashAttentionBackwardSm100:
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_load)
+            _setmaxregister_decrease(self.num_regs_load)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1503,7 +1520,7 @@ class FlashAttentionBackwardSm100:
         #  MMA
         # (12)
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_mma)
+            _setmaxregister_decrease(self.num_regs_mma)
 
             # Alloc tmem buffer
             tmem.allocate(self.tmem_alloc_cols)
@@ -1557,7 +1574,7 @@ class FlashAttentionBackwardSm100:
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
+            _setmaxregister_increase(self.num_regs_compute)  # 8 warps
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
@@ -1607,7 +1624,7 @@ class FlashAttentionBackwardSm100:
         # Reduce
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            _setmaxregister_increase(self.num_regs_reduce)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.dQacc_reduce(
@@ -3184,6 +3201,7 @@ class FlashAttentionBackwardSm100:
 
                 ##### dS.T = P.T * (dP.T - Psum)   [softmax]
                 ##### dS.T = P.T * (1 - P.T) * dP.T  [sigmoid]
+                sigmoid_grad_scale = softmax_scale_log2 * 0.6931471805599453
                 for stage in cutlass.range_constexpr(num_stages):
                     tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
@@ -3197,8 +3215,8 @@ class FlashAttentionBackwardSm100:
                             p0 = tSrS_cur[2 * v]
                             p1 = tSrS_cur[2 * v + 1]
                             # dS = P * (1 - P) * dP
-                            tdPrdP_cur[2 * v] = p0 * (1.0 - p0) * tdPrdP_cur[2 * v]
-                            tdPrdP_cur[2 * v + 1] = p1 * (1.0 - p1) * tdPrdP_cur[2 * v + 1]
+                            tdPrdP_cur[2 * v] = sigmoid_grad_scale * p0 * (1.0 - p0) * tdPrdP_cur[2 * v]
+                            tdPrdP_cur[2 * v + 1] = sigmoid_grad_scale * p1 * (1.0 - p1) * tdPrdP_cur[2 * v + 1]
                     else:
                         # Softmax backward: dS = P * (dP - Di)
                         tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]

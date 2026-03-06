@@ -223,7 +223,7 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
             self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
+            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
 
 
 @dataclass(frozen=True)
@@ -272,9 +272,7 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive_and_expect_tx(
-                    state.index, tx_count, loc=loc, ip=ip
-                ),
+                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count),
                 loc=loc,
                 ip=ip,
             )

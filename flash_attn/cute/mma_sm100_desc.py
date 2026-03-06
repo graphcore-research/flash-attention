@@ -3,6 +3,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/mma_traits_sm100.hpp
 
+import re
 from enum import IntEnum
 
 import cutlass
@@ -188,8 +189,31 @@ class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
 # ---------------------------------------------------------------------------
 
 
+_SWIZZLE_RE = re.compile(r"S<\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*>")
+
+
+def _decode_swizzle_triple(swizzle) -> tuple[int, int, int]:
+    if all(hasattr(swizzle, name) for name in ("num_bits", "num_base", "num_shift")):
+        return swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+
+    candidates = [swizzle]
+    if hasattr(swizzle, "attribute"):
+        candidates.append(swizzle.attribute)
+    if hasattr(swizzle, "type"):
+        candidates.append(swizzle.type)
+        if hasattr(swizzle.type, "attribute"):
+            candidates.append(swizzle.type.attribute)
+
+    for candidate in candidates:
+        match = _SWIZZLE_RE.search(str(candidate))
+        if match is not None:
+            return tuple(int(match.group(i)) for i in range(1, 4))
+
+    raise TypeError(f"Unable to decode swizzle triple from {swizzle!r}")
+
+
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
-    B, M, S = swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+    B, M, S = _decode_swizzle_triple(swizzle)
 
     if M == 4:  # Swizzle<*,4,3>
         if S != 3:

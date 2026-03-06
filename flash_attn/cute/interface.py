@@ -22,7 +22,7 @@
 import os
 import math
 from functools import lru_cache
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Sequence
 
 import torch
 
@@ -54,6 +54,16 @@ from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn.cute.output_gate_ops import (
+    derive_grad_poly_coeffs,
+    normalize_poly_coeffs as _normalize_poly_coeffs,
+    output_gate_backward as _output_gate_backward_poly,
+    output_gate_backward_spline as _output_gate_backward_spline,
+    output_gate_forward as _output_gate_forward_poly,
+    output_gate_forward_spline as _output_gate_forward_spline,
+    use_fused_output_gate as _use_fused_output_gate,
+    use_spline_sigmoid_gate as _use_spline_sigmoid_gate,
+)
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -95,6 +105,71 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
 
+def _sum_to_shape(x: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor:
+    while x.ndim > len(shape):
+        x = x.sum(dim=0)
+    for dim, expected in enumerate(shape):
+        current = x.shape[dim]
+        if expected == current:
+            continue
+        if expected == 1:
+            x = x.sum(dim=dim, keepdim=True)
+            continue
+        raise ValueError(f"Cannot reduce shape {tuple(x.shape)} to {shape}")
+    return x
+
+
+def _prepare_output_gate(
+    output_gate: torch.Tensor,
+    out_shape: Tuple[int, ...],
+) -> Tuple[torch.Tensor, str, Tuple[int, ...]]:
+    original_shape = tuple(output_gate.shape)
+    if original_shape == out_shape:
+        return output_gate, "identity", original_shape
+    if output_gate.ndim == len(out_shape) - 1 and original_shape == out_shape[:-1]:
+        return output_gate.unsqueeze(-1), "unsqueeze_last", original_shape
+    if (
+        output_gate.ndim == len(out_shape) - 1
+        and original_shape[:-1] == out_shape[:-2]
+        and original_shape[-1] == out_shape[-2] * out_shape[-1]
+    ):
+        return output_gate.reshape(out_shape), "flatten_last2", original_shape
+    try:
+        torch.broadcast_shapes(original_shape, out_shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"output_gate shape {original_shape} is not compatible with attention output shape {out_shape}"
+        ) from exc
+    return output_gate, "identity", original_shape
+
+
+def _restore_output_gate_grad(
+    grad_base: torch.Tensor,
+    gate_mode: str,
+    original_shape: Tuple[int, ...],
+) -> torch.Tensor:
+    if gate_mode == "flatten_last2":
+        return grad_base.reshape(original_shape)
+    if gate_mode == "unsqueeze_last":
+        return grad_base.squeeze(-1)
+    return grad_base
+
+
+def _compute_output_gate_exact_activation_and_grad(gate: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    activation = torch.sigmoid(gate)
+    return activation, activation * (1.0 - activation)
+
+
+def _materialize_output_gate_tensor(
+    gate: torch.Tensor,
+    out_shape: Tuple[int, ...],
+    transform_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+) -> torch.Tensor:
+    gate_tensor = gate if transform_fn is None else transform_fn(gate)
+    if tuple(gate_tensor.shape) != out_shape:
+        gate_tensor = gate_tensor.expand(out_shape)
+    return gate_tensor.contiguous()
+
 
 def _flash_attn_fwd(
     q: torch.Tensor,
@@ -128,6 +203,8 @@ def _flash_attn_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    output_gate_activation: Optional[torch.Tensor] = None,
+    output_gate_use_spline: bool = False,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     sigmoid_attention: bool = False,
     sigmoid_sfu_freq: int = 16,
@@ -147,7 +224,9 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
-    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    q, k, v, output_gate_activation = [
+        maybe_contiguous(t) for t in (q, k, v, output_gate_activation)
+    ]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -219,6 +298,7 @@ def _flash_attn_fwd(
             seqused_k,
             page_table,
             learnable_sink,
+            output_gate_activation,
         )
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
@@ -246,6 +326,14 @@ def _flash_attn_fwd(
         )
     else:
         _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v), out_torch_dtype, device)
+    if output_gate_activation is not None:
+        _validate_tensor(
+            output_gate_activation,
+            "output_gate_activation",
+            (*q_batch_seqlen_shape, num_head, head_dim_v),
+            out_torch_dtype,
+            device,
+        )
 
     if lse is None:
         lse = (
@@ -319,6 +407,9 @@ def _flash_attn_fwd(
         )
 
     is_split_kv = num_splits > 1
+    if output_gate_activation is not None:
+        assert arch // 10 in [10, 11], "CuTe fused output gate requires SM100/SM110"
+        assert not is_split_kv, "CuTe fused output gate does not support SplitKV"
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
@@ -411,6 +502,8 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        output_gate_activation is not None,
+        output_gate_use_spline,
         sigmoid_attention,
         sigmoid_sfu_freq,
         sigmoid_sfu_res,
@@ -437,6 +530,9 @@ def _flash_attn_fwd(
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
+        output_gate_activation_tensor = (
+            to_cute_tensor(output_gate_activation) if output_gate_activation is not None else None
+        )
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -515,6 +611,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
+                output_gate_use_spline=output_gate_use_spline,
                 sigmoid_attention=sigmoid_attention,
                 sigmoid_sfu_freq=sigmoid_sfu_freq,
                 sigmoid_sfu_res=sigmoid_sfu_res,
@@ -525,52 +622,98 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            window_size_left,
-            window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-            options="--enable-tvm-ffi",
-        )
+        if arch // 10 == 9:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                output_gate_activation_tensor,
+                lse_tensor,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        _flash_attn_fwd.compile_cache[compile_key](
-            q.detach(),
-            k.detach(),
-            v.detach(),
-            out.detach() if not is_split_kv else out_partial,
-            lse_partial if is_split_kv else lse,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            window_size_left,
-            window_size_right,
-            learnable_sink,
-            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-            aux_tensors,
-        )
+        if arch // 10 == 9:
+            _flash_attn_fwd.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial if is_split_kv else lse,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+                window_size_left,
+                window_size_right,
+                learnable_sink,
+                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                aux_tensors,
+            )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                out.detach() if not is_split_kv else out_partial,
+                output_gate_activation,
+                lse_partial if is_split_kv else lse,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+                window_size_left,
+                window_size_right,
+                learnable_sink,
+                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                aux_tensors,
+            )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -630,7 +773,10 @@ def _flash_attn_bwd(
     sigmoid_bias: float | None = None,
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    output_gate_activation: Optional[torch.Tensor] = None,
+    output_gate_use_spline: bool = False,
+    return_output_gate_grad: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
@@ -686,10 +832,24 @@ def _flash_attn_bwd(
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
+    if output_gate_activation is not None:
+        assert arch // 10 in [10, 11], "CuTe fused output gate requires SM100/SM110"
     
-    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
+    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, output_gate_activation = [
         maybe_contiguous(t)
-        for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        for t in (
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            output_gate_activation,
+        )
     ]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -756,12 +916,31 @@ def _flash_attn_bwd(
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype, (
         "inputs must have the same dtype"
     )
+    if output_gate_activation is not None:
+        _validate_tensor(
+            output_gate_activation,
+            "output_gate_activation",
+            out.shape,
+            q.dtype,
+            q.device,
+        )
     for t in [cu_seqlens_q, cu_seqlens_k]:
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
     assert all(
-        t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
+        t is None or t.is_cuda
+        for t in (
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            output_gate_activation,
+        )
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
@@ -885,6 +1064,13 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
+    if output_gate_activation is not None:
+        dout_attn = torch.empty_like(dout)
+        doutput_gate = torch.empty_like(out) if return_output_gate_grad else None
+    else:
+        dout_attn = None
+        doutput_gate = None
+
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (
         arch,
@@ -895,14 +1081,22 @@ def _flash_attn_bwd(
         num_threads,
         cu_seqlens_q is None,
         seqused_q is None,
+        output_gate_activation is None,
+        output_gate_use_spline,
+        doutput_gate is None,
         get_broadcast_dims(out),
         get_broadcast_dims(dout),
     )
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         o_tensor, do_tensor = [to_cute_tensor(t) for t in (out, dout)]
+        gate_act_tensor = (
+            to_cute_tensor(output_gate_activation) if output_gate_activation is not None else None
+        )
         dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
             to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
         ]
+        do_attn_tensor = to_cute_tensor(dout_attn) if dout_attn is not None else None
+        dgate_tensor = to_cute_tensor(doutput_gate) if doutput_gate is not None else None
         lse_tensor = to_cute_tensor(lse, assumed_align=4)
         cu_seqlens_q_tensor, seqused_q_tensor = [
             to_cute_tensor(t, assumed_align=4) if t is not None else None
@@ -915,12 +1109,16 @@ def _flash_attn_bwd(
             arch,
             m_block_size,
             num_threads=num_threads,
+            output_gate_use_spline=output_gate_use_spline,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
             fa_bwd_pre,
             o_tensor,
             do_tensor,
+            gate_act_tensor,
+            do_attn_tensor,
+            dgate_tensor,
             dpsum_tensor,
             lse_tensor,
             lse_log2_tensor,
@@ -934,6 +1132,9 @@ def _flash_attn_bwd(
         _flash_attn_bwd.compile_cache_pre[compile_key_pre](
             out,
             dout,
+            output_gate_activation,
+            dout_attn,
+            doutput_gate,
             dpsum,
             lse,
             lse_log2,
@@ -942,6 +1143,7 @@ def _flash_attn_bwd(
             seqused_q,
             current_stream,
         )
+    dout_main = dout_attn if dout_attn is not None else dout
 
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty num_threads is only actually
@@ -1009,7 +1211,7 @@ def _flash_attn_bwd(
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
-            get_broadcast_dims(dout),
+            get_broadcast_dims(dout_main),
         )
     else:
         compile_key = (
@@ -1046,11 +1248,11 @@ def _flash_attn_bwd(
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
-            get_broadcast_dims(dout),
+            get_broadcast_dims(dout_main),
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
+            to_cute_tensor(t) for t in (q, k, v, dout_main, dq, dk, dv)
         ]
         dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
             to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
@@ -1175,7 +1377,7 @@ def _flash_attn_bwd(
             q.detach(),
             k.detach(),
             v.detach(),
-            dout,
+            dout_main,
             lse_log2,
             dpsum,
             dq_accum,
@@ -1342,6 +1544,9 @@ def _flash_attn_bwd(
                 current_stream,
             )
 
+    if return_output_gate_grad:
+        assert doutput_gate is not None
+        return dq, dk, dv, doutput_gate
     return dq, dk, dv
 
 
@@ -1376,7 +1581,26 @@ class FlashAttnFunc(torch.autograd.Function):
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
         sigmoid_bias: float | None = None,
+        output_gate: Optional[torch.Tensor] = None,
+        gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
+        gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
+        gate_sigmoid_poly_clamp: float = 6.0,
     ):
+        gate_sigmoid_poly_coeffs = _normalize_poly_coeffs(
+            gate_sigmoid_poly_coeffs, "gate_sigmoid_poly_coeffs"
+        )
+        gate_sigmoid_grad_poly_coeffs = _normalize_poly_coeffs(
+            gate_sigmoid_grad_poly_coeffs, "gate_sigmoid_grad_poly_coeffs"
+        )
+        use_spline_sigmoid_gate = _use_spline_sigmoid_gate(
+            gate_sigmoid_poly_coeffs, gate_sigmoid_grad_poly_coeffs
+        )
+        if (
+            gate_sigmoid_poly_coeffs is not None
+            and gate_sigmoid_grad_poly_coeffs is None
+            and not use_spline_sigmoid_gate
+        ):
+            gate_sigmoid_grad_poly_coeffs = derive_grad_poly_coeffs(gate_sigmoid_poly_coeffs)
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
         if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
@@ -1387,6 +1611,35 @@ class FlashAttnFunc(torch.autograd.Function):
                 mask_block_idx=mask_block_idx,
                 block_size=block_size,
             )
+        gate_mode = "identity"
+        gate_original_shape: Tuple[int, ...] | None = None
+        gate_base = None
+        gate_saved = None
+        gate_input = None
+        can_fuse_output_gate = False
+        output_gate_use_spline = False
+        if output_gate is not None:
+            expected_out_shape = (*q.shape[:-1], v.shape[-1])
+            gate_base, gate_mode, gate_original_shape = _prepare_output_gate(
+                output_gate, expected_out_shape
+            )
+            assert gate_base.dtype == q.dtype, "output_gate must have the same dtype as q/k/v"
+            assert gate_base.device == q.device, "output_gate must be on the same device as q/k/v"
+            can_fuse_output_gate = (
+                _get_device_arch() // 10 in [10, 11]
+                and num_splits == 1
+                and _use_fused_output_gate(
+                    gate_sigmoid_poly_coeffs,
+                    gate_sigmoid_grad_poly_coeffs,
+                )
+            )
+            if can_fuse_output_gate:
+                output_gate_use_spline = gate_sigmoid_poly_coeffs is not None
+                gate_input = _materialize_output_gate_tensor(
+                    gate_base,
+                    expected_out_shape,
+                )
+                gate_saved = gate_input
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1402,12 +1655,36 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
+            output_gate_activation=gate_input,
+            output_gate_use_spline=output_gate_use_spline,
             sigmoid_attention=sigmoid_attention,
             sigmoid_sfu_freq=sigmoid_sfu_freq,
             sigmoid_sfu_res=sigmoid_sfu_res,
             sigmoid_bias=sigmoid_bias,
         )
-        ctx.save_for_backward(q, k, v, out, lse)
+        out_base = out
+        if output_gate is not None:
+            if can_fuse_output_gate:
+                gate_saved = gate_input
+            elif gate_sigmoid_poly_coeffs is None:
+                gate_saved = _materialize_output_gate_tensor(
+                    gate_base,
+                    tuple(out_base.shape),
+                    torch.sigmoid,
+                )
+                out = out_base * gate_saved.to(dtype=out_base.dtype)
+            elif use_spline_sigmoid_gate:
+                out, gate_saved = _output_gate_forward_spline(out_base, gate_base)
+            else:
+                out = _output_gate_forward_poly(
+                    out_base, gate_base, gate_sigmoid_poly_coeffs, gate_sigmoid_poly_clamp
+                )
+                gate_saved = gate_base
+
+        if gate_saved is not None:
+            ctx.save_for_backward(q, k, v, out if can_fuse_output_gate else out_base, lse, gate_saved)
+        else:
+            ctx.save_for_backward(q, k, v, out_base, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -1420,30 +1697,148 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.sigmoid_sfu_freq = sigmoid_sfu_freq
         ctx.sigmoid_sfu_res = sigmoid_sfu_res
         ctx.sigmoid_bias = sigmoid_bias
+        ctx.has_output_gate = gate_base is not None
+        ctx.output_gate_fused = can_fuse_output_gate
+        ctx.output_gate_use_spline = output_gate_use_spline
+        ctx.gate_base_shape = tuple(gate_base.shape) if gate_base is not None else None
+        ctx.use_spline_sigmoid_gate = use_spline_sigmoid_gate and gate_base is not None
+        ctx.gate_mode = gate_mode
+        ctx.gate_original_shape = gate_original_shape
+        ctx.gate_sigmoid_poly_coeffs = gate_sigmoid_poly_coeffs
+        ctx.gate_sigmoid_grad_poly_coeffs = gate_sigmoid_grad_poly_coeffs
+        ctx.gate_sigmoid_poly_clamp = gate_sigmoid_poly_clamp
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse = ctx.saved_tensors
-        dq, dk, dv = _flash_attn_bwd(
-            q,
-            k,
-            v,
-            out,
-            dout,
-            lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
-            window_size_left=ctx.window_size[0],
-            window_size_right=ctx.window_size[1],
-            deterministic=ctx.deterministic,
-            sigmoid_attention=ctx.sigmoid_attention,
-            sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
-            sigmoid_sfu_res=ctx.sigmoid_sfu_res,
-            sigmoid_bias=ctx.sigmoid_bias,
+        if ctx.has_output_gate:
+            q, k, v, out, lse, gate_saved = ctx.saved_tensors
+            if ctx.output_gate_fused:
+                dq, dk, dv, grad_gate_full = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    deterministic=ctx.deterministic,
+                    sigmoid_attention=ctx.sigmoid_attention,
+                    sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+                    sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_bias=ctx.sigmoid_bias,
+                    output_gate_activation=gate_saved,
+                    output_gate_use_spline=ctx.output_gate_use_spline,
+                    return_output_gate_grad=True,
+                )
+            elif ctx.gate_sigmoid_poly_coeffs is None:
+                dout_attn = dout * gate_saved.to(dtype=dout.dtype)
+                grad_gate_full = (dout * out).to(dtype=gate_saved.dtype) * gate_saved * (1.0 - gate_saved)
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    deterministic=ctx.deterministic,
+                    sigmoid_attention=ctx.sigmoid_attention,
+                    sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+                    sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_bias=ctx.sigmoid_bias,
+                )
+            elif ctx.use_spline_sigmoid_gate:
+                dout_attn, grad_gate_full = _output_gate_backward_spline(dout, out, gate_saved)
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    deterministic=ctx.deterministic,
+                    sigmoid_attention=ctx.sigmoid_attention,
+                    sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+                    sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_bias=ctx.sigmoid_bias,
+                )
+            else:
+                gate_base = gate_saved
+                dout_attn, grad_gate_full = _output_gate_backward_poly(
+                    dout,
+                    out,
+                    gate_base,
+                    ctx.gate_sigmoid_poly_coeffs,
+                    ctx.gate_sigmoid_grad_poly_coeffs,
+                    ctx.gate_sigmoid_poly_clamp,
+                )
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    deterministic=ctx.deterministic,
+                    sigmoid_attention=ctx.sigmoid_attention,
+                    sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+                    sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_bias=ctx.sigmoid_bias,
+                )
+            grad_gate_base = _sum_to_shape(grad_gate_full, ctx.gate_base_shape)
+            d_output_gate = _restore_output_gate_grad(
+                grad_gate_base, ctx.gate_mode, ctx.gate_original_shape
+            )
+        else:
+            q, k, v, out, lse = ctx.saved_tensors
+            d_output_gate = None
+            dq, dk, dv = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                ctx.softmax_scale,
+                ctx.causal,
+                ctx.softcap,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                deterministic=ctx.deterministic,
+                sigmoid_attention=ctx.sigmoid_attention,
+                sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
+                sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                sigmoid_bias=ctx.sigmoid_bias,
+            )
+        return (
+            dq,
+            dk,
+            dv,
+            *((None,) * 19),
+            d_output_gate,
+            None,
+            None,
+            None,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1471,7 +1866,55 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        output_gate: Optional[torch.Tensor] = None,
+        gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
+        gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
+        gate_sigmoid_poly_clamp: float = 6.0,
     ):
+        gate_sigmoid_poly_coeffs = _normalize_poly_coeffs(
+            gate_sigmoid_poly_coeffs, "gate_sigmoid_poly_coeffs"
+        )
+        gate_sigmoid_grad_poly_coeffs = _normalize_poly_coeffs(
+            gate_sigmoid_grad_poly_coeffs, "gate_sigmoid_grad_poly_coeffs"
+        )
+        use_spline_sigmoid_gate = _use_spline_sigmoid_gate(
+            gate_sigmoid_poly_coeffs, gate_sigmoid_grad_poly_coeffs
+        )
+        if (
+            gate_sigmoid_poly_coeffs is not None
+            and gate_sigmoid_grad_poly_coeffs is None
+            and not use_spline_sigmoid_gate
+        ):
+            gate_sigmoid_grad_poly_coeffs = derive_grad_poly_coeffs(gate_sigmoid_poly_coeffs)
+        gate_mode = "identity"
+        gate_original_shape: Tuple[int, ...] | None = None
+        gate_base = None
+        gate_saved = None
+        gate_input = None
+        can_fuse_output_gate = False
+        output_gate_use_spline = False
+        if output_gate is not None:
+            expected_out_shape = (*q.shape[:-1], v.shape[-1])
+            gate_base, gate_mode, gate_original_shape = _prepare_output_gate(
+                output_gate, expected_out_shape
+            )
+            assert gate_base.dtype == q.dtype, "output_gate must have the same dtype as q/k/v"
+            assert gate_base.device == q.device, "output_gate must be on the same device as q/k/v"
+            can_fuse_output_gate = (
+                _get_device_arch() // 10 in [10, 11]
+                and num_splits == 1
+                and _use_fused_output_gate(
+                    gate_sigmoid_poly_coeffs,
+                    gate_sigmoid_grad_poly_coeffs,
+                )
+            )
+            if can_fuse_output_gate:
+                output_gate_use_spline = gate_sigmoid_poly_coeffs is not None
+                gate_input = _materialize_output_gate_tensor(
+                    gate_base,
+                    expected_out_shape,
+                )
+                gate_saved = gate_input
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1494,8 +1937,43 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            output_gate_activation=gate_input,
+            output_gate_use_spline=output_gate_use_spline,
         )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        out_base = out
+        if output_gate is not None:
+            if can_fuse_output_gate:
+                gate_saved = gate_input
+            elif gate_sigmoid_poly_coeffs is None:
+                gate_saved = _materialize_output_gate_tensor(
+                    gate_base,
+                    tuple(out_base.shape),
+                    torch.sigmoid,
+                )
+                out = out_base * gate_saved.to(dtype=out_base.dtype)
+            elif use_spline_sigmoid_gate:
+                out, gate_saved = _output_gate_forward_spline(out_base, gate_base)
+            else:
+                out = _output_gate_forward_poly(
+                    out_base, gate_base, gate_sigmoid_poly_coeffs, gate_sigmoid_poly_clamp
+                )
+                gate_saved = gate_base
+
+        if gate_saved is not None:
+            ctx.save_for_backward(
+                q,
+                k,
+                v,
+                out if can_fuse_output_gate else out_base,
+                lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                gate_saved,
+            )
+        else:
+            ctx.save_for_backward(q, k, v, out_base, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -1503,6 +1981,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.has_output_gate = gate_base is not None
+        ctx.output_gate_fused = can_fuse_output_gate
+        ctx.output_gate_use_spline = output_gate_use_spline
+        ctx.gate_base_shape = tuple(gate_base.shape) if gate_base is not None else None
+        ctx.use_spline_sigmoid_gate = use_spline_sigmoid_gate and gate_base is not None
+        ctx.gate_mode = gate_mode
+        ctx.gate_original_shape = gate_original_shape
+        ctx.gate_sigmoid_poly_coeffs = gate_sigmoid_poly_coeffs
+        ctx.gate_sigmoid_grad_poly_coeffs = gate_sigmoid_grad_poly_coeffs
+        ctx.gate_sigmoid_poly_clamp = gate_sigmoid_poly_clamp
         # LSE gradient is not supported yet
         if lse is not None:
             ctx.mark_non_differentiable(lse)
@@ -1510,30 +1998,147 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        if ctx.has_output_gate:
+            q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, gate_saved = ctx.saved_tensors
+            if ctx.output_gate_fused:
+                dq, dk, dv, grad_gate_full = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    deterministic=ctx.deterministic,
+                    output_gate_activation=gate_saved,
+                    output_gate_use_spline=ctx.output_gate_use_spline,
+                    return_output_gate_grad=True,
+                )
+            elif ctx.gate_sigmoid_poly_coeffs is None:
+                dout_attn = dout * gate_saved.to(dtype=dout.dtype)
+                grad_gate_full = (dout * out).to(dtype=gate_saved.dtype) * gate_saved * (1.0 - gate_saved)
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    deterministic=ctx.deterministic,
+                )
+            elif ctx.use_spline_sigmoid_gate:
+                dout_attn, grad_gate_full = _output_gate_backward_spline(dout, out, gate_saved)
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    deterministic=ctx.deterministic,
+                )
+            else:
+                gate_base = gate_saved
+                dout_attn, grad_gate_full = _output_gate_backward_poly(
+                    dout,
+                    out,
+                    gate_base,
+                    ctx.gate_sigmoid_poly_coeffs,
+                    ctx.gate_sigmoid_grad_poly_coeffs,
+                    ctx.gate_sigmoid_poly_clamp,
+                )
+                dq, dk, dv = _flash_attn_bwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout_attn,
+                    lse,
+                    ctx.softmax_scale,
+                    ctx.causal,
+                    ctx.softcap,
+                    window_size_left=ctx.window_size[0],
+                    window_size_right=ctx.window_size[1],
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    deterministic=ctx.deterministic,
+                )
+            grad_gate_base = _sum_to_shape(grad_gate_full, ctx.gate_base_shape)
+            d_output_gate = _restore_output_gate_grad(
+                grad_gate_base, ctx.gate_mode, ctx.gate_original_shape
+            )
+        else:
+            q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+            d_output_gate = None
         assert ctx.softcap == 0.0
-        dq, dk, dv = _flash_attn_bwd(
-            q,
-            k,
-            v,
-            out,
-            dout,
-            lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
-            window_size_left=ctx.window_size[0],
-            window_size_right=ctx.window_size[1],
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            max_seqlen_q=ctx.max_seqlen_q,
-            max_seqlen_k=ctx.max_seqlen_k,
-            deterministic=ctx.deterministic,
-        )
+        if not ctx.has_output_gate:
+            dq, dk, dv = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                ctx.softmax_scale,
+                ctx.causal,
+                ctx.softcap,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                max_seqlen_q=ctx.max_seqlen_q,
+                max_seqlen_k=ctx.max_seqlen_k,
+                deterministic=ctx.deterministic,
+            )
 
-        return dq, dk, dv, *((None,) * 20)
+        return (
+            dq,
+            dk,
+            dv,
+            *((None,) * 18),
+            d_output_gate,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_func(
@@ -1559,6 +2164,10 @@ def flash_attn_func(
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
     sigmoid_bias: float | None = None,
+    output_gate: Optional[torch.Tensor] = None,
+    gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
+    gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
+    gate_sigmoid_poly_clamp: float = 6.0,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1583,6 +2192,10 @@ def flash_attn_func(
         sigmoid_sfu_freq,
         sigmoid_sfu_res,
         sigmoid_bias,
+        output_gate,
+        gate_sigmoid_poly_coeffs,
+        gate_sigmoid_grad_poly_coeffs,
+        gate_sigmoid_poly_clamp,
     )
 
 
@@ -1608,6 +2221,10 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    output_gate: Optional[torch.Tensor] = None,
+    gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
+    gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
+    gate_sigmoid_poly_clamp: float = 6.0,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1631,6 +2248,10 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        output_gate,
+        gate_sigmoid_poly_coeffs,
+        gate_sigmoid_grad_poly_coeffs,
+        gate_sigmoid_poly_clamp,
     )
 
 

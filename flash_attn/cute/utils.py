@@ -508,6 +508,63 @@ def sigmoid_fast_2(
     return rx, ry
 
 
+@dsl_user_op
+def sigmoid_grad_fast_even_d5_bf16_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """BF16-optimized D5 even polynomial for sigmoid'(x)."""
+    clamp = Float32(4.75)
+    c0 = 0.2500000000
+    c1 = -0.0046386719
+    c2 = -0.0722656250
+    c3 = 0.0257568359
+    c4 = -0.0034027100
+    c5 = 0.0001573563
+    ax = fabs_f32(x, loc=loc, ip=ip)
+    ay = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(ax, clamp, loc=loc, ip=ip)
+    ty = fmin(ay, clamp, loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((c5, c5), (tx, ty), (c4, c4), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c3, c3), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c2, c2), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c1, c1), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c0, c0), loc=loc, ip=ip)
+    return rx, ry
+
+
+@dsl_user_op
+def sigmoid_grad_fast_even_d5_f16_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """FP16-optimized D5 even polynomial for sigmoid'(x)."""
+    clamp = Float32(5.5)
+    c0 = 0.2500000000
+    c1 = 0.0081405640
+    c2 = -0.0934448242
+    c3 = 0.0364685059
+    c4 = -0.0055160522
+    c5 = 0.0003011227
+    ax = fabs_f32(x, loc=loc, ip=ip)
+    ay = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(ax, clamp, loc=loc, ip=ip)
+    ty = fmin(ay, clamp, loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((c5, c5), (tx, ty), (c4, c4), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c3, c3), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c2, c2), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c1, c1), loc=loc, ip=ip)
+    rx, ry = fma_packed_f32x2((rx, ry), (tx, ty), (c0, c0), loc=loc, ip=ip)
+    return rx, ry
+
+
+def sigmoid_grad_fast_even_d5_2(
+    x: Float32, y: Float32, q_dtype, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Select the fitted D5 even sigmoid-gradient polynomial by activation dtype."""
+    if const_expr(q_dtype is cutlass.BFloat16):
+        return sigmoid_grad_fast_even_d5_bf16_2(x, y, loc=loc, ip=ip)
+    return sigmoid_grad_fast_even_d5_f16_2(x, y, loc=loc, ip=ip)
+
+
 def sigmoid_native_2(x, y):
     """SFU-based sigmoid: sigmoid(x) = rcp(1 + exp2(-x * log2(e))).
 

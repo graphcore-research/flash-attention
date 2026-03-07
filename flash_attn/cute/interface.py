@@ -773,6 +773,7 @@ def _flash_attn_bwd(
     sigmoid_bias: float | None = None,
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
+    sigmoid_use_direct_bwd_poly: bool = False,
     output_gate_activation: Optional[torch.Tensor] = None,
     output_gate_use_spline: bool = False,
     return_output_gate_grad: bool = False,
@@ -1245,6 +1246,7 @@ def _flash_attn_bwd(
             sigmoid_bias,
             sigmoid_sfu_freq,
             sigmoid_sfu_res,
+            sigmoid_use_direct_bwd_poly,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1337,6 +1339,7 @@ def _flash_attn_bwd(
                 sigmoid_bias=sigmoid_bias,
                 sigmoid_sfu_freq=sigmoid_sfu_freq,
                 sigmoid_sfu_res=sigmoid_sfu_res,
+                sigmoid_use_direct_bwd_poly=sigmoid_use_direct_bwd_poly,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1580,6 +1583,7 @@ class FlashAttnFunc(torch.autograd.Function):
         sigmoid_attention: bool = False,
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
+        sigmoid_use_direct_bwd_poly: bool = False,
         sigmoid_bias: float | None = None,
         output_gate: Optional[torch.Tensor] = None,
         gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
@@ -1696,6 +1700,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.sigmoid_attention = sigmoid_attention
         ctx.sigmoid_sfu_freq = sigmoid_sfu_freq
         ctx.sigmoid_sfu_res = sigmoid_sfu_res
+        ctx.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
         ctx.sigmoid_bias = sigmoid_bias
         ctx.has_output_gate = gate_base is not None
         ctx.output_gate_fused = can_fuse_output_gate
@@ -1730,6 +1735,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_attention=ctx.sigmoid_attention,
                     sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
                     output_gate_activation=gate_saved,
                     output_gate_use_spline=ctx.output_gate_use_spline,
@@ -1754,6 +1760,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_attention=ctx.sigmoid_attention,
                     sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
                 )
             elif ctx.use_spline_sigmoid_gate:
@@ -1774,6 +1781,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_attention=ctx.sigmoid_attention,
                     sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
                 )
             else:
@@ -1802,6 +1810,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_attention=ctx.sigmoid_attention,
                     sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                    sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
                 )
             grad_gate_base = _sum_to_shape(grad_gate_full, ctx.gate_base_shape)
@@ -1827,13 +1836,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 sigmoid_attention=ctx.sigmoid_attention,
                 sigmoid_sfu_freq=ctx.sigmoid_sfu_freq,
                 sigmoid_sfu_res=ctx.sigmoid_sfu_res,
+                sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                 sigmoid_bias=ctx.sigmoid_bias,
             )
         return (
             dq,
             dk,
             dv,
-            *((None,) * 19),
+            *((None,) * 20),
             d_output_gate,
             None,
             None,
@@ -2163,6 +2173,7 @@ def flash_attn_func(
     sigmoid_attention: bool = False,
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
+    sigmoid_use_direct_bwd_poly: bool = False,
     sigmoid_bias: float | None = None,
     output_gate: Optional[torch.Tensor] = None,
     gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
@@ -2191,6 +2202,7 @@ def flash_attn_func(
         sigmoid_attention,
         sigmoid_sfu_freq,
         sigmoid_sfu_res,
+        sigmoid_use_direct_bwd_poly,
         sigmoid_bias,
         output_gate,
         gate_sigmoid_poly_coeffs,

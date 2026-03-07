@@ -86,6 +86,7 @@ class FlashAttentionBackwardSm100:
         sigmoid_bias: float | None = None,
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
+        sigmoid_use_direct_bwd_poly: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -149,6 +150,7 @@ class FlashAttentionBackwardSm100:
         self.sigmoid_bias = sigmoid_bias
         self.sigmoid_sfu_freq = sigmoid_sfu_freq
         self.sigmoid_sfu_res = sigmoid_sfu_res
+        self.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3122,8 +3124,12 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                if const_expr(self.sigmoid_attention and self.sigmoid_use_direct_bwd_poly):
+                    tSrSigGrad_t2r = cute.make_fragment_like(tSrS_t2r, Float32)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                    if const_expr(self.sigmoid_attention and self.sigmoid_use_direct_bwd_poly):
+                        tSrSigGrad_cur = tSrSigGrad_t2r[None, stage, 0, 0]
                     if const_expr(self.sigmoid_attention):
                         # Sigmoid: P = sigmoid(S * softmax_scale + bias)
                         LN2 = 0.6931471805599453
@@ -3140,10 +3146,20 @@ class FlashAttentionBackwardSm100:
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):
                                 # Polynomial (FMA) path
-                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.sigmoid_fast_2(s0, s1)
+                                p0, p1 = utils.sigmoid_fast_2(s0, s1)
+                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
+                                if const_expr(self.sigmoid_use_direct_bwd_poly):
+                                    g0, g1 = utils.sigmoid_grad_fast_even_d5_2(
+                                        s0, s1, self.q_dtype
+                                    )
+                                    tSrSigGrad_cur[2 * v], tSrSigGrad_cur[2 * v + 1] = g0, g1
                             else:
                                 # SFU path (exp2 + rcp_approx)
-                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.sigmoid_native_2(s0, s1)
+                                p0, p1 = utils.sigmoid_native_2(s0, s1)
+                                tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
+                                if const_expr(self.sigmoid_use_direct_bwd_poly):
+                                    tSrSigGrad_cur[2 * v] = p0 * (1.0 - p0)
+                                    tSrSigGrad_cur[2 * v + 1] = p1 * (1.0 - p1)
                     else:
                         # Softmax: P = exp2(S * scale_log2 - LSE)
                         tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3210,13 +3226,26 @@ class FlashAttentionBackwardSm100:
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     if const_expr(self.sigmoid_attention):
-                        # Sigmoid backward: dS = P * (1 - P) * dP
-                        for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
-                            p0 = tSrS_cur[2 * v]
-                            p1 = tSrS_cur[2 * v + 1]
-                            # dS = P * (1 - P) * dP
-                            tdPrdP_cur[2 * v] = sigmoid_grad_scale * p0 * (1.0 - p0) * tdPrdP_cur[2 * v]
-                            tdPrdP_cur[2 * v + 1] = sigmoid_grad_scale * p1 * (1.0 - p1) * tdPrdP_cur[2 * v + 1]
+                        if const_expr(self.sigmoid_use_direct_bwd_poly):
+                            tSrSigGrad_cur = tSrSigGrad_t2r[None, stage, 0, 0]
+                            for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                                tdPrdP_cur[2 * v] = (
+                                    sigmoid_grad_scale
+                                    * tSrSigGrad_cur[2 * v]
+                                    * tdPrdP_cur[2 * v]
+                                )
+                                tdPrdP_cur[2 * v + 1] = (
+                                    sigmoid_grad_scale
+                                    * tSrSigGrad_cur[2 * v + 1]
+                                    * tdPrdP_cur[2 * v + 1]
+                                )
+                        else:
+                            # Sigmoid backward: dS = P * (1 - P) * dP
+                            for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                                p0 = tSrS_cur[2 * v]
+                                p1 = tSrS_cur[2 * v + 1]
+                                tdPrdP_cur[2 * v] = sigmoid_grad_scale * p0 * (1.0 - p0) * tdPrdP_cur[2 * v]
+                                tdPrdP_cur[2 * v + 1] = sigmoid_grad_scale * p1 * (1.0 - p1) * tdPrdP_cur[2 * v + 1]
                     else:
                         # Softmax backward: dS = P * (dP - Di)
                         tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]

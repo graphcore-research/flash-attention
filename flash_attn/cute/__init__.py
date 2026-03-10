@@ -13,6 +13,12 @@ from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
+from .hsa import (
+    compute_hsa_mask,
+    flash_attn_hsa_func,
+    get_hsa_mask_mod,
+    hsa_reference_attention,
+)
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
 
@@ -23,4 +29,8 @@ cute.compile = cute_compile_patched
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "flash_attn_hsa_func",
+    "get_hsa_mask_mod",
+    "compute_hsa_mask",
+    "hsa_reference_attention",
 ]

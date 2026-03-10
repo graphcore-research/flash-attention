@@ -1357,6 +1357,7 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         mask_mod: Optional[Callable] = None,
+        aux_tensors: Optional[list] = None,
         full_block_cnt: Optional[torch.Tensor] = None,
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
@@ -1387,15 +1388,18 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
         )
-        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or []))
+        ctx.num_aux_tensors = len(aux_tensors) if aux_tensors is not None else 0
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.mask_mod = mask_mod
         # LSE gradient is not supported yet
         if lse is not None:
             ctx.mark_non_differentiable(lse)
@@ -1403,7 +1407,9 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        q, k, v, out, lse = saved[:5]
+        aux_tensors = list(saved[5:]) if ctx.num_aux_tensors > 0 else None
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -1417,8 +1423,10 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            mask_mod=ctx.mask_mod,
+            aux_tensors=aux_tensors,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1524,6 +1532,7 @@ def flash_attn_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
     full_block_cnt: Optional[torch.Tensor] = None,
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
@@ -1544,6 +1553,7 @@ def flash_attn_func(
         pack_gqa,
         deterministic,
         mask_mod,
+        aux_tensors,
         full_block_cnt,
         full_block_idx,
         mask_block_cnt,

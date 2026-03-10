@@ -4,6 +4,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/mma_traits_sm100.hpp
 
 from enum import IntEnum
+import re
 
 import cutlass
 import cutlass.cute as cute
@@ -188,8 +189,19 @@ class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
 # ---------------------------------------------------------------------------
 
 
+def _swizzle_triple(swizzle) -> tuple[int, int, int]:
+    """Extract (B, M, S) from either a rich Swizzle value or a raw SwizzleType."""
+    if hasattr(swizzle, "num_bits"):
+        return swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+
+    match = re.search(r'S<(\d+),(\d+),(\d+)>', str(swizzle))
+    if match is None:
+        raise TypeError(f"Unable to parse swizzle triple from {swizzle!r}")
+    return tuple(int(group) for group in match.groups())
+
+
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
-    B, M, S = swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+    B, M, S = _swizzle_triple(swizzle)
 
     if M == 4:  # Swizzle<*,4,3>
         if S != 3:

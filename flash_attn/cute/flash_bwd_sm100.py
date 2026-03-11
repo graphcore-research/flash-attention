@@ -87,6 +87,7 @@ class FlashAttentionBackwardSm100:
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
         sigmoid_use_direct_bwd_poly: bool = False,
+        sigmoid_poly_backend: str = "cute",
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -151,6 +152,7 @@ class FlashAttentionBackwardSm100:
         self.sigmoid_sfu_freq = sigmoid_sfu_freq
         self.sigmoid_sfu_res = sigmoid_sfu_res
         self.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
+        self.sigmoid_poly_backend = sigmoid_poly_backend
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3146,11 +3148,19 @@ class FlashAttentionBackwardSm100:
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):
                                 # Polynomial (FMA) path
-                                p0, p1 = utils.sigmoid_fast_2(s0, s1)
+                                # Match the forward attention path: use the saturating
+                                # odd-form surrogate so the tail stays sparse instead of
+                                # flattening to a constant floor after bias.
+                                p0, p1 = utils.sigmoid_poly_backend_2(
+                                    s0, s1, backend=self.sigmoid_poly_backend
+                                )
                                 tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
                                 if const_expr(self.sigmoid_use_direct_bwd_poly):
-                                    g0, g1 = utils.sigmoid_grad_fast_even_d5_2(
-                                        s0, s1, self.q_dtype
+                                    g0, g1 = utils.sigmoid_grad_poly_backend_2(
+                                        s0,
+                                        s1,
+                                        self.q_dtype,
+                                        backend=self.sigmoid_poly_backend,
                                     )
                                     tSrSigGrad_cur[2 * v], tSrSigGrad_cur[2 * v + 1] = g0, g1
                             else:

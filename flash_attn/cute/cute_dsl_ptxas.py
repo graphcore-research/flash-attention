@@ -11,6 +11,7 @@ import re
 import ctypes
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 import cutlass
 
@@ -20,6 +21,7 @@ VERBOSE = os.environ.get("CUTE_DSL_PTXAS_VERBOSE", "0") == "1"
 
 _original_load_cuda_library = None
 _user_wanted_ptx = False  # True if user originally set CUTE_DSL_KEEP_PTX=1
+_extra_ptx_providers: list[Callable[[str], str | None]] = []
 
 
 def _log(msg):
@@ -42,22 +44,38 @@ def _get_ptx(compiled_func) -> tuple[str, Path] | None:
     return None
 
 
+def register_extra_ptx_provider(provider: Callable[[str], str | None]) -> None:
+    if provider not in _extra_ptx_providers:
+        _extra_ptx_providers.append(provider)
+
+
+def _augment_ptx(ptx_content: str) -> str:
+    augmented = ptx_content.replace("\x00", "").rstrip() + "\n"
+    for provider in _extra_ptx_providers:
+        extra = provider(augmented)
+        if extra:
+            augmented += "\n" + extra.replace("\x00", "").rstrip() + "\n"
+    return augmented
+
+
 def _compile_ptx(ptx_path: Path, ptx_content: str) -> bytes:
     """Compile PTX to cubin using system ptxas."""
+    ptx_content = _augment_ptx(ptx_content)
     # Extract arch from PTX
     match = re.search(r"\.target\s+(sm_\d+[a-z]?)", ptx_content)
     arch = match.group(1) if match else "sm_90a"
 
-    # Write stripped content back if needed
-    if ptx_path.read_text() != ptx_content:
-        ptx_path.write_text(ptx_content)
+    compile_ptx_path = ptx_path
+    if _extra_ptx_providers:
+        compile_ptx_path = ptx_path.with_suffix(".augmented.ptx")
+    compile_ptx_path.write_text(ptx_content)
 
     # Compile
-    cubin_tmp = ptx_path.with_suffix(".cubin.tmp")
+    cubin_tmp = compile_ptx_path.with_suffix(".cubin.tmp")
     try:
         assert CUTE_DSL_PTXAS_PATH is not None
         result = subprocess.run(
-            [CUTE_DSL_PTXAS_PATH, f"-arch={arch}", "-O3", "-o", str(cubin_tmp), str(ptx_path)],
+            [CUTE_DSL_PTXAS_PATH, f"-arch={arch}", "-O3", "-o", str(cubin_tmp), str(compile_ptx_path)],
             capture_output=True,
             text=True,
         )
@@ -69,13 +87,15 @@ def _compile_ptx(ptx_path: Path, ptx_content: str) -> bytes:
 
         # Save cubin if CUTE_DSL_KEEP_CUBIN is set
         if os.environ.get("CUTE_DSL_KEEP_CUBIN", "0") == "1":
-            cubin_out = ptx_path.with_suffix(".cubin")
+            cubin_out = compile_ptx_path.with_suffix(".cubin")
             cubin_out.write_bytes(cubin_data)
             _log(f"Saved: {cubin_out}")
 
         return cubin_data
     finally:
         cubin_tmp.unlink(missing_ok=True)
+        if compile_ptx_path is not ptx_path and not _user_wanted_ptx:
+            compile_ptx_path.unlink(missing_ok=True)
 
 
 def _patched_load_cuda_library(self):
@@ -91,6 +111,8 @@ def _patched_load_cuda_library(self):
     try:
         cubin = _compile_ptx(ptx_path, ptx_content)
     except Exception as e:
+        if _extra_ptx_providers:
+            raise
         _log(f"Compilation failed ({e}), falling back to embedded ptxas")
         return _original_load_cuda_library(self)
 

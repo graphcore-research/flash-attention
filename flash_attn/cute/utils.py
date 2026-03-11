@@ -15,8 +15,25 @@ from cutlass.cute.runtime import from_dlpack
 
 
 import quack.activation
+from flash_attn.cute.handwritten_spline_ptx import (
+    get_handwritten_inline_asm,
+    handwritten_spline_ptx_provider,
+    require_device_backend_support,
+)
 
 _MIXER_ATTRS = ("__vec_size__",)
+_HANDWRITTEN_PTX_REGISTERED = False
+
+
+def ensure_handwritten_device_backend() -> None:
+    global _HANDWRITTEN_PTX_REGISTERED
+    require_device_backend_support()
+    if _HANDWRITTEN_PTX_REGISTERED:
+        return
+    from flash_attn.cute import cute_dsl_ptxas
+
+    cute_dsl_ptxas.register_extra_ptx_provider(handwritten_spline_ptx_provider)
+    _HANDWRITTEN_PTX_REGISTERED = True
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
@@ -169,7 +186,7 @@ def create_softcap_scoremod_bwd_ste(softcap_val=None):
 # =============================================================================
 # Spline tanh emulation — FMA-only, no SFU
 # ODD polynomial: tanh(x) = sign(x) * |x| * poly(|x|)
-# D5 fit on [0, 3.0], max abs error < 0.00053
+# Default D6 path uses the CuTe-target refit used for FA4 score_mod.
 # =============================================================================
 
 @dsl_user_op
@@ -225,41 +242,38 @@ def copysign_f32(mag: float | Float32, sign_val: float | Float32, *, loc=None, i
 
 @dsl_user_op
 def tanh_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
-    """Scalar f32 spline tanh: tanh(x) ≈ x*poly(|x|) for |x|<3, ±1 otherwise."""
+    """Scalar f32 D6 softcap tanh using the CuTe-target refit."""
     poly_tanh_d6 = (
-        0.9999999999996861,
-        0.018184368627828466,
-        -0.44364107914224865,
-        0.21709437130752046,
-        -0.023897373260303105,
-        -0.0071969181772045645,
-        0.0015005805508435293,
+        1.0112760066986084,
+        -0.02337932586669922,
+        -0.410724401473999,
+        0.23259931802749634,
+        -0.05259401723742485,
+        0.004392100498080254,
     )
-    clamp = 3.0
+    clamp = 3.75
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     t = fmin(abs_x, clamp, loc=loc, ip=ip)
     h = evaluate_polynomial(t, poly_tanh_d6, loc=loc, ip=ip)
     poly_result = x * h
-    # For |x| >= clamp, return ±tanh(3.0) ~ 0.995 instead of ±1 to keep gradients alive
-    saturated = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
-    return select_(abs_x < clamp, poly_result, saturated)
+    poly_result = fmin(poly_result, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_result, x, loc=loc, ip=ip)
 
 
 @dsl_user_op
 def tanh_emulation_2(
     x: Float32, y: Float32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
-    """Paired f32x2 spline tanh for ILP — processes 2 values simultaneously."""
+    """Paired f32x2 D6 softcap tanh using the CuTe-target refit."""
     poly_tanh_d6 = (
-        0.9999999999996861,
-        0.018184368627828466,
-        -0.44364107914224865,
-        0.21709437130752046,
-        -0.023897373260303105,
-        -0.0071969181772045645,
-        0.0015005805508435293,
+        1.0112760066986084,
+        -0.02337932586669922,
+        -0.410724401473999,
+        0.23259931802749634,
+        -0.05259401723742485,
+        0.004392100498080254,
     )
-    clamp = 3.0
+    clamp = 3.75
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     abs_y = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(abs_x, clamp, loc=loc, ip=ip)
@@ -267,10 +281,9 @@ def tanh_emulation_2(
     hx, hy = evaluate_polynomial_2(tx, ty, poly_tanh_d6, loc=loc, ip=ip)
     poly_x = x * hx
     poly_y = y * hy
-    poly_y = y * hy
-    sat_x = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
-    sat_y = copysign_f32(0.9950547536867305, y, loc=loc, ip=ip)
-    return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+    poly_x = fmin(poly_x, 1.0, loc=loc, ip=ip)
+    poly_y = fmin(poly_y, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_x, x, loc=loc, ip=ip), copysign_f32(poly_y, y, loc=loc, ip=ip)
 
 
 @cute.jit
@@ -287,56 +300,45 @@ def tanh_emulationf(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
 
 
 # =============================================================================
-# D3 Tanh — LIGHTWEIGHT (2 FMA + 1 mul), matches SPLINE_TANH_FWD_D3 CUDA kernel
-# ODD polynomial: tanh(x) = sign(x) * |x| * poly(|x|), domain [0,3]
-# Coefficients: c1=1.124, c2=-0.427, c3=0.054, max_abs_error ≈ 0.011
+# D3 Tanh — CuTe-target refit for FA4 score_mod
+# ODD polynomial: tanh(x) = sign(x) * |x| * poly(|x|), clamp on |x|
 # =============================================================================
 
 @dsl_user_op
 def tanh_emulation_d3(x: Float32, *, loc=None, ip=None) -> Float32:
-    """Scalar f32 D3 spline tanh: tanh(x) ≈ x*poly(|x|) for |x|<3, ±1 otherwise.
-    Only 2 FMAs + 1 mul vs D6's 6 FMAs + 1 mul."""
-    c1 = 1.1240234375
-    c2 = -0.4267578125
-    c3 = 0.054229736328125
-    clamp = 3.0
+    """Scalar f32 D3 softcap tanh using the CuTe-target refit."""
+    c1 = 1.1250368356704712
+    c2 = -0.4274371862411499
+    c3 = 0.05404994636774063
+    clamp = 3.25
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     t = fmin(abs_x, clamp, loc=loc, ip=ip)
-    # Horner: h(t) = t * (c1 + t*(c2 + c3*t))  — just 2 FMA + 1 mul
-    h = t * Float32(c3) + Float32(c2)       # c3*t + c2
-    h = t * h + Float32(c1)                 # t*(c3*t+c2) + c1
-    poly_result = t * h                     # t * (c1 + t*(c2 + c3*t))
-    # Restore sign via copysign on the result (tanh is odd)
-    poly_result = copysign_f32(poly_result, x, loc=loc, ip=ip)
-    # Saturate: |x| >= 3 → ±tanh(3) ≈ ±0.995
-    saturated = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
-    return select_(abs_x < clamp, poly_result, saturated)
+    h = t * Float32(c3) + Float32(c2)
+    h = t * h + Float32(c1)
+    poly_result = fmin(t * h, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_result, x, loc=loc, ip=ip)
 
 
 @dsl_user_op
 def tanh_emulation_d3_2(
     x: Float32, y: Float32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
-    """Paired f32x2 D3 spline tanh — 2 FMA + 1 mul per element for ILP."""
-    c1 = 1.1240234375
-    c2 = -0.4267578125
-    c3 = 0.054229736328125
-    clamp = 3.0
+    """Paired f32x2 D3 softcap tanh using the CuTe-target refit."""
+    c1 = 1.1250368356704712
+    c2 = -0.4274371862411499
+    c3 = 0.05404994636774063
+    clamp = 3.25
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     abs_y = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(abs_x, clamp, loc=loc, ip=ip)
     ty = fmin(abs_y, clamp, loc=loc, ip=ip)
-    # Horner 2-wide: h(t) = t*(c1 + t*(c2 + c3*t))
     hx, hy = fma_packed_f32x2((Float32(c3), Float32(c3)), (tx, ty), (Float32(c2), Float32(c2)), loc=loc, ip=ip)
     hx, hy = fma_packed_f32x2((tx, ty), (hx, hy), (Float32(c1), Float32(c1)), loc=loc, ip=ip)
-    poly_x = tx * hx
-    poly_y = ty * hy
-    # Restore sign (tanh is odd)
+    poly_x = fmin(tx * hx, 1.0, loc=loc, ip=ip)
+    poly_y = fmin(ty * hy, 1.0, loc=loc, ip=ip)
     poly_x = copysign_f32(poly_x, x, loc=loc, ip=ip)
     poly_y = copysign_f32(poly_y, y, loc=loc, ip=ip)
-    sat_x = copysign_f32(0.9950547536867305, x, loc=loc, ip=ip)
-    sat_y = copysign_f32(0.9950547536867305, y, loc=loc, ip=ip)
-    return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+    return poly_x, poly_y
 
 
 @cute.jit
@@ -350,6 +352,206 @@ def tanh_emulationf_d3(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
         return res.load()
     else:
         return tanh_emulation_d3(x)
+
+
+# =============================================================================
+# D4 / D5 Tanh — BF16-optimized forward fits from spline_ops
+# These retain STE backward in training experiments; only the forward surrogate
+# changes to test whether D3 forward error is the source of loss drift.
+# =============================================================================
+
+@dsl_user_op
+def tanh_emulation_d4(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Scalar f32 D4 softcap tanh using the CuTe-target refit."""
+    poly_tanh_d4 = (
+        1.105966567993164,
+        -0.3748559057712555,
+        0.016082974150776863,
+        0.007882718928158283,
+    )
+    clamp = 2.75
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    t = fmin(abs_x, clamp, loc=loc, ip=ip)
+    h = evaluate_polynomial(t, poly_tanh_d4, loc=loc, ip=ip)
+    poly_result = t * h
+    poly_result = fmin(poly_result, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_result, x, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def tanh_emulation_d4_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 D4 softcap tanh using the CuTe-target refit."""
+    poly_tanh_d4 = (
+        1.105966567993164,
+        -0.3748559057712555,
+        0.016082974150776863,
+        0.007882718928158283,
+    )
+    clamp = 2.75
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    hx, hy = evaluate_polynomial_2(tx, ty, poly_tanh_d4, loc=loc, ip=ip)
+    poly_x = fmin(tx * hx, 1.0, loc=loc, ip=ip)
+    poly_y = fmin(ty * hy, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_x, x, loc=loc, ip=ip), copysign_f32(poly_y, y, loc=loc, ip=ip)
+
+
+@cute.jit
+def tanh_emulationf_d4(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_emulation_d4_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        return tanh_emulation_d4(x)
+
+
+@dsl_user_op
+def tanh_emulation_d5(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Scalar f32 D5 softcap tanh using the CuTe-target refit."""
+    poly_tanh_d5 = (
+        1.0582209825515747,
+        -0.219370037317276,
+        -0.14333371818065643,
+        0.0728820413351059,
+        -0.00920027308166027,
+    )
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    t = fmin(abs_x, clamp, loc=loc, ip=ip)
+    h = evaluate_polynomial(t, poly_tanh_d5, loc=loc, ip=ip)
+    poly_result = t * h
+    poly_result = fmin(poly_result, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_result, x, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def tanh_emulation_d5_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Paired f32x2 D5 softcap tanh using the CuTe-target refit."""
+    poly_tanh_d5 = (
+        1.0582209825515747,
+        -0.219370037317276,
+        -0.14333371818065643,
+        0.0728820413351059,
+        -0.00920027308166027,
+    )
+    clamp = 3.0
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    hx, hy = evaluate_polynomial_2(tx, ty, poly_tanh_d5, loc=loc, ip=ip)
+    poly_x = fmin(tx * hx, 1.0, loc=loc, ip=ip)
+    poly_y = fmin(ty * hy, 1.0, loc=loc, ip=ip)
+    return copysign_f32(poly_x, x, loc=loc, ip=ip), copysign_f32(poly_y, y, loc=loc, ip=ip)
+
+
+@cute.jit
+def tanh_emulationf_d5(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_emulation_d5_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        return tanh_emulation_d5(x)
+
+
+@dsl_user_op
+def tanh_handwritten_device_d3_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_tanh_fwd_d3_bf16x2", loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def tanh_handwritten_device_d4_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_tanh_fwd_d4_bf16x2", loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def tanh_handwritten_device_d5_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_tanh_fwd_d5_bf16x2", loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def tanh_handwritten_device_d6_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_tanh_fwd_d6_bf16x2", loc=loc, ip=ip
+    )
+
+
+@cute.jit
+def tanh_handwritten_devicef_d3(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_handwritten_device_d3_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = tanh_handwritten_device_d3_2(x, x)
+        return out0
+
+
+@cute.jit
+def tanh_handwritten_devicef_d4(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_handwritten_device_d4_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = tanh_handwritten_device_d4_2(x, x)
+        return out0
+
+
+@cute.jit
+def tanh_handwritten_devicef_d5(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_handwritten_device_d5_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = tanh_handwritten_device_d5_2(x, x)
+        return out0
+
+
+@cute.jit
+def tanh_handwritten_devicef_d6(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_handwritten_device_d6_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = tanh_handwritten_device_d6_2(x, x)
+        return out0
 
 
 # =============================================================================
@@ -412,6 +614,30 @@ def create_softcap_scoremod_spline_d3(softcap_val):
     return scoremod_premask_fn
 
 
+def create_softcap_scoremod_spline_d4(softcap_val):
+    """Softcapping scoremod using D4 spline tanh forward."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_emulationf_d4(scores)
+
+    return scoremod_premask_fn
+
+
+def create_softcap_scoremod_spline_d5(softcap_val):
+    """Softcapping scoremod using D5 spline tanh forward."""
+    inv_softcap = 1.0 / softcap_val
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_emulationf_d5(scores)
+
+    return scoremod_premask_fn
+
+
 def create_softcap_scoremod_bwd_spline_d3(softcap_val):
     """Softcapping scoremod gradient using D4 tanh gradient spline."""
     inv_softcap = 1.0 / softcap_val
@@ -424,6 +650,60 @@ def create_softcap_scoremod_bwd_spline_d3(softcap_val):
         return grad * derivative
 
     return scoremod_bwd_fn
+
+
+def create_softcap_scoremod_spline_device(softcap_val, degree: int = 3):
+    """Softcapping scoremod using handwritten BF16 spline device wrappers."""
+    ensure_handwritten_device_backend()
+    inv_softcap = 1.0 / softcap_val
+    fn_by_degree = {
+        3: tanh_handwritten_devicef_d3,
+        4: tanh_handwritten_devicef_d4,
+        5: tanh_handwritten_devicef_d5,
+        6: tanh_handwritten_devicef_d6,
+    }
+    if degree not in fn_by_degree:
+        raise ValueError(f"Unsupported handwritten softcap degree: {degree}")
+    tanh_fn = fn_by_degree[degree]
+    tanh_fn.__degree__ = degree
+    tanh_fn.__backend__ = "device"
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_fn(scores)
+
+    scoremod_premask_fn.__degree__ = degree
+    scoremod_premask_fn.__backend__ = "device"
+    return scoremod_premask_fn
+
+
+def create_softcap_scoremod_spline_cute(softcap_val, degree: int = 3):
+    """Softcapping scoremod using CuTe-authored polynomial paths."""
+    fn_by_degree = {
+        3: create_softcap_scoremod_spline_d3,
+        4: create_softcap_scoremod_spline_d4,
+        5: create_softcap_scoremod_spline_d5,
+        6: create_softcap_scoremod_spline,
+    }
+    if degree not in fn_by_degree:
+        raise ValueError(f"Unsupported CuTe softcap degree: {degree}")
+    scoremod_premask_fn = fn_by_degree[degree](softcap_val)
+    scoremod_premask_fn.__degree__ = degree
+    scoremod_premask_fn.__backend__ = "cute"
+    return scoremod_premask_fn
+
+
+def create_softcap_scoremod_backend(
+    softcap_val,
+    degree: int = 3,
+    backend: str = "cute",
+):
+    if backend == "cute":
+        return create_softcap_scoremod_spline_cute(softcap_val, degree=degree)
+    if backend == "device":
+        return create_softcap_scoremod_spline_device(softcap_val, degree=degree)
+    raise ValueError(f"Unsupported softcap polynomial backend: {backend}")
 
 
 def create_softcap_scoremod_bwd_spline_d3_1mt2(softcap_val):
@@ -447,12 +727,10 @@ def sigmoid_emulation_2(
 ) -> Tuple[Float32, Float32]:
     """Paired f32x2 spline sigmoid for ILP — processes 2 values simultaneously.
 
-    D3 minimax polynomial on [0,6] with odd symmetry:
-      h(t) = t * (c1 + t*(c2 + c3*t))
-      sigmoid(x) = 0.5 + copysign(h(min(|x|,6)), x)
+    This is the original FA4 D3 sigmoid polynomial that gave the stable B3
+    training surface. The handwritten `device` backend is aligned to this same
+    approximation family so backend comparisons stay apples-to-apples.
     """
-    # D3 minimax polynomial for h(x) = sigmoid(x) - 0.5 (odd function).
-    # h(x) = x * poly(|x|) — sign comes from x, like tanh (avoids broken copysign).
     c0 = 0.281005859375
     c1 = -0.0533447265625
     c2 = 0.0033893585205078125
@@ -461,16 +739,35 @@ def sigmoid_emulation_2(
     abs_y = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(abs_x, clamp, loc=loc, ip=ip)
     ty = fmin(abs_y, clamp, loc=loc, ip=ip)
-    # Horner: poly(t) = (c2*t + c1)*t + c0
     px, py = fma_packed_f32x2((c2, c2), (tx, ty), (c1, c1), loc=loc, ip=ip)
     px, py = fma_packed_f32x2((px, py), (tx, ty), (c0, c0), loc=loc, ip=ip)
-    # h(x) = x * poly(|x|) — sign from x, like tanh
     poly_x = Float32(0.5) + x * px
     poly_y = Float32(0.5) + y * py
-    # Saturate: for |x| >= clamp, sigmoid → 0 or 1
     sat_x = select_(x > Float32(0.0), Float32(1.0), Float32(0.0))
     sat_y = select_(y > Float32(0.0), Float32(1.0), Float32(0.0))
     return select_(abs_x < clamp, poly_x, sat_x), select_(abs_y < clamp, poly_y, sat_y)
+
+
+@dsl_user_op
+def sigmoid_handwritten_device_d3_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_sigmoid_fwd_d3_bf16x2", loc=loc, ip=ip
+    )
+
+
+@cute.jit
+def sigmoid_handwritten_devicef_d3(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = sigmoid_handwritten_device_d3_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = sigmoid_handwritten_device_d3_2(x, x)
+        return out0
 
 
 @dsl_user_op
@@ -563,6 +860,42 @@ def sigmoid_grad_fast_even_d5_2(
     if const_expr(q_dtype is cutlass.BFloat16):
         return sigmoid_grad_fast_even_d5_bf16_2(x, y, loc=loc, ip=ip)
     return sigmoid_grad_fast_even_d5_f16_2(x, y, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sigmoid_grad_handwritten_device_d5_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    return call_handwritten_bf16x2_f32x2(
+        x, y, "fa4_spline_sigmoid_grad_d5_bf16x2", loc=loc, ip=ip
+    )
+
+
+def sigmoid_poly_backend_2(
+    x: Float32,
+    y: Float32,
+    backend: cutlass.Constexpr[str] = "cute",
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    if const_expr(backend == "device"):
+        return sigmoid_handwritten_device_d3_2(x, y, loc=loc, ip=ip)
+    return sigmoid_emulation_2(x, y, loc=loc, ip=ip)
+
+
+def sigmoid_grad_poly_backend_2(
+    x: Float32,
+    y: Float32,
+    q_dtype,
+    backend: cutlass.Constexpr[str] = "cute",
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    if const_expr(backend == "device"):
+        return sigmoid_grad_handwritten_device_d5_2(x, y, loc=loc, ip=ip)
+    return sigmoid_grad_fast_even_d5_2(x, y, q_dtype, loc=loc, ip=ip)
 
 
 def sigmoid_native_2(x, y):
@@ -1021,6 +1354,48 @@ def cvt_f16x2_f32(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@dsl_user_op
+def unpack_bf16x2_f32(src: cutlass.Int32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    out_f32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [cutlass.Int32(src).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 r0;\n\t"
+        ".reg .b16 h0, h1;\n\t"
+        "mov.b32 r0, $2;\n\t"
+        "mov.b32 {h0, h1}, r0;\n\t"
+        "cvt.f32.bf16 $0, h0;\n\t"
+        "cvt.f32.bf16 $1, h1;\n\t"
+        "}\n",
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
+    return out0, out1
+
+
+@dsl_user_op
+def call_handwritten_bf16x2_f32x2(
+    x: Float32, y: Float32, symbol: cutlass.Constexpr[str], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    asm = get_handwritten_inline_asm(str(symbol))
+    packed = cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip), Float32(y).ir_value(loc=loc, ip=ip)],
+            asm,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return unpack_bf16x2_f32(packed, loc=loc, ip=ip)
 
 
 @overload

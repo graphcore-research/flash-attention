@@ -122,12 +122,14 @@ class FlashAttentionForwardSm100:
         sigmoid_sfu_freq: int = 16,
         sigmoid_sfu_res: int = 0,
         sigmoid_bias: float | None = None,
+        sigmoid_poly_backend: str = "cute",
     ):
         self.output_gate_use_spline = output_gate_use_spline
         self.sigmoid_attention = sigmoid_attention
         self.sigmoid_sfu_freq = sigmoid_sfu_freq
         self.sigmoid_sfu_res = sigmoid_sfu_res
         self.sigmoid_bias = sigmoid_bias
+        self.sigmoid_poly_backend = sigmoid_poly_backend
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -1889,6 +1891,7 @@ class FlashAttentionForwardSm100:
                 sigmoid_sfu_freq=self.sigmoid_sfu_freq,
                 sigmoid_sfu_res=self.sigmoid_sfu_res,
                 sigmoid_bias=sigmoid_bias,
+                sigmoid_poly_backend=self.sigmoid_poly_backend,
             )
             softmax.reset()
 

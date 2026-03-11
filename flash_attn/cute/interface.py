@@ -210,6 +210,7 @@ def _flash_attn_fwd(
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
     sigmoid_bias: Optional[float] = None,
+    sigmoid_poly_backend: str = "cute",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -472,6 +473,8 @@ def _flash_attn_fwd(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    if sigmoid_attention and sigmoid_poly_backend == "device":
+        utils.ensure_handwritten_device_backend()
     
     compile_key = (
         dtype,
@@ -508,6 +511,7 @@ def _flash_attn_fwd(
         sigmoid_sfu_freq,
         sigmoid_sfu_res,
         sigmoid_bias,
+        sigmoid_poly_backend,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -616,6 +620,7 @@ def _flash_attn_fwd(
                 sigmoid_sfu_freq=sigmoid_sfu_freq,
                 sigmoid_sfu_res=sigmoid_sfu_res,
                 sigmoid_bias=sigmoid_bias,
+                sigmoid_poly_backend=sigmoid_poly_backend,
             )
         else:
             raise ValueError(
@@ -774,6 +779,7 @@ def _flash_attn_bwd(
     sigmoid_sfu_freq: int = 16,
     sigmoid_sfu_res: int = 0,
     sigmoid_use_direct_bwd_poly: bool = False,
+    sigmoid_poly_backend: str = "cute",
     output_gate_activation: Optional[torch.Tensor] = None,
     output_gate_use_spline: bool = False,
     return_output_gate_grad: bool = False,
@@ -835,6 +841,8 @@ def _flash_attn_bwd(
         use_2cta_instrs = cluster_size==2
     if output_gate_activation is not None:
         assert arch // 10 in [10, 11], "CuTe fused output gate requires SM100/SM110"
+    if sigmoid_attention and sigmoid_poly_backend == "device":
+        utils.ensure_handwritten_device_backend()
     
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, output_gate_activation = [
         maybe_contiguous(t)
@@ -1247,6 +1255,7 @@ def _flash_attn_bwd(
             sigmoid_sfu_freq,
             sigmoid_sfu_res,
             sigmoid_use_direct_bwd_poly,
+            sigmoid_poly_backend,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1340,6 +1349,7 @@ def _flash_attn_bwd(
                 sigmoid_sfu_freq=sigmoid_sfu_freq,
                 sigmoid_sfu_res=sigmoid_sfu_res,
                 sigmoid_use_direct_bwd_poly=sigmoid_use_direct_bwd_poly,
+                sigmoid_poly_backend=sigmoid_poly_backend,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1585,6 +1595,7 @@ class FlashAttnFunc(torch.autograd.Function):
         sigmoid_sfu_res: int = 0,
         sigmoid_use_direct_bwd_poly: bool = False,
         sigmoid_bias: float | None = None,
+        sigmoid_poly_backend: str = "cute",
         output_gate: Optional[torch.Tensor] = None,
         gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
         gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
@@ -1665,6 +1676,7 @@ class FlashAttnFunc(torch.autograd.Function):
             sigmoid_sfu_freq=sigmoid_sfu_freq,
             sigmoid_sfu_res=sigmoid_sfu_res,
             sigmoid_bias=sigmoid_bias,
+            sigmoid_poly_backend=sigmoid_poly_backend,
         )
         out_base = out
         if output_gate is not None:
@@ -1702,6 +1714,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.sigmoid_sfu_res = sigmoid_sfu_res
         ctx.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
         ctx.sigmoid_bias = sigmoid_bias
+        ctx.sigmoid_poly_backend = sigmoid_poly_backend
         ctx.has_output_gate = gate_base is not None
         ctx.output_gate_fused = can_fuse_output_gate
         ctx.output_gate_use_spline = output_gate_use_spline
@@ -1737,6 +1750,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
                     sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
+                    sigmoid_poly_backend=ctx.sigmoid_poly_backend,
                     output_gate_activation=gate_saved,
                     output_gate_use_spline=ctx.output_gate_use_spline,
                     return_output_gate_grad=True,
@@ -1762,6 +1776,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
                     sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
+                    sigmoid_poly_backend=ctx.sigmoid_poly_backend,
                 )
             elif ctx.use_spline_sigmoid_gate:
                 dout_attn, grad_gate_full = _output_gate_backward_spline(dout, out, gate_saved)
@@ -1783,6 +1798,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
                     sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
+                    sigmoid_poly_backend=ctx.sigmoid_poly_backend,
                 )
             else:
                 gate_base = gate_saved
@@ -1812,6 +1828,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     sigmoid_sfu_res=ctx.sigmoid_sfu_res,
                     sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                     sigmoid_bias=ctx.sigmoid_bias,
+                    sigmoid_poly_backend=ctx.sigmoid_poly_backend,
                 )
             grad_gate_base = _sum_to_shape(grad_gate_full, ctx.gate_base_shape)
             d_output_gate = _restore_output_gate_grad(
@@ -1838,12 +1855,13 @@ class FlashAttnFunc(torch.autograd.Function):
                 sigmoid_sfu_res=ctx.sigmoid_sfu_res,
                 sigmoid_use_direct_bwd_poly=ctx.sigmoid_use_direct_bwd_poly,
                 sigmoid_bias=ctx.sigmoid_bias,
+                sigmoid_poly_backend=ctx.sigmoid_poly_backend,
             )
         return (
             dq,
             dk,
             dv,
-            *((None,) * 20),
+            *((None,) * 21),
             d_output_gate,
             None,
             None,
@@ -2175,6 +2193,7 @@ def flash_attn_func(
     sigmoid_sfu_res: int = 0,
     sigmoid_use_direct_bwd_poly: bool = False,
     sigmoid_bias: float | None = None,
+    sigmoid_poly_backend: str = "cute",
     output_gate: Optional[torch.Tensor] = None,
     gate_sigmoid_poly_coeffs: Optional[Sequence[float]] = None,
     gate_sigmoid_grad_poly_coeffs: Optional[Sequence[float]] = None,
@@ -2204,6 +2223,7 @@ def flash_attn_func(
         sigmoid_sfu_res,
         sigmoid_use_direct_bwd_poly,
         sigmoid_bias,
+        sigmoid_poly_backend,
         output_gate,
         gate_sigmoid_poly_coeffs,
         gate_sigmoid_grad_poly_coeffs,

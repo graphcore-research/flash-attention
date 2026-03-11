@@ -176,6 +176,7 @@ class SoftmaxSm100(Softmax):
     sigmoid_sfu_res: cutlass.Constexpr[int] = 0
     # Sigmoid attention bias: b = -log(n) per FlashSigmoid paper (2409.04431)
     sigmoid_bias: Float32 = Float32(0.0)
+    sigmoid_poly_backend: cutlass.Constexpr[str] = "cute"
 
     @staticmethod
     def create(
@@ -185,6 +186,7 @@ class SoftmaxSm100(Softmax):
         sigmoid_sfu_freq: cutlass.Constexpr[int] = 16,
         sigmoid_sfu_res: cutlass.Constexpr[int] = 0,
         sigmoid_bias: Float32 = Float32(0.0),
+        sigmoid_poly_backend: cutlass.Constexpr[str] = "cute",
     ):
         num_rows = 1
         arch = 100
@@ -201,6 +203,7 @@ class SoftmaxSm100(Softmax):
             sigmoid_sfu_freq=sigmoid_sfu_freq,
             sigmoid_sfu_res=sigmoid_sfu_res,
             sigmoid_bias=sigmoid_bias,
+            sigmoid_poly_backend=sigmoid_poly_backend,
         )
 
     @cute.jit
@@ -327,8 +330,12 @@ class SoftmaxSm100(Softmax):
                 if cutlass.const_expr(
                     k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                 ):
-                    # Lean polynomial (FMA) path — 5 ops per pair
-                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_fast_2(s0, s1)
+                    # Use the saturating odd-form sigmoid surrogate in attention so
+                    # the negative tail does not collapse into a constant floor after
+                    # the FlashSigmoid -log(n) bias is applied.
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_poly_backend_2(
+                        s0, s1, backend=self.sigmoid_poly_backend
+                    )
                 else:
                     # SFU path (exp2 + rcp_approx)
                     acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_native_2(s0, s1)

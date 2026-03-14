@@ -119,6 +119,29 @@ def _sum_to_shape(x: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor:
     return x
 
 
+def _validate_attention_poly_configuration(
+    *,
+    score_mod: Optional[Callable],
+    score_mod_bwd: Optional[Callable],
+    sigmoid_attention: bool,
+    sigmoid_poly_backend: str,
+    sigmoid_coeff_source: str,
+) -> None:
+    if sigmoid_attention and sigmoid_coeff_source == "sollya" and sigmoid_poly_backend != "device":
+        raise ValueError(
+            "Sollya sigmoid attention fits are device-only; use sigmoid_poly_backend='device'."
+        )
+    for label, fn in (("score_mod", score_mod), ("score_mod_bwd", score_mod_bwd)):
+        if fn is None:
+            continue
+        coeff_source = getattr(fn, "__coeff_source__", None)
+        backend = getattr(fn, "__backend__", None)
+        if coeff_source == "sollya" and backend != "device":
+            raise ValueError(
+                f"Sollya softcap attention fits are device-only; {label} uses backend={backend!r}."
+            )
+
+
 def _prepare_output_gate(
     output_gate: torch.Tensor,
     out_shape: Tuple[int, ...],
@@ -230,6 +253,13 @@ def _flash_attn_fwd(
     q, k, v, output_gate_activation = [
         maybe_contiguous(t) for t in (q, k, v, output_gate_activation)
     ]
+    _validate_attention_poly_configuration(
+        score_mod=score_mod,
+        score_mod_bwd=None,
+        sigmoid_attention=sigmoid_attention,
+        sigmoid_poly_backend=sigmoid_poly_backend,
+        sigmoid_coeff_source=sigmoid_coeff_source,
+    )
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -985,6 +1015,14 @@ def _flash_attn_bwd(
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd_native(softcap)
         softcap = 0.0  # score_mod handles it now
+
+    _validate_attention_poly_configuration(
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        sigmoid_attention=sigmoid_attention,
+        sigmoid_poly_backend=sigmoid_poly_backend,
+        sigmoid_coeff_source=sigmoid_coeff_source,
+    )
 
     device = q.device
     out_torch_dtype = q.dtype

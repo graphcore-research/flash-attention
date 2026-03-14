@@ -47,6 +47,20 @@ def _validate_coeff_source(coeff_source: str) -> str:
     return coeff_source
 
 
+def _validate_attention_backend_source(
+    *,
+    backend: str,
+    coeff_source: str,
+    family: str,
+) -> str:
+    coeff_source = _validate_coeff_source(coeff_source)
+    if coeff_source == "sollya" and backend != "device":
+        raise ValueError(
+            f"Sollya {family} attention fits are device-only; got backend={backend!r}."
+        )
+    return coeff_source
+
+
 def _annotate_poly_callable(
     fn: Callable,
     *,
@@ -928,6 +942,11 @@ def create_softcap_scoremod_backend(
     backend: str = "cute",
     coeff_source: str = "current",
 ):
+    coeff_source = _validate_attention_backend_source(
+        backend=backend,
+        coeff_source=coeff_source,
+        family="softcap",
+    )
     if backend == "cute":
         return create_softcap_scoremod_spline_cute(
             softcap_val,
@@ -951,6 +970,11 @@ def create_softcap_scoremod_bwd_backend(
     coeff_source: str = "current",
 ):
     """Backend-explicit softcap backward selector for the longer-run port."""
+    coeff_source = _validate_attention_backend_source(
+        backend=backend,
+        coeff_source=coeff_source,
+        family="softcap",
+    )
     backward_mode = backward_mode.lower()
     if backward_mode == "ste":
         return create_softcap_scoremod_bwd_ste(softcap_val)

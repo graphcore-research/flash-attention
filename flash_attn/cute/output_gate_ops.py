@@ -5,6 +5,7 @@ from functools import lru_cache
 from typing import Optional, Sequence, Tuple
 
 import torch
+from flash_attn.cute.polynomial_manifest import get_default_output_gate_coeffs
 
 try:
     import triton
@@ -19,9 +20,7 @@ except ImportError:
 
 MAX_POLY_COEFFS = 8
 DEFAULT_SIGMOID_SPLINE_POLY_COEFFS = (
-    0.281005859375,
-    -0.0533447265625,
-    0.0033893585205078125,
+    get_default_output_gate_coeffs()
 )
 
 

@@ -20,9 +20,21 @@ from flash_attn.cute.handwritten_spline_ptx import (
     handwritten_spline_ptx_provider,
     require_device_backend_support,
 )
+from flash_attn.cute.polynomial_manifest import (
+    get_default_output_gate_coeffs,
+    get_sigmoid_forward_spec,
+    get_sigmoid_gradient_spec,
+    get_softcap_tanh_analytical_backward_coeffs,
+    get_softcap_tanh_forward_spec,
+)
 
 _MIXER_ATTRS = ("__vec_size__",)
 _HANDWRITTEN_PTX_REGISTERED = False
+SOFTCAP_TANH_D4_SPEC = get_softcap_tanh_forward_spec()
+SOFTCAP_TANH_D4_ANALYTICAL_BWD = get_softcap_tanh_analytical_backward_coeffs()
+SIGMOID_D3_SPEC = get_sigmoid_forward_spec()
+SIGMOID_GRAD_D5_BF16_SPEC = get_sigmoid_gradient_spec()
+DEFAULT_OUTPUT_GATE_COEFFS = get_default_output_gate_coeffs()
 
 
 def ensure_handwritten_device_backend() -> None:
@@ -362,14 +374,9 @@ def tanh_emulationf_d3(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
 
 @dsl_user_op
 def tanh_emulation_d4(x: Float32, *, loc=None, ip=None) -> Float32:
-    """Scalar f32 D4 softcap tanh using the CuTe-target refit."""
-    poly_tanh_d4 = (
-        1.105966567993164,
-        -0.3748559057712555,
-        0.016082974150776863,
-        0.007882718928158283,
-    )
-    clamp = 2.75
+    """Scalar f32 D4 softcap tanh using the canonical BF16-aligned refit."""
+    poly_tanh_d4 = SOFTCAP_TANH_D4_SPEC.coeffs
+    clamp = SOFTCAP_TANH_D4_SPEC.clamp
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     t = fmin(abs_x, clamp, loc=loc, ip=ip)
     h = evaluate_polynomial(t, poly_tanh_d4, loc=loc, ip=ip)
@@ -382,14 +389,9 @@ def tanh_emulation_d4(x: Float32, *, loc=None, ip=None) -> Float32:
 def tanh_emulation_d4_2(
     x: Float32, y: Float32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
-    """Paired f32x2 D4 softcap tanh using the CuTe-target refit."""
-    poly_tanh_d4 = (
-        1.105966567993164,
-        -0.3748559057712555,
-        0.016082974150776863,
-        0.007882718928158283,
-    )
-    clamp = 2.75
+    """Paired f32x2 D4 softcap tanh using the canonical BF16-aligned refit."""
+    poly_tanh_d4 = SOFTCAP_TANH_D4_SPEC.coeffs
+    clamp = SOFTCAP_TANH_D4_SPEC.clamp
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     abs_y = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(abs_x, clamp, loc=loc, ip=ip)
@@ -601,6 +603,34 @@ def tanh_gradf_d4(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
         return Float32(1.0) - t * t
 
 
+@dsl_user_op
+def tanh_grad_analytic_d4_2(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Analytical derivative of the canonical D4 softcap forward polynomial."""
+    clamp = Float32(SOFTCAP_TANH_D4_SPEC.clamp)
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+    ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+    rx, ry = evaluate_polynomial_2(tx, ty, SOFTCAP_TANH_D4_ANALYTICAL_BWD, loc=loc, ip=ip)
+    sat = Float32(0.0)
+    return select_(abs_x < clamp, rx, sat), select_(abs_y < clamp, ry, sat)
+
+
+@cute.jit
+def tanh_grad_analyticf_d4(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        res = cute.make_fragment(x.shape, Float32)
+        res.store(x)
+        for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+            res[i], res[i + 1] = tanh_grad_analytic_d4_2(res[i], res[i + 1])
+        return res.load()
+    else:
+        out0, _ = tanh_grad_analytic_d4_2(x, x)
+        return out0
+
+
 # D3 softcap score_mod — lightweight, matches CUDA kernel performance
 def create_softcap_scoremod_spline_d3(softcap_val):
     """Softcapping scoremod using D3 spline tanh (2 FMA+1 mul, no SFU)."""
@@ -706,6 +736,68 @@ def create_softcap_scoremod_backend(
     raise ValueError(f"Unsupported softcap polynomial backend: {backend}")
 
 
+def create_softcap_scoremod_bwd_backend(
+    softcap_val,
+    degree: int = 4,
+    backend: str = "device",
+    backward_mode: str = "analytical",
+):
+    """Backend-explicit softcap backward selector for the longer-run port."""
+    backward_mode = backward_mode.lower()
+    if backward_mode == "ste":
+        return create_softcap_scoremod_bwd_ste(softcap_val)
+    if backward_mode == "native":
+        return create_softcap_scoremod_bwd_native(softcap_val)
+
+    inv_softcap = 1.0 / softcap_val
+
+    if backward_mode == "analytical":
+        if degree != 4:
+            raise ValueError(
+                f"Analytical softcap backward is only canonicalized for D4, got D{degree}"
+            )
+
+        @cute.jit
+        def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+            scores = acc_S_SSA * inv_softcap
+            derivative = tanh_grad_analyticf_d4(scores)
+            return grad * derivative
+
+        scoremod_bwd_fn.__degree__ = degree
+        scoremod_bwd_fn.__backend__ = backend
+        scoremod_bwd_fn.__backward_mode__ = backward_mode
+        return scoremod_bwd_fn
+
+    if backward_mode in ("exact", "exact_1mt2"):
+        fn_by_degree = {
+            ("cute", 3): tanh_emulationf_d3,
+            ("cute", 4): tanh_emulationf_d4,
+            ("cute", 5): tanh_emulationf_d5,
+            ("cute", 6): tanh_emulationf,
+            ("device", 3): tanh_handwritten_devicef_d3,
+            ("device", 4): tanh_handwritten_devicef_d4,
+            ("device", 5): tanh_handwritten_devicef_d5,
+            ("device", 6): tanh_handwritten_devicef_d6,
+        }
+        tanh_fn = fn_by_degree.get((backend, degree))
+        if tanh_fn is None:
+            raise ValueError(f"Unsupported exact softcap backward for backend={backend!r}, degree={degree}")
+
+        @cute.jit
+        def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+            scores = acc_S_SSA * inv_softcap
+            t = tanh_fn(scores)
+            derivative = Float32(1.0) - t * t
+            return grad * derivative
+
+        scoremod_bwd_fn.__degree__ = degree
+        scoremod_bwd_fn.__backend__ = backend
+        scoremod_bwd_fn.__backward_mode__ = backward_mode
+        return scoremod_bwd_fn
+
+    raise ValueError(f"Unsupported softcap backward mode: {backward_mode}")
+
+
 def create_softcap_scoremod_bwd_spline_d3_1mt2(softcap_val):
     """Softcapping scoremod gradient using D3 tanh + 1-tanh² (same pattern as D6)."""
     inv_softcap = 1.0 / softcap_val
@@ -731,10 +823,8 @@ def sigmoid_emulation_2(
     training surface. The handwritten `device` backend is aligned to this same
     approximation family so backend comparisons stay apples-to-apples.
     """
-    c0 = 0.281005859375
-    c1 = -0.0533447265625
-    c2 = 0.0033893585205078125
-    clamp = 6.0
+    c0, c1, c2 = SIGMOID_D3_SPEC.coeffs
+    clamp = SIGMOID_D3_SPEC.clamp
     abs_x = fabs_f32(x, loc=loc, ip=ip)
     abs_y = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(abs_x, clamp, loc=loc, ip=ip)
@@ -786,11 +876,9 @@ def sigmoid_fast_2(
     Ops: 2 fmax + 2 fmin + 2 fabs + 3 FMA pairs = 9 paired ops
     (fabs is free - just clears sign bit)
     """
-    c1 = 0.281005859375
-    c2 = -0.0533447265625
-    c3 = 0.0033893585205078125
-    pos_clamp = Float32(6.0)
-    neg_clamp = Float32(-6.0)
+    c1, c2, c3 = SIGMOID_D3_SPEC.coeffs
+    pos_clamp = Float32(SIGMOID_D3_SPEC.clamp)
+    neg_clamp = Float32(-SIGMOID_D3_SPEC.clamp)
     # 2-sided clamp: t = max(min(x, 6), -6)
     tx = fmax(fmin(x, pos_clamp, loc=loc, ip=ip), neg_clamp, loc=loc, ip=ip)
     ty = fmax(fmin(y, pos_clamp, loc=loc, ip=ip), neg_clamp, loc=loc, ip=ip)
@@ -810,13 +898,8 @@ def sigmoid_grad_fast_even_d5_bf16_2(
     x: Float32, y: Float32, *, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
     """BF16-optimized D5 even polynomial for sigmoid'(x)."""
-    clamp = Float32(4.75)
-    c0 = 0.2500000000
-    c1 = -0.0046386719
-    c2 = -0.0722656250
-    c3 = 0.0257568359
-    c4 = -0.0034027100
-    c5 = 0.0001573563
+    clamp = Float32(SIGMOID_GRAD_D5_BF16_SPEC.clamp)
+    c0, c1, c2, c3, c4, c5 = SIGMOID_GRAD_D5_BF16_SPEC.coeffs
     ax = fabs_f32(x, loc=loc, ip=ip)
     ay = fabs_f32(y, loc=loc, ip=ip)
     tx = fmin(ax, clamp, loc=loc, ip=ip)

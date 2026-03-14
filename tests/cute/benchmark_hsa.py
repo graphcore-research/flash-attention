@@ -3,7 +3,12 @@ from dataclasses import dataclass
 
 import torch
 
-from flash_attn.cute import flash_attn_hsa_func, hsa_reference_attention
+from flash_attn.cute import (
+    build_hsa_schedule,
+    flash_attn_hsa_func,
+    flash_attn_hsa_sparse_func,
+    hsa_reference_attention,
+)
 
 
 @dataclass
@@ -93,17 +98,30 @@ def run_case(case: BenchmarkCase):
     device = "cuda"
     dtype = torch.bfloat16
     keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
     q = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     k = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     v = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
 
     out_fa4 = _unwrap_output(flash_attn_hsa_func(q, k, v, keep_ids, hash_ids))
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
     out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
     max_diff = (out_fa4.float() - out_ref.float()).abs().max().item()
     mean_diff = (out_fa4.float() - out_ref.float()).abs().mean().item()
+    sparse_max_diff = (out_sparse.float() - out_ref.float()).abs().max().item()
+    sparse_mean_diff = (out_sparse.float() - out_ref.float()).abs().mean().item()
 
     fa4_ms = _measure_ms(
         lambda: _unwrap_output(flash_attn_hsa_func(q, k, v, keep_ids, hash_ids)),
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    sparse_ms = _measure_ms(
+        lambda: _unwrap_output(
+            flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+        ),
         case.warmup_iters,
         case.benchmark_iters,
     )
@@ -113,11 +131,14 @@ def run_case(case: BenchmarkCase):
         max(5, case.benchmark_iters // 2),
     )
     speedup = ref_ms / fa4_ms if fa4_ms > 0 else float("inf")
+    sparse_speedup = ref_ms / sparse_ms if sparse_ms > 0 else float("inf")
 
     print(
         f"{case.name}: shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, D={case.headdim}) "
-        f"max_diff={max_diff:.6f} mean_diff={mean_diff:.6f} "
-        f"fa4_ms={fa4_ms:.3f} ref_ms={ref_ms:.3f} speedup={speedup:.2f}x"
+        f"maskmod_max_diff={max_diff:.6f} maskmod_mean_diff={mean_diff:.6f} "
+        f"sparse_max_diff={sparse_max_diff:.6f} sparse_mean_diff={sparse_mean_diff:.6f} "
+        f"maskmod_ms={fa4_ms:.3f} sparse_ms={sparse_ms:.3f} ref_ms={ref_ms:.3f} "
+        f"maskmod_speedup={speedup:.2f}x sparse_speedup={sparse_speedup:.2f}x"
     )
 
 

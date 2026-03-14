@@ -4,17 +4,29 @@ import torch
 
 try:
     from flash_attn.cute import (
+        backward_descriptors_to_attend_mask,
+        build_hsa_schedule,
+        compute_hsa_mask,
         flash_attn_func,
         flash_attn_hsa_func,
+        flash_attn_hsa_sparse_func,
+        forward_descriptors_to_attend_mask,
         get_hsa_mask_mod,
         hsa_reference_attention,
+        schedule_to_attend_mask,
     )
     _IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - import guard for unsupported envs
+    build_hsa_schedule = None
+    backward_descriptors_to_attend_mask = None
+    compute_hsa_mask = None
     flash_attn_func = None
     flash_attn_hsa_func = None
+    flash_attn_hsa_sparse_func = None
+    forward_descriptors_to_attend_mask = None
     get_hsa_mask_mod = None
     hsa_reference_attention = None
+    schedule_to_attend_mask = None
     _IMPORT_ERROR = exc
 
 
@@ -29,9 +41,25 @@ pytestmark = pytest.mark.skipif(
     reason=f"HSA FA4 test requires CUDA SM90+ with FA4 available ({_IMPORT_ERROR!r})",
 )
 
+HAS_HSA_SPARSE_FA4 = HAS_HSA_FA4 and torch.cuda.get_device_capability()[0] >= 10
+
 
 def _unwrap_output(result):
     return result[0] if isinstance(result, tuple) else result
+
+
+def _empty_stream_like(stream):
+    stream_type = stream.__class__
+    device = stream.query_indices.device
+    return stream_type(
+        query_indices=torch.empty(0, dtype=torch.int32, device=device),
+        key_indices=torch.empty(0, dtype=torch.int32, device=device),
+        row_indices=torch.empty(0, dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.tensor([0], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0], dtype=torch.int32, device=device),
+        max_seqlen_q=0,
+        max_seqlen_k=0,
+    )
 
 
 def _make_hsa_metadata(batch_size, seqlen, device):
@@ -176,3 +204,176 @@ def test_fixed_length_public_api_supports_aux_tensors_in_backward():
     assert torch.isfinite(q.grad).all()
     assert torch.isfinite(k.grad).all()
     assert torch.isfinite(v.grad).all()
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_schedule_reconstructs_dense_mask():
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    dense_mask = schedule_to_attend_mask(schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_forward_descriptors_reconstruct_dense_mask():
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    dense_mask = forward_descriptors_to_attend_mask(schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_backward_descriptors_reconstruct_dense_mask():
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    dense_mask = backward_descriptors_to_attend_mask(schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse_forward_matches_reference():
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 129, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
+    out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_sparse_forward")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse_runtime_uses_canonical_schedule_only():
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 129, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    schedule.sentence_stream = _empty_stream_like(schedule.sentence_stream)
+    schedule.section_prefix_stream = _empty_stream_like(schedule.section_prefix_stream)
+    schedule.document_prefix_stream = _empty_stream_like(schedule.document_prefix_stream)
+    schedule.section_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+    schedule.document_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
+    out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_sparse_canonical_schedule")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 129, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    schedule.sentence_stream = _empty_stream_like(schedule.sentence_stream)
+    schedule.section_prefix_stream = _empty_stream_like(schedule.section_prefix_stream)
+    schedule.document_prefix_stream = _empty_stream_like(schedule.document_prefix_stream)
+    schedule.section_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+    schedule.document_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_varlen_fa4_stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy forward helper used")),
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_varlen_fa4_bwd",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy backward helper used")),
+    )
+
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(
+            q,
+            k,
+            v,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+            hsa_schedule=schedule,
+        )
+    )
+    loss_sparse = out_sparse.float().square().mean()
+    loss_sparse.backward()
+
+    out_ref = hsa_reference_attention(q.detach(), k.detach(), v.detach(), keep_ids, hash_ids)
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_sparse_no_legacy_helpers")
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse_backward_matches_reference():
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    q_sparse = q_data.clone().requires_grad_(True)
+    k_sparse = k_data.clone().requires_grad_(True)
+    v_sparse = v_data.clone().requires_grad_(True)
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(
+            q_sparse,
+            k_sparse,
+            v_sparse,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+            hsa_schedule=schedule,
+        )
+    )
+    loss_sparse = out_sparse.float().square().mean()
+    loss_sparse.backward()
+
+    q_ref = q_data.clone().float().requires_grad_(True)
+    k_ref = k_data.clone().float().requires_grad_(True)
+    v_ref = v_data.clone().float().requires_grad_(True)
+    out_ref = hsa_reference_attention(
+        q_ref.to(dtype=dtype),
+        k_ref.to(dtype=dtype),
+        v_ref.to(dtype=dtype),
+        keep_ids,
+        hash_ids,
+    ).float()
+    loss_ref = out_ref.square().mean()
+    loss_ref.backward()
+
+    _assert_close(out_sparse.float(), out_ref, "hsa_sparse_backward_output")
+    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_sparse_q_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_sparse_k_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_sparse_v_grad", atol=6e-2, rtol=6e-2)

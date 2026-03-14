@@ -177,6 +177,8 @@ class SoftmaxSm100(Softmax):
     # Sigmoid attention bias: b = -log(n) per FlashSigmoid paper (2409.04431)
     sigmoid_bias: Float32 = Float32(0.0)
     sigmoid_poly_backend: cutlass.Constexpr[str] = "cute"
+    sigmoid_degree: cutlass.Constexpr[int] = 3
+    sigmoid_coeff_source: cutlass.Constexpr[str] = "current"
 
     @staticmethod
     def create(
@@ -187,6 +189,8 @@ class SoftmaxSm100(Softmax):
         sigmoid_sfu_res: cutlass.Constexpr[int] = 0,
         sigmoid_bias: Float32 = Float32(0.0),
         sigmoid_poly_backend: cutlass.Constexpr[str] = "cute",
+        sigmoid_degree: cutlass.Constexpr[int] = 3,
+        sigmoid_coeff_source: cutlass.Constexpr[str] = "current",
     ):
         num_rows = 1
         arch = 100
@@ -204,6 +208,8 @@ class SoftmaxSm100(Softmax):
             sigmoid_sfu_res=sigmoid_sfu_res,
             sigmoid_bias=sigmoid_bias,
             sigmoid_poly_backend=sigmoid_poly_backend,
+            sigmoid_degree=sigmoid_degree,
+            sigmoid_coeff_source=sigmoid_coeff_source,
         )
 
     @cute.jit
@@ -334,7 +340,11 @@ class SoftmaxSm100(Softmax):
                     # the negative tail does not collapse into a constant floor after
                     # the FlashSigmoid -log(n) bias is applied.
                     acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_poly_backend_2(
-                        s0, s1, backend=self.sigmoid_poly_backend
+                        s0,
+                        s1,
+                        backend=self.sigmoid_poly_backend,
+                        degree=self.sigmoid_degree,
+                        coeff_source=self.sigmoid_coeff_source,
                     )
                 else:
                     # SFU path (exp2 + rcp_approx)

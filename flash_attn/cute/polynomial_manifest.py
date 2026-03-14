@@ -19,6 +19,8 @@ class PolynomialSpec:
     coeffs: tuple[float, ...]
     backend_targets: tuple[str, ...]
     notes: str = ""
+    source: str = "current"
+    family: str = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,8 @@ class ComposedPolynomialSpec:
     composed_from: str
     backend_targets: tuple[str, ...]
     notes: str = ""
+    source: str = "current"
+    degree: int | None = None
 
 
 SOFTCAP_TANH_D4 = PolynomialSpec(
@@ -160,36 +164,183 @@ ACTIVE_POLYNOMIALS: tuple[PolynomialSpec, ...] = (
 ACTIVE_COMPOSED_POLYNOMIALS: tuple[ComposedPolynomialSpec, ...] = (SWISH_D3_COMPOSED,)
 
 STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_odd_bf16.cuh"
+SOLLYA_STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_sollya_bf16.cuh"
+SOLLYA_SWEEP_JSON = (
+    Path(__file__).resolve().parents[3]
+    / "autonumerics_zero"
+    / "cuda_benchmarks"
+    / "analysis_results"
+    / "sollya_device_bf16.json"
+)
+
+_SWEEP_META = {
+    "tanh_fwd": {
+        "name_prefix": "softcap_tanh",
+        "target": "tanh(x)",
+        "symmetry": "odd-factorized",
+        "backend_targets": ("cute", "device"),
+        "notes": "BF16 softcap tanh sweep row.",
+    },
+    "sigmoid_fwd": {
+        "name_prefix": "sigmoid",
+        "target": "sigmoid(x)",
+        "symmetry": "odd-centered",
+        "backend_targets": ("cute", "device", "output_gate"),
+        "notes": "BF16 sigmoid sweep row.",
+    },
+    "sigmoid_bwd": {
+        "name_prefix": "sigmoid_grad",
+        "target": "sigmoid'(x)",
+        "symmetry": "even",
+        "backend_targets": ("cute", "device"),
+        "notes": "BF16 direct sigmoid-gradient sweep row.",
+    },
+    "swish_bwd": {
+        "name_prefix": "swish_grad",
+        "target": "swish'(x)",
+        "symmetry": "odd-centered",
+        "backend_targets": ("spline_ops",),
+        "notes": "BF16 swish-gradient sweep row.",
+    },
+    "gelu_fwd": {
+        "name_prefix": "gelu_fwd",
+        "target": "gelu(x)",
+        "symmetry": "odd-centered",
+        "backend_targets": ("spline_ops",),
+        "notes": "BF16 GeLU forward sweep row.",
+    },
+    "gelu_bwd": {
+        "name_prefix": "gelu_bwd",
+        "target": "gelu'(x)",
+        "symmetry": "odd-centered",
+        "backend_targets": ("spline_ops",),
+        "notes": "BF16 GeLU backward sweep row.",
+    },
+}
 
 
-def get_softcap_tanh_forward_spec(degree: int = 4, backend: str = "device") -> PolynomialSpec:
-    if degree != 4:
-        raise ValueError(f"Only D4 is canonicalized for the current softcap port, got D{degree}")
-    if backend not in SOFTCAP_TANH_D4.backend_targets:
-        raise ValueError(f"Unsupported backend '{backend}' for canonical softcap D4")
-    return SOFTCAP_TANH_D4
+def _load_sollya_sweep_data() -> dict[str, object]:
+    if not SOLLYA_SWEEP_JSON.is_file():
+        raise FileNotFoundError(
+            f"Missing Sollya sweep JSON at {SOLLYA_SWEEP_JSON}. "
+            "Run generate_sollya_structs_bf16.py first."
+        )
+    import json
+
+    return json.loads(SOLLYA_SWEEP_JSON.read_text())
+
+
+def _row_for_family_degree(family: str, degree: int) -> dict[str, object]:
+    data = _load_sollya_sweep_data()
+    degree_key = f"D{degree}"
+    try:
+        return data["families"][family][degree_key]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported family/degree pair: {family} D{degree}") from exc
+
+
+def _generic_spec_from_sweep(
+    family: str,
+    degree: int,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    if coeff_source not in ("current", "sollya"):
+        raise ValueError(f"Unsupported coeff_source={coeff_source!r}")
+    meta = _SWEEP_META[family]
+    row = _row_for_family_degree(family, degree)
+    coeff_key = "current_coeffs" if coeff_source == "current" else "sollya_coeffs"
+    objective = (
+        "current_bf16_runtime"
+        if coeff_source == "current"
+        else "sollya_fpminimax_bf16_runtime"
+    )
+    return PolynomialSpec(
+        name=f"{meta['name_prefix']}_d{degree}_{coeff_source}",
+        target=meta["target"],
+        symmetry=meta["symmetry"],
+        degree=degree,
+        fit_interval=float(row["clamp"]),
+        clamp=float(row["clamp"]),
+        objective=objective,
+        coeffs=tuple(float(coeff) for coeff in row[coeff_key]),
+        backend_targets=tuple(meta["backend_targets"]),
+        notes=meta["notes"],
+        source=coeff_source,
+        family=family,
+    )
+
+
+def _swish_forward_composed_spec(
+    degree: int,
+    coeff_source: str = "current",
+) -> ComposedPolynomialSpec:
+    sigmoid_row = _row_for_family_degree("sigmoid_fwd", degree)
+    struct_key = "current_struct" if coeff_source == "current" else "sollya_struct"
+    return ComposedPolynomialSpec(
+        name=f"swish_d{degree}_composed_{coeff_source}",
+        target="swish(x)",
+        composed_from=str(sigmoid_row[struct_key]),
+        backend_targets=("spline_ops", "device"),
+        notes="Swish forward composes x with the matching sigmoid sweep row.",
+        source=coeff_source,
+        degree=degree,
+    )
+
+
+def get_softcap_tanh_forward_spec(
+    degree: int = 4,
+    backend: str = "device",
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    spec = (
+        SOFTCAP_TANH_D4
+        if degree == 4 and coeff_source == "current"
+        else _generic_spec_from_sweep("tanh_fwd", degree, coeff_source=coeff_source)
+    )
+    if backend not in spec.backend_targets:
+        raise ValueError(f"Unsupported backend '{backend}' for softcap D{degree} ({coeff_source})")
+    return spec
 
 
 def get_softcap_tanh_analytical_backward_coeffs(
     degree: int = 4,
     backend: str = "device",
+    coeff_source: str = "current",
 ) -> tuple[float, ...]:
-    spec = get_softcap_tanh_forward_spec(degree=degree, backend=backend)
+    spec = get_softcap_tanh_forward_spec(
+        degree=degree,
+        backend=backend,
+        coeff_source=coeff_source,
+    )
     return tuple((i + 1) * coeff for i, coeff in enumerate(spec.coeffs))
 
 
-def get_sigmoid_forward_spec() -> PolynomialSpec:
-    return SIGMOID_D3
+def get_sigmoid_forward_spec(
+    degree: int = 3,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    if degree == 3 and coeff_source == "current":
+        return SIGMOID_D3
+    return _generic_spec_from_sweep("sigmoid_fwd", degree, coeff_source=coeff_source)
 
 
-def get_sigmoid_gradient_spec(dtype: str = "bf16") -> PolynomialSpec:
+def get_sigmoid_gradient_spec(
+    dtype: str = "bf16",
+    degree: int = 5,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
     if dtype != "bf16":
         raise ValueError(f"Only BF16 sigmoid-gradient coefficients are canonicalized, got {dtype!r}")
-    return SIGMOID_GRAD_D5_BF16
+    if degree == 5 and coeff_source == "current":
+        return SIGMOID_GRAD_D5_BF16
+    return _generic_spec_from_sweep("sigmoid_bwd", degree, coeff_source=coeff_source)
 
 
-def get_default_output_gate_coeffs() -> tuple[float, ...]:
-    return SIGMOID_D3.coeffs
+def get_default_output_gate_coeffs(
+    coeff_source: str = "current",
+    degree: int = 3,
+) -> tuple[float, ...]:
+    return get_sigmoid_forward_spec(degree=degree, coeff_source=coeff_source).coeffs
 
 
 def get_default_swish_specs() -> tuple[ComposedPolynomialSpec, PolynomialSpec]:
@@ -198,6 +349,42 @@ def get_default_swish_specs() -> tuple[ComposedPolynomialSpec, PolynomialSpec]:
 
 def get_default_gelu_specs() -> tuple[PolynomialSpec, PolynomialSpec]:
     return GELU_FWD_D5_BF16, GELU_BWD_D5_BF16
+
+
+def get_swish_forward_spec(
+    degree: int = 3,
+    coeff_source: str = "current",
+) -> ComposedPolynomialSpec:
+    if degree == 3 and coeff_source == "current":
+        return SWISH_D3_COMPOSED
+    return _swish_forward_composed_spec(degree, coeff_source=coeff_source)
+
+
+def get_swish_backward_spec(
+    degree: int = 4,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    if degree == 4 and coeff_source == "current":
+        return SWISH_GRAD_D4_BF16
+    return _generic_spec_from_sweep("swish_bwd", degree, coeff_source=coeff_source)
+
+
+def get_gelu_forward_spec(
+    degree: int = 5,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    if degree == 5 and coeff_source == "current":
+        return GELU_FWD_D5_BF16
+    return _generic_spec_from_sweep("gelu_fwd", degree, coeff_source=coeff_source)
+
+
+def get_gelu_backward_spec(
+    degree: int = 5,
+    coeff_source: str = "current",
+) -> PolynomialSpec:
+    if degree == 5 and coeff_source == "current":
+        return GELU_BWD_D5_BF16
+    return _generic_spec_from_sweep("gelu_bwd", degree, coeff_source=coeff_source)
 
 
 def coeffs_to_cli_arg(coeffs: Iterable[float]) -> str:
@@ -296,6 +483,42 @@ def _check_composed_struct(errors: list[str], header_text: str, struct_name: str
     body = match.group(1)
     if spec.composed_from not in body:
         errors.append(f"{struct_name}: expected composed source {spec.composed_from}")
+
+
+def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tuple[str, ...]:
+    current_header_text = STRUCT_HEADER.read_text()
+    sollya_header_text = SOLLYA_STRUCT_HEADER.read_text()
+    sweep_data = _load_sollya_sweep_data()
+    errors: list[str] = []
+    audited: list[str] = []
+    for family, degree, coeff_source in selections:
+        row = sweep_data["families"][family][f"D{degree}"]
+        header_text = current_header_text if coeff_source == "current" else sollya_header_text
+        struct_key = "current_struct" if coeff_source == "current" else "sollya_struct"
+        struct_name = row[struct_key]
+        if family == "swish_fwd":
+            _check_composed_struct(
+                errors,
+                header_text,
+                struct_name,
+                get_swish_forward_spec(degree=degree, coeff_source=coeff_source),
+            )
+            audited.append(f"swish_fwd_d{degree}_{coeff_source}")
+            continue
+        spec = {
+            "tanh_fwd": get_softcap_tanh_forward_spec,
+            "sigmoid_fwd": get_sigmoid_forward_spec,
+            "sigmoid_bwd": get_sigmoid_gradient_spec,
+            "swish_bwd": get_swish_backward_spec,
+            "gelu_fwd": get_gelu_forward_spec,
+            "gelu_bwd": get_gelu_backward_spec,
+        }[family](degree=degree, coeff_source=coeff_source)
+        _check_struct_against_spec(errors, header_text, struct_name, spec)
+        audited.append(spec.name)
+    if errors:
+        joined = "\n".join(f"- {err}" for err in errors)
+        raise RuntimeError(f"Polynomial selection audit failed:\n{joined}")
+    return tuple(audited)
 
 
 def audit_active_polynomials() -> list[str]:

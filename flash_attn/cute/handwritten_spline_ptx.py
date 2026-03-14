@@ -12,45 +12,20 @@ _ROOT = Path(__file__).resolve().parents[3]
 _SPLINE_HEADER = (
     _ROOT / "autonumerics_zero" / "spline_ops" / "spline_structs_odd_bf16.cuh"
 )
+_SPLINE_SOLLYA_HEADER = (
+    _ROOT / "autonumerics_zero" / "spline_ops" / "spline_structs_sollya_bf16.cuh"
+)
 _CUDA_INCLUDE = Path("/usr/local/cuda/include")
 
 
 
-_SIGMOID_FWD_D3_CANONICAL_INLINE_ASM = """{
-	.reg .pred 	%p<4>;
-	.reg .f32 	%f<24>;
-	.reg .b32 	%r<2>;
-	mov.f32 %f1, $1;
-	mov.f32 %f2, $2;
-	abs.f32 %f3, %f1;
-	abs.f32 %f4, %f2;
-	mov.f32 %f5, 0f40C00000;
-	min.f32 %f6, %f3, %f5;
-	min.f32 %f7, %f4, %f5;
-	mov.f32 %f8, 0f3B5E2000;
-	mov.f32 %f9, 0fBD5A8000;
-	fma.rn.f32 %f10, %f8, %f6, %f9;
-	fma.rn.f32 %f11, %f8, %f7, %f9;
-	mov.f32 %f12, 0f3E8FE000;
-	fma.rn.f32 %f13, %f10, %f6, %f12;
-	fma.rn.f32 %f14, %f11, %f7, %f12;
-	mov.f32 %f15, 0f3F000000;
-	fma.rn.f32 %f16, %f1, %f13, %f15;
-	fma.rn.f32 %f17, %f2, %f14, %f15;
-	setp.gt.f32 %p1, %f1, 0f00000000;
-	setp.gt.f32 %p2, %f2, 0f00000000;
-	setp.lt.f32 %p3, %f3, %f5;
-	setp.lt.f32 %p4, %f4, %f5;
-	selp.f32 %f18, 0f3F800000, 0f00000000, %p1;
-	selp.f32 %f19, 0f3F800000, 0f00000000, %p2;
-	selp.f32 %f20, %f16, %f18, %p3;
-	selp.f32 %f21, %f17, %f19, %p4;
-	{ cvt.rn.bf16x2.f32 %r1, %f21, %f20;}
-	mov.b32 $0, %r1;
-}
-"""
-
+_DEGREES = (3, 4, 5, 6)
+_SOURCES = ("current", "sollya")
 _HANDWRITTEN_SYMBOLS = {
+    *(f"fa4_spline_tanh_fwd_{source}_d{degree}_bf16x2" for source in _SOURCES for degree in _DEGREES),
+    *(f"fa4_spline_sigmoid_fwd_{source}_d{degree}_bf16x2" for source in _SOURCES for degree in _DEGREES),
+    *(f"fa4_spline_sigmoid_grad_{source}_d{degree}_bf16x2" for source in _SOURCES for degree in _DEGREES),
+    # Backward-compatible aliases for the current default rows.
     "fa4_spline_tanh_fwd_d3_bf16x2",
     "fa4_spline_tanh_fwd_d4_bf16x2",
     "fa4_spline_tanh_fwd_d5_bf16x2",
@@ -84,6 +59,8 @@ def _strip_ptx_module_header(ptx: str) -> str:
 def require_device_backend_support() -> None:
     if not _SPLINE_HEADER.is_file():
         raise RuntimeError(f"Missing spline header: {_SPLINE_HEADER}")
+    if not _SPLINE_SOLLYA_HEADER.is_file():
+        raise RuntimeError(f"Missing Sollya spline header: {_SPLINE_SOLLYA_HEADER}")
     if not _CUDA_INCLUDE.is_dir():
         raise RuntimeError(f"Missing CUDA include directory: {_CUDA_INCLUDE}")
 
@@ -95,9 +72,47 @@ def handwritten_symbol_names() -> set[str]:
 @lru_cache(maxsize=1)
 def get_handwritten_spline_ptx() -> str:
     require_device_backend_support()
+    tanh_wrappers = []
+    sigmoid_wrappers = []
+    sigmoid_grad_wrappers = []
+    for degree in _DEGREES:
+        tanh_wrappers.append(
+            f"""
+extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_current_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(TANH_FWD_D{degree}_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+
+extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_sollya_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(TANH_FWD_D{degree}_ODD_SOLLYA_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+"""
+        )
+        sigmoid_wrappers.append(
+            f"""
+extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_fwd_current_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(SIGMOID_FWD_D{degree}_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+
+extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_fwd_sollya_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(SIGMOID_FWD_D{degree}_ODD_SOLLYA_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+"""
+        )
+        sigmoid_grad_wrappers.append(
+            f"""
+extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_grad_current_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(SIGMOID_BWD_D{degree}_EVEN_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+
+extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_grad_sollya_d{degree}_bf16x2(float x, float y) {{
+    return fa4_pack_bits(SIGMOID_BWD_D{degree}_EVEN_SOLLYA_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+}}
+"""
+        )
     src = f"""
 #include <cuda_bf16.h>
 #include "{_SPLINE_HEADER.as_posix()}"
+#include "{_SPLINE_SOLLYA_HEADER.as_posix()}"
 
 static __device__ __forceinline__ __nv_bfloat162 fa4_pack_bf16x2(float x, float y) {{
     return __floats2bfloat162_rn(x, y);
@@ -107,40 +122,28 @@ static __device__ __forceinline__ unsigned int fa4_pack_bits(__nv_bfloat162 v) {
     return *reinterpret_cast<unsigned int*>(&v);
 }}
 
+{''.join(tanh_wrappers)}
+{''.join(sigmoid_wrappers)}
+{''.join(sigmoid_grad_wrappers)}
+
+// Backward-compatible aliases for the current default symbols.
 extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_d3_bf16x2(float x, float y) {{
-    return fa4_pack_bits(TANH_FWD_D3_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+    return fa4_spline_tanh_fwd_current_d3_bf16x2(x, y);
 }}
-
 extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_d4_bf16x2(float x, float y) {{
-    return fa4_pack_bits(TANH_FWD_D4_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+    return fa4_spline_tanh_fwd_current_d4_bf16x2(x, y);
 }}
-
 extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_d5_bf16x2(float x, float y) {{
-    return fa4_pack_bits(TANH_FWD_D5_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+    return fa4_spline_tanh_fwd_current_d5_bf16x2(x, y);
 }}
-
 extern "C" __device__ __noinline__ unsigned int fa4_spline_tanh_fwd_d6_bf16x2(float x, float y) {{
-    return fa4_pack_bits(TANH_FWD_D6_ODD_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+    return fa4_spline_tanh_fwd_current_d6_bf16x2(x, y);
 }}
-
 extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_fwd_d3_bf16x2(float x, float y) {{
-    constexpr float clamp = 6.0f;
-    constexpr float c0 = 0.281005859375f;
-    constexpr float c1 = -0.0533447265625f;
-    constexpr float c2 = 0.0033893585205078125f;
-    float ax = fabsf(x);
-    float ay = fabsf(y);
-    float tx = fminf(ax, clamp);
-    float ty = fminf(ay, clamp);
-    float px = fmaf(fmaf(c2, tx, c1), tx, c0);
-    float py = fmaf(fmaf(c2, ty, c1), ty, c0);
-    float sx = ax < clamp ? fmaf(x, px, 0.5f) : (x > 0.0f ? 1.0f : 0.0f);
-    float sy = ay < clamp ? fmaf(y, py, 0.5f) : (y > 0.0f ? 1.0f : 0.0f);
-    return fa4_pack_bits(fa4_pack_bf16x2(sx, sy));
+    return fa4_spline_sigmoid_fwd_current_d3_bf16x2(x, y);
 }}
-
 extern "C" __device__ __noinline__ unsigned int fa4_spline_sigmoid_grad_d5_bf16x2(float x, float y) {{
-    return fa4_pack_bits(SIGMOID_BWD_D5_EVEN_BF16::evaluate(fa4_pack_bf16x2(x, y)));
+    return fa4_spline_sigmoid_grad_current_d5_bf16x2(x, y);
 }}
 """
     err, prog = nvrtc.nvrtcCreateProgram(src.encode(), b"fa4_handwritten_spline_wrappers.cu", 0, [], [])
@@ -223,8 +226,6 @@ def _translate_body_to_inline_asm(body: str, symbol: str) -> str:
 def get_handwritten_inline_asm(symbol: str) -> str:
     if symbol not in _HANDWRITTEN_SYMBOLS:
         raise ValueError(f"Unsupported handwritten spline symbol: {symbol}")
-    if symbol == "fa4_spline_sigmoid_fwd_d3_bf16x2":
-        return _SIGMOID_FWD_D3_CANONICAL_INLINE_ASM
     ptx = get_handwritten_spline_ptx()
     body = _extract_function_body(ptx, symbol)
     return _translate_body_to_inline_asm(body, symbol)

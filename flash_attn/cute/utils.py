@@ -3,6 +3,7 @@
 import math
 import hashlib
 import inspect
+from functools import lru_cache
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
@@ -35,6 +36,39 @@ SOFTCAP_TANH_D4_ANALYTICAL_BWD = get_softcap_tanh_analytical_backward_coeffs()
 SIGMOID_D3_SPEC = get_sigmoid_forward_spec()
 SIGMOID_GRAD_D5_BF16_SPEC = get_sigmoid_gradient_spec()
 DEFAULT_OUTPUT_GATE_COEFFS = get_default_output_gate_coeffs()
+_POLY_SOURCES = ("current", "sollya")
+
+
+def _validate_coeff_source(coeff_source: str) -> str:
+    if coeff_source not in _POLY_SOURCES:
+        raise ValueError(
+            f"Unsupported coeff_source={coeff_source!r}. Expected one of {_POLY_SOURCES}."
+        )
+    return coeff_source
+
+
+def _annotate_poly_callable(
+    fn: Callable,
+    *,
+    degree: int,
+    backend: str,
+    coeff_source: str,
+    family: str,
+) -> Callable:
+    fn.__degree__ = degree
+    fn.__backend__ = backend
+    fn.__coeff_source__ = coeff_source
+    fn.__poly_family__ = family
+    return fn
+
+
+def _handwritten_symbol(
+    family: str,
+    degree: int,
+    coeff_source: str,
+) -> str:
+    _validate_coeff_source(coeff_source)
+    return f"fa4_spline_{family}_{coeff_source}_d{degree}_bf16x2"
 
 
 def ensure_handwritten_device_backend() -> None:
@@ -556,6 +590,165 @@ def tanh_handwritten_devicef_d6(x: cute.TensorSSA | Float32) -> cute.TensorSSA |
         return out0
 
 
+@lru_cache(maxsize=None)
+def _make_tanh_device_pair_fn(degree: int, coeff_source: str = "current"):
+    coeff_source = _validate_coeff_source(coeff_source)
+    symbol = _handwritten_symbol("tanh_fwd", degree, coeff_source)
+
+    @dsl_user_op
+    def tanh_device_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        return call_handwritten_bf16x2_f32x2(x, y, symbol, loc=loc, ip=ip)
+
+    return _annotate_poly_callable(
+        tanh_device_pair,
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+        family="tanh_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_fragment_from_pair_fn(
+    pair_fn: Callable,
+    degree: int,
+    backend: str,
+    coeff_source: str,
+    family: str,
+):
+    @cute.jit
+    def fragment_fn(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
+        if const_expr(isinstance(x, cute.TensorSSA)):
+            res = cute.make_fragment(x.shape, Float32)
+            res.store(x)
+            for i in cutlass.range_constexpr(0, cute.size(x.shape), 2):
+                res[i], res[i + 1] = pair_fn(res[i], res[i + 1])
+            return res.load()
+        out0, _ = pair_fn(x, x)
+        return out0
+
+    return _annotate_poly_callable(
+        fragment_fn,
+        degree=degree,
+        backend=backend,
+        coeff_source=coeff_source,
+        family=family,
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_device_fragment_fn(degree: int, coeff_source: str = "current"):
+    return _make_fragment_from_pair_fn(
+        _make_tanh_device_pair_fn(degree, coeff_source),
+        degree=degree,
+        backend="device",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_cute_pair_fn(degree: int, coeff_source: str = "current"):
+    spec = get_softcap_tanh_forward_spec(
+        degree=degree,
+        backend="cute",
+        coeff_source=coeff_source,
+    )
+    coeff_source = spec.source
+    poly = spec.coeffs
+    clamp = spec.clamp
+
+    @dsl_user_op
+    def tanh_cute_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        abs_x = fabs_f32(x, loc=loc, ip=ip)
+        abs_y = fabs_f32(y, loc=loc, ip=ip)
+        tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+        ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+        hx, hy = evaluate_polynomial_2(tx, ty, poly, loc=loc, ip=ip)
+        poly_x = fmin(tx * hx, 1.0, loc=loc, ip=ip)
+        poly_y = fmin(ty * hy, 1.0, loc=loc, ip=ip)
+        return (
+            copysign_f32(poly_x, x, loc=loc, ip=ip),
+            copysign_f32(poly_y, y, loc=loc, ip=ip),
+        )
+
+    return _annotate_poly_callable(
+        tanh_cute_pair,
+        degree=degree,
+        backend="cute",
+        coeff_source=coeff_source,
+        family="tanh_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_cute_fragment_fn(degree: int, coeff_source: str = "current"):
+    return _make_fragment_from_pair_fn(
+        _make_tanh_cute_pair_fn(degree, coeff_source),
+        degree=degree,
+        backend="cute",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_derivative_pair_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    forward_spec = get_softcap_tanh_forward_spec(
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+    )
+    coeff_source = forward_spec.source
+    clamp = Float32(forward_spec.clamp)
+    deriv_coeffs = get_softcap_tanh_analytical_backward_coeffs(
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+    )
+
+    @dsl_user_op
+    def tanh_derivative_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        abs_x = fabs_f32(x, loc=loc, ip=ip)
+        abs_y = fabs_f32(y, loc=loc, ip=ip)
+        tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+        ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+        rx, ry = evaluate_polynomial_2(tx, ty, deriv_coeffs, loc=loc, ip=ip)
+        sat = Float32(0.0)
+        return select_(abs_x < clamp, rx, sat), select_(abs_y < clamp, ry, sat)
+
+    return _annotate_poly_callable(
+        tanh_derivative_pair,
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+        family="tanh_bwd_analytical",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_derivative_fragment_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    return _make_fragment_from_pair_fn(
+        _make_tanh_derivative_pair_fn(degree, coeff_source),
+        degree=degree,
+        backend="device",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_bwd_analytical",
+    )
+
+
 # =============================================================================
 # D4 Tanh gradient — for backward pass of D3 tanh softcap
 # tanh'(x) = 1 - tanh(x)^2, symmetric (even function on |x|)
@@ -682,57 +875,71 @@ def create_softcap_scoremod_bwd_spline_d3(softcap_val):
     return scoremod_bwd_fn
 
 
-def create_softcap_scoremod_spline_device(softcap_val, degree: int = 3):
+def create_softcap_scoremod_spline_device(
+    softcap_val,
+    degree: int = 3,
+    coeff_source: str = "current",
+):
     """Softcapping scoremod using handwritten BF16 spline device wrappers."""
     ensure_handwritten_device_backend()
     inv_softcap = 1.0 / softcap_val
-    fn_by_degree = {
-        3: tanh_handwritten_devicef_d3,
-        4: tanh_handwritten_devicef_d4,
-        5: tanh_handwritten_devicef_d5,
-        6: tanh_handwritten_devicef_d6,
-    }
-    if degree not in fn_by_degree:
-        raise ValueError(f"Unsupported handwritten softcap degree: {degree}")
-    tanh_fn = fn_by_degree[degree]
-    tanh_fn.__degree__ = degree
-    tanh_fn.__backend__ = "device"
+    tanh_fn = _make_tanh_device_fragment_fn(degree, coeff_source)
 
     @cute.jit
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
         scores = acc_S_SSA * inv_softcap
         return softcap_val * tanh_fn(scores)
 
-    scoremod_premask_fn.__degree__ = degree
-    scoremod_premask_fn.__backend__ = "device"
-    return scoremod_premask_fn
+    return _annotate_poly_callable(
+        scoremod_premask_fn,
+        degree=degree,
+        backend="device",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_fwd",
+    )
 
 
-def create_softcap_scoremod_spline_cute(softcap_val, degree: int = 3):
+def create_softcap_scoremod_spline_cute(
+    softcap_val,
+    degree: int = 3,
+    coeff_source: str = "current",
+):
     """Softcapping scoremod using CuTe-authored polynomial paths."""
-    fn_by_degree = {
-        3: create_softcap_scoremod_spline_d3,
-        4: create_softcap_scoremod_spline_d4,
-        5: create_softcap_scoremod_spline_d5,
-        6: create_softcap_scoremod_spline,
-    }
-    if degree not in fn_by_degree:
-        raise ValueError(f"Unsupported CuTe softcap degree: {degree}")
-    scoremod_premask_fn = fn_by_degree[degree](softcap_val)
-    scoremod_premask_fn.__degree__ = degree
-    scoremod_premask_fn.__backend__ = "cute"
-    return scoremod_premask_fn
+    inv_softcap = 1.0 / softcap_val
+    tanh_fn = _make_tanh_cute_fragment_fn(degree, coeff_source)
+
+    @cute.jit
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        scores = acc_S_SSA * inv_softcap
+        return softcap_val * tanh_fn(scores)
+
+    return _annotate_poly_callable(
+        scoremod_premask_fn,
+        degree=degree,
+        backend="cute",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_fwd",
+    )
 
 
 def create_softcap_scoremod_backend(
     softcap_val,
     degree: int = 3,
     backend: str = "cute",
+    coeff_source: str = "current",
 ):
     if backend == "cute":
-        return create_softcap_scoremod_spline_cute(softcap_val, degree=degree)
+        return create_softcap_scoremod_spline_cute(
+            softcap_val,
+            degree=degree,
+            coeff_source=coeff_source,
+        )
     if backend == "device":
-        return create_softcap_scoremod_spline_device(softcap_val, degree=degree)
+        return create_softcap_scoremod_spline_device(
+            softcap_val,
+            degree=degree,
+            coeff_source=coeff_source,
+        )
     raise ValueError(f"Unsupported softcap polynomial backend: {backend}")
 
 
@@ -741,6 +948,7 @@ def create_softcap_scoremod_bwd_backend(
     degree: int = 4,
     backend: str = "device",
     backward_mode: str = "analytical",
+    coeff_source: str = "current",
 ):
     """Backend-explicit softcap backward selector for the longer-run port."""
     backward_mode = backward_mode.lower()
@@ -752,36 +960,33 @@ def create_softcap_scoremod_bwd_backend(
     inv_softcap = 1.0 / softcap_val
 
     if backward_mode == "analytical":
-        if degree != 4:
-            raise ValueError(
-                f"Analytical softcap backward is only canonicalized for D4, got D{degree}"
-            )
+        derivative_fn = _make_tanh_derivative_fragment_fn(degree, coeff_source)
 
         @cute.jit
         def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
             scores = acc_S_SSA * inv_softcap
-            derivative = tanh_grad_analyticf_d4(scores)
+            derivative = derivative_fn(scores)
             return grad * derivative
 
-        scoremod_bwd_fn.__degree__ = degree
-        scoremod_bwd_fn.__backend__ = backend
+        scoremod_bwd_fn = _annotate_poly_callable(
+            scoremod_bwd_fn,
+            degree=degree,
+            backend=backend,
+            coeff_source=_validate_coeff_source(coeff_source),
+            family="tanh_bwd_analytical",
+        )
         scoremod_bwd_fn.__backward_mode__ = backward_mode
         return scoremod_bwd_fn
 
     if backward_mode in ("exact", "exact_1mt2"):
-        fn_by_degree = {
-            ("cute", 3): tanh_emulationf_d3,
-            ("cute", 4): tanh_emulationf_d4,
-            ("cute", 5): tanh_emulationf_d5,
-            ("cute", 6): tanh_emulationf,
-            ("device", 3): tanh_handwritten_devicef_d3,
-            ("device", 4): tanh_handwritten_devicef_d4,
-            ("device", 5): tanh_handwritten_devicef_d5,
-            ("device", 6): tanh_handwritten_devicef_d6,
-        }
-        tanh_fn = fn_by_degree.get((backend, degree))
-        if tanh_fn is None:
-            raise ValueError(f"Unsupported exact softcap backward for backend={backend!r}, degree={degree}")
+        if backend == "cute":
+            tanh_fn = _make_tanh_cute_fragment_fn(degree, coeff_source)
+        elif backend == "device":
+            tanh_fn = _make_tanh_device_fragment_fn(degree, coeff_source)
+        else:
+            raise ValueError(
+                f"Unsupported exact softcap backward for backend={backend!r}, degree={degree}"
+            )
 
         @cute.jit
         def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -790,8 +995,13 @@ def create_softcap_scoremod_bwd_backend(
             derivative = Float32(1.0) - t * t
             return grad * derivative
 
-        scoremod_bwd_fn.__degree__ = degree
-        scoremod_bwd_fn.__backend__ = backend
+        scoremod_bwd_fn = _annotate_poly_callable(
+            scoremod_bwd_fn,
+            degree=degree,
+            backend=backend,
+            coeff_source=_validate_coeff_source(coeff_source),
+            family="tanh_bwd_exact",
+        )
         scoremod_bwd_fn.__backward_mode__ = backward_mode
         return scoremod_bwd_fn
 
@@ -954,17 +1164,125 @@ def sigmoid_grad_handwritten_device_d5_2(
     )
 
 
+@lru_cache(maxsize=None)
+def _make_sigmoid_cute_pair_fn(degree: int, coeff_source: str = "current"):
+    spec = get_sigmoid_forward_spec(degree=degree, coeff_source=coeff_source)
+    coeff_source = spec.source
+    poly = spec.coeffs
+    clamp = Float32(spec.clamp)
+
+    @dsl_user_op
+    def sigmoid_cute_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        abs_x = fabs_f32(x, loc=loc, ip=ip)
+        abs_y = fabs_f32(y, loc=loc, ip=ip)
+        tx = fmin(abs_x, clamp, loc=loc, ip=ip)
+        ty = fmin(abs_y, clamp, loc=loc, ip=ip)
+        px, py = evaluate_polynomial_2(tx, ty, poly, loc=loc, ip=ip)
+        hx, hy = (tx * px, ty * py)
+        signed_x = copysign_f32(hx, x, loc=loc, ip=ip)
+        signed_y = copysign_f32(hy, y, loc=loc, ip=ip)
+        return signed_x + Float32(0.5), signed_y + Float32(0.5)
+
+    return _annotate_poly_callable(
+        sigmoid_cute_pair,
+        degree=degree,
+        backend="cute",
+        coeff_source=coeff_source,
+        family="sigmoid_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_sigmoid_device_pair_fn(degree: int, coeff_source: str = "current"):
+    coeff_source = _validate_coeff_source(coeff_source)
+    symbol = _handwritten_symbol("sigmoid_fwd", degree, coeff_source)
+
+    @dsl_user_op
+    def sigmoid_device_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        return call_handwritten_bf16x2_f32x2(x, y, symbol, loc=loc, ip=ip)
+
+    return _annotate_poly_callable(
+        sigmoid_device_pair,
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+        family="sigmoid_fwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_sigmoid_grad_cute_pair_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    spec = get_sigmoid_gradient_spec(
+        dtype="bf16",
+        degree=degree,
+        coeff_source=coeff_source,
+    )
+    coeff_source = spec.source
+    clamp = Float32(spec.clamp)
+    poly = spec.coeffs
+
+    @dsl_user_op
+    def sigmoid_grad_cute_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        ax = fabs_f32(x, loc=loc, ip=ip)
+        ay = fabs_f32(y, loc=loc, ip=ip)
+        tx = fmin(ax, clamp, loc=loc, ip=ip)
+        ty = fmin(ay, clamp, loc=loc, ip=ip)
+        return evaluate_polynomial_2(tx, ty, poly, loc=loc, ip=ip)
+
+    return _annotate_poly_callable(
+        sigmoid_grad_cute_pair,
+        degree=degree,
+        backend="cute",
+        coeff_source=coeff_source,
+        family="sigmoid_bwd",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_sigmoid_grad_device_pair_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    coeff_source = _validate_coeff_source(coeff_source)
+    symbol = _handwritten_symbol("sigmoid_grad", degree, coeff_source)
+
+    @dsl_user_op
+    def sigmoid_grad_device_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        return call_handwritten_bf16x2_f32x2(x, y, symbol, loc=loc, ip=ip)
+
+    return _annotate_poly_callable(
+        sigmoid_grad_device_pair,
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+        family="sigmoid_bwd",
+    )
+
+
 def sigmoid_poly_backend_2(
     x: Float32,
     y: Float32,
     backend: cutlass.Constexpr[str] = "cute",
+    degree: cutlass.Constexpr[int] = 3,
+    coeff_source: cutlass.Constexpr[str] = "current",
     *,
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32]:
     if const_expr(backend == "device"):
-        return sigmoid_handwritten_device_d3_2(x, y, loc=loc, ip=ip)
-    return sigmoid_emulation_2(x, y, loc=loc, ip=ip)
+        return _make_sigmoid_device_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
+    return _make_sigmoid_cute_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
 
 
 def sigmoid_grad_poly_backend_2(
@@ -972,13 +1290,21 @@ def sigmoid_grad_poly_backend_2(
     y: Float32,
     q_dtype,
     backend: cutlass.Constexpr[str] = "cute",
+    degree: cutlass.Constexpr[int] = 5,
+    coeff_source: cutlass.Constexpr[str] = "current",
     *,
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32]:
+    if const_expr(q_dtype is not cutlass.BFloat16):
+        if const_expr(backend == "device" or degree != 5 or coeff_source != "current"):
+            raise ValueError(
+                "Non-BF16 sigmoid direct backward only supports the legacy current D5 CuTe path."
+            )
+        return sigmoid_grad_fast_even_d5_f16_2(x, y, loc=loc, ip=ip)
     if const_expr(backend == "device"):
-        return sigmoid_grad_handwritten_device_d5_2(x, y, loc=loc, ip=ip)
-    return sigmoid_grad_fast_even_d5_2(x, y, q_dtype, loc=loc, ip=ip)
+        return _make_sigmoid_grad_device_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
+    return _make_sigmoid_grad_cute_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
 
 
 def sigmoid_native_2(x, y):

@@ -7,6 +7,7 @@ from flash_attn.cute.polynomial_manifest import (
     SIGMOID_D3,
     SWISH_D3_COMPOSED,
     SWISH_GRAD_D4_BF16,
+    audit_polynomial_selection,
     assert_active_polynomials_in_sync,
     evaluate_centered_sigmoid_forward,
     evaluate_odd_factorized_derivative,
@@ -16,6 +17,11 @@ from flash_attn.cute.polynomial_manifest import (
     get_default_output_gate_coeffs,
     get_default_gelu_specs,
     get_default_swish_specs,
+    get_gelu_forward_spec,
+    get_sigmoid_forward_spec,
+    get_sigmoid_gradient_spec,
+    get_softcap_tanh_forward_spec,
+    get_swish_forward_spec,
     get_softcap_tanh_analytical_backward_coeffs,
     run_polynomial_coefficient_audit,
 )
@@ -38,6 +44,50 @@ def test_polynomial_coefficient_audit_reports_all_active_defaults():
         "gelu_fwd_d5_bf16",
         "gelu_bwd_d5_bf16",
         "swish_d3_composed",
+    )
+
+
+def test_source_aware_lookup_defaults_and_sollya_rows():
+    assert get_softcap_tanh_forward_spec() == SOFTCAP_TANH_D4
+    assert get_sigmoid_forward_spec() == SIGMOID_D3
+    assert get_sigmoid_gradient_spec() == get_sigmoid_gradient_spec(
+        degree=5,
+        coeff_source="current",
+    )
+
+    softcap_sollya = get_softcap_tanh_forward_spec(degree=6, coeff_source="sollya")
+    sigmoid_sollya = get_sigmoid_forward_spec(degree=4, coeff_source="sollya")
+    gelu_sollya = get_gelu_forward_spec(degree=3, coeff_source="sollya")
+    swish_sollya = get_swish_forward_spec(degree=5, coeff_source="sollya")
+
+    assert softcap_sollya.source == "sollya"
+    assert sigmoid_sollya.source == "sollya"
+    assert gelu_sollya.source == "sollya"
+    assert swish_sollya.source == "sollya"
+    assert softcap_sollya.degree == 6
+    assert sigmoid_sollya.degree == 4
+    assert gelu_sollya.degree == 3
+    assert swish_sollya.degree == 5
+
+
+def test_selection_audit_checks_current_and_sollya_headers():
+    audited = audit_polynomial_selection(
+        (
+            ("tanh_fwd", 4, "current"),
+            ("sigmoid_fwd", 3, "current"),
+            ("sigmoid_fwd", 4, "sollya"),
+            ("sigmoid_bwd", 5, "sollya"),
+            ("swish_fwd", 6, "sollya"),
+            ("gelu_fwd", 3, "sollya"),
+        )
+    )
+    assert audited == (
+        "softcap_tanh_d4",
+        "sigmoid_d3",
+        "sigmoid_d4_sollya",
+        "sigmoid_grad_d5_sollya",
+        "swish_fwd_d6_sollya",
+        "gelu_fwd_d3_sollya",
     )
 
 

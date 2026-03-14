@@ -88,6 +88,8 @@ class FlashAttentionBackwardSm100:
         sigmoid_sfu_res: int = 0,
         sigmoid_use_direct_bwd_poly: bool = False,
         sigmoid_poly_backend: str = "cute",
+        sigmoid_degree: int = 3,
+        sigmoid_coeff_source: str = "current",
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -153,6 +155,8 @@ class FlashAttentionBackwardSm100:
         self.sigmoid_sfu_res = sigmoid_sfu_res
         self.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
         self.sigmoid_poly_backend = sigmoid_poly_backend
+        self.sigmoid_degree = sigmoid_degree
+        self.sigmoid_coeff_source = sigmoid_coeff_source
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3152,7 +3156,11 @@ class FlashAttentionBackwardSm100:
                                 # odd-form surrogate so the tail stays sparse instead of
                                 # flattening to a constant floor after bias.
                                 p0, p1 = utils.sigmoid_poly_backend_2(
-                                    s0, s1, backend=self.sigmoid_poly_backend
+                                    s0,
+                                    s1,
+                                    backend=self.sigmoid_poly_backend,
+                                    degree=self.sigmoid_degree,
+                                    coeff_source=self.sigmoid_coeff_source,
                                 )
                                 tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
                                 if const_expr(self.sigmoid_use_direct_bwd_poly):
@@ -3161,6 +3169,8 @@ class FlashAttentionBackwardSm100:
                                         s1,
                                         self.q_dtype,
                                         backend=self.sigmoid_poly_backend,
+                                        degree=self.sigmoid_degree,
+                                        coeff_source=self.sigmoid_coeff_source,
                                     )
                                     tSrSigGrad_cur[2 * v], tSrSigGrad_cur[2 * v + 1] = g0, g1
                             else:

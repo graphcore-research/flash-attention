@@ -217,6 +217,19 @@ class FP4FlashAttentionForwardSm100:
             for i in range(self.q_stage)
         ]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
+
+        # FP4: TMEM offsets for scale factors (placed after S/O regions)
+        # Scale factors are small: ~1 column each for SFA and SFK
+        if self.use_fp4_qk:
+            # Each scale factor needs ceil(M / sf_vec_size) columns
+            # For NVFP4 (sf_vec=16): 128/16 = 8 scale values → fits in 1 TMEM col
+            self.tmem_sfa_offset = self.tmem_total
+            self.tmem_sfk_offset = self.tmem_sfa_offset + 1
+            self.tmem_total = self.tmem_sfk_offset + 1
+        else:
+            self.tmem_sfa_offset = 0
+            self.tmem_sfk_offset = 0
+
         assert self.tmem_total <= self.tmem_alloc_cols
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
@@ -967,6 +980,14 @@ class FP4FlashAttentionForwardSm100:
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
+        # FP4: Create SMEM tensors for scale factors
+        if const_expr(self.use_fp4_qk):
+            sSFA = storage.sSFA.get_tensor(sSFA_layout.outer, swizzle=sSFA_layout.inner)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout.outer, swizzle=sSFK_layout.inner)
+        else:
+            sSFA = None
+            sSFK = None
+
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
 
@@ -1451,7 +1472,6 @@ class FP4FlashAttentionForwardSm100:
 
         if const_expr(self.use_fp4_qk):
             # FP4 block-scaled QK GEMM dispatch
-            # TODO Phase 3: tmem_sa_addr and tmem_sb_addr will come from TMEM scale allocation
             scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
             gemm_Si = [
                 partial(
@@ -1461,8 +1481,8 @@ class FP4FlashAttentionForwardSm100:
                     tCrB_layout=tSrK[None, None, None, 0].layout,
                     smem_var_name_prefix=f"fa_fwd_q_smem_desc",
                     idesc_var_name=f"fa_fwd_qk_mma_idesc",
-                    tmem_sa_addr=Int32(0),  # TODO: wire after Phase 3 TMEM scale allocation
-                    tmem_sb_addr=Int32(0),  # TODO: wire after Phase 3 TMEM scale allocation
+                    tmem_sa_addr=Int32(self.tmem_sfa_offset),
+                    tmem_sb_addr=Int32(self.tmem_sfk_offset),
                     smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                     scale_vec=scale_vec,
                     zero_init=True,

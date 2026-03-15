@@ -114,19 +114,53 @@ class HSABlockSparseRuntime:
 
     forward_sparse: HSABlockSparseTensors
     backward_sparse: HSABlockSparseTensors
-    aux_tensors: list[torch.Tensor]
+    backward_packed_masks: "HSABwdPackedMasks"
+    forward_aux_tensors: list[torch.Tensor]
+    backward_aux_tensors: list[torch.Tensor]
     forward_block_q: int
     backward_block_q: int
     block_k: int
+    backward_subtile_factor: int
 
     def to(self, device: torch.device | str):
+        def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
+            moved = tensor.to(device=device)
+            if hasattr(tensor, "__assumed_align__"):
+                setattr(moved, "__assumed_align__", getattr(tensor, "__assumed_align__"))
+            if hasattr(tensor, "__leading_dim__"):
+                setattr(moved, "__leading_dim__", getattr(tensor, "__leading_dim__"))
+            return moved
+
         return HSABlockSparseRuntime(
             forward_sparse=self.forward_sparse.to(device=device),
             backward_sparse=self.backward_sparse.to(device=device),
-            aux_tensors=[tensor.to(device=device) for tensor in self.aux_tensors],
+            backward_packed_masks=self.backward_packed_masks.to(device=device),
+            forward_aux_tensors=[_move_aux(tensor) for tensor in self.forward_aux_tensors],
+            backward_aux_tensors=[_move_aux(tensor) for tensor in self.backward_aux_tensors],
             forward_block_q=self.forward_block_q,
             backward_block_q=self.backward_block_q,
             block_k=self.block_k,
+            backward_subtile_factor=self.backward_subtile_factor,
+        )
+
+
+@dataclass
+class HSABwdPackedMasks:
+    """Packed exact masks for HSA backward partial blocks."""
+
+    block_id_table: torch.Tensor
+    mask_words: torch.Tensor
+    q_block_size: int
+    k_block_size: int
+    words_per_row: int
+
+    def to(self, device: torch.device | str):
+        return HSABwdPackedMasks(
+            block_id_table=self.block_id_table.to(device=device),
+            mask_words=self.mask_words.to(device=device),
+            q_block_size=self.q_block_size,
+            k_block_size=self.k_block_size,
+            words_per_row=self.words_per_row,
         )
 
 
@@ -234,6 +268,18 @@ def _ensure_int32(x: torch.Tensor) -> torch.Tensor:
 
 def _empty_int32(device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int32, device=device)
+
+
+def _tag_aux_tensor(
+    t: torch.Tensor,
+    *,
+    assumed_align: Optional[int] = 4,
+    leading_dim: int = -1,
+) -> torch.Tensor:
+    if assumed_align is not None:
+        setattr(t, "__assumed_align__", assumed_align)
+    setattr(t, "__leading_dim__", t.ndim - 1 if leading_dim == -1 else leading_dim)
+    return t
 
 
 def _make_stream_pack(
@@ -823,14 +869,14 @@ def _build_hsa_schedule_aux_tensors(schedule: HSASchedule) -> list[torch.Tensor]
     bsz, seqlen = schedule.batch_size, schedule.seqlen
     device = schedule.sentence_start.device
     return [
-        schedule.sentence_segment_id.view(bsz, seqlen).contiguous(),
-        schedule.sentence_segment_offset.view(bsz, seqlen).contiguous(),
-        schedule.section_segment_id.view(bsz, seqlen).contiguous(),
-        schedule.section_segment_offset.view(bsz, seqlen).contiguous(),
-        schedule.section_self_allowed.view(bsz, seqlen).to(dtype=torch.int32, device=device).contiguous(),
-        schedule.document_segment_id.view(bsz, seqlen).contiguous(),
-        schedule.document_segment_offset.view(bsz, seqlen).contiguous(),
-        schedule.document_self_allowed.view(bsz, seqlen).to(dtype=torch.int32, device=device).contiguous(),
+        _tag_aux_tensor(schedule.sentence_segment_id.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.sentence_segment_offset.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.section_segment_id.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.section_segment_offset.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.section_self_allowed.view(bsz, seqlen).to(dtype=torch.int32, device=device).contiguous()),
+        _tag_aux_tensor(schedule.document_segment_id.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.document_segment_offset.view(bsz, seqlen).contiguous()),
+        _tag_aux_tensor(schedule.document_self_allowed.view(bsz, seqlen).to(dtype=torch.int32, device=device).contiguous()),
     ]
 
 
@@ -1004,16 +1050,32 @@ def _build_forward_hsa_block_sparse_tensors(
     )
 
 
-def _build_backward_hsa_block_sparse_tensors(
+def _set_block_mask_bit(
+    block_words: list[list[int]],
+    *,
+    q_local: int,
+    k_local: int,
+):
+    word_idx = k_local // 32
+    bit_idx = k_local % 32
+    block_words[q_local][word_idx] |= 1 << bit_idx
+
+
+def _as_signed_int32(word: int) -> int:
+    return word if word < (1 << 31) else word - (1 << 32)
+
+
+def _build_backward_hsa_packed_masks(
     schedule: HSASchedule,
     *,
     q_block_size: int,
     k_block_size: int,
-) -> HSABlockSparseTensors:
+) -> tuple[HSABlockSparseTensors, HSABwdPackedMasks]:
     bsz, seqlen = schedule.batch_size, schedule.seqlen
     num_q_blocks = (seqlen + q_block_size - 1) // q_block_size
     num_k_blocks = (seqlen + k_block_size - 1) // k_block_size
-    counts = [[[0 for _ in range(num_q_blocks)] for _ in range(num_k_blocks)] for _ in range(bsz)]
+    words_per_row = (k_block_size + 31) // 32
+    block_masks: dict[tuple[int, int, int], list[list[int]]] = {}
 
     sentence_q_start = schedule.sentence_q_start.detach().cpu().tolist()
     sentence_q_len = schedule.sentence_q_len.detach().cpu().tolist()
@@ -1022,41 +1084,137 @@ def _build_backward_hsa_block_sparse_tensors(
     document_t_row_ptr = schedule.document_t_row_ptr.detach().cpu().tolist()
     document_t_col_idx = schedule.document_t_col_idx.detach().cpu().tolist()
 
+    def add_pair(batch_idx: int, key_idx: int, query_idx: int):
+        k_block = key_idx // k_block_size
+        q_block = query_idx // q_block_size
+        q_local = query_idx - q_block * q_block_size
+        k_local = key_idx - k_block * k_block_size
+        block_words = block_masks.setdefault(
+            (batch_idx, k_block, q_block),
+            [[0 for _ in range(words_per_row)] for _ in range(q_block_size)],
+        )
+        _set_block_mask_bit(block_words, q_local=q_local, k_local=k_local)
+
     for flat_key in range(schedule.num_rows):
         batch_idx, key_idx = divmod(flat_key, seqlen)
-        k_block = key_idx // k_block_size
 
         sent_q_len = sentence_q_len[flat_key]
         if sent_q_len > 0:
             sent_q_start = sentence_q_start[flat_key]
-            _accumulate_interval_counts(
-                counts,
-                batch_idx,
-                k_block,
-                sent_q_start,
-                sent_q_start + sent_q_len,
-                q_block_size,
-            )
+            for query_idx in range(sent_q_start, sent_q_start + sent_q_len):
+                add_pair(batch_idx, key_idx, query_idx)
 
         for offset in range(section_t_row_ptr[flat_key], section_t_row_ptr[flat_key + 1]):
-            counts[batch_idx][k_block][section_t_col_idx[offset] // q_block_size] += 1
+            add_pair(batch_idx, key_idx, section_t_col_idx[offset])
         for offset in range(document_t_row_ptr[flat_key], document_t_row_ptr[flat_key + 1]):
-            counts[batch_idx][k_block][document_t_col_idx[offset] // q_block_size] += 1
+            add_pair(batch_idx, key_idx, document_t_col_idx[offset])
 
-    valid_counts = [
-        [
-            min(k_block_size, seqlen - k_block * k_block_size)
-            * min(q_block_size, seqlen - q_block * q_block_size)
-            for q_block in range(num_q_blocks)
-        ]
-        for k_block in range(num_k_blocks)
-    ]
-    return _counts_to_block_sparse_tensors(
-        counts,
-        valid_counts,
-        block_size=(q_block_size, k_block_size),
+    mask_block_cnt = torch.zeros((bsz, 1, num_k_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
+    mask_block_idx = torch.zeros(
+        (bsz, 1, num_k_blocks, num_q_blocks),
+        dtype=torch.int32,
         device=schedule.sentence_start.device,
     )
+    full_block_cnt = torch.zeros((bsz, 1, num_k_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
+    full_block_idx = torch.zeros(
+        (bsz, 1, num_k_blocks, num_q_blocks),
+        dtype=torch.int32,
+        device=schedule.sentence_start.device,
+    )
+    block_id_table = torch.zeros(
+        (bsz, num_k_blocks, num_q_blocks),
+        dtype=torch.int32,
+        device=schedule.sentence_start.device,
+    )
+
+    partial_mask_words: list[list[list[int]]] = [
+        [[0 for _ in range(words_per_row)] for _ in range(q_block_size)]
+    ]
+
+    for batch_idx in range(bsz):
+        for k_block in range(num_k_blocks):
+            mask_indices: list[int] = []
+            full_indices: list[int] = []
+            q_blocks = sorted(
+                q_block
+                for (batch, key_block, q_block) in block_masks.keys()
+                if batch == batch_idx and key_block == k_block
+            )
+
+            k_len = min(k_block_size, seqlen - k_block * k_block_size)
+            tail_mask = (1 << (k_len % 32)) - 1 if k_len % 32 != 0 else None
+
+            for q_block in q_blocks:
+                block_words = block_masks[(batch_idx, k_block, q_block)]
+                q_len = min(q_block_size, seqlen - q_block * q_block_size)
+                valid_count = q_len * k_len
+                allowed_count = 0
+                for row_idx in range(q_len):
+                    for word_idx, word in enumerate(block_words[row_idx]):
+                        clamped_word = word
+                        if tail_mask is not None and word_idx == words_per_row - 1:
+                            clamped_word &= tail_mask
+                        allowed_count += int(clamped_word).bit_count()
+
+                if allowed_count == valid_count:
+                    full_indices.append(q_block)
+                    continue
+
+                mask_indices.append(q_block)
+                block_id_table[batch_idx, k_block, q_block] = len(partial_mask_words)
+                partial_mask_words.append(block_words)
+
+            mask_block_cnt[batch_idx, 0, k_block] = len(mask_indices)
+            full_block_cnt[batch_idx, 0, k_block] = len(full_indices)
+            if mask_indices:
+                mask_block_idx[batch_idx, 0, k_block, : len(mask_indices)] = torch.tensor(
+                    mask_indices,
+                    dtype=torch.int32,
+                    device=schedule.sentence_start.device,
+                )
+            if full_indices:
+                full_block_idx[batch_idx, 0, k_block, : len(full_indices)] = torch.tensor(
+                    full_indices,
+                    dtype=torch.int32,
+                    device=schedule.sentence_start.device,
+                )
+
+    sparse_tensors = HSABlockSparseTensors(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_block_size, k_block_size),
+    )
+    packed_masks = HSABwdPackedMasks(
+        block_id_table=block_id_table,
+        mask_words=torch.tensor(
+            [
+                [[_as_signed_int32(word) for word in row] for row in block_words]
+                for block_words in partial_mask_words
+            ],
+            dtype=torch.int32,
+            device=schedule.sentence_start.device,
+        ),
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+        words_per_row=words_per_row,
+    )
+    return sparse_tensors, packed_masks
+
+
+def _build_backward_hsa_block_sparse_tensors(
+    schedule: HSASchedule,
+    *,
+    q_block_size: int,
+    k_block_size: int,
+) -> HSABlockSparseTensors:
+    sparse_tensors, _ = _build_backward_hsa_packed_masks(
+        schedule,
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+    )
+    return sparse_tensors
 
 
 def forward_block_sparse_to_attend_mask(
@@ -1129,6 +1287,56 @@ def backward_block_sparse_to_attend_mask(
     return attend
 
 
+def backward_packed_masks_to_attend_mask(
+    schedule: HSASchedule,
+    sparse_tensors: HSABlockSparseTensors,
+    packed_masks: HSABwdPackedMasks,
+) -> torch.Tensor:
+    attend = torch.zeros(
+        schedule.batch_size,
+        schedule.seqlen,
+        schedule.seqlen,
+        dtype=torch.bool,
+        device=schedule.sentence_start.device,
+    )
+    q_block_size, k_block_size = sparse_tensors.block_size
+    bsz, seqlen = schedule.batch_size, schedule.seqlen
+    mask_block_cnt = sparse_tensors.mask_block_cnt.detach().cpu()
+    mask_block_idx = sparse_tensors.mask_block_idx.detach().cpu()
+    full_block_cnt = sparse_tensors.full_block_cnt.detach().cpu()
+    full_block_idx = sparse_tensors.full_block_idx.detach().cpu()
+    block_id_table = packed_masks.block_id_table.detach().cpu()
+    mask_words = packed_masks.mask_words.detach().cpu()
+
+    for batch_idx in range(bsz):
+        num_k_blocks = mask_block_cnt.shape[2]
+        for k_block in range(num_k_blocks):
+            k_start = k_block * k_block_size
+            k_end = min(seqlen, k_start + k_block_size)
+            full_count = int(full_block_cnt[batch_idx, 0, k_block].item())
+            for idx in range(full_count):
+                q_block = int(full_block_idx[batch_idx, 0, k_block, idx].item())
+                q_start = q_block * q_block_size
+                q_end = min(seqlen, q_start + q_block_size)
+                attend[batch_idx, q_start:q_end, k_start:k_end] = True
+
+            mask_count = int(mask_block_cnt[batch_idx, 0, k_block].item())
+            for idx in range(mask_count):
+                q_block = int(mask_block_idx[batch_idx, 0, k_block, idx].item())
+                q_start = q_block * q_block_size
+                q_end = min(seqlen, q_start + q_block_size)
+                block_id = int(block_id_table[batch_idx, k_block, q_block].item())
+                for q_local in range(q_end - q_start):
+                    for k_local in range(k_end - k_start):
+                        word_idx = k_local // 32
+                        bit_idx = k_local % 32
+                        word = int(mask_words[block_id, q_local, word_idx].item()) & 0xFFFFFFFF
+                        if (word >> bit_idx) & 1:
+                            attend[batch_idx, q_start + q_local, k_start + k_local] = True
+
+    return attend
+
+
 def _get_hsa_forward_q_block_size(q: torch.Tensor, k: torch.Tensor) -> int:
     num_q_heads = q.shape[-2]
     num_kv_heads = k.shape[-2]
@@ -1141,11 +1349,17 @@ def _get_hsa_forward_q_block_size(q: torch.Tensor, k: torch.Tensor) -> int:
 def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> HSABlockSparseRuntime:
     cache = getattr(schedule, "_hsa_block_sparse_runtime_cache", None)
     forward_block_q = _get_hsa_forward_q_block_size(q, k)
-    backward_block_q = 256
+    backward_block_q = 128
     block_k = 128
     cache_key = (str(q.device), forward_block_q, backward_block_q, block_k)
     if cache is not None and cache_key in cache:
         return cache[cache_key]
+
+    backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
+        schedule,
+        q_block_size=backward_block_q,
+        k_block_size=block_k,
+    )
 
     runtime = HSABlockSparseRuntime(
         forward_sparse=_build_forward_hsa_block_sparse_tensors(
@@ -1153,15 +1367,17 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
             q_block_size=forward_block_q,
             k_block_size=block_k,
         ),
-        backward_sparse=_build_backward_hsa_block_sparse_tensors(
-            schedule,
-            q_block_size=backward_block_q,
-            k_block_size=block_k,
-        ),
-        aux_tensors=_build_hsa_schedule_aux_tensors(schedule),
+        backward_sparse=backward_sparse,
+        backward_packed_masks=backward_packed_masks,
+        forward_aux_tensors=_build_hsa_schedule_aux_tensors(schedule),
+        backward_aux_tensors=[
+            _tag_aux_tensor(backward_packed_masks.block_id_table),
+            _tag_aux_tensor(backward_packed_masks.mask_words),
+        ],
         forward_block_q=forward_block_q,
         backward_block_q=backward_block_q,
         block_k=block_k,
+        backward_subtile_factor=1,
     )
     if cache is None:
         cache = {}
@@ -1229,6 +1445,40 @@ def get_hsa_schedule_mask_mod():
         return in_bounds & (same_sentence | same_section | same_document)
 
     return _hsa_schedule_mask
+
+
+@lru_cache(maxsize=1)
+def get_hsa_backward_packed_mask_mod():
+    """Return the CuTe mask_mod for packed backward HSA partial blocks."""
+    cutlass, cute, utils, fast_sampling, _, _, _ = _lazy_cute_imports()
+
+    @fast_sampling
+    @cute.jit
+    def _hsa_backward_packed_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        block_id_table = aux_tensors[0]
+        mask_words = aux_tensors[1]
+
+        b = utils.ssa_to_scalar(batch)
+        q_idx = utils.ssa_to_scalar(m_idx)
+        kv_idx = utils.ssa_to_scalar(n_idx)
+        safe_q_idx = q_idx % seqlen_info.seqlen_q
+        safe_kv_idx = kv_idx % seqlen_info.seqlen_k
+        in_bounds = (q_idx < seqlen_info.seqlen_q) & (kv_idx < seqlen_info.seqlen_k)
+
+        q_block = safe_q_idx // 128
+        k_block = safe_kv_idx // 128
+        q_local = safe_q_idx % 128
+        k_local = safe_kv_idx % 128
+        word_idx = k_local // 32
+        bit_idx = k_local % 32
+
+        block_id = block_id_table[b, k_block, q_block]
+        mask_word = cutlass.Uint32(mask_words[block_id, q_local, word_idx])
+        bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+        allowed = cutlass.Boolean(in_bounds & (bit != cutlass.Uint32(0)))
+        return utils.scalar_to_ssa(allowed, cutlass.Boolean)
+
+    return _hsa_backward_packed_mask
 
 
 @lru_cache(maxsize=1)
@@ -1647,7 +1897,7 @@ def _run_hsa_blocksparse_forward(
         causal=False,
         pack_gqa=False,
         mask_mod=get_hsa_schedule_mask_mod(),
-        aux_tensors=runtime.aux_tensors,
+        aux_tensors=runtime.forward_aux_tensors,
         block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.forward_sparse),
         return_lse=True,
     )
@@ -1664,6 +1914,8 @@ def _run_hsa_blocksparse_backward(
     schedule: HSASchedule,
     softmax_scale: float,
     deterministic: bool,
+    keep_ids: Optional[torch.Tensor] = None,
+    hash_ids: Optional[torch.Tensor] = None,
 ):
     _, _, _, _, _, _, flash_attn_bwd = _lazy_cute_imports()
     runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
@@ -1678,9 +1930,10 @@ def _run_hsa_blocksparse_backward(
         causal=False,
         pack_gqa=False,
         deterministic=deterministic,
-        mask_mod=get_hsa_schedule_mask_mod(),
-        aux_tensors=runtime.aux_tensors,
+        mask_mod=get_hsa_backward_packed_mask_mod(),
+        aux_tensors=runtime.backward_aux_tensors,
         block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.backward_sparse),
+        subtile_factor_override=runtime.backward_subtile_factor,
     )
 
 
@@ -1691,6 +1944,8 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        keep_ids: Optional[torch.Tensor],
+        hash_ids: Optional[torch.Tensor],
         schedule: HSASchedule,
         softmax_scale: float,
         deterministic: bool,
@@ -1700,6 +1955,8 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
 
         out, lse = run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
         ctx.schedule = schedule
+        ctx.keep_ids = keep_ids
+        ctx.hash_ids = hash_ids
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
         ctx.save_for_backward(q, k, v, out, lse)
@@ -1723,8 +1980,10 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
             ctx.schedule,
             ctx.softmax_scale,
             ctx.deterministic,
+            ctx.keep_ids,
+            ctx.hash_ids,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 class _FlashAttnHSASparseExactFunc(torch.autograd.Function):
@@ -1825,11 +2084,27 @@ def flash_attn_hsa_sparse_func(
         )
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
+    normalized_keep_ids = None
+    normalized_hash_ids = None
+    if keep_ids is not None and hash_ids is not None:
+        normalized_keep_ids = _ensure_int32(keep_ids)
+        normalized_hash_ids = _ensure_int32(hash_ids)
+        if normalized_keep_ids.device != q.device:
+            normalized_keep_ids = normalized_keep_ids.to(device=q.device)
+        if normalized_hash_ids.device != q.device:
+            normalized_hash_ids = normalized_hash_ids.to(device=q.device)
+        if not normalized_keep_ids.is_contiguous():
+            normalized_keep_ids = normalized_keep_ids.contiguous()
+        if not normalized_hash_ids.is_contiguous():
+            normalized_hash_ids = normalized_hash_ids.contiguous()
+
     if torch.cuda.get_device_capability(q.device)[0] >= 10:
         return _FlashAttnHSABlockSparseFunc.apply(
             q,
             k,
             v,
+            normalized_keep_ids,
+            normalized_hash_ids,
             hsa_schedule,
             scale,
             deterministic,

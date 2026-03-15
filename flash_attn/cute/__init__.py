@@ -15,6 +15,7 @@ from .interface import (
 )
 from .hsa import (
     HSASchedule,
+    backward_packed_masks_to_attend_mask,
     backward_descriptors_to_attend_mask,
     build_hsa_schedule,
     compute_hsa_mask,
@@ -43,6 +44,7 @@ __all__ = [
     "schedule_to_attend_mask",
     "forward_descriptors_to_attend_mask",
     "backward_descriptors_to_attend_mask",
+    "backward_packed_masks_to_attend_mask",
     "compute_hsa_mask",
     "hsa_reference_attention",
     "hsa_sparse_reference_attention",

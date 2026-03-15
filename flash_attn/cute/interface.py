@@ -630,6 +630,7 @@ def _flash_attn_bwd(
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    subtile_factor_override: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
@@ -723,8 +724,7 @@ def _flash_attn_bwd(
         m_block_size = 64
         dQ_swapAB = False
 
-    # NB: this could be derived from the block_sparse_tensors but for now we hardcode it to 2
-    subtile_factor = 2
+    subtile_factor = subtile_factor_override if subtile_factor_override is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
@@ -954,8 +954,10 @@ def _flash_attn_bwd(
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
     cute_aux_tensors = None
+    aux_tensor_metadata = None
     if aux_tensors is not None:
-        cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+        cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -1003,8 +1005,10 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_tensor_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            subtile_factor,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1032,8 +1036,10 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_tensor_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            subtile_factor,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,

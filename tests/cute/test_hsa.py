@@ -4,6 +4,7 @@ import torch
 
 try:
     from flash_attn.cute import (
+        backward_packed_masks_to_attend_mask,
         backward_descriptors_to_attend_mask,
         build_hsa_schedule,
         compute_hsa_mask,
@@ -19,6 +20,7 @@ try:
 except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     build_hsa_schedule = None
     backward_descriptors_to_attend_mask = None
+    backward_packed_masks_to_attend_mask = None
     compute_hsa_mask = None
     flash_attn_func = None
     flash_attn_hsa_func = None
@@ -234,6 +236,24 @@ def test_hsa_backward_descriptors_reconstruct_dense_mask():
     keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
     schedule = build_hsa_schedule(keep_ids, hash_ids)
     dense_mask = backward_descriptors_to_attend_mask(schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_backward_packed_masks_reconstruct_dense_mask():
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=193, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    sparse_tensors, packed_masks = hsa_module._build_backward_hsa_packed_masks(
+        schedule,
+        q_block_size=128,
+        k_block_size=128,
+    )
+    dense_mask = backward_packed_masks_to_attend_mask(schedule, sparse_tensors, packed_masks)
     ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
 
     assert torch.equal(dense_mask, ref_mask)

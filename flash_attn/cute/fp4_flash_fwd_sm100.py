@@ -447,6 +447,30 @@ class FP4FlashAttentionForwardSm100:
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
+
+        # FP4: Scale factor SMEM layouts for Q and K scales
+        if const_expr(self.use_fp4_qk):
+            sSFA_layout = bs_layout.make_smem_layout_sfa(
+                tiled_mma_qk, self.mma_tiler_qk, self.fp4_sf_vec_size, self.q_stage
+            )
+            sSFK_layout = bs_layout.make_smem_layout_sfb(
+                tiled_mma_qk, self.mma_tiler_qk, self.fp4_sf_vec_size, self.kv_stage
+            )
+            # TMEM layouts for scale factors
+            sSFA_layout_per_stage = cute.select(sSFA_layout, mode=[0, 1, 2])
+            sSFK_layout_per_stage = cute.select(sSFK_layout, mode=[0, 1, 2])
+            tSFA_layout = bs_layout.make_tmem_layout_sfa(
+                tiled_mma_qk, self.mma_tiler_qk, self.fp4_sf_vec_size, sSFA_layout_per_stage
+            )
+            tSFK_layout = bs_layout.make_tmem_layout_sfb(
+                tiled_mma_qk, self.mma_tiler_qk, self.fp4_sf_vec_size, sSFK_layout_per_stage
+            )
+        else:
+            sSFA_layout = None
+            sSFK_layout = None
+            tSFA_layout = None
+            tSFK_layout = None
+
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
@@ -599,6 +623,14 @@ class FP4FlashAttentionForwardSm100:
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
 
+        # FP4: Compute scale factor SMEM sizes
+        if const_expr(self.use_fp4_qk):
+            sSFA_size = cute.cosize(sSFA_layout)
+            sSFK_size = cute.cosize(sSFK_layout)
+        else:
+            sSFA_size = 0
+            sSFK_size = 0
+
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
@@ -628,6 +660,15 @@ class FP4FlashAttentionForwardSm100:
                 # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
+            ]
+            # FP4: Scale factor SMEM for Q and K scales
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[self.fp4_sf_dtype, sSFA_size],
+                128,  # 128-byte alignment for scale factors
+            ]
+            sSFK: cute.struct.Align[
+                cute.struct.MemRange[self.fp4_sf_dtype, sSFK_size],
+                128,
             ]
 
         self.shared_storage = SharedStorage
@@ -672,6 +713,10 @@ class FP4FlashAttentionForwardSm100:
             tP_layout,
             sV_layout,
             sO_layout,
+            sSFA_layout,
+            sSFK_layout,
+            tSFA_layout,
+            tSFK_layout,
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
@@ -717,6 +762,10 @@ class FP4FlashAttentionForwardSm100:
         tP_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
+        sSFA_layout,  # None for BF16 path, cute.Layout for FP4
+        sSFK_layout,  # None for BF16 path, cute.Layout for FP4
+        tSFA_layout,  # None for BF16 path, cute.Layout for FP4 (TMEM)
+        tSFK_layout,  # None for BF16 path, cute.Layout for FP4 (TMEM)
         gmem_tiled_copy_O: Optional[cute.TiledCopy],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,

@@ -1,4 +1,11 @@
-# Supported features:
+# FP4 variant of flash_fwd_sm100.py
+# Supports FP4 (E2M1) block-scaled MMA for QK product with pre-quantized Q/K.
+# Based on flash_fwd_sm100.py with modifications for:
+# - FP4 QK GEMM via tcgen05.mma.kind::mxf4nvf4.block_scale
+# - Scale factor SMEM/TMEM handling
+# - FP4 input tensors (packed fp4x2) + fp8 scale factors
+#
+# Original supported features (BF16 path still works):
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
@@ -6,9 +13,6 @@
 # - varlen
 # - sliding window
 # - split-kv
-# Unsupported features that will be added later:
-# - page size != 128
-# - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
@@ -21,10 +25,11 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Boolean, const_expr
+from cutlass import Float32, Float4E2M1FN, Float8E4M3FN, Float8E8M0FNU, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+import cutlass.utils.blockscaled_layout as bs_layout
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
@@ -61,7 +66,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
 )
 
-class FlashAttentionForwardSm100:
+class FP4FlashAttentionForwardSm100:
 
     def __init__(
         self,
@@ -84,11 +89,20 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
+        # FP4 QK configuration
+        use_fp4_qk: bool = True,
+        fp4_sf_dtype: str = "e4m3",   # "e4m3" (NVFP4) or "e8m0" (MXFP4)
+        fp4_sf_vec_size: int = 16,     # 16 for NVFP4, 32 for MXFP4
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        # FP4 QK configuration
+        self.use_fp4_qk = use_fp4_qk
+        self.fp4_sf_dtype = Float8E4M3FN if fp4_sf_dtype == "e4m3" else Float8E8M0FNU
+        self.fp4_sf_vec_size = fp4_sf_vec_size
         # self.dtype = dtype
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
+        # padding head_dim to a multiple of 64 for FP4 (K=64 per MMA instruction)
+        # or 16 for BF16
+        hdim_multiple_of = 64 if use_fp4_qk else 16
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
@@ -348,9 +362,12 @@ class FlashAttentionForwardSm100:
 
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+            raise TypeError(f"Type mismatch Q vs K: {self.q_dtype} != {self.k_dtype}")
+        if const_expr(not self.use_fp4_qk):
+            # Standard BF16 path: Q/K/V must all match
+            if const_expr(self.q_dtype != self.v_dtype):
+                raise TypeError(f"Type mismatch Q vs V: {self.q_dtype} != {self.v_dtype}")
+        # For FP4 QK: Q/K are FP4 (fp4x2 packed), V stays BF16/FP16
         self._setup_attributes()
         self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
@@ -377,14 +394,26 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
-        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
-            self.q_dtype,
-            q_major_mode,
-            k_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
+        if const_expr(self.use_fp4_qk):
+            # FP4 block-scaled MMA for QK product
+            tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                Float4E2M1FN,
+                q_major_mode,
+                k_major_mode,
+                self.fp4_sf_dtype,
+                self.fp4_sf_vec_size,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
+        else:
+            tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+                self.q_dtype,
+                q_major_mode,
+                k_major_mode,
+                self.qk_acc_dtype,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
@@ -1350,51 +1379,64 @@ class FlashAttentionForwardSm100:
             tSrQs = (tSrQ[None, None, None, 0],)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
-        qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
+        if const_expr(self.use_fp4_qk):
+            qk_mma_idesc = sm100_desc.mma_op_to_idesc_block_scaled(qk_mma_op)
+        else:
+            qk_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op)
+        pv_mma_idesc = sm100_desc.mma_op_to_idesc(pv_mma_op)
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
         q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
 
         sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
-        sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
+        if const_expr(self.use_fp4_qk):
+            sm100_utils.declare_ptx_idesc_block_scaled(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
+        else:
+            sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
         sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
 
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
-        gemm_Si = [
-            partial(
-                # sm100_utils.gemm_ptx_precomputed,
-                # self.tmem_s_offset[stage],
-                # smem_desc_start_a=q_smem_start[stage],
-                # idesc=qk_mma_idesc,
-                # smem_desc_base_a=q_smem_base,
-                # smem_desc_base_b=k_smem_base,
-                # tCrA_layout=tSrQ[None, None, None, 0].layout,
-                sm100_utils.gemm_ptx_precomputed_varname,
-                self.tmem_s_offset[stage],
-                # idesc=qk_mma_idesc,
-                smem_desc_base_b=k_smem_base,
-                tCrB_layout=tSrK[None, None, None, 0].layout,
-                smem_var_name_prefix=f"fa_fwd_q_smem_desc",
-                idesc_var_name=f"fa_fwd_qk_mma_idesc",
-                smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                zero_init=True,
-                cta_group=self.cta_group_size,
-            )
-            for stage in range(self.q_stage)
-        ]
-        # gemm_Si = [
-        #     partial(
-        #         sm100_utils.gemm,
-        #         tiled_mma_qk,
-        #         tStS[None, None, None, stage],
-        #         tCrA=tSrQ[None, None, None, stage],
-        #         zero_init=True,
-        #     )
-        #     for stage in range(self.q_stage)
-        # ]
+
+        if const_expr(self.use_fp4_qk):
+            # FP4 block-scaled QK GEMM dispatch
+            # TODO Phase 3: tmem_sa_addr and tmem_sb_addr will come from TMEM scale allocation
+            scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_fp4_block_scaled,
+                    self.tmem_s_offset[stage],
+                    smem_desc_base_b=k_smem_base,
+                    tCrB_layout=tSrK[None, None, None, 0].layout,
+                    smem_var_name_prefix=f"fa_fwd_q_smem_desc",
+                    idesc_var_name=f"fa_fwd_qk_mma_idesc",
+                    tmem_sa_addr=Int32(0),  # TODO: wire after Phase 3 TMEM scale allocation
+                    tmem_sb_addr=Int32(0),  # TODO: wire after Phase 3 TMEM scale allocation
+                    smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                    scale_vec=scale_vec,
+                    zero_init=True,
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
+        else:
+            # Standard BF16 QK GEMM dispatch
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_precomputed_varname,
+                    self.tmem_s_offset[stage],
+                    smem_desc_base_b=k_smem_base,
+                    tCrB_layout=tSrK[None, None, None, 0].layout,
+                    smem_var_name_prefix=f"fa_fwd_q_smem_desc",
+                    idesc_var_name=f"fa_fwd_qk_mma_idesc",
+                    smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                    zero_init=True,
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
         gemm_Pi = [
             partial(
                 # sm100_utils.gemm_ptx_precomputed,

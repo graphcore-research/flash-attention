@@ -174,6 +174,102 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     )
 
 
+# ---------------------------------------------------------------------------
+# Block-scaled instruction descriptor (for FP4 / MX-scaled MMA)
+# ---------------------------------------------------------------------------
+
+
+class BlockScaledScaleType(IntEnum):
+    """Scale factor type: bit 23 in block-scaled idesc."""
+    E4M3 = 0   # NVFP4: fp8e4m3 scales
+    E8M0 = 1   # MXFP4: fp8e8m0 scales
+
+
+def make_block_scaled_instr_desc(
+    M: int,            # 128 or 256
+    N: int,            # multiple of 8
+    a_neg: bool = False,
+    b_neg: bool = False,
+    scale_type: BlockScaledScaleType = BlockScaledScaleType.E4M3,
+    scale_factor_id: int = 0,  # 0 or 2 for NVFP4; 0,1,2,3 for MXFP8
+    is_fp4: bool = True,       # True for E2M1, False for E4M3 (MXFP8)
+) -> int:
+    """
+    Build the 32-bit instruction descriptor for Blackwell block-scaled MMA.
+    Used with tcgen05.mma.kind::mxf4nvf4.block_scale (or kind::mxf4 / kind::mxf8).
+
+    The bit layout is DIFFERENT from standard MMA idesc:
+    - Bits 4-5:   B scale_factor_id
+    - Bits 7-9:   A format (E2M1=0b001 for FP4, E4M3=0b000 for FP8)
+    - Bits 10-11: B format (E2M1=0b01, E4M3=0b00)
+    - Bit 13:     A negate
+    - Bit 14:     B negate
+    - Bits 15-16: transpose A/B (always 0 for block-scaled)
+    - Bits 17-22: N >> 3
+    - Bit 23:     scale_type (0=E4M3, 1=E8M0)
+    - Bits 24-26: SBZ
+    - Bits 27-28: M >> 7  (NOT M >> 4 like standard!)
+    - Bits 29-30: A scale_factor_id
+    - Bit 31:     K select (0=K64 for FP4)
+
+    Reference: TK tcgen05.cuh instruction_descriptor<> template.
+    """
+    desc = 0
+    desc |= 0b00 << 0                              # SBZ
+    desc |= 0b0 << 2                                # dense (not sparse)
+    desc |= 0b0 << 3                                # SBZ
+    desc |= (scale_factor_id & 0x3) << 4            # B scale factor ID
+    desc |= 0b0 << 6                                # SBZ
+
+    if is_fp4:
+        desc |= 0b001 << 7                          # A format: E2M1
+        desc |= 0b01 << 10                          # B format: E2M1
+        desc |= 0b0 << 12                           # SBZ
+    else:
+        desc |= 0b000 << 7                          # A format: E4M3
+        desc |= 0b000 << 10                         # B format: E4M3
+
+    desc |= (int(a_neg) & 0x1) << 13                # A negate
+    desc |= (int(b_neg) & 0x1) << 14                # B negate
+    desc |= 0b0 << 15                               # A transpose (always 0)
+    desc |= 0b0 << 16                               # B transpose (always 0)
+    desc |= ((N >> 3) & 0x3F) << 17                 # N dimension
+    desc |= (int(scale_type) & 0x1) << 23           # scale type
+    desc |= 0b000 << 24                             # SBZ
+    desc |= ((M >> 7) & 0x3) << 27                  # M dimension (M>>7!)
+    desc |= (scale_factor_id & 0x3) << 29           # A scale factor ID
+    desc |= 0b0 << 31                               # K select (0 = K=64 for FP4)
+
+    return desc & 0xFFFF_FFFF
+
+
+def mma_op_to_idesc_block_scaled(
+    op,   # BlockScaledMmaOp
+    scale_factor_id: int = 0,
+):
+    """Convert a block-scaled MMA op to its instruction descriptor."""
+    is_fp4 = hasattr(op, 'a_dtype') and op.a_dtype is cutlass.Float4E2M1FN
+
+    # Determine scale type from sf_dtype
+    if hasattr(op, 'sf_dtype'):
+        if op.sf_dtype is cutlass.Float8E4M3FN:
+            scale_type = BlockScaledScaleType.E4M3
+        elif op.sf_dtype is cutlass.Float8E8M0FNU:
+            scale_type = BlockScaledScaleType.E8M0
+        else:
+            raise TypeError(f"Unsupported sf_dtype: {op.sf_dtype}")
+    else:
+        scale_type = BlockScaledScaleType.E4M3
+
+    return make_block_scaled_instr_desc(
+        M=op.shape_mnk[0],
+        N=op.shape_mnk[1],
+        scale_type=scale_type,
+        scale_factor_id=scale_factor_id,
+        is_fp4=is_fp4,
+    )
+
+
 class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
     SWIZZLE_NONE = 0  # (a.k.a. “INTERLEAVE” in older docs)
     SWIZZLE_128B_BASE32B = 1

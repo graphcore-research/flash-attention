@@ -1087,3 +1087,115 @@ def gemm_ptx_precomputed_varname(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+@cute.jit
+def declare_ptx_idesc_block_scaled(
+    op,  # BlockScaledMmaOp
+    scale_factor_id: int = 0,
+    var_name: str = "idesc",
+) -> None:
+    """Declare a PTX register holding the block-scaled instruction descriptor."""
+    idesc = const_expr(sm100_desc.mma_op_to_idesc_block_scaled(op, scale_factor_id))
+    llvm.inline_asm(
+        None,
+        [],
+        f".reg .b32 {var_name};\n\t"
+        f"mov.b32 {var_name}, {hex(idesc)};\n\t",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ptx_fp4_block_scaled(
+    acc_tmem_addr: Int32,
+    smem_desc_start_b: Int32,
+    smem_desc_base_b: int,
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,     # pre-declared Q smem descriptors
+    idesc_var_name: str,           # pre-declared block-scaled idesc
+    tmem_sa_addr: Int32,           # TMEM address of A (Q) scale factors
+    tmem_sb_addr: Int32,           # TMEM address of B (K) scale factors
+    smem_offset: int,
+    scale_vec: str = "4X",         # "4X" for NVFP4 (block_size=16), "2X" for MXFP4 (block_size=32)
+    zero_init: bool | Boolean = False,
+    cta_group: int = 1,
+) -> None:
+    """
+    Emit FP4 block-scaled MMA PTX: tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::XY
+
+    This is the FP4 analogue of gemm_ptx_precomputed_varname, but emits block-scaled
+    PTX with TMEM scale operands [tmem_sa] and [tmem_sb].
+
+    Pattern per K-tile:
+        @leader_thread tcgen05.mma.cta_group::X.kind::mxf4nvf4.block_scale.scale_vec::YZ
+            [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sa], [tmem_sb], p;
+    """
+    from flash_attn.cute.blackwell_helpers import i64_to_i32x2
+
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+
+    ptx_kind = f"kind::mxf4nvf4.block_scale.scale_vec::{scale_vec}"
+
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_sa_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_sb_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 tmem_sa, tmem_sb;\n\t"
+        ".reg .b32 smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+        ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+        f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 tmem_acc, $2;\n\t"
+        f"mov.b32 tmem_sa, $3;\n\t"
+        f"mov.b32 tmem_sb, $4;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $0;\n\t"
+        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+        # Update Q smem descs with offset (same pattern as BF16 version)
+        f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_0;\n\t"
+        f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+        f"mov.b64 {smem_var_name_prefix}_0, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+        f"mov.b64 smem_desc_b_0, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+        + "".join(
+            (
+                f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                f"mov.b64 smem_desc_b_{k}, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+            )
+            for k in range(1, num_k_tile)
+        )
+        + "setp.ne.b32 p, $1, 0;\n\t"
+        # First MMA with zero_init control
+        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, [tmem_sa], [tmem_sb], {pred_str};\n\t"
+        + "".join(
+            (
+                f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, [tmem_sa], [tmem_sb], 1;\n\t"
+            )
+            for k in range(1, num_k_tile)
+        )
+        + "}\n",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )

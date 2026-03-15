@@ -578,28 +578,9 @@ class FP4FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
             )
 
-        # FP4: TMA atoms for scale factor loading (GMEM → SMEM)
-        tma_atom_Q_scale = None
-        tma_atom_K_scale = None
-        if const_expr(self.use_fp4_qk and mQ_scale is not None):
-            # Q scale follows the same as Q (operand A) but with scale factor layout
-            tma_atom_Q_scale, mQ_scale = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mQ_scale,
-                cute.select(sSFA_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                cta_layout_vmnk.shape,
-            )
-            # K scale follows the same as K (operand B)
-            tma_atom_K_scale, mK_scale = cute.nvgpu.make_tiled_tma_atom_B(
-                tma_load_op,
-                mK_scale,
-                cute.select(sSFK_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                cta_layout_vmnk.shape,
-            )
+        # FP4: Scale factors are small enough to load manually (no TMA needed)
+        # Scale tensors are passed directly to the kernel as raw pointers
+        # The kernel will load them into SMEM cooperatively
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
@@ -751,9 +732,7 @@ class FP4FlashAttentionForwardSm100:
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
-            # FP4: scale factor TMA atoms and tensors
-            tma_atom_Q_scale,
-            tma_atom_K_scale,
+            # FP4: scale factor tensors (raw pointers, no TMA)
             mQ_scale,
             mK_scale,
             softmax_scale_log2,
@@ -805,9 +784,7 @@ class FP4FlashAttentionForwardSm100:
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
-        # FP4: scale factor TMA atoms and tensors
-        tma_atom_Q_scale: Optional[cute.CopyAtom],
-        tma_atom_K_scale: Optional[cute.CopyAtom],
+        # FP4: scale factor tensors (raw pointers, no TMA)
         mQ_scale: Optional[cute.Tensor],
         mK_scale: Optional[cute.Tensor],
         softmax_scale_log2: Float32,

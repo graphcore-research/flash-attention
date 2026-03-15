@@ -327,6 +327,9 @@ class FP4FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # FP4: scale factor tensors (same batch/head dims as Q/K, reduced d dim)
+        mQ_scale: Optional[cute.Tensor] = None,  # (b, s_q, h, d//sf_vec) fp8
+        mK_scale: Optional[cute.Tensor] = None,  # (b_k, s_k, h_k, d//sf_vec) fp8
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -347,14 +350,24 @@ class FP4FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        # FP4: align and transpose scale tensors alongside Q/K
+        if const_expr(self.use_fp4_qk and mQ_scale is not None):
+            mQ_scale = assume_tensor_aligned(mQ_scale)
+            mK_scale = assume_tensor_aligned(mK_scale)
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
+        # FP4: transpose scale tensors the same way as Q/K
+        if const_expr(self.use_fp4_qk and mQ_scale is not None):
+            mQ_scale = cute.make_tensor(mQ_scale.iterator, cute.select(mQ_scale.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
             for t in (mK, mV)
         ]
+        # FP4: transpose K scale tensor
+        if const_expr(self.use_fp4_qk and mK_scale is not None):
+            mK_scale = cute.make_tensor(mK_scale.iterator, cute.select(mK_scale.layout, mode=KV_layout_transpose))
         if const_expr(self.is_split_kv):
             O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
             LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
@@ -565,6 +578,29 @@ class FP4FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
             )
 
+        # FP4: TMA atoms for scale factor loading (GMEM → SMEM)
+        tma_atom_Q_scale = None
+        tma_atom_K_scale = None
+        if const_expr(self.use_fp4_qk and mQ_scale is not None):
+            # Q scale follows the same as Q (operand A) but with scale factor layout
+            tma_atom_Q_scale, mQ_scale = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mQ_scale,
+                cute.select(sSFA_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+            # K scale follows the same as K (operand B)
+            tma_atom_K_scale, mK_scale = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mK_scale,
+                cute.select(sSFK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
@@ -715,6 +751,11 @@ class FP4FlashAttentionForwardSm100:
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
+            # FP4: scale factor TMA atoms and tensors
+            tma_atom_Q_scale,
+            tma_atom_K_scale,
+            mQ_scale,
+            mK_scale,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -764,6 +805,11 @@ class FP4FlashAttentionForwardSm100:
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
+        # FP4: scale factor TMA atoms and tensors
+        tma_atom_Q_scale: Optional[cute.CopyAtom],
+        tma_atom_K_scale: Optional[cute.CopyAtom],
+        mQ_scale: Optional[cute.Tensor],
+        mK_scale: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Float32 | None,
         window_size_left: Optional[Int32],

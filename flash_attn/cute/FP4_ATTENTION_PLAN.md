@@ -1,45 +1,46 @@
-# FP4 Flash Attention — Integration Plan
+# FP4 Flash Attention Plan
 
-## Goal
-Adapt FA4's CUTE-DSL flash attention to use FP4 (E2M1) block-scaled MMA for the QK product,
-with pre-quantized Q and K inputs (NVFP4 or MXFP4 format).
+## Current Scope
+- QK-only FP4 forward on SM100/SM110.
+- Dense fixed-length attention only.
+- Supported shapes: batched MHA and GQA, causal and noncausal, `num_splits=1`.
+- Unsupported in this landing: varlen, paged KV, block sparsity, local windowing, backward, FP4 PV.
 
-## Architecture Overview
+## Public API
+- `_flash_attn_fwd(...)` and `flash_attn_func(...)` now accept:
+  - `fp4_qk_format: Optional[Literal["nvfp4", "mxfp4"]] = None`
+  - `q_scale: Optional[torch.Tensor] = None`
+  - `k_scale: Optional[torch.Tensor] = None`
+- Tensor contract:
+  - `q`, `k`: packed `torch.uint8`, shape `(..., head_dim // 2)`
+  - `v`: `torch.float16` or `torch.bfloat16`
+  - `q_scale`, `k_scale`: FP8 with shape `(..., head_dim // 16)` for `nvfp4`, `(..., head_dim // 32)` for `mxfp4`
+- Format mapping:
+  - `nvfp4` -> `fp4_sf_dtype="e4m3"`, `fp4_sf_vec_size=16`
+  - `mxfp4` -> `fp4_sf_dtype="e8m0"`, `fp4_sf_vec_size=32`
 
-### Current (BF16)
-```
-Q[bf16] → SMEM → tcgen05.mma.kind::f16 → S[fp32 in TMEM] → softmax → P → PV GEMM → O
-K[bf16] → SMEM ↗
-```
+## Kernel Status
+- `FP4FlashAttentionForwardSm100` remains the implementation home for FP4 QK.
+- Packed FP4 Q/K are reinterpreted as logical `Float4E2M1FN` CuTe tensors in `cute_dsl_utils.py`.
+- Scale tensors are reinterpreted with `blockscaled_layout.tile_atom_to_shape_SF(...)` inside the kernel setup.
+- Q/K scale staging is manual cooperative GMEM->SMEM in v1.
+  - No scale TMA is used in this landing.
+  - MMA copies staged scales from SMEM to TMEM with `copy_scale_smem_to_tmem(...)` before each FP4 QK instruction.
+- `use_2cta_instrs` is forced off for FP4 QK.
 
-### Target (FP4)
-```
-Q[fp4]    → SMEM → tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X → S[fp32 in TMEM] → softmax → P → PV GEMM → O
-K[fp4]    → SMEM ↗
-Q_sc[fp8] → SMEM → tcgen05.cp → TMEM (scale A) ↗
-K_sc[fp8] → SMEM → tcgen05.cp → TMEM (scale B) ↗
-```
+## Tests
+- Root-level smoke script was replaced by pytest coverage in `tests/cute/test_fp4_flash_attn.py`.
+- Coverage includes:
+  - fake-compile checks for `nvfp4` and `mxfp4`
+  - head dims `64` and `128`
+  - causal and noncausal dense forward
+  - compile-cache separation between BF16, `nvfp4`, and `mxfp4`
+  - validation errors for missing scales, wrong dtypes/shapes, and unsupported features
+  - runtime GPU comparisons against a dequantized BF16 reference for dense MHA and GQA
 
-## Files
-
-| File | Status | Purpose |
-|------|--------|---------|
-| `mma_sm100_desc.py` | ✅ Done | Block-scaled idesc |
-| `blackwell_helpers.py` | ✅ Done | FP4 PTX emission + scale copy |
-| `fp4_flash_fwd_sm100.py` | 🔧 Phase 4 done | FP4 forward attention |
-| `fp4_flash_bwd_sm100.py` | 📋 Later | FP4 backward attention |
-
-## Progress
-
-### ✅ Phases 1-4 Complete
-- `FP4FlashAttentionForwardSm100` class with `use_fp4_qk` flag
-- `make_blockscaled_trivial_tiled_mma` → `MmaMXF4NVF4Op` for QK
-- Block-scaled idesc, FP4 GEMM dispatch with TMEM scale addresses
-- Scale factor SMEM/TMEM layouts, SharedStorage fields
-- `copy_scale_smem_to_tmem` PTX helper
-
-### 🔧 Phase 5: Input Interface (Remaining)
-- Accept FP4 Q/K tensors (packed fp4x2) + fp8 scale tensors
-- Add TMA for Q_scale, K_scale (GMEM→SMEM)
-- Pipeline scale loads alongside Q/K data loads
-- Test compilation
+## Next Step
+- Add an explicit FP4 PV path.
+- Expected follow-up API additions:
+  - `use_fp4_pv`
+  - `v_scale`
+- That work will quantize `P` on the fly at the softmax/PV handoff while keeping the current QK FP4 path intact.

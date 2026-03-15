@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
@@ -1199,3 +1199,41 @@ def gemm_ptx_fp4_block_scaled(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def copy_scale_smem_to_tmem(
+    tmem_addr: Int32,
+    smem_desc: int,    # 64-bit TMA/SMEM descriptor for scale factor data
+    cta_group: int = 1,
+) -> None:
+    """
+    Copy scale factors from SMEM to TMEM via tcgen05.cp.
+
+    Emits: tcgen05.cp.cta_group::X.32x128b.warpx4 [tmem_addr], smem_desc;
+
+    This is used to load Q/K scale factors into TMEM before the block-scaled MMA.
+    The .warpx4 broadcast means all 4 warp-groups in the warp see the same data.
+
+    Args:
+        tmem_addr: TMEM destination address for scale factors
+        smem_desc: 64-bit descriptor for SMEM source (layout + address)
+        cta_group: 1 or 2 for CTA group size
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value(),
+            Int64(smem_desc).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"@leader_thread tcgen05.cp.cta_group::{cta_group}.32x128b.warpx4 [$0], $1;\n\t"
+        "}\n",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+

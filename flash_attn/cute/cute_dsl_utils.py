@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import ctypes
 from typing import Tuple
 from functools import partial, lru_cache
 from dataclasses import dataclass, fields
@@ -16,10 +17,48 @@ except ImportError:
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
+from cutlass.base_dsl.runtime.dlpack_types import DLTensor, DLDataType
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack, make_fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
+
+
+class _DLManagedTensor(ctypes.Structure):
+    pass
+
+
+_DLPACK_DELETER = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+_DLManagedTensor._fields_ = [
+    ("dl_tensor", DLTensor),
+    ("manager_ctx", ctypes.c_void_p),
+    ("deleter", _DLPACK_DELETER),
+]
+
+_PYTHONAPI = ctypes.pythonapi
+_PYTHONAPI.PyCapsule_GetPointer.restype = ctypes.c_void_p
+_PYTHONAPI.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+_FP4X2_DLPACK_DTYPE = DLDataType(17, 4, 2)
+
+
+class PackedFP4x2Tensor:
+    """Expose packed uint8 storage to TVM-FFI as float4_e2m1fnx2."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self._capsules = []
+
+    def __dlpack_device__(self):
+        return self.tensor.__dlpack_device__()
+
+    def __dlpack__(self, stream=None):
+        stream_arg = -1 if stream is None else stream
+        capsule = self.tensor.__dlpack__(stream=stream_arg)
+        ptr = _PYTHONAPI.PyCapsule_GetPointer(capsule, b"dltensor")
+        managed = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor))
+        managed.contents.dl_tensor.dtype = _FP4X2_DLPACK_DTYPE
+        self._capsules.append(capsule)
+        return capsule
 
 
 load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
@@ -198,3 +237,7 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     patterns are not interchangeable.
     """
     return tuple(s == 0 for s in tensor.stride())
+
+
+def to_tvm_ffi_fp4x2_tensor(tensor: torch.Tensor) -> PackedFP4x2Tensor:
+    return PackedFP4x2Tensor(tensor)

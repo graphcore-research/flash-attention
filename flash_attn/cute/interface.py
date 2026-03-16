@@ -21,6 +21,7 @@
 
 import os
 import math
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable, Literal
@@ -48,7 +49,8 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_fp4_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+    to_cute_tensor, to_cute_fp4_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
+    get_aux_tensor_metadata, get_broadcast_dims,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
@@ -233,10 +235,18 @@ def _validate_fp4_qk_inputs(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch],
     window_size_left: Optional[int],
     window_size_right: Optional[int],
+    causal: bool,
+    softcap: Optional[float],
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    aux_tensors: Optional[list[torch.Tensor]],
+    learnable_sink: Optional[torch.Tensor],
     num_splits: int,
     arch: int,
 ) -> Tuple[int, int]:
     _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
+    if fp4_qk_format != "nvfp4":
+        raise NotImplementedError("FP4 QK bring-up currently only supports fp4_qk_format='nvfp4'.")
     if arch // 10 not in [10, 11]:
         raise NotImplementedError("FP4 QK forward is only supported on SM100/SM110 in this milestone.")
     if cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None:
@@ -247,12 +257,22 @@ def _validate_fp4_qk_inputs(
         raise NotImplementedError("FP4 QK forward does not support block sparsity in this milestone.")
     if num_splits != 1:
         raise NotImplementedError("FP4 QK forward does not support SplitKV in this milestone.")
+    if causal:
+        raise NotImplementedError("FP4 QK bring-up currently only supports noncausal attention.")
     if window_size_left is not None or window_size_right is not None:
         raise NotImplementedError("FP4 QK forward does not support local/sliding-window attention in this milestone.")
+    if score_mod is not None or mask_mod is not None:
+        raise NotImplementedError("FP4 QK bring-up does not support custom score_mod or mask_mod.")
+    if softcap is not None and softcap != 0.0:
+        raise NotImplementedError("FP4 QK bring-up does not support softcap.")
+    if aux_tensors is not None:
+        raise NotImplementedError("FP4 QK bring-up does not support aux_tensors.")
+    if learnable_sink is not None:
+        raise NotImplementedError("FP4 QK bring-up does not support learnable_sink.")
     if q.dtype != torch.uint8 or k.dtype != torch.uint8:
         raise TypeError("FP4 QK expects packed uint8 Q/K tensors.")
-    if v.dtype not in [torch.float16, torch.bfloat16]:
-        raise TypeError("FP4 QK expects V to be float16 or bfloat16.")
+    if v.dtype != torch.bfloat16:
+        raise NotImplementedError("FP4 QK bring-up currently only supports BF16 V.")
     if q_scale is None or k_scale is None:
         raise ValueError("FP4 QK requires both q_scale and k_scale tensors.")
     if q_scale.dtype != sf_dtype or k_scale.dtype != sf_dtype:
@@ -260,6 +280,8 @@ def _validate_fp4_qk_inputs(
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
     head_dim = q.shape[-1] * 2
+    if head_dim != 64 or v.shape[-1] != 64:
+        raise NotImplementedError("FP4 QK bring-up currently only supports head_dim=head_dim_v=64.")
     if head_dim % sf_vec_size != 0:
         raise ValueError(f"FP4 head_dim={head_dim} must be divisible by scale vec size {sf_vec_size}.")
     expected_q_scale_shape = (*q.shape[:-1], head_dim // sf_vec_size)
@@ -470,11 +492,15 @@ def _flash_attn_fwd(
             block_sparse_tensors=block_sparse_tensors,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            causal=causal,
+            softcap=softcap,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            learnable_sink=learnable_sink,
             num_splits=num_splits,
             arch=arch,
         )
-        if score_mod is not None or mask_mod is not None or (softcap is not None and softcap != 0.0):
-            raise NotImplementedError("FP4 QK forward only supports standard dense causal/noncausal attention in this milestone.")
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
@@ -523,7 +549,9 @@ def _flash_attn_fwd(
         num_threads = 128
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
-    if tile_mn is None:
+    if is_fp4_qk:
+        fwd_cfg = FwdConfig(128, 128, True, True)
+    elif tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
             # D<=64:  128x128 → 48 KB (good occupancy)
@@ -557,7 +585,9 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if arch // 10 == 10:
+    if is_fp4_qk:
+        q_stage = 1
+    elif arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
@@ -700,6 +730,15 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
+        compile_start_time = None
+        if is_fp4_qk and fa_logging.get_fa_log_level() >= 1:
+            compile_start_time = time.perf_counter()
+            fa_logging.fa_log(
+                1,
+                "FP4 compile start "
+                f"(format={fp4_qk_format}, q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+                f"tile=({tile_m},{tile_n}), q_stage={q_stage}, pack_gqa={pack_gqa})",
+            )
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -723,18 +762,24 @@ def _flash_attn_fwd(
             k_tensor = to_cute_fp4_tensor(k)
             q_scale_tensor = to_cute_tensor(q_scale)
             k_scale_tensor = to_cute_tensor(k_scale)
+            if compile_start_time is not None:
+                fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:
             q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
             q_scale_tensor, k_scale_tensor = None, None
         v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (v, out if not is_split_kv else out_partial)
         ]
+        if compile_start_time is not None:
+            fa_logging.fa_log(1, "FP4 V/O tensor conversion done")
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+        if compile_start_time is not None:
+            fa_logging.fa_log(1, "FP4 LSE tensor conversion done")
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -796,6 +841,8 @@ def _flash_attn_fwd(
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,
                 )
+                if compile_start_time is not None:
+                    fa_logging.fa_log(1, "FP4 kernel object construction done")
             else:
                 fa_fwd = FlashAttentionForwardSm100(
                     head_dim,
@@ -849,6 +896,8 @@ def _flash_attn_fwd(
             )
         # TODO: check @can_implement
         if is_fp4_qk:
+            if compile_start_time is not None:
+                fa_logging.fa_log(1, "FP4 cute.compile start")
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
                 q_tensor,
@@ -894,6 +943,8 @@ def _flash_attn_fwd(
                 cute_aux_tensors,
                 options="--enable-tvm-ffi",
             )
+        if compile_start_time is not None:
+            fa_logging.fa_log(1, f"FP4 compile done in {time.perf_counter() - compile_start_time:.3f}s")
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
@@ -901,9 +952,19 @@ def _flash_attn_fwd(
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
         if is_fp4_qk:
+            launch_start_time = None
+            if fa_logging.get_fa_log_level() >= 1:
+                launch_start_time = time.perf_counter()
+                fa_logging.fa_log(
+                    1,
+                    "FP4 runtime launch start "
+                    f"(format={fp4_qk_format}, q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)})",
+                )
+            q_runtime = to_tvm_ffi_fp4x2_tensor(q.detach())
+            k_runtime = to_tvm_ffi_fp4x2_tensor(k.detach())
             _flash_attn_fwd.compile_cache[compile_key](
-                q.detach(),
-                k.detach(),
+                q_runtime,
+                k_runtime,
                 v.detach(),
                 out.detach(),
                 lse,
@@ -922,6 +983,16 @@ def _flash_attn_fwd(
                 q_scale,
                 k_scale,
             )
+            if launch_start_time is not None:
+                fa_logging.fa_log(
+                    1, f"FP4 runtime launch returned in {time.perf_counter() - launch_start_time:.3f}s"
+                )
+                sync_start_time = time.perf_counter()
+                fa_logging.fa_log(1, "FP4 runtime sync start")
+                torch.cuda.synchronize(device)
+                fa_logging.fa_log(
+                    1, f"FP4 runtime sync done in {time.perf_counter() - sync_start_time:.3f}s"
+                )
         else:
             _flash_attn_fwd.compile_cache[compile_key](
                 q.detach(),

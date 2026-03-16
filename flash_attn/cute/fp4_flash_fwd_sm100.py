@@ -219,14 +219,17 @@ class FP4FlashAttentionForwardSm100:
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
 
         # FP4: TMEM offsets for scale factors (placed after S/O regions)
-        # Scale factors are small: ~1 column each for SFA and SFK
         if self.use_fp4_qk:
-            # Each scale factor needs ceil(M / sf_vec_size) columns
-            # For NVFP4 (sf_vec=16): 128/16 = 8 scale values → fits in 1 TMEM col
+            sf_atom_mn = 32
+            mma_inst_tile_k = 4
+            self.tmem_sfa_cols = (self.mma_tiler_qk[0] // sf_atom_mn) * mma_inst_tile_k
+            self.tmem_sfk_cols = (max(self.mma_tiler_qk[1], 128) // sf_atom_mn) * mma_inst_tile_k
             self.tmem_sfa_offset = self.tmem_total
-            self.tmem_sfk_offset = self.tmem_sfa_offset + 1
-            self.tmem_total = self.tmem_sfk_offset + 1
+            self.tmem_sfk_offset = self.tmem_sfa_offset + self.tmem_sfa_cols
+            self.tmem_total = self.tmem_sfk_offset + self.tmem_sfk_cols
         else:
+            self.tmem_sfa_cols = 0
+            self.tmem_sfk_cols = 0
             self.tmem_sfa_offset = 0
             self.tmem_sfk_offset = 0
 
@@ -288,6 +291,10 @@ class FP4FlashAttentionForwardSm100:
             else max(smem_size_k_per_stage, smem_size_v_per_stage)
         ) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
+        if self.use_fp4_qk:
+            # FP4 keeps K and V in separate SMEM buffers and adds scale-factor storage,
+            # so the generic KV-stage heuristic can overcommit static shared memory.
+            kv_stage = min(kv_stage, 8)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -684,8 +691,6 @@ class FP4FlashAttentionForwardSm100:
             # m_barriers for pipelines
             mbar_load_Q: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_load_KV: cute.struct.MemRange[Int64, self.kv_stage * 2]
-            mbar_load_Q_scale: cute.struct.MemRange[Int64, self.q_stage * 2]
-            mbar_load_K_scale: cute.struct.MemRange[Int64, self.kv_stage * 2]
             mbar_S_full_P_full_O_rescaled: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_P_full_lastsplit: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_O_full: cute.struct.MemRange[Int64, self.q_stage * 2]
@@ -892,9 +897,7 @@ class FP4FlashAttentionForwardSm100:
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         mma_warp = ThreadCooperativeGroup(len([self.mma_warp_id]))
-        mma_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE)
         load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
-        scale_load_warp = ThreadCooperativeGroup(cute.arch.WARP_SIZE)
         tma_warp = ThreadCooperativeGroup(1)
         softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
@@ -947,23 +950,6 @@ class FP4FlashAttentionForwardSm100:
                 producer_group=cpasync_producer_group,
                 consumer_group=mma_warp,
                 cta_layout_vmnk=cta_layout_vmnk,
-                defer_sync=True,
-            )
-        pipeline_q_scale = None
-        pipeline_k_scale = None
-        if const_expr(self.use_fp4_qk):
-            pipeline_q_scale = pipeline_custom.PipelineAsync.create(
-                barrier_storage=storage.mbar_load_Q_scale.data_ptr(),
-                num_stages=self.q_stage,
-                producer_group=scale_load_warp,
-                consumer_group=mma_threads,
-                defer_sync=True,
-            )
-            pipeline_k_scale = pipeline_custom.PipelineAsync.create(
-                barrier_storage=storage.mbar_load_K_scale.data_ptr(),
-                num_stages=self.kv_stage,
-                producer_group=scale_load_warp,
-                consumer_group=mma_threads,
                 defer_sync=True,
             )
         # This pipeline is not the typical producer-consumer pipeline. The "producer" mma warp
@@ -1113,7 +1099,6 @@ class FP4FlashAttentionForwardSm100:
 
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
-
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1145,15 +1130,12 @@ class FP4FlashAttentionForwardSm100:
                 tma_atom_V,
                 pipeline_q,
                 pipeline_kv,
-                pipeline_q_scale,
-                pipeline_k_scale,
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
             )
-
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1163,6 +1145,19 @@ class FP4FlashAttentionForwardSm100:
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            if const_expr(self.use_fp4_qk):
+                assert tSFA_layout is not None and tSFK_layout is not None
+                tCtSFA = cute.make_tensor(
+                    cute.recast_ptr(tmem_ptr + self.tmem_sfa_offset, dtype=self.fp4_sf_dtype),
+                    tSFA_layout,
+                )
+                tCtSFK = cute.make_tensor(
+                    cute.recast_ptr(tmem_ptr + self.tmem_sfk_offset, dtype=self.fp4_sf_dtype),
+                    tSFK_layout,
+                )
+            else:
+                tCtSFA = None
+                tCtSFK = None
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -1174,10 +1169,10 @@ class FP4FlashAttentionForwardSm100:
                 tStS,
                 tOtO,
                 tOrP,
+                tCtSFA,
+                tCtSFK,
                 pipeline_q,
                 pipeline_kv,
-                pipeline_q_scale,
-                pipeline_k_scale,
                 pipeline_s_p_o,
                 pipeline_p_lastsplit,
                 pipeline_o_acc,
@@ -1192,7 +1187,6 @@ class FP4FlashAttentionForwardSm100:
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
-
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1317,8 +1311,6 @@ class FP4FlashAttentionForwardSm100:
         tma_atom_V: Optional[cute.CopyAtom],
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
-        pipeline_q_scale: Optional[pipeline.PipelineAsync],
-        pipeline_k_scale: Optional[pipeline.PipelineAsync],
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
@@ -1332,15 +1324,6 @@ class FP4FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
-        q_scale_producer_state = None
-        k_scale_producer_state = None
-        if const_expr(self.use_fp4_qk):
-            q_scale_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.q_stage
-            )
-            k_scale_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.kv_stage
-            )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1355,7 +1338,6 @@ class FP4FlashAttentionForwardSm100:
             if const_expr(self.use_fp4_qk):
                 assert mQ_scale is not None and mK_scale is not None
                 assert sSFA is not None and sSFK is not None
-                assert pipeline_q_scale is not None and pipeline_k_scale is not None
                 # FP4 QK is dense-only in v1, so the grouped (head, batch) scale mode
                 # can be indexed directly without the varlen batch offset helpers.
                 mQ_scale_cur = mQ_scale[None, None, (head_idx, batch_idx)]
@@ -1475,15 +1457,10 @@ class FP4FlashAttentionForwardSm100:
                         paged_kv_manager.load_page_table(n_block_first)
                     load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     if const_expr(self.use_fp4_qk) and warp_idx == self.load_warp_ids[0]:
-                        pipeline_k_scale.producer_acquire_w_index_phase(
-                            k_scale_producer_state.index, k_scale_producer_state.phase
-                        )
                         self.load_scale_stage(
                             gK_scale[None, None, n_block_max - 1],
-                            sSFK[None, None, None, k_scale_producer_state.index],
+                            sSFK[None, None, None, kv_producer_state.index],
                         )
-                        pipeline_k_scale.producer_commit_w_index(k_scale_producer_state.index)
-                        k_scale_producer_state.advance()
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
                         # load_Q(block=0, stage=0)  # Q0
@@ -1493,15 +1470,10 @@ class FP4FlashAttentionForwardSm100:
                         # tma_bar_ptr = pipeline_kv.producer_get_barrier(kv_producer_state)
                         load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
                         if const_expr(self.use_fp4_qk):
-                            pipeline_q_scale.producer_acquire_w_index_phase(
-                                q_scale_producer_state.index, q_scale_producer_state.phase
-                            )
                             self.load_scale_stage(
                                 gQ_scale[None, None, 0],
-                                sSFA[None, None, None, q_scale_producer_state.index],
+                                sSFA[None, None, None, 0],
                             )
-                            pipeline_q_scale.producer_commit_w_index(q_scale_producer_state.index)
-                            q_scale_producer_state.advance()
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
                         # load_Q(block=1, stage=1)  # Q1
@@ -1509,15 +1481,10 @@ class FP4FlashAttentionForwardSm100:
                         tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
                         load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
                         if const_expr(self.use_fp4_qk):
-                            pipeline_q_scale.producer_acquire_w_index_phase(
-                                q_scale_producer_state.index, q_scale_producer_state.phase
-                            )
                             self.load_scale_stage(
                                 gQ_scale[None, None, 1],
-                                sSFA[None, None, None, q_scale_producer_state.index],
+                                sSFA[None, None, None, 1],
                             )
-                            pipeline_q_scale.producer_commit_w_index(q_scale_producer_state.index)
-                            q_scale_producer_state.advance()
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     kv_producer_state.advance()
@@ -1533,15 +1500,10 @@ class FP4FlashAttentionForwardSm100:
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                         if const_expr(self.use_fp4_qk) and warp_idx == self.load_warp_ids[0]:
-                            pipeline_k_scale.producer_acquire_w_index_phase(
-                                k_scale_producer_state.index, k_scale_producer_state.phase
-                            )
                             self.load_scale_stage(
                                 gK_scale[None, None, n_block],
-                                sSFK[None, None, None, k_scale_producer_state.index],
+                                sSFK[None, None, None, kv_producer_state.index],
                             )
-                            pipeline_k_scale.producer_commit_w_index(k_scale_producer_state.index)
-                            k_scale_producer_state.advance()
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                         kv_producer_state.advance()
@@ -1569,9 +1531,6 @@ class FP4FlashAttentionForwardSm100:
             # End of persistent scheduler loop
 
         pipeline_kv.producer_tail(kv_producer_state)
-        if const_expr(self.use_fp4_qk) and warp_idx == self.load_warp_ids[0]:
-            pipeline_q_scale.producer_tail(q_scale_producer_state)
-            pipeline_k_scale.producer_tail(k_scale_producer_state)
         # This is equivalent to pipeline_q.producer_tail
         if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
@@ -1589,10 +1548,10 @@ class FP4FlashAttentionForwardSm100:
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
         tOrP: cute.Tensor,
+        tCtSFA: Optional[cute.Tensor],
+        tCtSFK: Optional[cute.Tensor],
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
-        pipeline_q_scale: Optional[pipeline.PipelineAsync],
-        pipeline_k_scale: Optional[pipeline.PipelineAsync],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
@@ -1606,6 +1565,26 @@ class FP4FlashAttentionForwardSm100:
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
+        if const_expr(self.use_fp4_qk):
+            assert sSFA is not None and sSFK is not None
+            assert tCtSFA is not None and tCtSFK is not None
+            (
+                tiled_copy_s2t_sfa,
+                tCsSFA_compact_s2t,
+                tCtSFA_compact_s2t,
+            ) = self.scale_s2t_copy_and_partition(sSFA, tCtSFA)
+            (
+                tiled_copy_s2t_sfk,
+                tCsSFK_compact_s2t,
+                tCtSFK_compact_s2t,
+            ) = self.scale_s2t_copy_and_partition(sSFK, tCtSFK)
+        else:
+            tiled_copy_s2t_sfa = None
+            tCsSFA_compact_s2t = None
+            tCtSFA_compact_s2t = None
+            tiled_copy_s2t_sfk = None
+            tCsSFK_compact_s2t = None
+            tCtSFK_compact_s2t = None
         if const_expr(self.q_stage == 2):
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
         else:
@@ -1620,15 +1599,7 @@ class FP4FlashAttentionForwardSm100:
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
-        if const_expr(self.use_fp4_qk):
-            assert sSFA is not None and sSFK is not None
-            q_scale_smem_base = sm100_desc.smem_desc_base_from_tensor(sSFA, sm100_desc.Major.K)
-            k_scale_smem_base = sm100_desc.smem_desc_base_from_tensor(sSFK, sm100_desc.Major.K)
-        else:
-            q_scale_smem_base = None
-            k_scale_smem_base = None
         q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
-
         sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
         if const_expr(self.use_fp4_qk):
             sm100_utils.declare_ptx_idesc_block_scaled(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
@@ -1704,16 +1675,9 @@ class FP4FlashAttentionForwardSm100:
         # ]
 
         mma_q_consumer_phase = Int32(0)
-        mma_q_scale_consumer_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
-        mma_k_scale_consumer_state = None
-        if const_expr(self.use_fp4_qk):
-            assert pipeline_q_scale is not None and pipeline_k_scale is not None
-            mma_k_scale_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.kv_stage
-            )
         P_full_O_rescaled_phase = Int32(0)
 
         tile_scheduler = TileSchedulerCls()
@@ -1748,15 +1712,9 @@ class FP4FlashAttentionForwardSm100:
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
                     pipeline_q.consumer_wait_w_index_phase(stage, mma_q_consumer_phase)
-                    if const_expr(self.use_fp4_qk):
-                        pipeline_q_scale.consumer_wait_w_index_phase(stage, mma_q_scale_consumer_phase)
                     # 2. wait for K0
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                        if const_expr(self.use_fp4_qk):
-                            pipeline_k_scale.consumer_wait_w_index_phase(
-                                mma_k_scale_consumer_state.index, mma_k_scale_consumer_state.phase
-                            )
                     Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tSrKi = tSrK[None, None, None, Ki_index]
                     # We don't need to acquire empty S0 / S1.
@@ -1769,20 +1727,15 @@ class FP4FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     if const_expr(self.use_fp4_qk):
-                        sm100_utils.copy_scale_smem_to_tmem(
-                            Int32(self.tmem_sfa_offset),
-                            self.make_scale_smem_desc(
-                                sSFA[None, None, None, stage], q_scale_smem_base
-                            ),
-                            cta_group=self.cta_group_size,
+                        cute.copy(
+                            tiled_copy_s2t_sfa,
+                            tCsSFA_compact_s2t[(None, None, None, None, stage)],
+                            tCtSFA_compact_s2t,
                         )
-                        sm100_utils.copy_scale_smem_to_tmem(
-                            Int32(self.tmem_sfk_offset),
-                            self.make_scale_smem_desc(
-                                sSFK[None, None, None, mma_k_scale_consumer_state.index],
-                                k_scale_smem_base,
-                            ),
-                            cta_group=self.cta_group_size,
+                        cute.copy(
+                            tiled_copy_s2t_sfk,
+                            tCsSFK_compact_s2t[(None, None, None, None, Ki_index)],
+                            tCtSFK_compact_s2t,
                         )
                     # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
                     gemm_Si[stage](
@@ -1792,12 +1745,8 @@ class FP4FlashAttentionForwardSm100:
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
-                mma_q_scale_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
-                if const_expr(self.use_fp4_qk):
-                    pipeline_k_scale.consumer_release_w_index(mma_k_scale_consumer_state.index)
-                    mma_k_scale_consumer_state.advance()
                 mma_kv_consumer_state.advance()
                 # End of GEMM (Q1 * K0 -> S1)
                 # Note: Q0 & Q1 are still needed in the seqlen_kv loop
@@ -1849,10 +1798,6 @@ class FP4FlashAttentionForwardSm100:
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
-                            if const_expr(self.use_fp4_qk):
-                                pipeline_k_scale.consumer_wait_w_index_phase(
-                                    mma_k_scale_consumer_state.index, mma_k_scale_consumer_state.phase
-                                )
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         # 2. gemm
                         # Don't need to wait for the softmax warp to have finished reading the previous
@@ -1863,20 +1808,15 @@ class FP4FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if const_expr(self.use_fp4_qk):
-                            sm100_utils.copy_scale_smem_to_tmem(
-                                Int32(self.tmem_sfa_offset),
-                                self.make_scale_smem_desc(
-                                    sSFA[None, None, None, stage], q_scale_smem_base
-                                ),
-                                cta_group=self.cta_group_size,
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t[(None, None, None, None, stage)],
+                                tCtSFA_compact_s2t,
                             )
-                            sm100_utils.copy_scale_smem_to_tmem(
-                                Int32(self.tmem_sfk_offset),
-                                self.make_scale_smem_desc(
-                                    sSFK[None, None, None, mma_k_scale_consumer_state.index],
-                                    k_scale_smem_base,
-                                ),
-                                cta_group=self.cta_group_size,
+                            cute.copy(
+                                tiled_copy_s2t_sfk,
+                                tCsSFK_compact_s2t[(None, None, None, None, Ki_index)],
+                                tCtSFK_compact_s2t,
                             )
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
                         gemm_Si[stage](
@@ -1888,9 +1828,6 @@ class FP4FlashAttentionForwardSm100:
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
-                    if const_expr(self.use_fp4_qk):
-                        pipeline_k_scale.consumer_release_w_index(mma_k_scale_consumer_state.index)
-                        mma_k_scale_consumer_state.advance()
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
                     O_should_accumulate = True
@@ -1899,8 +1836,6 @@ class FP4FlashAttentionForwardSm100:
                 # release Q0 & Q1
                 for stage in cutlass.range(self.q_stage):
                     pipeline_q.consumer_release_w_index(stage)
-                    if const_expr(self.use_fp4_qk):
-                        pipeline_q_scale.consumer_release_w_index(stage)
 
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
@@ -1949,9 +1884,11 @@ class FP4FlashAttentionForwardSm100:
 
     @cute.jit
     def load_scale_stage(self, gScale: cute.Tensor, sScale: cute.Tensor):
+        gScale = cute.filter_zeros(gScale)
+        sScale = cute.filter_zeros(sScale)
+        gScale = cute.group_modes(gScale, 0, cute.rank(gScale))
+        sScale = cute.group_modes(sScale, 0, cute.rank(sScale))
         with cute.arch.elect_one():
-            # The FP4 scale tiles have different source/destination rank structure,
-            # so use a basic elementwise copy instead of autovec_copy's vectorized path.
             cute.basic_copy(gScale, sScale)
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
@@ -1960,10 +1897,26 @@ class FP4FlashAttentionForwardSm100:
         )
 
     @cute.jit
-    def make_scale_smem_desc(self, sScale: cute.Tensor, smem_desc_base: int) -> Int64:
-        smem_desc_base_lo, smem_desc_hi = sm100_utils.i64_to_i32x2(smem_desc_base)
-        smem_desc_lo = Int32(smem_desc_base_lo | sm100_desc.make_smem_desc_start_addr(sScale.iterator))
-        return (Int64(smem_desc_hi) << 32) | Int64(smem_desc_lo)
+    def scale_s2t_copy_and_partition(
+        self,
+        sSF: cute.Tensor,
+        tSF: cute.Tensor,
+    ):
+        tCsSF_compact = cute.filter_zeros(sSF)
+        tCtSF_compact = cute.filter_zeros(tSF)
+        cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(cta_group),
+            self.fp4_sf_dtype,
+        )
+        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
+        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
+        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
+            tiled_copy_s2t, tCsSF_compact_s2t_
+        )
+        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
+        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
     # for both softmax0 and softmax1 warp group
     @cute.jit

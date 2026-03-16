@@ -555,6 +555,7 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    pack_gqa_explicit = pack_gqa is True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
@@ -593,6 +594,23 @@ def _flash_attn_fwd(
     if arch // 10 == 12:
         num_threads = 128
 
+    fp4_q3_pack_shape = (
+        is_fp4_qk
+        and arch // 10 in [10, 11]
+        and qhead_per_kvhead == 3
+        and head_dim == 128
+        and head_dim_v == 128
+        and not causal
+        and not local
+        and num_splits == 1
+        and page_size in [None, 128]
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+    )
+
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if is_fp4_qk:
         fwd_cfg = FwdConfig(128, 128, True, True)
@@ -623,7 +641,8 @@ def _flash_attn_fwd(
 
     if arch // 10 in [10, 11]:
         if pack_gqa and (128 % qhead_per_kvhead != 0):
-            pack_gqa = False
+            if not is_fp4_qk or not (fp4_q3_pack_shape and pack_gqa_explicit):
+                pack_gqa = False
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -645,6 +664,11 @@ def _flash_attn_fwd(
             and cu_seqlens_q is None
             and seqused_q is None
             and not use_block_sparsity
+        )
+        fp4_gqa_pack_shape = (
+            fp4_speed_shape
+            and pack_gqa
+            and qhead_per_kvhead == 3
         )
         fp4_use_2cta_instrs = (
             fp4_speed_shape

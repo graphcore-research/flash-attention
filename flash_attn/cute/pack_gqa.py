@@ -36,6 +36,29 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
     return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
 
 
+def pack_gqa_layout_seqmajor(T, qhead_per_kvhead, nheads_kv, head_idx):
+    """Pack GQA with the sequence submode first inside the folded row mode.
+
+    This keeps the flattened packed row order as `(seqlen_idx, qhead_idx)`, which
+    is friendlier to TMA tiling when the head grouping factor does not divide the
+    Blackwell FP4 MMA M tile.
+    """
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (T.shape[0], qhead_per_kvhead),
+        *[T.shape[i] for i in range(1, head_idx)],
+        nheads_kv,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_packed = (
+        (T.stride[0], head_stride),
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
 def unpack_gqa_layout(T, qhead_per_kvhead, head_idx):
     """Reverse of pack_gqa_layout: unfold qhead_per_kvhead from the seqlen dimension (mode 0).
 
@@ -72,11 +95,13 @@ class PackGQA:
         head_dim_padded: cutlass.Constexpr[int],
         check_hdim_oob: cutlass.Constexpr[bool],
         qhead_per_kvhead: cutlass.Constexpr[bool],
+        seqmajor_layout: cutlass.Constexpr[bool] = False,
     ):
         self.m_block_size = m_block_size
         self.head_dim_padded = head_dim_padded
         self.check_hdim_oob = check_hdim_oob
         self.qhead_per_kvhead = qhead_per_kvhead
+        self.seqmajor_layout = seqmajor_layout
 
     @cute.jit
     def compute_ptr(
@@ -95,7 +120,8 @@ class PackGQA:
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
+            packed_idx = ((m_idx, h_idx),) if cutlass.const_expr(self.seqmajor_layout) else ((h_idx, m_idx),)
+            tPrPtr[i] = utils.elem_pointer(tensor, packed_idx).toint()
         return tPrPtr
 
     @cute.jit

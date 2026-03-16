@@ -52,7 +52,7 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, pack_gqa_layout_seqmajor
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
@@ -143,11 +143,8 @@ class FP4FlashAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
+        self.pack_gqa_seqmajor = self.pack_gqa and self.mma_tiler_qk[0] % self.qhead_per_kvhead != 0
         self.q_subtile_factor = q_subtile_factor
-        if pack_gqa:
-            assert m_block_size % self.qhead_per_kvhead == 0, (
-                "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
-            )
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
@@ -394,18 +391,6 @@ class FP4FlashAttentionForwardSm100:
         # FP4: transpose K scale tensor
         if const_expr(self.use_fp4_qk and mK_scale is not None):
             mK_scale = cute.make_tensor(mK_scale.iterator, cute.select(mK_scale.layout, mode=KV_layout_transpose))
-            mQ_scale = cute.make_tensor(
-                mQ_scale.iterator,
-                bs_layout.tile_atom_to_shape_SF(
-                    cute.group_modes(mQ.shape, 2, 4), self.fp4_sf_vec_size
-                ),
-            )
-            mK_scale = cute.make_tensor(
-                mK_scale.iterator,
-                bs_layout.tile_atom_to_shape_SF(
-                    cute.group_modes(mK.shape, 2, 4), self.fp4_sf_vec_size
-                ),
-            )
         if const_expr(self.is_split_kv):
             O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
             LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
@@ -424,6 +409,34 @@ class FP4FlashAttentionForwardSm100:
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            pack_gqa_layout_fn = (
+                pack_gqa_layout_seqmajor if const_expr(self.pack_gqa_seqmajor) else pack_gqa_layout
+            )
+            mQ = pack_gqa_layout_fn(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(self.use_fp4_qk and mQ_scale is not None):
+                mQ_scale = pack_gqa_layout_fn(
+                    mQ_scale, self.qhead_per_kvhead, nheads_kv, head_idx=2
+                )
+            mO = pack_gqa_layout_fn(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(mLSE is not None):
+                mLSE = pack_gqa_layout_fn(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+
+        if const_expr(self.use_fp4_qk and mK_scale is not None):
+            mQ_scale = cute.make_tensor(
+                mQ_scale.iterator,
+                bs_layout.tile_atom_to_shape_SF(
+                    cute.group_modes(mQ.shape, 2, 4), self.fp4_sf_vec_size
+                ),
+            )
+            mK_scale = cute.make_tensor(
+                mK_scale.iterator,
+                bs_layout.tile_atom_to_shape_SF(
+                    cute.group_modes(mK.shape, 2, 4), self.fp4_sf_vec_size
+                ),
+            )
+
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch Q vs K: {self.q_dtype} != {self.k_dtype}")
@@ -433,7 +446,12 @@ class FP4FlashAttentionForwardSm100:
                 raise TypeError(f"Type mismatch Q vs V: {self.q_dtype} != {self.v_dtype}")
         # For FP4 QK: Q/K are FP4 (fp4x2 packed), V stays BF16/FP16
         self._setup_attributes()
-        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = (
+            self.arch >= Arch.sm_90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and not self.pack_gqa_seqmajor
+        )
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
@@ -562,13 +580,6 @@ class FP4FlashAttentionForwardSm100:
                     stride=(*sV_layout.outer.stride[:-1], stage_stride),
                 ),
             )
-
-        if const_expr(self.pack_gqa):
-            nheads_kv = mK.shape[2]
-            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
-            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
-            if const_expr(mLSE is not None):
-                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
@@ -1098,7 +1109,11 @@ class FP4FlashAttentionForwardSm100:
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
+            seqlen_q_static=(
+                mQ.shape[0]
+                if const_expr(not self.pack_gqa)
+                else (mQ.shape[0][0] if const_expr(self.pack_gqa_seqmajor) else mQ.shape[0][1])
+            ),
             seqlen_k_static=mK.shape[0]
             if const_expr(mPageTable is None)
             else mK.shape[0] * mPageTable.shape[1],
@@ -2674,9 +2689,13 @@ class FP4FlashAttentionForwardSm100:
                     else:
                         mLSE_cur = mLSE[None, head_idx, batch_idx]
                 else:
-                    offset = (
-                        seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                    )
+                    offset = seqlen.offset_q
+                    if const_expr(self.pack_gqa):
+                        offset = (
+                            (seqlen.offset_q, 0)
+                            if const_expr(self.pack_gqa_seqmajor)
+                            else (0, seqlen.offset_q)
+                        )
                     if const_expr(self.is_split_kv):
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx, split_idx])
                     else:
@@ -2875,6 +2894,7 @@ class FP4FlashAttentionForwardSm100:
             self.head_dim_v_padded,
             self.check_hdim_v_oob,
             self.qhead_per_kvhead,
+            seqmajor_layout=self.pack_gqa_seqmajor,
         )
 
         # load acc O from smem to rmem for wider vectorization

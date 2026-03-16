@@ -236,6 +236,74 @@ class HSAHybridBackwardBatch:
 
 
 @dataclass
+class HSAMonolithicBackwardSchedule:
+    """Kernel-facing packed backward descriptors grouped by key block."""
+
+    k_block_size: int
+    anchor_row_panel_size: int
+    blocks_per_batch: int
+    sentence_full_kblock_row_ptr: torch.Tensor
+    sentence_full_q_start: torch.Tensor
+    sentence_full_q_len: torch.Tensor
+    sentence_full_k_local_start: torch.Tensor
+    sentence_full_k_len: torch.Tensor
+    sentence_tail_kblock_row_ptr: torch.Tensor
+    sentence_tail_q_start: torch.Tensor
+    sentence_tail_q_len: torch.Tensor
+    sentence_tail_k_local_start: torch.Tensor
+    sentence_tail_k_len: torch.Tensor
+    sentence_tail_row0_prefix_len: torch.Tensor
+    anchor_full_kblock_row_ptr: torch.Tensor
+    anchor_full_q_row_start: torch.Tensor
+    anchor_full_q_row_count: torch.Tensor
+    anchor_full_k_local_start: torch.Tensor
+    anchor_full_k_len: torch.Tensor
+    anchor_tail_kblock_row_ptr: torch.Tensor
+    anchor_tail_q_row_start: torch.Tensor
+    anchor_tail_q_row_count: torch.Tensor
+    anchor_tail_k_local_start: torch.Tensor
+    anchor_tail_k_len: torch.Tensor
+    anchor_tail_prefix_row_start: torch.Tensor
+    anchor_q_indices: torch.Tensor
+    anchor_prefix_len: torch.Tensor
+
+    def to(self, device: torch.device | str):
+        return HSAMonolithicBackwardSchedule(
+            k_block_size=self.k_block_size,
+            anchor_row_panel_size=self.anchor_row_panel_size,
+            blocks_per_batch=self.blocks_per_batch,
+            sentence_full_kblock_row_ptr=self.sentence_full_kblock_row_ptr.to(device=device),
+            sentence_full_q_start=self.sentence_full_q_start.to(device=device),
+            sentence_full_q_len=self.sentence_full_q_len.to(device=device),
+            sentence_full_k_local_start=self.sentence_full_k_local_start.to(device=device),
+            sentence_full_k_len=self.sentence_full_k_len.to(device=device),
+            sentence_tail_kblock_row_ptr=self.sentence_tail_kblock_row_ptr.to(device=device),
+            sentence_tail_q_start=self.sentence_tail_q_start.to(device=device),
+            sentence_tail_q_len=self.sentence_tail_q_len.to(device=device),
+            sentence_tail_k_local_start=self.sentence_tail_k_local_start.to(device=device),
+            sentence_tail_k_len=self.sentence_tail_k_len.to(device=device),
+            sentence_tail_row0_prefix_len=self.sentence_tail_row0_prefix_len.to(device=device),
+            anchor_full_kblock_row_ptr=self.anchor_full_kblock_row_ptr.to(device=device),
+            anchor_full_q_row_start=self.anchor_full_q_row_start.to(device=device),
+            anchor_full_q_row_count=self.anchor_full_q_row_count.to(device=device),
+            anchor_full_k_local_start=self.anchor_full_k_local_start.to(device=device),
+            anchor_full_k_len=self.anchor_full_k_len.to(device=device),
+            anchor_tail_kblock_row_ptr=self.anchor_tail_kblock_row_ptr.to(device=device),
+            anchor_tail_q_row_start=self.anchor_tail_q_row_start.to(device=device),
+            anchor_tail_q_row_count=self.anchor_tail_q_row_count.to(device=device),
+            anchor_tail_k_local_start=self.anchor_tail_k_local_start.to(device=device),
+            anchor_tail_k_len=self.anchor_tail_k_len.to(device=device),
+            anchor_tail_prefix_row_start=self.anchor_tail_prefix_row_start.to(device=device),
+            anchor_q_indices=self.anchor_q_indices.to(device=device),
+            anchor_prefix_len=self.anchor_prefix_len.to(device=device),
+        )
+
+    @property
+    def num_k_blocks(self) -> int:
+        return self.sentence_full_kblock_row_ptr.shape[0] - 1
+
+
+@dataclass
 class HSAFusedForwardSchedule:
     """Packed query-block descriptors for the internal HSA fused-forward path."""
 
@@ -1781,6 +1849,280 @@ def hybrid_backward_to_attend_mask(
                     attend[batch_idx, query_pos, key_rows[:prefix].long()] = True
 
     return attend
+
+
+def _build_hsa_monolithic_backward_schedule(
+    hybrid_schedule: HSAHybridBackwardSchedule,
+    *,
+    seqlen: int,
+    device: torch.device | str,
+) -> HSAMonolithicBackwardSchedule:
+    k_block_size = hybrid_schedule.k_block_size
+    num_k_blocks = hybrid_schedule.num_k_blocks
+
+    sentence_full_kblock_row_ptr = [0]
+    sentence_full_q_start: list[int] = []
+    sentence_full_q_len: list[int] = []
+    sentence_full_k_local_start: list[int] = []
+    sentence_full_k_len: list[int] = []
+
+    sentence_tail_kblock_row_ptr = [0]
+    sentence_tail_q_start: list[int] = []
+    sentence_tail_q_len: list[int] = []
+    sentence_tail_k_local_start: list[int] = []
+    sentence_tail_k_len: list[int] = []
+    sentence_tail_row0_prefix_len: list[int] = []
+
+    anchor_full_kblock_row_ptr = [0]
+    anchor_full_q_row_start: list[int] = []
+    anchor_full_q_row_count: list[int] = []
+    anchor_full_k_local_start: list[int] = []
+    anchor_full_k_len: list[int] = []
+
+    anchor_tail_kblock_row_ptr = [0]
+    anchor_tail_q_row_start: list[int] = []
+    anchor_tail_q_row_count: list[int] = []
+    anchor_tail_k_local_start: list[int] = []
+    anchor_tail_k_len: list[int] = []
+    anchor_tail_prefix_row_start: list[int] = []
+    anchor_prefix_len: list[int] = []
+
+    for global_k_block in range(num_k_blocks):
+        batch_idx = global_k_block // hybrid_schedule.blocks_per_batch
+        k_block = global_k_block % hybrid_schedule.blocks_per_batch
+        block_flat_start = batch_idx * seqlen + k_block * k_block_size
+        sent_desc_start = int(hybrid_schedule.sentence_kblock_row_ptr[global_k_block].item())
+        sent_desc_end = int(hybrid_schedule.sentence_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_desc_start, sent_desc_end):
+            q_start = int(hybrid_schedule.sentence_q_start[desc_idx].item())
+            q_len = int(hybrid_schedule.sentence_q_len[desc_idx].item())
+            k_start = int(hybrid_schedule.sentence_k_start[desc_idx].item())
+            k_len = int(hybrid_schedule.sentence_k_len[desc_idx].item())
+            if q_len <= 0 or k_len <= 0:
+                continue
+            k_local_start = k_start % k_block_size
+            row0_prefix_len = max(0, min(k_len, q_start - k_start + 1))
+            tail_rows = min(q_len, max(0, k_len - row0_prefix_len))
+            if tail_rows > 0:
+                sentence_tail_q_start.append(q_start)
+                sentence_tail_q_len.append(tail_rows)
+                sentence_tail_k_local_start.append(k_local_start)
+                sentence_tail_k_len.append(k_len)
+                sentence_tail_row0_prefix_len.append(row0_prefix_len)
+            if q_len > tail_rows:
+                sentence_full_q_start.append(q_start + tail_rows)
+                sentence_full_q_len.append(q_len - tail_rows)
+                sentence_full_k_local_start.append(k_local_start)
+                sentence_full_k_len.append(k_len)
+        sentence_full_kblock_row_ptr.append(len(sentence_full_q_start))
+        sentence_tail_kblock_row_ptr.append(len(sentence_tail_q_start))
+
+        anchor_desc_start = int(hybrid_schedule.anchor_kblock_row_ptr[global_k_block].item())
+        anchor_desc_end = int(hybrid_schedule.anchor_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_desc_start, anchor_desc_end):
+            q_row_start = int(hybrid_schedule.anchor_q_row_ptr[desc_idx].item())
+            q_row_end = int(hybrid_schedule.anchor_q_row_ptr[desc_idx + 1].item())
+            q_row_count = q_row_end - q_row_start
+            if q_row_count <= 0:
+                continue
+            k_row_start = int(hybrid_schedule.anchor_k_row_ptr[desc_idx].item())
+            k_row_end = int(hybrid_schedule.anchor_k_row_ptr[desc_idx + 1].item())
+            key_rows = hybrid_schedule.anchor_k_indices[k_row_start:k_row_end].detach().cpu().tolist()
+            if not key_rows:
+                continue
+            local_key_rows = [flat_row - block_flat_start for flat_row in key_rows]
+            if any(local_row < 0 or local_row >= k_block_size for local_row in local_key_rows):
+                raise ValueError("Anchor key rows must stay within the owning key block")
+            if any(curr <= prev for prev, curr in zip(local_key_rows, local_key_rows[1:])):
+                raise ValueError("Anchor key rows must remain strictly increasing within a key block")
+
+            prefix_row_start = int(hybrid_schedule.anchor_prefix_row_ptr[desc_idx].item())
+            prefix_row_end = int(hybrid_schedule.anchor_prefix_row_ptr[desc_idx + 1].item())
+            prefix_rows = hybrid_schedule.anchor_prefix_len[prefix_row_start:prefix_row_end].detach().cpu().tolist()
+            if len(prefix_rows) != q_row_count:
+                raise ValueError("Anchor prefix metadata must align with anchor query rows")
+            if any(curr < prev for prev, curr in zip(prefix_rows, prefix_rows[1:])):
+                raise ValueError("Anchor prefix rows must be nondecreasing within a packed descriptor")
+
+            run_start = 0
+            while run_start < len(local_key_rows):
+                run_end = run_start + 1
+                while run_end < len(local_key_rows) and local_key_rows[run_end] == local_key_rows[run_end - 1] + 1:
+                    run_end += 1
+
+                k_local_start = local_key_rows[run_start]
+                k_len = run_end - run_start
+                local_prefix_rows = [min(max(prefix - run_start, 0), k_len) for prefix in prefix_rows]
+
+                positive_start = 0
+                while positive_start < q_row_count and local_prefix_rows[positive_start] == 0:
+                    positive_start += 1
+                if positive_start < q_row_count:
+                    full_start = positive_start
+                    while full_start < q_row_count and local_prefix_rows[full_start] < k_len:
+                        full_start += 1
+                    if any(prefix != k_len for prefix in local_prefix_rows[full_start:]):
+                        raise ValueError("Anchor local prefix rows must end in a full-visibility suffix")
+
+                    tail_prefix_rows = local_prefix_rows[positive_start:full_start]
+                    if tail_prefix_rows:
+                        anchor_tail_q_row_start.append(q_row_start + positive_start)
+                        anchor_tail_q_row_count.append(len(tail_prefix_rows))
+                        anchor_tail_k_local_start.append(k_local_start)
+                        anchor_tail_k_len.append(k_len)
+                        anchor_tail_prefix_row_start.append(len(anchor_prefix_len))
+                        anchor_prefix_len.extend(tail_prefix_rows)
+
+                    full_count = q_row_count - full_start
+                    if full_count > 0:
+                        anchor_full_q_row_start.append(q_row_start + full_start)
+                        anchor_full_q_row_count.append(full_count)
+                        anchor_full_k_local_start.append(k_local_start)
+                        anchor_full_k_len.append(k_len)
+
+                run_start = run_end
+        anchor_full_kblock_row_ptr.append(len(anchor_full_q_row_start))
+        anchor_tail_kblock_row_ptr.append(len(anchor_tail_q_row_start))
+
+    def _tensor(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int32, device=device) if values else _empty_int32(device)
+
+    return HSAMonolithicBackwardSchedule(
+        k_block_size=k_block_size,
+        anchor_row_panel_size=hybrid_schedule.anchor_row_panel_size,
+        blocks_per_batch=hybrid_schedule.blocks_per_batch,
+        sentence_full_kblock_row_ptr=torch.tensor(sentence_full_kblock_row_ptr, dtype=torch.int32, device=device),
+        sentence_full_q_start=_tensor(sentence_full_q_start),
+        sentence_full_q_len=_tensor(sentence_full_q_len),
+        sentence_full_k_local_start=_tensor(sentence_full_k_local_start),
+        sentence_full_k_len=_tensor(sentence_full_k_len),
+        sentence_tail_kblock_row_ptr=torch.tensor(sentence_tail_kblock_row_ptr, dtype=torch.int32, device=device),
+        sentence_tail_q_start=_tensor(sentence_tail_q_start),
+        sentence_tail_q_len=_tensor(sentence_tail_q_len),
+        sentence_tail_k_local_start=_tensor(sentence_tail_k_local_start),
+        sentence_tail_k_len=_tensor(sentence_tail_k_len),
+        sentence_tail_row0_prefix_len=_tensor(sentence_tail_row0_prefix_len),
+        anchor_full_kblock_row_ptr=torch.tensor(anchor_full_kblock_row_ptr, dtype=torch.int32, device=device),
+        anchor_full_q_row_start=_tensor(anchor_full_q_row_start),
+        anchor_full_q_row_count=_tensor(anchor_full_q_row_count),
+        anchor_full_k_local_start=_tensor(anchor_full_k_local_start),
+        anchor_full_k_len=_tensor(anchor_full_k_len),
+        anchor_tail_kblock_row_ptr=torch.tensor(anchor_tail_kblock_row_ptr, dtype=torch.int32, device=device),
+        anchor_tail_q_row_start=_tensor(anchor_tail_q_row_start),
+        anchor_tail_q_row_count=_tensor(anchor_tail_q_row_count),
+        anchor_tail_k_local_start=_tensor(anchor_tail_k_local_start),
+        anchor_tail_k_len=_tensor(anchor_tail_k_len),
+        anchor_tail_prefix_row_start=_tensor(anchor_tail_prefix_row_start),
+        anchor_q_indices=hybrid_schedule.anchor_q_indices.clone(),
+        anchor_prefix_len=_tensor(anchor_prefix_len),
+    )
+
+
+def monolithic_backward_to_attend_mask(
+    schedule: HSASchedule,
+    monolithic_schedule: HSAMonolithicBackwardSchedule,
+) -> torch.Tensor:
+    attend = torch.zeros(
+        schedule.batch_size,
+        schedule.seqlen,
+        schedule.seqlen,
+        dtype=torch.bool,
+        device=schedule.sentence_start.device,
+    )
+    seqlen = schedule.seqlen
+    k_block_size = monolithic_schedule.k_block_size
+
+    for global_k_block in range(monolithic_schedule.num_k_blocks):
+        batch_idx = global_k_block // monolithic_schedule.blocks_per_batch
+        block_k_start = (global_k_block % monolithic_schedule.blocks_per_batch) * k_block_size
+
+        sent_full_start = int(monolithic_schedule.sentence_full_kblock_row_ptr[global_k_block].item())
+        sent_full_end = int(monolithic_schedule.sentence_full_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_full_start, sent_full_end):
+            q_start = int(monolithic_schedule.sentence_full_q_start[desc_idx].item())
+            q_len = int(monolithic_schedule.sentence_full_q_len[desc_idx].item())
+            k_local_start = int(monolithic_schedule.sentence_full_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.sentence_full_k_len[desc_idx].item())
+            key_slice = slice(block_k_start + k_local_start, block_k_start + k_local_start + k_len)
+            attend[batch_idx, q_start : q_start + q_len, key_slice] = True
+
+        sent_tail_start = int(monolithic_schedule.sentence_tail_kblock_row_ptr[global_k_block].item())
+        sent_tail_end = int(monolithic_schedule.sentence_tail_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_tail_start, sent_tail_end):
+            q_start = int(monolithic_schedule.sentence_tail_q_start[desc_idx].item())
+            q_len = int(monolithic_schedule.sentence_tail_q_len[desc_idx].item())
+            k_local_start = int(monolithic_schedule.sentence_tail_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.sentence_tail_k_len[desc_idx].item())
+            row0_prefix_len = int(monolithic_schedule.sentence_tail_row0_prefix_len[desc_idx].item())
+            for q_offset in range(q_len):
+                prefix = min(k_len, row0_prefix_len + q_offset)
+                if prefix > 0:
+                    attend[
+                        batch_idx,
+                        q_start + q_offset,
+                        block_k_start + k_local_start : block_k_start + k_local_start + prefix,
+                    ] = True
+
+        anchor_full_start = int(monolithic_schedule.anchor_full_kblock_row_ptr[global_k_block].item())
+        anchor_full_end = int(monolithic_schedule.anchor_full_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_full_start, anchor_full_end):
+            q_row_start = int(monolithic_schedule.anchor_full_q_row_start[desc_idx].item())
+            q_row_count = int(monolithic_schedule.anchor_full_q_row_count[desc_idx].item())
+            k_local_start = int(monolithic_schedule.anchor_full_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.anchor_full_k_len[desc_idx].item())
+            query_rows = monolithic_schedule.anchor_q_indices[q_row_start : q_row_start + q_row_count].long() % seqlen
+            attend[
+                batch_idx,
+                query_rows,
+                block_k_start + k_local_start : block_k_start + k_local_start + k_len,
+            ] = True
+
+        anchor_tail_start = int(monolithic_schedule.anchor_tail_kblock_row_ptr[global_k_block].item())
+        anchor_tail_end = int(monolithic_schedule.anchor_tail_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_tail_start, anchor_tail_end):
+            q_row_start = int(monolithic_schedule.anchor_tail_q_row_start[desc_idx].item())
+            q_row_count = int(monolithic_schedule.anchor_tail_q_row_count[desc_idx].item())
+            k_local_start = int(monolithic_schedule.anchor_tail_k_local_start[desc_idx].item())
+            prefix_row_start = int(monolithic_schedule.anchor_tail_prefix_row_start[desc_idx].item())
+            query_rows = monolithic_schedule.anchor_q_indices[q_row_start : q_row_start + q_row_count].long() % seqlen
+            prefix_rows = monolithic_schedule.anchor_prefix_len[prefix_row_start : prefix_row_start + q_row_count].long()
+            for query_pos, prefix in zip(query_rows.tolist(), prefix_rows.tolist()):
+                if prefix > 0:
+                    attend[
+                        batch_idx,
+                        query_pos,
+                        block_k_start + k_local_start : block_k_start + k_local_start + prefix,
+                    ] = True
+
+    return attend
+
+
+def _get_hsa_monolithic_backward_schedule(
+    schedule: HSASchedule,
+    *,
+    k_block_size: int = 128,
+    anchor_row_panel_size: int = 64,
+) -> HSAMonolithicBackwardSchedule:
+    cache = getattr(schedule, "_hsa_monolithic_backward_cache", None)
+    cache_key = (str(schedule.sentence_start.device), k_block_size, anchor_row_panel_size)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    hybrid_schedule = _get_hsa_hybrid_backward_schedule(
+        schedule,
+        k_block_size=k_block_size,
+        anchor_row_panel_size=anchor_row_panel_size,
+    )
+    monolithic_schedule = _build_hsa_monolithic_backward_schedule(
+        hybrid_schedule,
+        seqlen=schedule.seqlen,
+        device=schedule.sentence_start.device,
+    )
+    if cache is None:
+        cache = {}
+        setattr(schedule, "_hsa_monolithic_backward_cache", cache)
+    cache[cache_key] = monolithic_schedule
+    return monolithic_schedule
 
 
 def _build_hsa_fused_forward_schedule(
@@ -3475,6 +3817,24 @@ def _run_hsa_blocksparse_backward(
     keep_ids: Optional[torch.Tensor] = None,
     hash_ids: Optional[torch.Tensor] = None,
 ):
+    if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
+        del keep_ids, hash_ids
+        from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_monolithic
+
+        try:
+            return run_hsa_bwd_sm100_monolithic(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                schedule,
+                softmax_scale,
+                deterministic,
+            )
+        except NotImplementedError:
+            pass
     if (
         os.environ.get("FLASH_ATTN_HSA_USE_PACKED_BWD", "0") == "1"
         or os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1"

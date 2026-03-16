@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.flash_hsa_fwd_sm100 import _materialize_runtime_state
 
 
@@ -28,6 +30,216 @@ def _is_supported_packed_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) 
     if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
         return False
     return True
+
+
+class FlashHSABackwardSm100:
+    """Scaffold for the future monolithic HSA backward kernel on SM100/SM110."""
+
+    arch = 100
+
+    def __init__(
+        self,
+        head_dim: int,
+        head_dim_v: int,
+        *,
+        qhead_per_kvhead: int,
+        k_block_size: int,
+        anchor_row_panel_size: int,
+        deterministic: bool,
+    ):
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.k_block_size = k_block_size
+        self.anchor_row_panel_size = anchor_row_panel_size
+        self.deterministic = deterministic
+
+
+@dataclass
+class HSAMonolithicBackwardLaunchPlan:
+    arch: int
+    dtype: torch.dtype
+    head_dim: int
+    head_dim_v: int
+    num_q_heads: int
+    num_kv_heads: int
+    qhead_per_kvhead: int
+    tile_m: int
+    tile_n: int
+    k_block_size: int
+    anchor_row_panel_size: int
+    deterministic: bool
+    dkv_postprocess: bool
+    num_k_blocks: int
+    num_sentence_full_desc: int
+    num_sentence_tail_desc: int
+    num_anchor_full_desc: int
+    num_anchor_tail_desc: int
+    total_anchor_q_rows: int
+    total_anchor_tail_prefix_rows: int
+    dq_accum_shape: tuple[int, ...]
+    dpsum_shape: tuple[int, ...]
+    lse_log2_shape: tuple[int, ...]
+    dk_accum_shape: Optional[tuple[int, ...]] = None
+    dv_accum_shape: Optional[tuple[int, ...]] = None
+    dQ_semaphore_shape: Optional[tuple[int, ...]] = None
+    dK_semaphore_shape: Optional[tuple[int, ...]] = None
+    dV_semaphore_shape: Optional[tuple[int, ...]] = None
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _build_hsa_bwd_monolithic_launch_plan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    monolithic_schedule,
+    deterministic: bool,
+) -> HSAMonolithicBackwardLaunchPlan:
+    batch_size, seqlen_q, num_q_heads, head_dim = q.shape
+    seqlen_k, num_kv_heads, head_dim_v = k.shape[1], k.shape[2], v.shape[3]
+    qhead_per_kvhead = num_q_heads // num_kv_heads
+    tile_m = 128
+    tile_n = monolithic_schedule.k_block_size
+    seqlen_q_rounded = _round_up(seqlen_q, tile_m)
+    seqlen_k_rounded = _round_up(seqlen_k, tile_n)
+    head_dim_rounded = _round_up(head_dim, 32)
+    head_dim_v_rounded = _round_up(head_dim_v, 32)
+    dkv_postprocess = qhead_per_kvhead > 1
+
+    dQ_semaphore_shape = None
+    dK_semaphore_shape = None
+    dV_semaphore_shape = None
+    if deterministic:
+        dQ_semaphore_shape = (batch_size, num_q_heads, seqlen_q_rounded // tile_m, 1)
+        if dkv_postprocess:
+            dK_semaphore_shape = (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2)
+            dV_semaphore_shape = (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2)
+
+    arch = torch.cuda.get_device_capability(q.device)[0] * 10 if q.is_cuda else 0
+    return HSAMonolithicBackwardLaunchPlan(
+        arch=arch,
+        dtype=q.dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        qhead_per_kvhead=qhead_per_kvhead,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        k_block_size=monolithic_schedule.k_block_size,
+        anchor_row_panel_size=monolithic_schedule.anchor_row_panel_size,
+        deterministic=deterministic,
+        dkv_postprocess=dkv_postprocess,
+        num_k_blocks=monolithic_schedule.num_k_blocks,
+        num_sentence_full_desc=int(monolithic_schedule.sentence_full_q_start.numel()),
+        num_sentence_tail_desc=int(monolithic_schedule.sentence_tail_q_start.numel()),
+        num_anchor_full_desc=int(monolithic_schedule.anchor_full_q_row_start.numel()),
+        num_anchor_tail_desc=int(monolithic_schedule.anchor_tail_q_row_start.numel()),
+        total_anchor_q_rows=int(monolithic_schedule.anchor_q_indices.numel()),
+        total_anchor_tail_prefix_rows=int(monolithic_schedule.anchor_prefix_len.numel()),
+        dq_accum_shape=(batch_size, num_q_heads, seqlen_q_rounded * head_dim_rounded),
+        dpsum_shape=(batch_size, num_q_heads, seqlen_q_rounded),
+        lse_log2_shape=(batch_size, num_q_heads, seqlen_q_rounded),
+        dk_accum_shape=(
+            (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_rounded) if dkv_postprocess else None
+        ),
+        dv_accum_shape=(
+            (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_v_rounded) if dkv_postprocess else None
+        ),
+        dQ_semaphore_shape=dQ_semaphore_shape,
+        dK_semaphore_shape=dK_semaphore_shape,
+        dV_semaphore_shape=dV_semaphore_shape,
+    )
+
+
+def _allocate_hsa_bwd_monolithic_workspaces(
+    plan: HSAMonolithicBackwardLaunchPlan,
+    *,
+    device: torch.device | str,
+) -> dict[str, Optional[torch.Tensor]]:
+    workspaces: dict[str, Optional[torch.Tensor]] = {
+        "dq_accum": torch.empty(plan.dq_accum_shape, dtype=torch.float32, device=device),
+        "dpsum": torch.empty(plan.dpsum_shape, dtype=torch.float32, device=device),
+        "lse_log2": torch.empty(plan.lse_log2_shape, dtype=torch.float32, device=device),
+        "dk_accum": None,
+        "dv_accum": None,
+        "dQ_semaphore": None,
+        "dK_semaphore": None,
+        "dV_semaphore": None,
+    }
+    if plan.dk_accum_shape is not None:
+        workspaces["dk_accum"] = torch.zeros(plan.dk_accum_shape, dtype=torch.float32, device=device)
+    if plan.dv_accum_shape is not None:
+        workspaces["dv_accum"] = torch.zeros(plan.dv_accum_shape, dtype=torch.float32, device=device)
+    if plan.dQ_semaphore_shape is not None:
+        workspaces["dQ_semaphore"] = torch.zeros(plan.dQ_semaphore_shape, dtype=torch.int32, device=device)
+    if plan.dK_semaphore_shape is not None:
+        workspaces["dK_semaphore"] = torch.zeros(plan.dK_semaphore_shape, dtype=torch.int32, device=device)
+    if plan.dV_semaphore_shape is not None:
+        workspaces["dV_semaphore"] = torch.zeros(plan.dV_semaphore_shape, dtype=torch.int32, device=device)
+    return workspaces
+
+
+def _build_hsa_bwd_monolithic_compile_key(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    monolithic_schedule,
+    deterministic: bool,
+):
+    num_q_heads = q.shape[2]
+    num_kv_heads = k.shape[2]
+    qhead_per_kvhead = num_q_heads // num_kv_heads
+    return (
+        q.dtype,
+        q.shape[-1],
+        v.shape[-1],
+        qhead_per_kvhead,
+        monolithic_schedule.k_block_size,
+        monolithic_schedule.anchor_row_panel_size,
+        deterministic,
+        torch.cuda.get_device_capability(q.device),
+        num_q_heads == num_kv_heads,
+    )
+
+
+def run_hsa_bwd_sm100_monolithic(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    softmax_scale: float,
+    deterministic: bool,
+):
+    del out, dout, lse, softmax_scale
+    if not _is_supported_packed_bwd(q, k, v):
+        raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
+
+    hsa_mod = _load_hsa_module()
+    monolithic_schedule = hsa_mod._get_hsa_monolithic_backward_schedule(schedule)
+    launch_plan = _build_hsa_bwd_monolithic_launch_plan(q, k, v, monolithic_schedule, deterministic)
+    compile_key = _build_hsa_bwd_monolithic_compile_key(q, k, v, monolithic_schedule, deterministic)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = FlashHSABackwardSm100(
+            q.shape[-1],
+            v.shape[-1],
+            qhead_per_kvhead=q.shape[2] // k.shape[2],
+            k_block_size=monolithic_schedule.k_block_size,
+            anchor_row_panel_size=monolithic_schedule.anchor_row_panel_size,
+            deterministic=deterministic,
+        )
+    run_hsa_bwd_sm100_monolithic.launch_plan_cache[compile_key] = launch_plan
+    raise NotImplementedError("Monolithic HSA backward kernel scaffold only; kernel body is not implemented yet")
+
+
+run_hsa_bwd_sm100_monolithic.compile_cache = get_jit_cache("hsa_bwd_monolithic")
+run_hsa_bwd_sm100_monolithic.launch_plan_cache = {}
 
 
 def _gather_batch_tensors(
@@ -122,6 +334,7 @@ def run_hsa_bwd_sm100_packed(
     softmax_scale: float,
     deterministic: bool,
 ):
+    """Prototype/reference packed backward path using gathered CuTe panel calls."""
     if not _is_supported_packed_bwd(q, k, v):
         raise NotImplementedError("Packed HSA backward requires CUDA SM100+/fp16 or bf16 fixed-length tensors")
 

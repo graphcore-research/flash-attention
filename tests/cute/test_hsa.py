@@ -384,6 +384,7 @@ def test_hsa_sparse_fused_forward_matches_reference(monkeypatch):
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     import flash_attn.cute.hsa as hsa_module
+    import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -416,6 +417,11 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
         hsa_module,
         "_run_hsa_backward_panel_batched",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "run_hsa_bwd_sm100_monolithic",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic backward scaffold used")),
     )
 
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)

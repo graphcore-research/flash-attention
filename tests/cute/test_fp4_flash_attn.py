@@ -415,6 +415,8 @@ def _run_fp4_runtime_case(
     *,
     head_dim: int,
     causal: bool,
+    seqlen_q: int = 128,
+    seqlen_k: int = 128,
     timeout_s: int = 180,
 ) -> None:
     script = textwrap.dedent(
@@ -444,8 +446,8 @@ def _run_fp4_runtime_case(
 
         torch.manual_seed(0)
         batch_size = 2
-        seqlen_q = 128
-        seqlen_k = 128
+        seqlen_q = {seqlen_q}
+        seqlen_k = {seqlen_k}
         head_dim = {head_dim}
         head_dim_v = {head_dim}
         # Keep the synthetic FP4 test inputs in a realistic pre-quantized range so the
@@ -531,12 +533,12 @@ def _run_fp4_runtime_case(
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
             "FP4 runtime case timed out after "
-            f"{timeout_s}s for ({num_heads}q,{num_heads_kv}kv,d={head_dim},causal={causal})."
+            f"{timeout_s}s for ({num_heads}q,{num_heads_kv}kv,d={head_dim},s_q={seqlen_q},s_k={seqlen_k},causal={causal})."
         )
     if result.returncode != 0:
         pytest.fail(
             "FP4 runtime subprocess failed for "
-            f"({num_heads}q,{num_heads_kv}kv,d={head_dim},causal={causal}).\n"
+            f"({num_heads}q,{num_heads_kv}kv,d={head_dim},s_q={seqlen_q},s_k={seqlen_k},causal={causal}).\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
@@ -557,3 +559,8 @@ def _run_fp4_runtime_case(
 def test_fp4_qk_runtime_matches_bf16_reference(num_heads, num_heads_kv, head_dim, causal):
     _require_sm100()
     _run_fp4_runtime_case(num_heads, num_heads_kv, head_dim=head_dim, causal=causal)
+
+
+def test_fp4_qk_runtime_matches_bf16_reference_long_seqlen_d128_noncausal_mha():
+    _require_sm100()
+    _run_fp4_runtime_case(4, 4, head_dim=128, causal=False, seqlen_q=512, seqlen_k=512)

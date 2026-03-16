@@ -1915,8 +1915,19 @@ class FP4FlashAttentionForwardSm100:
         sScale = cute.filter_zeros(sScale)
         gScale = cute.group_modes(gScale, 0, cute.rank(gScale))
         sScale = cute.group_modes(sScale, 0, cute.rank(sScale))
-        with cute.arch.elect_one():
-            cute.basic_copy(gScale, sScale)
+        # Dense NVFP4 bring-up only needs d64/d128 scales, so each stage is a
+        # multiple of 32 threads * 16 fp8 elements. Use the whole load warp
+        # instead of serializing the copy through a single elected thread.
+        tiled_copy_scale = copy_utils.tiled_copy_1d(
+            self.fp4_sf_dtype,
+            cute.arch.WARP_SIZE,
+            num_copy_elems=1,
+            is_async=False,
+        )
+        thr_copy_scale = tiled_copy_scale.get_slice(cute.arch.lane_idx())
+        tAgScale = thr_copy_scale.partition_S(gScale)
+        tAsScale = thr_copy_scale.partition_D(sScale)
+        cute.copy(tiled_copy_scale, tAgScale, tAsScale)
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,

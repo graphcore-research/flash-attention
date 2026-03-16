@@ -4,6 +4,7 @@ import torch
 
 try:
     from flash_attn.cute import (
+        hybrid_backward_to_attend_mask,
         backward_packed_masks_to_attend_mask,
         backward_descriptors_to_attend_mask,
         build_hsa_schedule,
@@ -26,6 +27,7 @@ except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     flash_attn_hsa_func = None
     flash_attn_hsa_sparse_func = None
     forward_descriptors_to_attend_mask = None
+    hybrid_backward_to_attend_mask = None
     get_hsa_mask_mod = None
     hsa_reference_attention = None
     schedule_to_attend_mask = None
@@ -260,6 +262,24 @@ def test_hsa_backward_packed_masks_reconstruct_dense_mask():
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_hybrid_backward_schedule_reconstructs_dense_mask():
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=193, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    hybrid_schedule = hsa_module._build_hsa_hybrid_backward_schedule(
+        schedule,
+        k_block_size=128,
+        anchor_row_panel_size=64,
+    )
+    dense_mask = hybrid_backward_to_attend_mask(schedule, hybrid_schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_sparse_forward_matches_reference():
     device = "cuda"
     dtype = torch.bfloat16
@@ -316,6 +336,7 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     schedule.document_prefix_stream = _empty_stream_like(schedule.document_prefix_stream)
     schedule.section_self_indices = torch.empty(0, dtype=torch.int32, device=device)
     schedule.document_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", "1")
 
     monkeypatch.setattr(
         hsa_module,
@@ -326,6 +347,11 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
         hsa_module,
         "_run_varlen_fa4_bwd",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy backward helper used")),
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_packed_mask_backward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
     )
 
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)
@@ -350,6 +376,54 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     assert q.grad is not None
     assert k.grad is not None
     assert v.grad is not None
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_hybrid_backward_matches_reference(monkeypatch):
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", "1")
+
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    q_sparse = q_data.clone().requires_grad_(True)
+    k_sparse = k_data.clone().requires_grad_(True)
+    v_sparse = v_data.clone().requires_grad_(True)
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(
+            q_sparse,
+            k_sparse,
+            v_sparse,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+            hsa_schedule=schedule,
+        )
+    )
+    loss_sparse = out_sparse.float().square().mean()
+    loss_sparse.backward()
+
+    q_ref = q_data.clone().float().requires_grad_(True)
+    k_ref = k_data.clone().float().requires_grad_(True)
+    v_ref = v_data.clone().float().requires_grad_(True)
+    out_ref = hsa_reference_attention(
+        q_ref.to(dtype=dtype),
+        k_ref.to(dtype=dtype),
+        v_ref.to(dtype=dtype),
+        keep_ids,
+        hash_ids,
+    ).float()
+    loss_ref = out_ref.square().mean()
+    loss_ref.backward()
+
+    _assert_close(out_sparse.float(), out_ref, "hsa_hybrid_backward_output")
+    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_hybrid_q_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_hybrid_k_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_hybrid_v_grad", atol=6e-2, rtol=6e-2)
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")

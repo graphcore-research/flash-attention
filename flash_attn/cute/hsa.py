@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
@@ -161,6 +162,70 @@ class HSABwdPackedMasks:
             q_block_size=self.q_block_size,
             k_block_size=self.k_block_size,
             words_per_row=self.words_per_row,
+        )
+
+
+@dataclass
+class HSAHybridBackwardSchedule:
+    """Packed KV-local gather/scatter metadata for the HSA hybrid backward path."""
+
+    k_block_size: int
+    anchor_row_panel_size: int
+    blocks_per_batch: int
+    sentence_kblock_row_ptr: torch.Tensor
+    sentence_segment_id: torch.Tensor
+    sentence_k_offset_start: torch.Tensor
+    sentence_k_offset_end: torch.Tensor
+    anchor_kblock_row_ptr: torch.Tensor
+    anchor_kind: torch.Tensor
+    anchor_segment_id: torch.Tensor
+    anchor_k_offset_start: torch.Tensor
+    anchor_k_offset_end: torch.Tensor
+    anchor_q_row_ptr: torch.Tensor
+    anchor_q_indices: torch.Tensor
+    anchor_prefix_len: torch.Tensor
+
+    def to(self, device: torch.device | str):
+        return HSAHybridBackwardSchedule(
+            k_block_size=self.k_block_size,
+            anchor_row_panel_size=self.anchor_row_panel_size,
+            blocks_per_batch=self.blocks_per_batch,
+            sentence_kblock_row_ptr=self.sentence_kblock_row_ptr.to(device=device),
+            sentence_segment_id=self.sentence_segment_id.to(device=device),
+            sentence_k_offset_start=self.sentence_k_offset_start.to(device=device),
+            sentence_k_offset_end=self.sentence_k_offset_end.to(device=device),
+            anchor_kblock_row_ptr=self.anchor_kblock_row_ptr.to(device=device),
+            anchor_kind=self.anchor_kind.to(device=device),
+            anchor_segment_id=self.anchor_segment_id.to(device=device),
+            anchor_k_offset_start=self.anchor_k_offset_start.to(device=device),
+            anchor_k_offset_end=self.anchor_k_offset_end.to(device=device),
+            anchor_q_row_ptr=self.anchor_q_row_ptr.to(device=device),
+            anchor_q_indices=self.anchor_q_indices.to(device=device),
+            anchor_prefix_len=self.anchor_prefix_len.to(device=device),
+        )
+
+    @property
+    def num_k_blocks(self) -> int:
+        return self.sentence_kblock_row_ptr.shape[0] - 1
+
+
+@dataclass
+class HSAHybridBackwardBatch:
+    """Stacked gather/scatter batch for one exact HSA backward panel shape."""
+
+    q_indices: torch.Tensor
+    k_indices: torch.Tensor
+    q_length: torch.Tensor
+    k_length: torch.Tensor
+    prefix_len: Optional[torch.Tensor]
+
+    def to(self, device: torch.device | str):
+        return HSAHybridBackwardBatch(
+            q_indices=self.q_indices.to(device=device),
+            k_indices=self.k_indices.to(device=device),
+            q_length=self.q_length.to(device=device),
+            k_length=self.k_length.to(device=device),
+            prefix_len=None if self.prefix_len is None else self.prefix_len.to(device=device),
         )
 
 
@@ -1337,6 +1402,233 @@ def backward_packed_masks_to_attend_mask(
     return attend
 
 
+def _build_hsa_hybrid_backward_schedule(
+    schedule: HSASchedule,
+    *,
+    k_block_size: int = 128,
+    anchor_row_panel_size: int = 64,
+) -> HSAHybridBackwardSchedule:
+    bsz, seqlen = schedule.batch_size, schedule.seqlen
+    blocks_per_batch = (seqlen + k_block_size - 1) // k_block_size
+    total_k_blocks = bsz * blocks_per_batch
+    device = schedule.sentence_start.device
+
+    sentence_segment_ptr = schedule.sentence_segment_ptr.detach().cpu().tolist()
+    sentence_segment_pos = schedule.sentence_segment_pos.detach().cpu().tolist()
+    section_segment_ptr = schedule.section_segment_ptr.detach().cpu().tolist()
+    section_segment_pos = schedule.section_segment_pos.detach().cpu().tolist()
+    section_self_allowed = schedule.section_self_allowed.detach().cpu().tolist()
+    document_segment_ptr = schedule.document_segment_ptr.detach().cpu().tolist()
+    document_segment_pos = schedule.document_segment_pos.detach().cpu().tolist()
+    document_self_allowed = schedule.document_self_allowed.detach().cpu().tolist()
+
+    sentence_buckets: list[list[tuple[int, int, int]]] = [[] for _ in range(total_k_blocks)]
+    anchor_buckets: list[list[tuple[int, int, int, int, list[int], list[int]]]] = [[] for _ in range(total_k_blocks)]
+
+    def append_sentence_descriptors(segment_ptr: list[int], segment_pos: list[int]):
+        num_segments = len(segment_ptr) - 1
+        for segment_id in range(num_segments):
+            seg_start = segment_ptr[segment_id]
+            seg_end = segment_ptr[segment_id + 1]
+            if seg_end <= seg_start:
+                continue
+            offset_start = 0
+            while offset_start < (seg_end - seg_start):
+                flat_row = segment_pos[seg_start + offset_start]
+                batch_idx, token_idx = divmod(flat_row, seqlen)
+                k_block = token_idx // k_block_size
+                offset_end = offset_start + 1
+                while offset_end < (seg_end - seg_start):
+                    next_row = segment_pos[seg_start + offset_end]
+                    next_batch_idx, next_token_idx = divmod(next_row, seqlen)
+                    if next_batch_idx != batch_idx or next_token_idx // k_block_size != k_block:
+                        break
+                    offset_end += 1
+                global_k_block = batch_idx * blocks_per_batch + k_block
+                sentence_buckets[global_k_block].append((segment_id, offset_start, offset_end))
+                offset_start = offset_end
+
+    def append_anchor_descriptors(
+        kind: int,
+        segment_ptr: list[int],
+        segment_pos: list[int],
+        self_allowed: list[bool],
+    ):
+        num_segments = len(segment_ptr) - 1
+        for segment_id in range(num_segments):
+            seg_start = segment_ptr[segment_id]
+            seg_end = segment_ptr[segment_id + 1]
+            seg_len = seg_end - seg_start
+            if seg_len <= 0:
+                continue
+            offset_start = 0
+            while offset_start < seg_len:
+                flat_key = segment_pos[seg_start + offset_start]
+                batch_idx, token_idx = divmod(flat_key, seqlen)
+                k_block = token_idx // k_block_size
+                offset_end = offset_start + 1
+                while offset_end < seg_len:
+                    next_key = segment_pos[seg_start + offset_end]
+                    next_batch_idx, next_token_idx = divmod(next_key, seqlen)
+                    if next_batch_idx != batch_idx or next_token_idx // k_block_size != k_block:
+                        break
+                    offset_end += 1
+
+                q_rows: list[int] = []
+                prefix_len: list[int] = []
+                chunk_len = offset_end - offset_start
+                for q_offset in range(seg_len):
+                    flat_query = segment_pos[seg_start + q_offset]
+                    allow_self = 1 if self_allowed[flat_query] else 0
+                    local_prefix = min(chunk_len, max(0, q_offset + allow_self - offset_start))
+                    if local_prefix <= 0:
+                        continue
+                    q_rows.append(flat_query)
+                    prefix_len.append(local_prefix)
+
+                if q_rows:
+                    global_k_block = batch_idx * blocks_per_batch + k_block
+                    for panel_start in range(0, len(q_rows), anchor_row_panel_size):
+                        panel_end = min(len(q_rows), panel_start + anchor_row_panel_size)
+                        anchor_buckets[global_k_block].append(
+                            (
+                                kind,
+                                segment_id,
+                                offset_start,
+                                offset_end,
+                                q_rows[panel_start:panel_end],
+                                prefix_len[panel_start:panel_end],
+                            )
+                        )
+
+                offset_start = offset_end
+
+    append_sentence_descriptors(sentence_segment_ptr, sentence_segment_pos)
+    append_anchor_descriptors(_DESC_SECTION, section_segment_ptr, section_segment_pos, section_self_allowed)
+    append_anchor_descriptors(_DESC_DOCUMENT, document_segment_ptr, document_segment_pos, document_self_allowed)
+
+    sentence_kblock_row_ptr = [0]
+    sentence_segment_id: list[int] = []
+    sentence_k_offset_start: list[int] = []
+    sentence_k_offset_end: list[int] = []
+    anchor_kblock_row_ptr = [0]
+    anchor_kind: list[int] = []
+    anchor_segment_id: list[int] = []
+    anchor_k_offset_start: list[int] = []
+    anchor_k_offset_end: list[int] = []
+    anchor_q_row_ptr = [0]
+    anchor_q_indices: list[int] = []
+    anchor_prefix_len: list[int] = []
+
+    for k_block_id in range(total_k_blocks):
+        sentence_descs = sorted(sentence_buckets[k_block_id], key=lambda desc: (desc[1], desc[2], desc[0]))
+        for segment_id, offset_start, offset_end in sentence_descs:
+            sentence_segment_id.append(segment_id)
+            sentence_k_offset_start.append(offset_start)
+            sentence_k_offset_end.append(offset_end)
+        sentence_kblock_row_ptr.append(len(sentence_segment_id))
+
+        anchor_descs = sorted(anchor_buckets[k_block_id], key=lambda desc: (desc[0], desc[2], desc[3], desc[1]))
+        for kind, segment_id, offset_start, offset_end, q_rows, prefix_len in anchor_descs:
+            anchor_kind.append(kind)
+            anchor_segment_id.append(segment_id)
+            anchor_k_offset_start.append(offset_start)
+            anchor_k_offset_end.append(offset_end)
+            anchor_q_indices.extend(q_rows)
+            anchor_prefix_len.extend(prefix_len)
+            anchor_q_row_ptr.append(len(anchor_q_indices))
+        anchor_kblock_row_ptr.append(len(anchor_kind))
+
+    return HSAHybridBackwardSchedule(
+        k_block_size=k_block_size,
+        anchor_row_panel_size=anchor_row_panel_size,
+        blocks_per_batch=blocks_per_batch,
+        sentence_kblock_row_ptr=torch.tensor(sentence_kblock_row_ptr, dtype=torch.int32, device=device),
+        sentence_segment_id=torch.tensor(sentence_segment_id, dtype=torch.int32, device=device)
+        if sentence_segment_id
+        else _empty_int32(device),
+        sentence_k_offset_start=torch.tensor(sentence_k_offset_start, dtype=torch.int32, device=device)
+        if sentence_k_offset_start
+        else _empty_int32(device),
+        sentence_k_offset_end=torch.tensor(sentence_k_offset_end, dtype=torch.int32, device=device)
+        if sentence_k_offset_end
+        else _empty_int32(device),
+        anchor_kblock_row_ptr=torch.tensor(anchor_kblock_row_ptr, dtype=torch.int32, device=device),
+        anchor_kind=torch.tensor(anchor_kind, dtype=torch.int32, device=device) if anchor_kind else _empty_int32(device),
+        anchor_segment_id=torch.tensor(anchor_segment_id, dtype=torch.int32, device=device)
+        if anchor_segment_id
+        else _empty_int32(device),
+        anchor_k_offset_start=torch.tensor(anchor_k_offset_start, dtype=torch.int32, device=device)
+        if anchor_k_offset_start
+        else _empty_int32(device),
+        anchor_k_offset_end=torch.tensor(anchor_k_offset_end, dtype=torch.int32, device=device)
+        if anchor_k_offset_end
+        else _empty_int32(device),
+        anchor_q_row_ptr=torch.tensor(anchor_q_row_ptr, dtype=torch.int32, device=device),
+        anchor_q_indices=torch.tensor(anchor_q_indices, dtype=torch.int32, device=device)
+        if anchor_q_indices
+        else _empty_int32(device),
+        anchor_prefix_len=torch.tensor(anchor_prefix_len, dtype=torch.int32, device=device)
+        if anchor_prefix_len
+        else _empty_int32(device),
+    )
+
+
+def hybrid_backward_to_attend_mask(
+    schedule: HSASchedule,
+    hybrid_schedule: HSAHybridBackwardSchedule,
+) -> torch.Tensor:
+    attend = torch.zeros(
+        schedule.batch_size,
+        schedule.seqlen,
+        schedule.seqlen,
+        dtype=torch.bool,
+        device=schedule.sentence_start.device,
+    )
+    seqlen = schedule.seqlen
+
+    for global_k_block in range(hybrid_schedule.num_k_blocks):
+        batch_idx = global_k_block // hybrid_schedule.blocks_per_batch
+
+        sent_desc_start = int(hybrid_schedule.sentence_kblock_row_ptr[global_k_block].item())
+        sent_desc_end = int(hybrid_schedule.sentence_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_desc_start, sent_desc_end):
+            segment_id = int(hybrid_schedule.sentence_segment_id[desc_idx].item())
+            offset_start = int(hybrid_schedule.sentence_k_offset_start[desc_idx].item())
+            offset_end = int(hybrid_schedule.sentence_k_offset_end[desc_idx].item())
+            seg_ptr_start = int(schedule.sentence_segment_ptr[segment_id].item())
+            seg_ptr_end = int(schedule.sentence_segment_ptr[segment_id + 1].item())
+            segment_rows = schedule.sentence_segment_pos[seg_ptr_start:seg_ptr_end].long() % seqlen
+            for key_offset in range(offset_start, offset_end):
+                key_pos = int(segment_rows[key_offset].item())
+                attend[batch_idx, segment_rows[key_offset:].long(), key_pos] = True
+
+        anchor_desc_start = int(hybrid_schedule.anchor_kblock_row_ptr[global_k_block].item())
+        anchor_desc_end = int(hybrid_schedule.anchor_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_desc_start, anchor_desc_end):
+            kind = int(hybrid_schedule.anchor_kind[desc_idx].item())
+            if kind == _DESC_SECTION:
+                seg_ptr = schedule.section_segment_ptr
+                seg_pos = schedule.section_segment_pos
+            else:
+                seg_ptr = schedule.document_segment_ptr
+                seg_pos = schedule.document_segment_pos
+            segment_id = int(hybrid_schedule.anchor_segment_id[desc_idx].item())
+            offset_start = int(hybrid_schedule.anchor_k_offset_start[desc_idx].item())
+            offset_end = int(hybrid_schedule.anchor_k_offset_end[desc_idx].item())
+            seg_ptr_start = int(seg_ptr[segment_id].item())
+            key_rows = seg_pos[seg_ptr_start + offset_start : seg_ptr_start + offset_end].long() % seqlen
+            q_row_start = int(hybrid_schedule.anchor_q_row_ptr[desc_idx].item())
+            q_row_end = int(hybrid_schedule.anchor_q_row_ptr[desc_idx + 1].item())
+            query_rows = hybrid_schedule.anchor_q_indices[q_row_start:q_row_end].long() % seqlen
+            prefix_len = hybrid_schedule.anchor_prefix_len[q_row_start:q_row_end].long()
+            for query_pos, prefix in zip(query_rows.tolist(), prefix_len.tolist()):
+                if prefix > 0:
+                    attend[batch_idx, query_pos, key_rows[:prefix].long()] = True
+
+    return attend
+
+
 def _get_hsa_forward_q_block_size(q: torch.Tensor, k: torch.Tensor) -> int:
     num_q_heads = q.shape[-2]
     num_kv_heads = k.shape[-2]
@@ -1344,6 +1636,134 @@ def _get_hsa_forward_q_block_size(q: torch.Tensor, k: torch.Tensor) -> int:
     arch_major = torch.cuda.get_device_capability(q.device)[0]
     q_stage = 2 if arch_major == 10 and q.shape[1] * qhead_per_kvhead > 128 else 1
     return q_stage * 128
+
+
+def _get_hsa_hybrid_backward_schedule(
+    schedule: HSASchedule,
+    *,
+    k_block_size: int = 128,
+    anchor_row_panel_size: int = 64,
+) -> HSAHybridBackwardSchedule:
+    cache = getattr(schedule, "_hsa_hybrid_backward_cache", None)
+    cache_key = (str(schedule.sentence_start.device), k_block_size, anchor_row_panel_size)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    hybrid_schedule = _build_hsa_hybrid_backward_schedule(
+        schedule,
+        k_block_size=k_block_size,
+        anchor_row_panel_size=anchor_row_panel_size,
+    )
+    if cache is None:
+        cache = {}
+        setattr(schedule, "_hsa_hybrid_backward_cache", cache)
+    cache[cache_key] = hybrid_schedule
+    return hybrid_schedule
+
+
+def _get_hsa_hybrid_backward_batches(
+    schedule: HSASchedule,
+    hybrid_schedule: HSAHybridBackwardSchedule,
+) -> tuple[list[HSAHybridBackwardBatch], list[HSAHybridBackwardBatch]]:
+    cache = getattr(schedule, "_hsa_hybrid_backward_batch_cache", None)
+    cache_key = (str(schedule.sentence_start.device), hybrid_schedule.k_block_size, hybrid_schedule.anchor_row_panel_size)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    device = schedule.sentence_start.device
+    sentence_segment_ptr = schedule.sentence_segment_ptr.detach().cpu().tolist()
+    sentence_segment_pos = schedule.sentence_segment_pos.detach().cpu().tolist()
+    section_segment_ptr = schedule.section_segment_ptr.detach().cpu().tolist()
+    section_segment_pos = schedule.section_segment_pos.detach().cpu().tolist()
+    document_segment_ptr = schedule.document_segment_ptr.detach().cpu().tolist()
+    document_segment_pos = schedule.document_segment_pos.detach().cpu().tolist()
+    sentence_entries: list[tuple[list[int], list[int]]] = []
+    for desc_idx in range(hybrid_schedule.sentence_segment_id.numel()):
+        segment_id = int(hybrid_schedule.sentence_segment_id[desc_idx].item())
+        offset_start = int(hybrid_schedule.sentence_k_offset_start[desc_idx].item())
+        offset_end = int(hybrid_schedule.sentence_k_offset_end[desc_idx].item())
+        seg_start = sentence_segment_ptr[segment_id]
+        seg_end = sentence_segment_ptr[segment_id + 1]
+        segment_rows = sentence_segment_pos[seg_start:seg_end]
+        sentence_entries.append((segment_rows[offset_start:], segment_rows[offset_start:offset_end]))
+
+    sentence_batches: list[HSAHybridBackwardBatch] = []
+    if sentence_entries:
+        max_q = max(len(q_rows) for q_rows, _ in sentence_entries)
+        max_k = max(len(k_rows) for _, k_rows in sentence_entries)
+        q_indices = torch.zeros((len(sentence_entries), max_q), dtype=torch.int32, device=device)
+        k_indices = torch.zeros((len(sentence_entries), max_k), dtype=torch.int32, device=device)
+        q_length = torch.zeros(len(sentence_entries), dtype=torch.int32, device=device)
+        k_length = torch.zeros(len(sentence_entries), dtype=torch.int32, device=device)
+        for entry_idx, (q_rows, k_rows) in enumerate(sentence_entries):
+            q_len = len(q_rows)
+            k_len = len(k_rows)
+            q_length[entry_idx] = q_len
+            k_length[entry_idx] = k_len
+            q_indices[entry_idx, :q_len] = torch.tensor(q_rows, dtype=torch.int32, device=device)
+            k_indices[entry_idx, :k_len] = torch.tensor(k_rows, dtype=torch.int32, device=device)
+        sentence_batches.append(
+            HSAHybridBackwardBatch(
+                q_indices=q_indices,
+                k_indices=k_indices,
+                q_length=q_length,
+                k_length=k_length,
+                prefix_len=None,
+            )
+        )
+
+    anchor_entries: list[tuple[list[int], list[int], list[int]]] = []
+    for desc_idx in range(hybrid_schedule.anchor_kind.numel()):
+        kind = int(hybrid_schedule.anchor_kind[desc_idx].item())
+        segment_id = int(hybrid_schedule.anchor_segment_id[desc_idx].item())
+        offset_start = int(hybrid_schedule.anchor_k_offset_start[desc_idx].item())
+        offset_end = int(hybrid_schedule.anchor_k_offset_end[desc_idx].item())
+        q_row_start = int(hybrid_schedule.anchor_q_row_ptr[desc_idx].item())
+        q_row_end = int(hybrid_schedule.anchor_q_row_ptr[desc_idx + 1].item())
+        if kind == _DESC_SECTION:
+            seg_ptr = section_segment_ptr
+            seg_pos = section_segment_pos
+        else:
+            seg_ptr = document_segment_ptr
+            seg_pos = document_segment_pos
+        seg_start = seg_ptr[segment_id]
+        key_rows = seg_pos[seg_start + offset_start : seg_start + offset_end]
+        q_rows = hybrid_schedule.anchor_q_indices[q_row_start:q_row_end].detach().cpu().tolist()
+        prefix_len = hybrid_schedule.anchor_prefix_len[q_row_start:q_row_end].detach().cpu().tolist()
+        anchor_entries.append((q_rows, key_rows, prefix_len))
+
+    anchor_batches: list[HSAHybridBackwardBatch] = []
+    if anchor_entries:
+        max_q = max(len(q_rows) for q_rows, _, _ in anchor_entries)
+        max_k = max(len(k_rows) for _, k_rows, _ in anchor_entries)
+        q_indices = torch.zeros((len(anchor_entries), max_q), dtype=torch.int32, device=device)
+        k_indices = torch.zeros((len(anchor_entries), max_k), dtype=torch.int32, device=device)
+        q_length = torch.zeros(len(anchor_entries), dtype=torch.int32, device=device)
+        k_length = torch.zeros(len(anchor_entries), dtype=torch.int32, device=device)
+        prefix_len = torch.zeros((len(anchor_entries), max_q), dtype=torch.int32, device=device)
+        for entry_idx, (q_rows, k_rows, prefix_rows) in enumerate(anchor_entries):
+            q_len = len(q_rows)
+            k_len = len(k_rows)
+            q_length[entry_idx] = q_len
+            k_length[entry_idx] = k_len
+            q_indices[entry_idx, :q_len] = torch.tensor(q_rows, dtype=torch.int32, device=device)
+            k_indices[entry_idx, :k_len] = torch.tensor(k_rows, dtype=torch.int32, device=device)
+            prefix_len[entry_idx, :q_len] = torch.tensor(prefix_rows, dtype=torch.int32, device=device)
+        anchor_batches.append(
+            HSAHybridBackwardBatch(
+                q_indices=q_indices,
+                k_indices=k_indices,
+                q_length=q_length,
+                k_length=k_length,
+                prefix_len=prefix_len,
+            )
+        )
+
+    if cache is None:
+        cache = {}
+        setattr(schedule, "_hsa_hybrid_backward_batch_cache", cache)
+    cache[cache_key] = (sentence_batches, anchor_batches)
+    return sentence_batches, anchor_batches
 
 
 def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> HSABlockSparseRuntime:
@@ -1880,6 +2300,214 @@ def _accumulate_self_stream_grads(
     dv_acc.index_add_(0, row_idx, _collapse_q_to_kv_heads(dv_part, v_sel.shape[1]))
 
 
+def _run_hsa_backward_panel(
+    q_sel: torch.Tensor,
+    k_sel: torch.Tensor,
+    v_sel: torch.Tensor,
+    out_sel: torch.Tensor,
+    dout_sel: torch.Tensor,
+    lse_sel: torch.Tensor,
+    softmax_scale: float,
+    *,
+    prefix_len: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq, dk, dv = _run_hsa_backward_panel_batched(
+        q_sel.unsqueeze(0),
+        k_sel.unsqueeze(0),
+        v_sel.unsqueeze(0),
+        out_sel.unsqueeze(0),
+        dout_sel.unsqueeze(0),
+        lse_sel.unsqueeze(0),
+        softmax_scale,
+        prefix_len=None if prefix_len is None else prefix_len.unsqueeze(0),
+        mask=None if mask is None else mask.unsqueeze(0),
+    )
+    return dq[0], dk[0], dv[0]
+
+
+def _run_hsa_backward_panel_batched(
+    q_sel: torch.Tensor,
+    k_sel: torch.Tensor,
+    v_sel: torch.Tensor,
+    out_sel: torch.Tensor,
+    dout_sel: torch.Tensor,
+    lse_sel: torch.Tensor,
+    softmax_scale: float,
+    *,
+    prefix_len: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_count, q_len = q_sel.shape[0], q_sel.shape[1]
+    k_len = k_sel.shape[1]
+    q_float = q_sel.float().contiguous()
+    k_expanded = _expand_kv_to_q_heads(k_sel.reshape(-1, k_sel.shape[2], k_sel.shape[3]).float(), q_sel.shape[2])
+    k_expanded = k_expanded.view(batch_count, k_len, q_sel.shape[2], k_sel.shape[3]).contiguous()
+    v_expanded = _expand_kv_to_q_heads(v_sel.reshape(-1, v_sel.shape[2], v_sel.shape[3]).float(), q_sel.shape[2])
+    v_expanded = v_expanded.view(batch_count, k_len, q_sel.shape[2], v_sel.shape[3]).contiguous()
+    out_float = out_sel.float().contiguous()
+    dout_float = dout_sel.float().contiguous()
+
+    num_q_heads = q_sel.shape[2]
+    q_hqd = q_float.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, q_len, q_sel.shape[3]).contiguous()
+    k_hkd = k_expanded.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, k_len, k_sel.shape[3]).contiguous()
+    v_hkd = v_expanded.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, k_len, v_sel.shape[3]).contiguous()
+
+    scores = torch.bmm(q_hqd, k_hkd.transpose(1, 2)) * softmax_scale
+    if prefix_len is not None:
+        valid = torch.arange(k_len, device=q_sel.device).view(1, 1, k_len) < prefix_len.unsqueeze(-1)
+    else:
+        assert mask is not None
+        valid = mask
+    valid_expanded = valid.unsqueeze(1).expand(batch_count, num_q_heads, q_len, k_len).reshape(
+        batch_count * num_q_heads, q_len, k_len
+    )
+    scores = scores.masked_fill(~valid_expanded, float("-inf"))
+
+    lse_expanded = lse_sel.permute(0, 2, 1).reshape(batch_count * num_q_heads, q_len, 1)
+    probs = torch.exp(scores - lse_expanded)
+    probs = probs * valid_expanded
+
+    dout_hqd = dout_float.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, q_len, dout_sel.shape[3]).contiguous()
+    dprob = torch.bmm(dout_hqd, v_hkd.transpose(1, 2))
+    delta = (out_float * dout_float).sum(dim=-1).permute(0, 2, 1).reshape(batch_count * num_q_heads, q_len, 1)
+    dscores = probs * (dprob - delta)
+
+    dq = torch.bmm(dscores, k_hkd).view(batch_count, num_q_heads, q_len, q_sel.shape[3]).permute(0, 2, 1, 3)
+    dq = dq.contiguous() * softmax_scale
+    dk_expanded = torch.bmm(dscores.transpose(1, 2), q_hqd)
+    dk_expanded = dk_expanded.view(batch_count, num_q_heads, k_len, k_sel.shape[3]).permute(0, 2, 1, 3).contiguous()
+    dk_expanded = dk_expanded * softmax_scale
+    dv_expanded = torch.bmm(probs.transpose(1, 2), dout_hqd)
+    dv_expanded = dv_expanded.view(batch_count, num_q_heads, k_len, v_sel.shape[3]).permute(0, 2, 1, 3).contiguous()
+    dk = _collapse_q_to_kv_heads(
+        dk_expanded.view(batch_count * k_len, num_q_heads, k_sel.shape[3]),
+        k_sel.shape[2],
+    ).view(batch_count, k_len, k_sel.shape[2], k_sel.shape[3])
+    dv = _collapse_q_to_kv_heads(
+        dv_expanded.view(batch_count * k_len, num_q_heads, v_sel.shape[3]),
+        v_sel.shape[2],
+    ).view(batch_count, k_len, v_sel.shape[2], v_sel.shape[3])
+    return dq, dk, dv
+
+
+def _run_hsa_hybrid_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule: HSASchedule,
+    softmax_scale: float,
+):
+    hybrid_schedule = _get_hsa_hybrid_backward_schedule(schedule)
+    sentence_batches, anchor_batches = _get_hsa_hybrid_backward_batches(schedule, hybrid_schedule)
+    bsz, seqlen = schedule.batch_size, schedule.seqlen
+    total_rows = schedule.num_rows
+    head_dim = q.shape[-1]
+    head_dim_v = v.shape[-1]
+
+    q_flat = q.reshape(total_rows, q.shape[2], head_dim)
+    k_flat = k.reshape(total_rows, k.shape[2], head_dim)
+    v_flat = v.reshape(total_rows, v.shape[2], head_dim_v)
+    out_flat = out.reshape(total_rows, out.shape[2], out.shape[3]).float()
+    dout_flat = dout.reshape(total_rows, dout.shape[2], dout.shape[3]).float()
+    lse_flat = lse.permute(0, 2, 1).contiguous().view(total_rows, q.shape[2]).float()
+
+    dq_acc = torch.zeros_like(q_flat, dtype=torch.float32)
+    dk_acc = torch.zeros_like(k_flat, dtype=torch.float32)
+    dv_acc = torch.zeros_like(v_flat, dtype=torch.float32)
+
+    for batch in sentence_batches:
+        q_indices = batch.q_indices.long()
+        k_indices = batch.k_indices.long()
+        q_sel = q_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], q.shape[2], head_dim
+        )
+        k_sel = k_flat.index_select(0, k_indices.reshape(-1)).view(
+            k_indices.shape[0], k_indices.shape[1], k.shape[2], head_dim
+        )
+        v_sel = v_flat.index_select(0, k_indices.reshape(-1)).view(
+            k_indices.shape[0], k_indices.shape[1], v.shape[2], head_dim_v
+        )
+        out_sel = out_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], out.shape[2], out.shape[3]
+        )
+        dout_sel = dout_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], dout.shape[2], dout.shape[3]
+        )
+        lse_sel = lse_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], q.shape[2]
+        )
+        q_offsets = torch.arange(q_indices.shape[1], device=q.device, dtype=torch.int32).view(1, -1, 1)
+        k_offsets = torch.arange(k_indices.shape[1], device=q.device, dtype=torch.int32).view(1, 1, -1)
+        q_valid = q_offsets.squeeze(-1) < batch.q_length.unsqueeze(1)
+        k_valid = k_offsets.squeeze(1) < batch.k_length.unsqueeze(1)
+        mask = (q_offsets >= k_offsets) & q_valid.unsqueeze(-1) & k_valid.unsqueeze(1)
+        dq, dk, dv = _run_hsa_backward_panel_batched(
+            q_sel,
+            k_sel,
+            v_sel,
+            out_sel,
+            dout_sel,
+            lse_sel,
+            softmax_scale,
+            mask=mask,
+        )
+        dq_acc.index_add_(0, q_indices[q_valid].long(), dq[q_valid])
+        dk_acc.index_add_(0, k_indices[k_valid].long(), dk[k_valid])
+        dv_acc.index_add_(0, k_indices[k_valid].long(), dv[k_valid])
+
+    for batch in anchor_batches:
+        q_indices = batch.q_indices.long()
+        k_indices = batch.k_indices.long()
+        q_sel = q_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], q.shape[2], head_dim
+        )
+        k_sel = k_flat.index_select(0, k_indices.reshape(-1)).view(
+            k_indices.shape[0], k_indices.shape[1], k.shape[2], head_dim
+        )
+        v_sel = v_flat.index_select(0, k_indices.reshape(-1)).view(
+            k_indices.shape[0], k_indices.shape[1], v.shape[2], head_dim_v
+        )
+        out_sel = out_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], out.shape[2], out.shape[3]
+        )
+        dout_sel = dout_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], dout.shape[2], dout.shape[3]
+        )
+        lse_sel = lse_flat.index_select(0, q_indices.reshape(-1)).view(
+            q_indices.shape[0], q_indices.shape[1], q.shape[2]
+        )
+        q_offsets = torch.arange(q_indices.shape[1], device=q.device, dtype=torch.int32).view(1, -1, 1)
+        k_offsets = torch.arange(k_indices.shape[1], device=q.device, dtype=torch.int32).view(1, 1, -1)
+        q_valid = q_offsets.squeeze(-1) < batch.q_length.unsqueeze(1)
+        k_valid = k_offsets.squeeze(1) < batch.k_length.unsqueeze(1)
+        mask = q_valid.unsqueeze(-1) & k_valid.unsqueeze(1) & (
+            k_offsets < batch.prefix_len.unsqueeze(-1)
+        )
+        dq, dk, dv = _run_hsa_backward_panel_batched(
+            q_sel,
+            k_sel,
+            v_sel,
+            out_sel,
+            dout_sel,
+            lse_sel,
+            softmax_scale,
+            mask=mask,
+        )
+        dq_acc.index_add_(0, q_indices[q_valid].long(), dq[q_valid])
+        dk_acc.index_add_(0, k_indices[k_valid].long(), dk[k_valid])
+        dv_acc.index_add_(0, k_indices[k_valid].long(), dv[k_valid])
+
+    return (
+        dq_acc.view_as(q).to(dtype=q.dtype),
+        dk_acc.view_as(k).to(dtype=k.dtype),
+        dv_acc.view_as(v).to(dtype=v.dtype),
+    )
+
+
 def _run_hsa_blocksparse_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1904,7 +2532,7 @@ def _run_hsa_blocksparse_forward(
     return out, lse
 
 
-def _run_hsa_blocksparse_backward(
+def _run_hsa_packed_mask_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1934,6 +2562,37 @@ def _run_hsa_blocksparse_backward(
         aux_tensors=runtime.backward_aux_tensors,
         block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.backward_sparse),
         subtile_factor_override=runtime.backward_subtile_factor,
+    )
+
+
+def _run_hsa_blocksparse_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule: HSASchedule,
+    softmax_scale: float,
+    deterministic: bool,
+    keep_ids: Optional[torch.Tensor] = None,
+    hash_ids: Optional[torch.Tensor] = None,
+):
+    if os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1":
+        del deterministic, keep_ids, hash_ids
+        return _run_hsa_hybrid_backward(q, k, v, out, dout, lse, schedule, softmax_scale)
+    return _run_hsa_packed_mask_backward(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        schedule,
+        softmax_scale,
+        deterministic,
+        keep_ids,
+        hash_ids,
     )
 
 

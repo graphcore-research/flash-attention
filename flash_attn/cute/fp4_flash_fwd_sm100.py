@@ -282,19 +282,33 @@ class FP4FlashAttentionForwardSm100:
 
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
         smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+        smem_size_q_scale = 0
+        smem_size_k_scale_per_stage = 0
+        if self.use_fp4_qk:
+            smem_size_q_scale = (
+                self.q_stage
+                * self.m_block_size
+                * (self.head_dim_padded // self.fp4_sf_vec_size)
+                * self.fp4_sf_dtype.width
+                // 8
+            )
+            smem_size_k_scale_per_stage = (
+                self.n_block_size
+                * (self.head_dim_padded // self.fp4_sf_vec_size)
+                * self.fp4_sf_dtype.width
+                // 8
+            )
+        smem_size_q_o = (
+            smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+        ) + smem_size_q_scale
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         smem_size_kv_per_stage = (
-            (smem_size_k_per_stage + smem_size_v_per_stage)
+            (smem_size_k_per_stage + smem_size_v_per_stage + smem_size_k_scale_per_stage)
             if self.use_fp4_qk
             else max(smem_size_k_per_stage, smem_size_v_per_stage)
         ) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
-        if self.use_fp4_qk:
-            # FP4 keeps K and V in separate SMEM buffers and adds scale-factor storage,
-            # so the generic KV-stage heuristic can overcommit static shared memory.
-            kv_stage = min(kv_stage, 8)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -1335,6 +1349,7 @@ class FP4FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            mma_tile_coord_v = thr_mma_qk.thr_idx
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
             gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1347,9 +1362,15 @@ class FP4FlashAttentionForwardSm100:
                 # FP4 QK is dense-only in v1, so the grouped (head, batch) scale mode
                 # can be indexed directly without the varlen batch offset helpers.
                 mQ_scale_cur = mQ_scale[None, None, (head_idx, batch_idx)]
-                gQ_scale = cute.local_tile(mQ_scale_cur, tiler_gQ, (m_block, 0))
+                tiler_gQ_scale = (
+                    (self.mma_tiler_qk[0] * self.q_stage) // self.cta_group_size,
+                    self.head_dim_padded,
+                )
+                gQ_scale_block = m_block * self.cta_group_size + mma_tile_coord_v
+                gQ_scale = cute.local_tile(mQ_scale_cur, tiler_gQ_scale, (gQ_scale_block, 0))
                 gQ_scale = layout_utils.select(
-                    cute.flat_divide(gQ_scale, (self.mma_tiler_qk[0],)), mode=[0, 2, 1]
+                    cute.flat_divide(gQ_scale, (self.mma_tiler_qk[0] // self.cta_group_size,)),
+                    mode=[0, 2, 1],
                 )
 
             head_idx_kv = (

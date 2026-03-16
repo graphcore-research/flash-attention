@@ -309,6 +309,51 @@ FP4_QK_FORMAT_CONFIG = {
 }
 
 
+def _fp4_qk_max_kv_stages(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    tile_m: int,
+    tile_n: int,
+    q_stage: int,
+    use_2cta_instrs: bool,
+    sf_vec_size: int,
+    smem_budget_bytes: int = 224 * 1024,
+) -> int:
+    bf16_width_bytes = 2
+    fp8_width_bytes = 1
+    q_storage_bytes = q_stage * tile_m * head_dim * 4 // 8
+    o_storage_bytes = q_stage * tile_m * head_dim_v * bf16_width_bytes
+    q_scale_bytes = q_stage * tile_m * (head_dim // sf_vec_size) * fp8_width_bytes
+    k_storage_bytes = tile_n * head_dim * 4 // 8
+    v_storage_bytes = tile_n * head_dim_v * bf16_width_bytes
+    k_scale_bytes = tile_n * (head_dim // sf_vec_size) * fp8_width_bytes
+    kv_stage_bytes = (k_storage_bytes + v_storage_bytes + k_scale_bytes) // (2 if use_2cta_instrs else 1)
+    available_smem_bytes = smem_budget_bytes - (q_storage_bytes + o_storage_bytes + q_scale_bytes)
+    if kv_stage_bytes <= 0 or available_smem_bytes <= 0:
+        return 0
+    return available_smem_bytes // kv_stage_bytes
+
+
+def _fp4_qk_tmem_fits(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    tile_m: int,
+    tile_n: int,
+    q_stage: int,
+    use_2cta_instrs: bool,
+    smem_budget_cols: int = 512,
+) -> bool:
+    sf_atom_mn = 32
+    mma_inst_tile_k = 4
+    mma_tiler_m = (2 if use_2cta_instrs else 1) * tile_m
+    sfa_cols = (mma_tiler_m // sf_atom_mn) * mma_inst_tile_k
+    sfk_cols = (max(tile_n, 128) // sf_atom_mn) * mma_inst_tile_k
+    base_cols = 2 * tile_n + q_stage * head_dim_v
+    return base_cols + sfa_cols + sfk_cols <= smem_budget_cols
+
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -585,8 +630,66 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    fp4_q_stage = 1
+    fp4_use_2cta_instrs = False
     if is_fp4_qk:
-        q_stage = 1
+        _, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_qk_format)
+        fp4_speed_shape = (
+            arch // 10 in [10, 11]
+            and head_dim == 128
+            and head_dim_v == 128
+            and not causal
+            and not local
+            and num_splits == 1
+            and page_size in [None, 128]
+            and cu_seqlens_q is None
+            and seqused_q is None
+            and not use_block_sparsity
+        )
+        fp4_use_2cta_instrs = (
+            fp4_speed_shape
+            and seqlen_q_packgqa > 2 * tile_m
+            and _fp4_qk_max_kv_stages(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                q_stage=1,
+                use_2cta_instrs=True,
+                sf_vec_size=fp4_sf_vec_size,
+            ) >= 2
+            and _fp4_qk_tmem_fits(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                q_stage=1,
+                use_2cta_instrs=True,
+            )
+        )
+        if (
+            fp4_speed_shape
+            and seqlen_q_packgqa > tile_m
+            and _fp4_qk_max_kv_stages(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                q_stage=2,
+                use_2cta_instrs=fp4_use_2cta_instrs,
+                sf_vec_size=fp4_sf_vec_size,
+            ) >= 2
+            and _fp4_qk_tmem_fits(
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                q_stage=2,
+                use_2cta_instrs=fp4_use_2cta_instrs,
+            )
+        ):
+            fp4_q_stage = 2
+        q_stage = fp4_q_stage
     elif arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
@@ -630,7 +733,7 @@ def _flash_attn_fwd(
         and seqlen_q_packgqa > 2 * tile_m
     )
     if is_fp4_qk:
-        use_2cta_instrs = False
+        use_2cta_instrs = fp4_use_2cta_instrs
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -836,7 +939,7 @@ def _flash_attn_fwd(
                     paged_kv_non_tma=False,
                     is_varlen_q=False,
                     q_subtile_factor=q_subtile_factor,
-                    use_2cta_instrs=False,
+                    use_2cta_instrs=use_2cta_instrs,
                     use_fp4_qk=True,
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,

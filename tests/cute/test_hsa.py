@@ -12,6 +12,7 @@ try:
         flash_attn_func,
         flash_attn_hsa_func,
         flash_attn_hsa_sparse_func,
+        fused_forward_to_attend_mask,
         forward_descriptors_to_attend_mask,
         get_hsa_mask_mod,
         hsa_reference_attention,
@@ -26,6 +27,7 @@ except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     flash_attn_func = None
     flash_attn_hsa_func = None
     flash_attn_hsa_sparse_func = None
+    fused_forward_to_attend_mask = None
     forward_descriptors_to_attend_mask = None
     hybrid_backward_to_attend_mask = None
     get_hsa_mask_mod = None
@@ -233,6 +235,24 @@ def test_hsa_forward_descriptors_reconstruct_dense_mask():
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_fused_forward_schedule_reconstructs_dense_mask():
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=193, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    fused_schedule = hsa_module._build_hsa_fused_forward_schedule(
+        schedule,
+        q_block_size=256,
+        k_block_size=128,
+    )
+    dense_mask = fused_forward_to_attend_mask(schedule, fused_schedule)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_backward_descriptors_reconstruct_dense_mask():
     device = "cuda"
     keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
@@ -323,6 +343,45 @@ def test_hsa_sparse_runtime_uses_canonical_schedule_only():
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse_fused_forward_matches_reference(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 129, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    schedule.sentence_stream = _empty_stream_like(schedule.sentence_stream)
+    schedule.section_prefix_stream = _empty_stream_like(schedule.section_prefix_stream)
+    schedule.document_prefix_stream = _empty_stream_like(schedule.document_prefix_stream)
+    schedule.section_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+    schedule.document_self_indices = torch.empty(0, dtype=torch.int32, device=device)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_FUSED_FWD", "1")
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_blocksparse_forward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("default sparse forward helper used")),
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_fused_forward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("python fused forward helper used")),
+    )
+
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
+    out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_sparse_fused_forward")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     import flash_attn.cute.hsa as hsa_module
 
@@ -336,7 +395,7 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     schedule.document_prefix_stream = _empty_stream_like(schedule.document_prefix_stream)
     schedule.section_self_indices = torch.empty(0, dtype=torch.int32, device=device)
     schedule.document_self_indices = torch.empty(0, dtype=torch.int32, device=device)
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_PACKED_BWD", "1")
 
     monkeypatch.setattr(
         hsa_module,
@@ -385,7 +444,7 @@ def test_hsa_hybrid_backward_matches_reference(monkeypatch):
     batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
     keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
     schedule = build_hsa_schedule(keep_ids, hash_ids)
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_PACKED_BWD", "1")
 
     q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
     k_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)

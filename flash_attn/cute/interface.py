@@ -257,8 +257,6 @@ def _validate_fp4_qk_inputs(
         raise NotImplementedError("FP4 QK forward does not support block sparsity in this milestone.")
     if num_splits != 1:
         raise NotImplementedError("FP4 QK forward does not support SplitKV in this milestone.")
-    if causal:
-        raise NotImplementedError("FP4 QK bring-up currently only supports noncausal attention.")
     if window_size_left is not None or window_size_right is not None:
         raise NotImplementedError("FP4 QK forward does not support local/sliding-window attention in this milestone.")
     if score_mod is not None or mask_mod is not None:
@@ -280,8 +278,10 @@ def _validate_fp4_qk_inputs(
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
     head_dim = q.shape[-1] * 2
-    if head_dim != 64 or v.shape[-1] != 64:
-        raise NotImplementedError("FP4 QK bring-up currently only supports head_dim=head_dim_v=64.")
+    if head_dim not in (64, 128) or v.shape[-1] != head_dim:
+        raise NotImplementedError(
+            "FP4 QK bring-up currently only supports head_dim=head_dim_v in {64, 128}."
+        )
     if head_dim % sf_vec_size != 0:
         raise ValueError(f"FP4 head_dim={head_dim} must be divisible by scale vec size {sf_vec_size}.")
     expected_q_scale_shape = (*q.shape[:-1], head_dim // sf_vec_size)

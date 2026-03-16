@@ -635,7 +635,10 @@ class FP4FlashAttentionForwardSm100:
             TileScheduler = SingleTileVarlenScheduler
         else:
             if const_expr(self.is_causal or self.is_local):
-                TileScheduler = SingleTileLPTScheduler
+                # The LPT scheduler is a performance heuristic. The FP4 bring-up path keeps
+                # causal dense forward on the simpler single-tile scheduler until the runtime
+                # path is stable under CuTe's dynamic loop constraints.
+                TileScheduler = SingleTileScheduler if const_expr(self.use_fp4_qk) else SingleTileLPTScheduler
             else:
                 TileScheduler = (
                     SingleTileScheduler
@@ -661,7 +664,10 @@ class FP4FlashAttentionForwardSm100:
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-            element_size=self.k_dtype.width // 8,
+            # The causal LPT scheduler estimates K/V residency in bytes. FP4 Q/K uses a logical
+            # 4-bit CuTe dtype, so width // 8 would become 0 and break scheduler compilation.
+            # Use packed-byte granularity for the FP4 K estimate in that path.
+            element_size=1 if const_expr(self.use_fp4_qk) else self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,

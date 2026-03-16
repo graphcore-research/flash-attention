@@ -135,20 +135,29 @@ def _dequantize_fp4(packed: torch.Tensor, scale: torch.Tensor, sf_vec_size: int)
     ).flatten(start_dim=-2)
 
 
-def test_fp4_qk_fake_compile_dense_forward(monkeypatch):
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v,causal",
+    [
+        (64, 64, False),
+        (64, 64, True),
+        (128, 128, False),
+        (128, 128, True),
+    ],
+)
+def test_fp4_qk_fake_compile_dense_forward(monkeypatch, head_dim, head_dim_v, causal):
     compile_calls = _install_fake_cuda_runtime(monkeypatch)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
             fp4_qk_format="nvfp4",
-            head_dim=64,
-            head_dim_v=64,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
         )
         out, lse = _flash_attn_fwd(
             q,
             k,
             v,
-            causal=False,
+            causal=causal,
             return_lse=True,
             _arch=100,
             fp4_qk_format="nvfp4",
@@ -207,8 +216,8 @@ def test_fp4_compile_cache_separates_bf16_and_fp4(monkeypatch):
         ({"q_scale_dtype": torch.float16}, TypeError),
         ({"k_scale_shape_delta": 1}, ValueError),
         ({"fp4_qk_format": "mxfp4"}, NotImplementedError),
-        ({"causal": True}, NotImplementedError),
-        ({"head_dim": 128, "head_dim_v": 128}, NotImplementedError),
+        ({"head_dim": 96, "head_dim_v": 96}, NotImplementedError),
+        ({"head_dim": 128, "head_dim_v": 64}, NotImplementedError),
         ({"v_dtype": torch.float16}, NotImplementedError),
         ({"num_splits": 2}, NotImplementedError),
         ({"window_size_left": 8}, NotImplementedError),
@@ -334,7 +343,14 @@ def _require_sm100():
         pytest.skip(f"FP4 runtime tests require SM100/SM110, got {major}.{minor}.")
 
 
-def _run_fp4_runtime_case(num_heads: int, num_heads_kv: int, timeout_s: int = 120) -> None:
+def _run_fp4_runtime_case(
+    num_heads: int,
+    num_heads_kv: int,
+    *,
+    head_dim: int,
+    causal: bool,
+    timeout_s: int = 180,
+) -> None:
     script = textwrap.dedent(
         f"""
         import torch
@@ -364,9 +380,11 @@ def _run_fp4_runtime_case(num_heads: int, num_heads_kv: int, timeout_s: int = 12
         batch_size = 2
         seqlen_q = 128
         seqlen_k = 128
-        head_dim = 64
-        head_dim_v = 64
-        scale_value = 0.25
+        head_dim = {head_dim}
+        head_dim_v = {head_dim}
+        # Keep the synthetic FP4 test inputs in a realistic pre-quantized range so the
+        # causal cases remain comparable to the dequantized BF16 reference at the chosen tolerance.
+        scale_value = 0.125
 
         q_packed = torch.randint(
             0,
@@ -410,7 +428,7 @@ def _run_fp4_runtime_case(num_heads: int, num_heads_kv: int, timeout_s: int = 12
             q_packed,
             k_packed,
             v,
-            causal=False,
+            causal={causal},
             return_lse=True,
             fp4_qk_format="nvfp4",
             q_scale=q_scale,
@@ -420,7 +438,7 @@ def _run_fp4_runtime_case(num_heads: int, num_heads_kv: int, timeout_s: int = 12
             q_ref,
             k_ref,
             v,
-            causal=False,
+            causal={causal},
             return_lse=True,
         )
         torch.cuda.synchronize()
@@ -446,22 +464,30 @@ def _run_fp4_runtime_case(num_heads: int, num_heads_kv: int, timeout_s: int = 12
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
-            f"FP4 runtime case timed out after {timeout_s}s for ({num_heads}q,{num_heads_kv}kv)."
+            "FP4 runtime case timed out after "
+            f"{timeout_s}s for ({num_heads}q,{num_heads_kv}kv,d={head_dim},causal={causal})."
         )
     if result.returncode != 0:
         pytest.fail(
             "FP4 runtime subprocess failed for "
-            f"({num_heads}q,{num_heads_kv}kv).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            f"({num_heads}q,{num_heads_kv}kv,d={head_dim},causal={causal}).\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
 
 @pytest.mark.parametrize(
-    "num_heads,num_heads_kv",
+    "num_heads,num_heads_kv,head_dim,causal",
     [
-        (4, 4),
-        (6, 2),
+        (4, 4, 64, False),
+        (6, 2, 64, False),
+        (4, 4, 64, True),
+        (6, 2, 64, True),
+        (4, 4, 128, False),
+        (6, 2, 128, False),
+        (4, 4, 128, True),
+        (6, 2, 128, True),
     ],
 )
-def test_fp4_qk_runtime_matches_bf16_reference(num_heads, num_heads_kv):
+def test_fp4_qk_runtime_matches_bf16_reference(num_heads, num_heads_kv, head_dim, causal):
     _require_sm100()
-    _run_fp4_runtime_case(num_heads, num_heads_kv)
+    _run_fp4_runtime_case(num_heads, num_heads_kv, head_dim=head_dim, causal=causal)

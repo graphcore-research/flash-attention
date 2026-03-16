@@ -17,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -135,20 +135,29 @@ def to_cute_fp4_tensor(
     fully_dynamic=False,
     enable_tvm_ffi=True,
 ):
-    """Convert packed uint8 storage into a logical FP4 CuTe tensor."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
-    tensor.element_type = cutlass.Float4E2M1FN
-    tensor = cute.make_tensor(tensor.iterator, cute.recast_layout(4, 8, tensor.layout))
-    if fully_dynamic:
-        tensor = tensor.mark_layout_dynamic()
-    else:
-        if leading_dim == -1:
-            leading_dim = t.ndim - 1
-        tensor = tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    return tensor.mark_compact_shape_dynamic(
-        mode=leading_dim if leading_dim != -1 else t.ndim - 1,
-        stride_order=t.dim_order(),
-        divisibility=32,
+    """Build a logical FP4 compile-time tensor spec for packed uint8 storage.
+
+    TVM-FFI already supports mapping packed `float4x2` runtime tensors to a
+    logical FP4 view when the compile-time spec declares a logical FP4 tensor.
+    We take that path here instead of reading `runtime._Tensor.layout`, which
+    is unsupported in the installed Cutlass runtime.
+    """
+    del fully_dynamic, enable_tvm_ffi
+    if leading_dim == -1:
+        leading_dim = t.ndim - 1
+    assert leading_dim == t.ndim - 1, "Packed FP4 tensors must keep the packed dimension innermost."
+    assert t.stride(leading_dim) == 1, "Packed FP4 tensors must be contiguous in the packed dimension."
+
+    logical_shape = (*t.shape[:-1], t.shape[-1] * 2)
+    logical_stride = tuple(
+        stride if dim == leading_dim else stride * 2
+        for dim, stride in enumerate(t.stride())
+    )
+    return make_fake_tensor(
+        cutlass.Float4E2M1FN,
+        logical_shape,
+        logical_stride,
+        assumed_align=assumed_align,
     )
 
 

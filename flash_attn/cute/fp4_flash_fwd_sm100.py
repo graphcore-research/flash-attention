@@ -282,7 +282,11 @@ class FP4FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        smem_size_kv_per_stage = (
+            (smem_size_k_per_stage + smem_size_v_per_stage)
+            if self.use_fp4_qk
+            else max(smem_size_k_per_stage, smem_size_v_per_stage)
+        ) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
@@ -298,6 +302,7 @@ class FP4FlashAttentionForwardSm100:
         # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
+            not self.use_fp4_qk and
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
         )
         self.uneven_kv_smem_offset = (
@@ -369,10 +374,16 @@ class FP4FlashAttentionForwardSm100:
         if const_expr(self.use_fp4_qk and mK_scale is not None):
             mK_scale = cute.make_tensor(mK_scale.iterator, cute.select(mK_scale.layout, mode=KV_layout_transpose))
             mQ_scale = cute.make_tensor(
-                mQ_scale.iterator, bs_layout.tile_atom_to_shape_SF(mQ.shape, self.fp4_sf_vec_size)
+                mQ_scale.iterator,
+                bs_layout.tile_atom_to_shape_SF(
+                    cute.group_modes(mQ.shape, 2, 4), self.fp4_sf_vec_size
+                ),
             )
             mK_scale = cute.make_tensor(
-                mK_scale.iterator, bs_layout.tile_atom_to_shape_SF(mK.shape, self.fp4_sf_vec_size)
+                mK_scale.iterator,
+                bs_layout.tile_atom_to_shape_SF(
+                    cute.group_modes(mK.shape, 2, 4), self.fp4_sf_vec_size
+                ),
             )
         if const_expr(self.is_split_kv):
             O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
@@ -471,7 +482,7 @@ class FP4FlashAttentionForwardSm100:
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage
         )
         tP_layout = sm100_utils_basic.make_smem_layout_a(
-            tiled_mma_pv, self.mma_tiler_pv, self.q_dtype, self.s_stage
+            tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.s_stage
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv, self.mma_tiler_pv, self.v_dtype, self.kv_stage
@@ -503,7 +514,7 @@ class FP4FlashAttentionForwardSm100:
             tSFA_layout = None
             tSFK_layout = None
 
-        if const_expr(not self.same_hdim_kv_padded):
+        if const_expr(not self.same_hdim_kv_padded and not self.use_fp4_qk):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
                 max(sK_layout.outer.stride[-1], 0)
@@ -658,6 +669,7 @@ class FP4FlashAttentionForwardSm100:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
+        sV_size = cute.cosize(sV_layout) if const_expr(self.use_fp4_qk) else 0
 
         # FP4: Compute scale factor SMEM sizes
         if const_expr(self.use_fp4_qk):
@@ -697,6 +709,10 @@ class FP4FlashAttentionForwardSm100:
             sK: cute.struct.Align[
                 # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, sV_size],
                 self.buffer_align_bytes,
             ]
             # FP4: Scale factor SMEM for Q and K scales
@@ -1021,8 +1037,12 @@ class FP4FlashAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        if const_expr(self.use_fp4_qk):
+            # FP4 QK keeps V in BF16/FP16, so K and V can no longer alias the same SMEM buffer.
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        else:
+            # Strip swizzle info to reuse smem when K and V share dtype/footprint.
+            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1032,8 +1052,8 @@ class FP4FlashAttentionForwardSm100:
 
         # FP4: Create SMEM tensors for scale factors
         if const_expr(self.use_fp4_qk):
-            sSFA = storage.sSFA.get_tensor(sSFA_layout.outer, swizzle=sSFA_layout.inner)
-            sSFK = storage.sSFK.get_tensor(sSFK_layout.outer, swizzle=sSFK_layout.inner)
+            sSFA = storage.sSFA.get_tensor(sSFA_layout)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout)
         else:
             sSFA = None
             sSFK = None
@@ -1336,7 +1356,9 @@ class FP4FlashAttentionForwardSm100:
                 assert mQ_scale is not None and mK_scale is not None
                 assert sSFA is not None and sSFK is not None
                 assert pipeline_q_scale is not None and pipeline_k_scale is not None
-                mQ_scale_cur = seqlen.offset_batch_Q(mQ_scale, batch_idx, dim=3)[None, None, head_idx]
+                # FP4 QK is dense-only in v1, so the grouped (head, batch) scale mode
+                # can be indexed directly without the varlen batch offset helpers.
+                mQ_scale_cur = mQ_scale[None, None, (head_idx, batch_idx)]
                 gQ_scale = cute.local_tile(mQ_scale_cur, tiler_gQ, (m_block, 0))
                 gQ_scale = layout_utils.select(
                     cute.flat_divide(gQ_scale, (self.mma_tiler_qk[0],)), mode=[0, 2, 1]
@@ -1349,12 +1371,14 @@ class FP4FlashAttentionForwardSm100:
                 if const_expr(not seqlen.has_cu_seqlens_k):
                     mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
                     if const_expr(self.use_fp4_qk):
-                        mK_scale_cur = mK_scale[None, None, head_idx_kv, batch_idx]
+                        mK_scale_cur = mK_scale[None, None, (head_idx_kv, batch_idx)]
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
                     if const_expr(self.use_fp4_qk):
-                        mK_scale_cur = cute.domain_offset((seqlen.offset_k, 0), mK_scale[None, None, head_idx_kv])
+                        mK_scale_cur = cute.domain_offset(
+                            (seqlen.offset_k, 0), mK_scale[None, None, (head_idx_kv, batch_idx)]
+                        )
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
                 if const_expr(self.use_fp4_qk):
@@ -1926,7 +1950,9 @@ class FP4FlashAttentionForwardSm100:
     @cute.jit
     def load_scale_stage(self, gScale: cute.Tensor, sScale: cute.Tensor):
         with cute.arch.elect_one():
-            cute.autovec_copy(gScale, sScale)
+            # The FP4 scale tiles have different source/destination rank structure,
+            # so use a basic elementwise copy instead of autovec_copy's vectorized path.
+            cute.basic_copy(gScale, sScale)
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
@@ -2084,7 +2110,7 @@ class FP4FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=8.0 if const_expr(self.v_dtype.width == 16) else 0.0,
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -2380,7 +2406,7 @@ class FP4FlashAttentionForwardSm100:
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(

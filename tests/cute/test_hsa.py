@@ -412,6 +412,11 @@ def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
         "_run_hsa_packed_mask_backward",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
     )
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_backward_panel_batched",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
+    )
 
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)
     k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype).requires_grad_(True)

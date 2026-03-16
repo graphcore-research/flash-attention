@@ -128,26 +128,34 @@ def _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, *, use_fused_fw
         )
 
 
-def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters):
+def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
+    env_updates = env_updates or {}
     q = q_data.clone().requires_grad_(True)
     k = k_data.clone().requires_grad_(True)
     v = v_data.clone().requires_grad_(True)
     loss = forward_fn(q, k, v).float().square().mean()
 
+    def _run():
+        with _temporary_env(**env_updates):
+            torch.autograd.grad(loss, (q, k, v), retain_graph=True)
+
     return _measure_ms(
-        lambda: torch.autograd.grad(loss, (q, k, v), retain_graph=True),
+        _run,
         warmup_iters,
         benchmark_iters,
     )
 
 
-def _measure_fwd_bwd_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters):
+def _measure_fwd_bwd_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
+    env_updates = env_updates or {}
+
     def _run():
         q = q_data.clone().requires_grad_(True)
         k = k_data.clone().requires_grad_(True)
         v = v_data.clone().requires_grad_(True)
-        out = forward_fn(q, k, v)
-        out.float().square().mean().backward()
+        with _temporary_env(**env_updates):
+            out = forward_fn(q, k, v)
+            out.float().square().mean().backward()
 
     return _measure_ms(_run, warmup_iters, benchmark_iters)
 
@@ -228,7 +236,15 @@ def run_case(case: BenchmarkCase):
 
     maskmod_bwd_ms = _measure_backward_ms(maskmod_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
     sparse_bwd_ms = _measure_backward_ms(sparse_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
-    packed_bwd_ms = _measure_backward_ms(packed_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
+    packed_bwd_ms = _measure_backward_ms(
+        packed_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
+    )
     ref_bwd_ms = _measure_backward_ms(
         dense_ref_forward,
         q_data,
@@ -238,14 +254,16 @@ def run_case(case: BenchmarkCase):
         max(5, case.benchmark_iters // 2),
     )
 
-    maskmod_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        maskmod_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters
-    )
-    sparse_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        sparse_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters
-    )
+    maskmod_fwd_bwd_ms = _measure_fwd_bwd_ms(maskmod_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
+    sparse_fwd_bwd_ms = _measure_fwd_bwd_ms(sparse_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
     packed_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        packed_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters
+        packed_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
     )
     ref_fwd_bwd_ms = _measure_fwd_bwd_ms(
         dense_ref_forward,

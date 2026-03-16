@@ -2633,6 +2633,31 @@ def get_hsa_backward_packed_mask_mod():
 
 
 @lru_cache(maxsize=1)
+def get_hsa_panel_prefix_mask_mod():
+    """Return a CuTe mask_mod for packed panel batches with per-row prefix lengths."""
+    cutlass, cute, utils, fast_sampling, _, _, _ = _lazy_cute_imports()
+
+    @fast_sampling
+    @cute.jit
+    def _hsa_panel_prefix_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        prefix_len = aux_tensors[0]
+        q_length = aux_tensors[1]
+        k_length = aux_tensors[2]
+
+        b = batch[0]
+        q_idx = m_idx[0]
+        kv_idx = n_idx[0]
+        safe_q_idx = q_idx % seqlen_info.seqlen_q
+
+        used_q = utils.scalar_to_ssa(q_length[b, safe_q_idx], cutlass.Int32)
+        used_k = utils.scalar_to_ssa(k_length[b, safe_q_idx], cutlass.Int32)
+        row_prefix = utils.scalar_to_ssa(prefix_len[b, safe_q_idx], cutlass.Int32)
+        return (q_idx < used_q) & (kv_idx < used_k) & (kv_idx < row_prefix)
+
+    return _hsa_panel_prefix_mask
+
+
+@lru_cache(maxsize=1)
 def get_hsa_mask_mod():
     """Return the CuTe mask_mod implementing nanochat's decoder-HDT attention."""
     cutlass, cute, utils, fast_sampling, _, _, _ = _lazy_cute_imports()
@@ -3454,8 +3479,23 @@ def _run_hsa_blocksparse_backward(
         os.environ.get("FLASH_ATTN_HSA_USE_PACKED_BWD", "0") == "1"
         or os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1"
     ):
-        del deterministic, keep_ids, hash_ids
-        return _run_hsa_hybrid_backward(q, k, v, out, dout, lse, schedule, softmax_scale)
+        del keep_ids, hash_ids
+        from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_packed
+
+        try:
+            return run_hsa_bwd_sm100_packed(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                schedule,
+                softmax_scale,
+                deterministic,
+            )
+        except NotImplementedError:
+            return _run_hsa_hybrid_backward(q, k, v, out, dout, lse, schedule, softmax_scale)
     return _run_hsa_packed_mask_backward(
         q,
         k,

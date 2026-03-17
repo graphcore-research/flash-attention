@@ -702,21 +702,13 @@ class FP4FlashAttentionForwardSm100:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         if const_expr(self.pack_gqa_local):
-            q_copy_bits = 16
-            q_copy_elems = q_copy_bits // self.q_storage_dtype.width
             q_storage_row_elems = self.head_dim_padded * self.q_dtype.width // self.q_storage_dtype.width
-            q_threads_per_row = q_storage_row_elems // q_copy_elems
-            atom_q_copy = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
+            gmem_tiled_copy_Q = fa_copy_utils.tiled_copy_2d(
                 self.q_storage_dtype,
-                num_bits_per_copy=q_copy_bits,
+                q_storage_row_elems,
+                cute.arch.WARP_SIZE,
+                is_async=False,
             )
-            tQ_layout = cute.make_ordered_layout(
-                (cute.arch.WARP_SIZE // q_threads_per_row, q_threads_per_row),
-                order=(1, 0),
-            )
-            vQ_layout = cute.make_layout((1, q_copy_elems))
-            gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_q_copy, tQ_layout, vQ_layout)
             gmem_tiled_copy_Q_scale = fa_copy_utils.tiled_copy_2d(
                 self.fp4_sf_dtype,
                 self.head_dim_padded // self.fp4_sf_vec_size,

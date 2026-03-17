@@ -217,19 +217,35 @@ class PackGQA:
         seqlen: cutlass.Int32,
     ):
         del gmem_tiled_copy
-        packed_cols = cute.size(sQ.shape[1])
+        packed_cols = self.head_dim_padded // 2
+        chunks_per_row = packed_cols // 4
+        rows_per_warp = cute.arch.WARP_SIZE // chunks_per_row
         row_limit = seqlen * self.qhead_per_kvhead
-        cols_per_thread = cute.ceil_div(packed_cols, cute.arch.WARP_SIZE)
-        for row in cutlass.range_constexpr(self.m_block_size):
+        row_in_group = tidx // chunks_per_row
+        chunk_idx = tidx % chunks_per_row
+        for row_group in cutlass.range_constexpr(self.m_block_size // rows_per_warp):
+            row = row_group * rows_per_warp + row_in_group
             packed_row = block * self.m_block_size + row
             if packed_row < row_limit:
                 seqlen_idx = packed_row // self.qhead_per_kvhead
                 subhead_idx = packed_row - seqlen_idx * self.qhead_per_kvhead
                 q_head = kv_head_idx * self.qhead_per_kvhead + subhead_idx
-                for col_i in cutlass.range_constexpr(cols_per_thread):
-                    col = tidx + col_i * cute.arch.WARP_SIZE
-                    if col < packed_cols:
-                        sQ[row, col] = mQ[seqlen_idx, col, q_head]
+                byte_col = chunk_idx * 4
+                q_word_ptr = cute.make_ptr(
+                    cutlass.Int32,
+                    utils.elem_pointer(mQ, (seqlen_idx, byte_col, q_head)).toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                )
+                s_word_ptr = cute.make_ptr(
+                    cutlass.Int32,
+                    utils.elem_pointer(sQ, (row, byte_col)).toint(),
+                    cute.AddressSpace.smem,
+                    assumed_align=4,
+                )
+                q_word = cute.make_tensor(q_word_ptr, (1,))
+                s_word = cute.make_tensor(s_word_ptr, (1,))
+                s_word[0] = q_word[0]
 
     @cute.jit
     def store_LSE(

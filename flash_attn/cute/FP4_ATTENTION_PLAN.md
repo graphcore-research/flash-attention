@@ -32,10 +32,11 @@
 - An experimental CTA-local packed GQA kernel path now exists behind the internal
   `FLASH_ATTN_FP4_Q3_LOCAL_PACK=1` selector.
   - The failing logical-FP4 copy was replaced with a raw packed-byte CTA-local Q gather into an aliased byte view of `sQ`.
+  - The current gather uses 32-bit chunk copies, which are faster than the initial byte-at-a-time bring-up.
   - The path compiles and runs for noncausal `GQA (6q,2kv), d128`, but it is not enabled by default.
-  - Current measurement with the raw-byte gather:
-    - `seqlen=512`: FP4/BF16 `1.307x`
-    - `seqlen=2048`: FP4/BF16 `1.787x`
+  - Current measurement with the 32-bit chunk gather:
+    - `seqlen=512`: FP4/BF16 `1.185x`
+    - `seqlen=2048`: FP4/BF16 `1.651x`
   - Because it misses the promotion gate, the grouped-KV default stays in place.
 
 ## Tests
@@ -52,8 +53,8 @@
 ## Next Step
 - Finish the last QK-only laggard first: noncausal `GQA (6q,2kv), d128`.
   - Keep the grouped-KV schedule as the default until a faster CTA-local KV-reuse path is ready.
-  - The raw-byte local-pack path is now a correctness/bring-up reference, not the next default.
-  - The next real optimization target is widening the raw-byte gather back toward an efficient vectorized load path without re-triggering CuTe's verifier failures.
+  - The raw-byte local-pack path is now a runnable optimization playground, but not the next default yet.
+  - The next real optimization target is reducing local-pack Q gather overhead further without re-triggering CuTe's vectorized-copy verifier failures.
 - FP4 PV remains the follow-up after the QK-only d128 GQA path has a real win.
   - Expected later API additions:
     - `use_fp4_pv`

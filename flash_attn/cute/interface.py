@@ -651,6 +651,8 @@ def _flash_attn_fwd(
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     fp4_q_stage = 1
     fp4_use_2cta_instrs = False
+    fp4_group_qheads_by_kv = False
+    fp4_is_persistent = False
     if is_fp4_qk:
         _, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_qk_format)
         fp4_speed_shape = (
@@ -670,49 +672,56 @@ def _flash_attn_fwd(
             and pack_gqa
             and qhead_per_kvhead == 3
         )
-        fp4_use_2cta_instrs = (
+        fp4_group_qheads_by_kv = (
             fp4_speed_shape
-            and seqlen_q_packgqa > 2 * tile_m
-            and _fp4_qk_max_kv_stages(
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                q_stage=1,
-                use_2cta_instrs=True,
-                sf_vec_size=fp4_sf_vec_size,
-            ) >= 2
-            and _fp4_qk_tmem_fits(
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                q_stage=1,
-                use_2cta_instrs=True,
-            )
+            and not pack_gqa
+            and qhead_per_kvhead == 3
         )
-        if (
-            fp4_speed_shape
-            and seqlen_q_packgqa > tile_m
-            and _fp4_qk_max_kv_stages(
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                q_stage=2,
-                use_2cta_instrs=fp4_use_2cta_instrs,
-                sf_vec_size=fp4_sf_vec_size,
-            ) >= 2
-            and _fp4_qk_tmem_fits(
-                head_dim=head_dim,
-                head_dim_v=head_dim_v,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                q_stage=2,
-                use_2cta_instrs=fp4_use_2cta_instrs,
+        fp4_is_persistent = not causal and not local
+        if not fp4_group_qheads_by_kv:
+            fp4_use_2cta_instrs = (
+                fp4_speed_shape
+                and seqlen_q_packgqa > 2 * tile_m
+                and _fp4_qk_max_kv_stages(
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    q_stage=1,
+                    use_2cta_instrs=True,
+                    sf_vec_size=fp4_sf_vec_size,
+                ) >= 2
+                and _fp4_qk_tmem_fits(
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    q_stage=1,
+                    use_2cta_instrs=True,
+                )
             )
-        ):
-            fp4_q_stage = 2
+            if (
+                fp4_speed_shape
+                and seqlen_q_packgqa > tile_m
+                and _fp4_qk_max_kv_stages(
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    q_stage=2,
+                    use_2cta_instrs=fp4_use_2cta_instrs,
+                    sf_vec_size=fp4_sf_vec_size,
+                ) >= 2
+                and _fp4_qk_tmem_fits(
+                    head_dim=head_dim,
+                    head_dim_v=head_dim_v,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    q_stage=2,
+                    use_2cta_instrs=fp4_use_2cta_instrs,
+                )
+            ):
+                fp4_q_stage = 2
         q_stage = fp4_q_stage
     elif arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
@@ -849,6 +858,8 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         use_2cta_instrs,
+        fp4_group_qheads_by_kv if is_fp4_qk else False,
+        fp4_is_persistent if is_fp4_qk else None,
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
@@ -956,7 +967,7 @@ def _flash_attn_fwd(
                     m_block_size=tile_m,
                     n_block_size=tile_n,
                     q_stage=q_stage,
-                    is_persistent=not causal and not local,
+                    is_persistent=fp4_is_persistent,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
@@ -967,6 +978,7 @@ def _flash_attn_fwd(
                     use_fp4_qk=True,
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,
+                    group_qheads_by_kv=fp4_group_qheads_by_kv,
                 )
                 if compile_start_time is not None:
                     fa_logging.fa_log(1, "FP4 kernel object construction done")

@@ -42,6 +42,7 @@ class TileSchedulerArguments(ParamsBase):
     headdim_v: Int32
     total_q: Int32
     tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    num_subhead: cutlass.Constexpr[int] = 1
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
@@ -58,9 +59,11 @@ class SingleTileScheduler:
     class Params(ParamsBase):
         num_block: Int32
         num_head: Int32
+        num_subhead_divmod: FastDivmodDivisor
         num_batch: Int32
         num_splits: Int32
         num_splits_divmod: FastDivmodDivisor
+        num_subhead: cutlass.Constexpr[int] = 1
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
 
@@ -68,12 +71,17 @@ class SingleTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileScheduler.Params":
+            assert args.num_subhead == 1 or not args.is_split_kv, (
+                "SingleTileScheduler does not support split-KV together with grouped subheads"
+            )
             return SingleTileScheduler.Params(
                 args.num_block,
                 args.num_head,
+                FastDivmodDivisor(args.num_subhead),
                 args.num_batch,
                 args.num_splits,
                 FastDivmodDivisor(args.num_splits),
+                args.num_subhead,
                 args.is_split_kv,
                 args.cluster_shape_mn,
             )
@@ -112,7 +120,7 @@ class SingleTileScheduler:
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
         return (
             cute.round_up(params.num_block, params.cluster_shape_mn[0]),
-            params.num_head * params.num_splits,
+            params.num_head * params.num_subhead * params.num_splits,
             params.num_batch,
         )
 
@@ -120,8 +128,14 @@ class SingleTileScheduler:
         block_idx, head_idx, batch_idx = self._blk_coord
         if const_expr(self.params.is_split_kv):
             head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
+            subhead_idx = Int32(0)
         else:
             split_idx = Int32(0)
+            subhead_idx = Int32(0)
+        if const_expr(self.params.num_subhead > 1):
+            head_idx, subhead_idx = divmod(head_idx, self.params.num_subhead_divmod)
+            if const_expr(not self.params.is_split_kv):
+                split_idx = subhead_idx
         return WorkTileInfo(
             (block_idx, head_idx, batch_idx, split_idx),
             self._is_first_block,
@@ -157,7 +171,9 @@ class StaticPersistentTileScheduler:
     class Params(ParamsBase):
         num_block_cluster_divmod: FastDivmodDivisor
         num_head_divmod: FastDivmodDivisor
+        num_subhead_divmod: FastDivmodDivisor
         total_blocks_cluster: Int32
+        num_subhead: cutlass.Constexpr[int] = 1
         cluster_shape_m: cutlass.Constexpr[int] = 1
 
         @staticmethod
@@ -165,11 +181,15 @@ class StaticPersistentTileScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
             num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
-            total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
+            total_blocks_cluster = (
+                num_block_cluster * args.num_head * args.num_batch * args.num_subhead
+            )
             return StaticPersistentTileScheduler.Params(
                 FastDivmodDivisor(num_block_cluster),
                 FastDivmodDivisor(args.num_head),
+                FastDivmodDivisor(args.num_subhead),
                 total_blocks_cluster,
+                args.num_subhead,
                 cluster_shape_m=args.cluster_shape_mn[0],
             )
 
@@ -208,13 +228,14 @@ class StaticPersistentTileScheduler:
 
     # @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_cluster_divmod)
+        hnb_idx, subhead_idx = divmod(self._tile_idx, self.params.num_subhead_divmod)
+        hn_idx, block_idx = divmod(hnb_idx, self.params.num_block_cluster_divmod)
         batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
         is_valid = self._tile_idx < self.params.total_blocks_cluster
         # if cute.arch.thread_idx()[0] == 0:
         #     cute.printf("TileScheduler: tile_idx=%d, hn_idx=%d, block_idx=%d, batch_idx=%d, head_idx=%d, is_valid=%d", self._tile_idx, hn_idx, block_idx, batch_idx, head_idx, is_valid)
         return WorkTileInfo(
-            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(subhead_idx)), is_valid
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):

@@ -93,6 +93,7 @@ class FP4FlashAttentionForwardSm100:
         use_fp4_qk: bool = True,
         fp4_sf_dtype: str = "e4m3",   # "e4m3" (NVFP4) or "e8m0" (MXFP4)
         fp4_sf_vec_size: int = 16,     # 16 for NVFP4, 32 for MXFP4
+        group_qheads_by_kv: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # FP4 QK configuration
@@ -144,9 +145,13 @@ class FP4FlashAttentionForwardSm100:
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
         self.pack_gqa_seqmajor = self.pack_gqa and self.mma_tiler_qk[0] % self.qhead_per_kvhead != 0
+        self.group_qheads_by_kv = group_qheads_by_kv
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
+        )
+        assert not (self.group_qheads_by_kv and self.pack_gqa), (
+            "KV-grouped GQA scheduling is only supported on the unpacked path"
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -266,6 +271,22 @@ class FP4FlashAttentionForwardSm100:
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
 
         self.buffer_align_bytes = 1024
+
+    @cute.jit
+    def q_head_idx(self, head_idx: Int32, split_idx: Int32):
+        return (
+            head_idx * self.qhead_per_kvhead + split_idx
+            if const_expr(self.group_qheads_by_kv)
+            else head_idx
+        )
+
+    @cute.jit
+    def kv_head_idx(self, head_idx: Int32):
+        return (
+            head_idx
+            if const_expr(self.group_qheads_by_kv or self.pack_gqa)
+            else head_idx // self.qhead_per_kvhead
+        )
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -672,7 +693,7 @@ class FP4FlashAttentionForwardSm100:
                 )
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
-            cute.size(mQ.shape[2]),
+            cute.size(mK.shape[2]) if const_expr(self.group_qheads_by_kv) else cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
@@ -685,6 +706,7 @@ class FP4FlashAttentionForwardSm100:
             total_q=cute.size(mQ.shape[0])
             if const_expr(mCuSeqlensQ is not None)
             else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            num_subhead=self.qhead_per_kvhead if const_expr(self.group_qheads_by_kv) else 1,
             tile_shape_mn=self.cta_tiler[:2],
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
@@ -1365,7 +1387,9 @@ class FP4FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mma_tile_coord_v = thr_mma_qk.thr_idx
-            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            q_head_idx = self.q_head_idx(head_idx, split_idx)
+            kv_head_idx = self.kv_head_idx(head_idx)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, q_head_idx]
             tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
             gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
             gQ = layout_utils.select(
@@ -1376,7 +1400,7 @@ class FP4FlashAttentionForwardSm100:
                 assert sSFA is not None and sSFK is not None
                 # FP4 QK is dense-only in v1, so the grouped (head, batch) scale mode
                 # can be indexed directly without the varlen batch offset helpers.
-                mQ_scale_cur = mQ_scale[None, None, (head_idx, batch_idx)]
+                mQ_scale_cur = mQ_scale[None, None, (q_head_idx, batch_idx)]
                 tiler_gQ_scale = (
                     (self.mma_tiler_qk[0] * self.q_stage) // self.cta_group_size,
                     self.head_dim_padded,
@@ -1388,20 +1412,17 @@ class FP4FlashAttentionForwardSm100:
                     mode=[0, 2, 1],
                 )
 
-            head_idx_kv = (
-                head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-            )
             if const_expr(mPageTable is None):
                 if const_expr(not seqlen.has_cu_seqlens_k):
-                    mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                    mK_cur, mV_cur = [t[None, None, kv_head_idx, batch_idx] for t in (mK, mV)]
                     if const_expr(self.use_fp4_qk):
-                        mK_scale_cur = mK_scale[None, None, (head_idx_kv, batch_idx)]
+                        mK_scale_cur = mK_scale[None, None, (kv_head_idx, batch_idx)]
                 else:
-                    mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
-                    mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
+                    mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, kv_head_idx])
+                    mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, kv_head_idx])
                     if const_expr(self.use_fp4_qk):
                         mK_scale_cur = cute.domain_offset(
-                            (seqlen.offset_k, 0), mK_scale[None, None, (head_idx_kv, batch_idx)]
+                            (seqlen.offset_k, 0), mK_scale[None, None, (kv_head_idx, batch_idx)]
                         )
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
@@ -1411,7 +1432,7 @@ class FP4FlashAttentionForwardSm100:
                     )
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
-                mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
+                mK_cur, mV_cur = [t[None, None, kv_head_idx, None] for t in (mK, mV)]
                 gK = cute.local_tile(
                     mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
                 )
@@ -1449,7 +1470,7 @@ class FP4FlashAttentionForwardSm100:
                     mV,
                     FastDivmodDivisor(page_size),
                     batch_idx,
-                    head_idx_kv,
+                    kv_head_idx,
                     tidx,
                     seqlen.seqlen_k,
                     0,  # leftpad_k
@@ -2060,6 +2081,7 @@ class FP4FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            q_head_idx = self.q_head_idx(head_idx, split_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -2071,7 +2093,7 @@ class FP4FlashAttentionForwardSm100:
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 batch_idx=batch_idx,
-                head_idx=head_idx,
+                head_idx=q_head_idx,
                 aux_tensors=aux_tensors,
             )
 
@@ -2153,7 +2175,7 @@ class FP4FlashAttentionForwardSm100:
                 sScale=sScale,
                 stage=stage,
                 batch_idx=batch_idx,
-                head_idx=head_idx,
+                head_idx=q_head_idx,
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
@@ -2505,13 +2527,14 @@ class FP4FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            q_head_idx = self.q_head_idx(head_idx, split_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             if const_expr(self.is_split_kv):
-                mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, q_head_idx, split_idx]
             else:
-                mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+                mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, q_head_idx]
             tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
             gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
             gO = layout_utils.select(
@@ -2579,7 +2602,7 @@ class FP4FlashAttentionForwardSm100:
                 learnable_sink_val = [None] * self.q_stage
                 if const_expr(learnable_sink is not None):
                     if const_expr(not self.pack_gqa):
-                        sink_val = Float32(learnable_sink[head_idx])
+                        sink_val = Float32(learnable_sink[q_head_idx])
                         learnable_sink_val = [sink_val] * self.q_stage
                     else:  # Each thread might have a different sink value due to different q_head
                         for stage in cutlass.range_constexpr(self.q_stage):
@@ -2685,9 +2708,9 @@ class FP4FlashAttentionForwardSm100:
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     if const_expr(self.is_split_kv):
-                        mLSE_cur = mLSE[None, head_idx, batch_idx, split_idx]
+                        mLSE_cur = mLSE[None, q_head_idx, batch_idx, split_idx]
                     else:
-                        mLSE_cur = mLSE[None, head_idx, batch_idx]
+                        mLSE_cur = mLSE[None, q_head_idx, batch_idx]
                 else:
                     offset = seqlen.offset_q
                     if const_expr(self.pack_gqa):
@@ -2697,9 +2720,9 @@ class FP4FlashAttentionForwardSm100:
                             else (0, seqlen.offset_q)
                         )
                     if const_expr(self.is_split_kv):
-                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx, split_idx])
+                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, q_head_idx, split_idx])
                     else:
-                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
+                        mLSE_cur = cute.domain_offset((offset,), mLSE[None, q_head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
                     gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
@@ -2938,14 +2961,15 @@ class FP4FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            q_head_idx = self.q_head_idx(head_idx, split_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 if const_expr(self.is_split_kv):
-                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, q_head_idx, split_idx]
                 else:
-                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, q_head_idx]
                 tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
                 gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
                 gO = layout_utils.select(

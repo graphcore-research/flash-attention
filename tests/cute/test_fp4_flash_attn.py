@@ -278,6 +278,46 @@ def test_fp4_gqa_d128_noncausal_explicit_pack_gqa_uses_2cta(monkeypatch):
     assert kernel_kwargs["use_2cta_instrs"] is True
 
 
+def test_fp4_gqa_d128_noncausal_default_uses_grouped_kv_reuse(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    kernel_kwargs = {}
+
+    def fake_fp4_kernel(*_args, **kwargs):
+        kernel_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=6,
+            num_heads_kv=2,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+        )
+
+    assert kernel_kwargs["pack_gqa"] is False
+    assert kernel_kwargs["group_qheads_by_kv"] is True
+    assert kernel_kwargs["m_block_size"] == 128
+    assert kernel_kwargs["n_block_size"] == 128
+    assert kernel_kwargs["q_stage"] == 1
+    assert kernel_kwargs["use_2cta_instrs"] is False
+    assert kernel_kwargs["is_persistent"] is True
+
+
 def test_fp4_causal_d128_keeps_bringup_schedule(monkeypatch):
     _install_fake_cuda_runtime(monkeypatch)
     kernel_kwargs = {}
@@ -454,6 +494,7 @@ def _run_fp4_runtime_case(
     causal: bool,
     seqlen_q: int = 128,
     seqlen_k: int = 128,
+    pack_gqa: bool = False,
     timeout_s: int = 180,
 ) -> None:
     script = textwrap.dedent(
@@ -538,6 +579,7 @@ def _run_fp4_runtime_case(
             fp4_qk_format="nvfp4",
             q_scale=q_scale,
             k_scale=k_scale,
+            pack_gqa={pack_gqa},
         )
         out_ref, lse_ref = _flash_attn_fwd(
             q_ref,
@@ -607,3 +649,8 @@ def test_fp4_qk_runtime_matches_bf16_reference_long_seqlen_d128_noncausal_mha():
 def test_fp4_qk_runtime_matches_bf16_reference_long_seqlen_d128_noncausal_gqa(seqlen):
     _require_sm100()
     _run_fp4_runtime_case(6, 2, head_dim=128, causal=False, seqlen_q=seqlen, seqlen_k=seqlen)
+
+
+def test_fp4_qk_runtime_explicit_pack_gqa_matches_bf16_reference():
+    _require_sm100()
+    _run_fp4_runtime_case(6, 2, head_dim=128, causal=False, pack_gqa=True)

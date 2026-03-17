@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -33,7 +34,7 @@ def _is_supported_packed_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) 
 
 
 class FlashHSABackwardSm100:
-    """Scaffold for the future monolithic HSA backward kernel on SM100/SM110."""
+    """Internal-only monolithic HSA backward kernel wrapper on SM100/SM110."""
 
     arch = 100
 
@@ -53,6 +54,8 @@ class FlashHSABackwardSm100:
         self.k_block_size = k_block_size
         self.anchor_row_panel_size = anchor_row_panel_size
         self.deterministic = deterministic
+        self.tile_m = 128
+        self.tile_n = k_block_size
 
 
 @dataclass
@@ -183,6 +186,264 @@ def _allocate_hsa_bwd_monolithic_workspaces(
     return workspaces
 
 
+def _prepare_hsa_bwd_monolithic_workspaces(
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    workspaces: dict[str, Optional[torch.Tensor]],
+):
+    assert workspaces["dq_accum"] is not None
+    assert workspaces["dpsum"] is not None
+    assert workspaces["lse_log2"] is not None
+    workspaces["dq_accum"].zero_()
+    workspaces["dpsum"].zero_()
+    workspaces["lse_log2"].zero_()
+    if workspaces["dk_accum"] is not None:
+        workspaces["dk_accum"].zero_()
+    if workspaces["dv_accum"] is not None:
+        workspaces["dv_accum"].zero_()
+    if workspaces["dQ_semaphore"] is not None:
+        workspaces["dQ_semaphore"].zero_()
+    if workspaces["dK_semaphore"] is not None:
+        workspaces["dK_semaphore"].zero_()
+    if workspaces["dV_semaphore"] is not None:
+        workspaces["dV_semaphore"].zero_()
+
+    seqlen = out.shape[1]
+    dpsum = (out.float() * dout.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
+    workspaces["dpsum"][:, :, :seqlen].copy_(dpsum)
+    workspaces["lse_log2"][:, :, :seqlen].copy_(lse.float() * math.log2(math.e))
+
+
+def _run_hsa_monolithic_panel_math(
+    q_sel: torch.Tensor,
+    k_sel: torch.Tensor,
+    v_sel: torch.Tensor,
+    out_sel: torch.Tensor,
+    dout_sel: torch.Tensor,
+    lse_sel: torch.Tensor,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hsa_mod = _load_hsa_module()
+    batch_count, q_len = q_sel.shape[0], q_sel.shape[1]
+    k_len = k_sel.shape[1]
+    num_q_heads = q_sel.shape[2]
+    q_float = q_sel.float().contiguous()
+    k_expanded = hsa_mod._expand_kv_to_q_heads(
+        k_sel.reshape(-1, k_sel.shape[2], k_sel.shape[3]).float(),
+        num_q_heads,
+    ).view(batch_count, k_len, num_q_heads, k_sel.shape[3]).contiguous()
+    v_expanded = hsa_mod._expand_kv_to_q_heads(
+        v_sel.reshape(-1, v_sel.shape[2], v_sel.shape[3]).float(),
+        num_q_heads,
+    ).view(batch_count, k_len, num_q_heads, v_sel.shape[3]).contiguous()
+    out_float = out_sel.float().contiguous()
+    dout_float = dout_sel.float().contiguous()
+
+    q_hqd = q_float.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, q_len, q_sel.shape[3]).contiguous()
+    k_hkd = k_expanded.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, k_len, k_sel.shape[3]).contiguous()
+    v_hkd = v_expanded.permute(0, 2, 1, 3).reshape(batch_count * num_q_heads, k_len, v_sel.shape[3]).contiguous()
+    scores = torch.bmm(q_hqd, k_hkd.transpose(1, 2)) * softmax_scale
+    lse_expanded = lse_sel.permute(0, 2, 1).reshape(batch_count * num_q_heads, q_len, 1)
+    probs = torch.exp(scores - lse_expanded)
+
+    dout_hqd = dout_float.permute(0, 2, 1, 3).reshape(
+        batch_count * num_q_heads, q_len, dout_sel.shape[3]
+    ).contiguous()
+    dprob = torch.bmm(dout_hqd, v_hkd.transpose(1, 2))
+    delta = (out_float * dout_float).sum(dim=-1).permute(0, 2, 1).reshape(
+        batch_count * num_q_heads, q_len, 1
+    )
+    dscores = probs * (dprob - delta)
+
+    dq = torch.bmm(dscores, k_hkd).view(batch_count, num_q_heads, q_len, q_sel.shape[3]).permute(0, 2, 1, 3)
+    dq = dq.contiguous() * softmax_scale
+    dk_expanded = torch.bmm(dscores.transpose(1, 2), q_hqd)
+    dk_expanded = dk_expanded.view(batch_count, num_q_heads, k_len, k_sel.shape[3]).permute(0, 2, 1, 3).contiguous()
+    dk_expanded = dk_expanded * softmax_scale
+    dv_expanded = torch.bmm(probs.transpose(1, 2), dout_hqd)
+    dv_expanded = dv_expanded.view(batch_count, num_q_heads, k_len, v_sel.shape[3]).permute(0, 2, 1, 3).contiguous()
+    dk = hsa_mod._collapse_q_to_kv_heads(
+        dk_expanded.view(batch_count * k_len, num_q_heads, k_sel.shape[3]),
+        k_sel.shape[2],
+    ).view(batch_count, k_len, k_sel.shape[2], k_sel.shape[3])
+    dv = hsa_mod._collapse_q_to_kv_heads(
+        dv_expanded.view(batch_count * k_len, num_q_heads, v_sel.shape[3]),
+        v_sel.shape[2],
+    ).view(batch_count, k_len, v_sel.shape[2], v_sel.shape[3])
+    return dq, dk, dv
+
+
+def _run_hsa_bwd_monolithic_main_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    monolithic_schedule,
+    launch_plan: HSAMonolithicBackwardLaunchPlan,
+    softmax_scale: float,
+    workspaces: dict[str, Optional[torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, num_q_heads, head_dim = q.shape
+    seqlen_k = k.shape[1]
+    num_kv_heads = k.shape[2]
+    head_dim_v = v.shape[-1]
+    total_rows = schedule.num_rows
+    device = q.device
+
+    q_flat = q.reshape(total_rows, num_q_heads, head_dim)
+    k_flat = k.reshape(total_rows, num_kv_heads, head_dim)
+    v_flat = v.reshape(total_rows, num_kv_heads, head_dim_v)
+    out_flat = out.reshape(total_rows, num_q_heads, head_dim_v).float()
+    dout_flat = dout.reshape(total_rows, num_q_heads, head_dim_v).float()
+    lse_flat = lse.permute(0, 2, 1).contiguous().view(total_rows, num_q_heads).float()
+
+    dq_acc_rows = torch.zeros_like(q_flat, dtype=torch.float32)
+    dk_acc_rows = torch.zeros_like(k_flat, dtype=torch.float32)
+    dv_acc_rows = torch.zeros_like(v_flat, dtype=torch.float32)
+
+    def _apply_descriptor(query_rows: torch.Tensor, key_rows: torch.Tensor):
+        if query_rows.numel() == 0 or key_rows.numel() == 0:
+            return
+        q_sel = q_flat.index_select(0, query_rows).unsqueeze(0)
+        k_sel = k_flat.index_select(0, key_rows).unsqueeze(0)
+        v_sel = v_flat.index_select(0, key_rows).unsqueeze(0)
+        out_sel = out_flat.index_select(0, query_rows).unsqueeze(0)
+        dout_sel = dout_flat.index_select(0, query_rows).unsqueeze(0)
+        lse_sel = lse_flat.index_select(0, query_rows).unsqueeze(0)
+        dq_part, dk_part, dv_part = _run_hsa_monolithic_panel_math(
+            q_sel,
+            k_sel,
+            v_sel,
+            out_sel,
+            dout_sel,
+            lse_sel,
+            softmax_scale,
+        )
+        dq_acc_rows.index_add_(0, query_rows, dq_part[0].float())
+        dk_acc_rows.index_add_(0, key_rows, dk_part[0].float())
+        dv_acc_rows.index_add_(0, key_rows, dv_part[0].float())
+
+    for global_k_block in range(monolithic_schedule.num_k_blocks):
+        batch_idx = global_k_block // monolithic_schedule.blocks_per_batch
+        block_k_start = (global_k_block % monolithic_schedule.blocks_per_batch) * monolithic_schedule.k_block_size
+        block_flat_start = batch_idx * seqlen_k + block_k_start
+
+        sent_full_start = int(monolithic_schedule.sentence_full_kblock_row_ptr[global_k_block].item())
+        sent_full_end = int(monolithic_schedule.sentence_full_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_full_start, sent_full_end):
+            q_start = int(monolithic_schedule.sentence_full_q_start[desc_idx].item())
+            q_len = int(monolithic_schedule.sentence_full_q_len[desc_idx].item())
+            k_local_start = int(monolithic_schedule.sentence_full_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.sentence_full_k_len[desc_idx].item())
+            query_rows = torch.arange(
+                batch_idx * seqlen_q + q_start,
+                batch_idx * seqlen_q + q_start + q_len,
+                device=device,
+                dtype=torch.long,
+            )
+            key_rows = torch.arange(
+                block_flat_start + k_local_start,
+                block_flat_start + k_local_start + k_len,
+                device=device,
+                dtype=torch.long,
+            )
+            _apply_descriptor(query_rows, key_rows)
+
+        sent_tail_start = int(monolithic_schedule.sentence_tail_kblock_row_ptr[global_k_block].item())
+        sent_tail_end = int(monolithic_schedule.sentence_tail_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(sent_tail_start, sent_tail_end):
+            q_start = int(monolithic_schedule.sentence_tail_q_start[desc_idx].item())
+            q_len = int(monolithic_schedule.sentence_tail_q_len[desc_idx].item())
+            k_local_start = int(monolithic_schedule.sentence_tail_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.sentence_tail_k_len[desc_idx].item())
+            row0_prefix_len = int(monolithic_schedule.sentence_tail_row0_prefix_len[desc_idx].item())
+            query_rows = torch.arange(
+                batch_idx * seqlen_q + q_start,
+                batch_idx * seqlen_q + q_start + q_len,
+                device=device,
+                dtype=torch.long,
+            )
+            for q_offset in range(q_len):
+                prefix = min(k_len, row0_prefix_len + q_offset)
+                if prefix <= 0:
+                    continue
+                key_rows = torch.arange(
+                    block_flat_start + k_local_start,
+                    block_flat_start + k_local_start + prefix,
+                    device=device,
+                    dtype=torch.long,
+                )
+                _apply_descriptor(query_rows[q_offset : q_offset + 1], key_rows)
+
+        anchor_full_start = int(monolithic_schedule.anchor_full_kblock_row_ptr[global_k_block].item())
+        anchor_full_end = int(monolithic_schedule.anchor_full_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_full_start, anchor_full_end):
+            q_row_start = int(monolithic_schedule.anchor_full_q_row_start[desc_idx].item())
+            q_row_count = int(monolithic_schedule.anchor_full_q_row_count[desc_idx].item())
+            k_local_start = int(monolithic_schedule.anchor_full_k_local_start[desc_idx].item())
+            k_len = int(monolithic_schedule.anchor_full_k_len[desc_idx].item())
+            query_rows = monolithic_schedule.anchor_q_indices[q_row_start : q_row_start + q_row_count].long()
+            key_rows = torch.arange(
+                block_flat_start + k_local_start,
+                block_flat_start + k_local_start + k_len,
+                device=device,
+                dtype=torch.long,
+            )
+            _apply_descriptor(query_rows, key_rows)
+
+        anchor_tail_start = int(monolithic_schedule.anchor_tail_kblock_row_ptr[global_k_block].item())
+        anchor_tail_end = int(monolithic_schedule.anchor_tail_kblock_row_ptr[global_k_block + 1].item())
+        for desc_idx in range(anchor_tail_start, anchor_tail_end):
+            q_row_start = int(monolithic_schedule.anchor_tail_q_row_start[desc_idx].item())
+            q_row_count = int(monolithic_schedule.anchor_tail_q_row_count[desc_idx].item())
+            k_local_start = int(monolithic_schedule.anchor_tail_k_local_start[desc_idx].item())
+            prefix_row_start = int(monolithic_schedule.anchor_tail_prefix_row_start[desc_idx].item())
+            query_rows = monolithic_schedule.anchor_q_indices[q_row_start : q_row_start + q_row_count].long()
+            prefix_rows = monolithic_schedule.anchor_prefix_len[prefix_row_start : prefix_row_start + q_row_count].long()
+            for query_row, prefix in zip(query_rows.tolist(), prefix_rows.tolist()):
+                if prefix <= 0:
+                    continue
+                key_rows = torch.arange(
+                    block_flat_start + k_local_start,
+                    block_flat_start + k_local_start + prefix,
+                    device=device,
+                    dtype=torch.long,
+                )
+                _apply_descriptor(torch.tensor([query_row], device=device, dtype=torch.long), key_rows)
+
+    dq_accum = workspaces["dq_accum"]
+    assert dq_accum is not None
+    head_dim_rounded = _round_up(head_dim, 32)
+    seqlen_q_rounded = _round_up(seqlen_q, launch_plan.tile_m)
+    dq_staging = dq_accum.view(batch_size, num_q_heads, seqlen_q_rounded, head_dim_rounded)
+    dq_staging.zero_()
+    dq_staging[:, :, :seqlen_q, :head_dim] = dq_acc_rows.view(batch_size, seqlen_q, num_q_heads, head_dim).permute(0, 2, 1, 3)
+    dq = dq_staging[:, :, :seqlen_q, :head_dim].permute(0, 2, 1, 3).contiguous().to(dtype=q.dtype)
+
+    if launch_plan.dkv_postprocess:
+        assert workspaces["dk_accum"] is not None and workspaces["dv_accum"] is not None
+        seqlen_k_rounded = _round_up(seqlen_k, launch_plan.tile_n)
+        head_dim_k_rounded = _round_up(head_dim, 32)
+        head_dim_v_rounded = _round_up(head_dim_v, 32)
+        dk_staging = workspaces["dk_accum"].view(batch_size, num_kv_heads, seqlen_k_rounded, head_dim_k_rounded)
+        dv_staging = workspaces["dv_accum"].view(batch_size, num_kv_heads, seqlen_k_rounded, head_dim_v_rounded)
+        dk_staging.zero_()
+        dv_staging.zero_()
+        dk_staging[:, :, :seqlen_k, :head_dim] = dk_acc_rows.view(batch_size, seqlen_k, num_kv_heads, head_dim).permute(0, 2, 1, 3)
+        dv_staging[:, :, :seqlen_k, :head_dim_v] = dv_acc_rows.view(batch_size, seqlen_k, num_kv_heads, head_dim_v).permute(0, 2, 1, 3)
+        dk = dk_staging[:, :, :seqlen_k, :head_dim].permute(0, 2, 1, 3).contiguous().to(dtype=k.dtype)
+        dv = dv_staging[:, :, :seqlen_k, :head_dim_v].permute(0, 2, 1, 3).contiguous().to(dtype=v.dtype)
+    else:
+        dk = dk_acc_rows.view_as(k).to(dtype=k.dtype)
+        dv = dv_acc_rows.view_as(v).to(dtype=v.dtype)
+
+    return dq, dk, dv
+
+
 def _build_hsa_bwd_monolithic_compile_key(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -217,7 +478,6 @@ def run_hsa_bwd_sm100_monolithic(
     softmax_scale: float,
     deterministic: bool,
 ):
-    del out, dout, lse, softmax_scale
     if not _is_supported_packed_bwd(q, k, v):
         raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
 
@@ -235,7 +495,21 @@ def run_hsa_bwd_sm100_monolithic(
             deterministic=deterministic,
         )
     run_hsa_bwd_sm100_monolithic.launch_plan_cache[compile_key] = launch_plan
-    raise NotImplementedError("Monolithic HSA backward kernel scaffold only; kernel body is not implemented yet")
+    workspaces = _allocate_hsa_bwd_monolithic_workspaces(launch_plan, device=q.device)
+    _prepare_hsa_bwd_monolithic_workspaces(out, dout, lse, workspaces)
+    return _run_hsa_bwd_monolithic_main_torch(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        schedule,
+        monolithic_schedule,
+        launch_plan,
+        softmax_scale,
+        workspaces,
+    )
 
 
 run_hsa_bwd_sm100_monolithic.compile_cache = get_jit_cache("hsa_bwd_monolithic")

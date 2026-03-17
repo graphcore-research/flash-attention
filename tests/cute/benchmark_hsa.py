@@ -117,10 +117,22 @@ def _temporary_env(**updates):
                 os.environ[key] = old_value
 
 
-def _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, *, use_fused_fwd=False, use_packed_bwd=False):
+def _run_sparse_attention(
+    q,
+    k,
+    v,
+    keep_ids,
+    hash_ids,
+    schedule,
+    *,
+    use_fused_fwd=False,
+    use_packed_bwd=False,
+    use_monolithic_bwd=False,
+):
     with _temporary_env(
         FLASH_ATTN_HSA_USE_FUSED_FWD="1" if use_fused_fwd else None,
         FLASH_ATTN_HSA_USE_PACKED_BWD="1" if use_packed_bwd else None,
+        FLASH_ATTN_HSA_USE_MONOLITHIC_BWD="1" if use_monolithic_bwd else None,
         FLASH_ATTN_HSA_USE_HYBRID_BWD=None,
     ):
         return _unwrap_output(
@@ -177,6 +189,9 @@ def run_case(case: BenchmarkCase):
     packed_forward = lambda q, k, v: _run_sparse_attention(
         q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=False, use_packed_bwd=True
     )
+    monolithic_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=False, use_monolithic_bwd=True
+    )
     fused_forward = lambda q, k, v: _run_sparse_attention(
         q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=True, use_packed_bwd=False
     )
@@ -187,6 +202,7 @@ def run_case(case: BenchmarkCase):
     out_fa4 = maskmod_forward(q_data, k_data, v_data)
     out_sparse = sparse_forward(q_data, k_data, v_data)
     out_packed = packed_forward(q_data, k_data, v_data)
+    out_monolithic = monolithic_forward(q_data, k_data, v_data)
     out_fused = fused_forward(q_data, k_data, v_data)
     out_ref = dense_ref_forward(q_data, k_data, v_data)
     max_diff = (out_fa4.float() - out_ref.float()).abs().max().item()
@@ -195,6 +211,8 @@ def run_case(case: BenchmarkCase):
     sparse_mean_diff = (out_sparse.float() - out_ref.float()).abs().mean().item()
     packed_max_diff = (out_packed.float() - out_ref.float()).abs().max().item()
     packed_mean_diff = (out_packed.float() - out_ref.float()).abs().mean().item()
+    monolithic_max_diff = (out_monolithic.float() - out_ref.float()).abs().max().item()
+    monolithic_mean_diff = (out_monolithic.float() - out_ref.float()).abs().mean().item()
     fused_max_diff = (out_fused.float() - out_ref.float()).abs().max().item()
     fused_mean_diff = (out_fused.float() - out_ref.float()).abs().mean().item()
 
@@ -210,6 +228,11 @@ def run_case(case: BenchmarkCase):
     )
     packed_ms = _measure_ms(
         lambda: packed_forward(q_data, k_data, v_data),
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    monolithic_ms = _measure_ms(
+        lambda: monolithic_forward(q_data, k_data, v_data),
         case.warmup_iters,
         case.benchmark_iters,
     )
@@ -245,6 +268,15 @@ def run_case(case: BenchmarkCase):
         case.benchmark_iters,
         env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
     )
+    monolithic_bwd_ms = _measure_backward_ms(
+        monolithic_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates={"FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
+    )
     ref_bwd_ms = _measure_backward_ms(
         dense_ref_forward,
         q_data,
@@ -265,6 +297,15 @@ def run_case(case: BenchmarkCase):
         case.benchmark_iters,
         env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
     )
+    monolithic_fwd_bwd_ms = _measure_fwd_bwd_ms(
+        monolithic_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates={"FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
+    )
     ref_fwd_bwd_ms = _measure_fwd_bwd_ms(
         dense_ref_forward,
         q_data,
@@ -277,6 +318,7 @@ def run_case(case: BenchmarkCase):
     speedup = ref_ms / fa4_ms if fa4_ms > 0 else float("inf")
     sparse_speedup = ref_ms / sparse_ms if sparse_ms > 0 else float("inf")
     packed_speedup = ref_ms / packed_ms if packed_ms > 0 else float("inf")
+    monolithic_speedup = ref_ms / monolithic_ms if monolithic_ms > 0 else float("inf")
     fused_speedup = ref_ms / fused_ms if fused_ms > 0 else float("inf")
 
     print(
@@ -284,13 +326,14 @@ def run_case(case: BenchmarkCase):
         f"maskmod_max_diff={max_diff:.6f} maskmod_mean_diff={mean_diff:.6f} "
         f"sparse_max_diff={sparse_max_diff:.6f} sparse_mean_diff={sparse_mean_diff:.6f} "
         f"packed_max_diff={packed_max_diff:.6f} packed_mean_diff={packed_mean_diff:.6f} "
+        f"monolithic_max_diff={monolithic_max_diff:.6f} monolithic_mean_diff={monolithic_mean_diff:.6f} "
         f"fused_max_diff={fused_max_diff:.6f} fused_mean_diff={fused_mean_diff:.6f} "
-        f"maskmod_ms={fa4_ms:.3f} sparse_ms={sparse_ms:.3f} packed_ms={packed_ms:.3f} fused_ms={fused_ms:.3f} "
+        f"maskmod_ms={fa4_ms:.3f} sparse_ms={sparse_ms:.3f} packed_ms={packed_ms:.3f} monolithic_ms={monolithic_ms:.3f} fused_ms={fused_ms:.3f} "
         f"dense_causal_ms={dense_causal_ms:.3f} dense_full_ms={dense_full_ms:.3f} ref_ms={ref_ms:.3f} "
-        f"maskmod_bwd_ms={maskmod_bwd_ms:.3f} sparse_bwd_ms={sparse_bwd_ms:.3f} packed_bwd_ms={packed_bwd_ms:.3f} ref_bwd_ms={ref_bwd_ms:.3f} "
+        f"maskmod_bwd_ms={maskmod_bwd_ms:.3f} sparse_bwd_ms={sparse_bwd_ms:.3f} packed_bwd_ms={packed_bwd_ms:.3f} monolithic_bwd_ms={monolithic_bwd_ms:.3f} ref_bwd_ms={ref_bwd_ms:.3f} "
         f"maskmod_fwd_bwd_ms={maskmod_fwd_bwd_ms:.3f} sparse_fwd_bwd_ms={sparse_fwd_bwd_ms:.3f} "
-        f"packed_fwd_bwd_ms={packed_fwd_bwd_ms:.3f} ref_fwd_bwd_ms={ref_fwd_bwd_ms:.3f} "
-        f"maskmod_speedup={speedup:.2f}x sparse_speedup={sparse_speedup:.2f}x packed_speedup={packed_speedup:.2f}x fused_speedup={fused_speedup:.2f}x"
+        f"packed_fwd_bwd_ms={packed_fwd_bwd_ms:.3f} monolithic_fwd_bwd_ms={monolithic_fwd_bwd_ms:.3f} ref_fwd_bwd_ms={ref_fwd_bwd_ms:.3f} "
+        f"maskmod_speedup={speedup:.2f}x sparse_speedup={sparse_speedup:.2f}x packed_speedup={packed_speedup:.2f}x monolithic_speedup={monolithic_speedup:.2f}x fused_speedup={fused_speedup:.2f}x"
     )
 
 

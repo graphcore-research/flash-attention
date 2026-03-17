@@ -54,6 +54,11 @@ _DESC_SENTENCE = 0
 _DESC_SECTION = 1
 _DESC_DOCUMENT = 2
 
+_HSA_FWD_TILE_NONE = 0
+_HSA_FWD_TILE_AFFINE_PREFIX = 1
+_HSA_FWD_TILE_ROW_PREFIX = 2
+_HSA_FWD_TILE_BITMAP = 3
+
 
 @dataclass
 class HSABlockDescriptors:
@@ -110,10 +115,41 @@ class HSABlockSparseTensors:
 
 
 @dataclass
+class HSAForwardTileMasks:
+    """Packed exact metadata for HSA forward partial tiles."""
+
+    block_id_table: torch.Tensor
+    tile_kind: torch.Tensor
+    affine_base: torch.Tensor
+    row_prefix_row_ptr: torch.Tensor
+    row_prefix_len: torch.Tensor
+    bitmap_word_row_ptr: torch.Tensor
+    bitmap_words: torch.Tensor
+    q_block_size: int
+    k_block_size: int
+    words_per_row: int
+
+    def to(self, device: torch.device | str):
+        return HSAForwardTileMasks(
+            block_id_table=self.block_id_table.to(device=device),
+            tile_kind=self.tile_kind.to(device=device),
+            affine_base=self.affine_base.to(device=device),
+            row_prefix_row_ptr=self.row_prefix_row_ptr.to(device=device),
+            row_prefix_len=self.row_prefix_len.to(device=device),
+            bitmap_word_row_ptr=self.bitmap_word_row_ptr.to(device=device),
+            bitmap_words=self.bitmap_words.to(device=device),
+            q_block_size=self.q_block_size,
+            k_block_size=self.k_block_size,
+            words_per_row=self.words_per_row,
+        )
+
+
+@dataclass
 class HSABlockSparseRuntime:
     """Cached runtime metadata for the single-call HSA block-sparse path."""
 
     forward_sparse: HSABlockSparseTensors
+    forward_tile_masks: HSAForwardTileMasks
     backward_sparse: HSABlockSparseTensors
     backward_packed_masks: "HSABwdPackedMasks"
     forward_aux_tensors: list[torch.Tensor]
@@ -134,6 +170,7 @@ class HSABlockSparseRuntime:
 
         return HSABlockSparseRuntime(
             forward_sparse=self.forward_sparse.to(device=device),
+            forward_tile_masks=self.forward_tile_masks.to(device=device),
             backward_sparse=self.backward_sparse.to(device=device),
             backward_packed_masks=self.backward_packed_masks.to(device=device),
             forward_aux_tensors=[_move_aux(tensor) for tensor in self.forward_aux_tensors],
@@ -1201,6 +1238,109 @@ def schedule_aux_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
     return attend.to(device=schedule.sentence_start.device)
 
 
+def _build_hsa_forward_tile_mask_aux_tensors(tile_masks: HSAForwardTileMasks) -> list[torch.Tensor]:
+    return [
+        _tag_aux_tensor(tile_masks.block_id_table),
+        _tag_aux_tensor(tile_masks.tile_kind),
+        _tag_aux_tensor(tile_masks.affine_base),
+        _tag_aux_tensor(tile_masks.row_prefix_row_ptr),
+        _tag_aux_tensor(tile_masks.row_prefix_len),
+        _tag_aux_tensor(tile_masks.bitmap_word_row_ptr),
+        _tag_aux_tensor(tile_masks.bitmap_words),
+    ]
+
+
+def _tile_prefix_len_for_row(
+    tile_masks: HSAForwardTileMasks,
+    *,
+    block_id: int,
+    q_local: int,
+    k_len: int,
+) -> int:
+    kind = int(tile_masks.tile_kind[block_id].item())
+    if kind == _HSA_FWD_TILE_AFFINE_PREFIX:
+        return max(0, min(k_len, int(tile_masks.affine_base[block_id].item()) + q_local))
+    if kind == _HSA_FWD_TILE_ROW_PREFIX:
+        start = int(tile_masks.row_prefix_row_ptr[block_id].item())
+        return max(0, min(k_len, int(tile_masks.row_prefix_len[start + q_local].item())))
+    raise ValueError(f"tile kind {kind} does not encode row prefixes")
+
+
+def forward_tile_masks_to_attend_mask(
+    schedule: HSASchedule,
+    sparse_tensors: HSABlockSparseTensors,
+    tile_masks: HSAForwardTileMasks,
+) -> torch.Tensor:
+    attend = torch.zeros(
+        schedule.batch_size,
+        schedule.seqlen,
+        schedule.seqlen,
+        dtype=torch.bool,
+        device=schedule.sentence_start.device,
+    )
+    q_block_size, k_block_size = sparse_tensors.block_size
+    bsz, seqlen = schedule.batch_size, schedule.seqlen
+    mask_block_cnt = sparse_tensors.mask_block_cnt.detach().cpu()
+    mask_block_idx = sparse_tensors.mask_block_idx.detach().cpu()
+    full_block_cnt = sparse_tensors.full_block_cnt.detach().cpu()
+    full_block_idx = sparse_tensors.full_block_idx.detach().cpu()
+    block_id_table = tile_masks.block_id_table.detach().cpu()
+    tile_kind = tile_masks.tile_kind.detach().cpu()
+    affine_base = tile_masks.affine_base.detach().cpu()
+    row_prefix_row_ptr = tile_masks.row_prefix_row_ptr.detach().cpu()
+    row_prefix_len = tile_masks.row_prefix_len.detach().cpu()
+    bitmap_word_row_ptr = tile_masks.bitmap_word_row_ptr.detach().cpu()
+    bitmap_words = tile_masks.bitmap_words.detach().cpu()
+
+    for batch_idx in range(bsz):
+        num_q_blocks = mask_block_cnt.shape[2]
+        for q_block in range(num_q_blocks):
+            q_start = q_block * q_block_size
+            q_end = min(seqlen, q_start + q_block_size)
+            q_len = q_end - q_start
+            full_count = int(full_block_cnt[batch_idx, 0, q_block].item())
+            for idx in range(full_count):
+                k_block = int(full_block_idx[batch_idx, 0, q_block, idx].item())
+                k_start = k_block * k_block_size
+                k_end = min(seqlen, k_start + k_block_size)
+                attend[batch_idx, q_start:q_end, k_start:k_end] = True
+
+            mask_count = int(mask_block_cnt[batch_idx, 0, q_block].item())
+            for idx in range(mask_count):
+                k_block = int(mask_block_idx[batch_idx, 0, q_block, idx].item())
+                k_start = k_block * k_block_size
+                k_end = min(seqlen, k_start + k_block_size)
+                k_len = k_end - k_start
+                block_id = int(block_id_table[batch_idx, q_block, k_block].item())
+                kind = int(tile_kind[block_id].item())
+                if kind in {_HSA_FWD_TILE_AFFINE_PREFIX, _HSA_FWD_TILE_ROW_PREFIX}:
+                    for q_local in range(q_len):
+                        if kind == _HSA_FWD_TILE_AFFINE_PREFIX:
+                            prefix_len = max(0, min(k_len, int(affine_base[block_id].item()) + q_local))
+                        else:
+                            prefix_start = int(row_prefix_row_ptr[block_id].item())
+                            prefix_len = max(
+                                0,
+                                min(k_len, int(row_prefix_len[prefix_start + q_local].item())),
+                            )
+                        if prefix_len > 0:
+                            attend[batch_idx, q_start + q_local, k_start : k_start + prefix_len] = True
+                    continue
+
+                word_start = int(bitmap_word_row_ptr[block_id].item())
+                for q_local in range(q_len):
+                    for k_local in range(k_len):
+                        word_idx = k_local // 32
+                        bit_idx = k_local % 32
+                        word = int(
+                            bitmap_words[word_start + q_local * tile_masks.words_per_row + word_idx].item()
+                        ) & 0xFFFFFFFF
+                        if (word >> bit_idx) & 1:
+                            attend[batch_idx, q_start + q_local, k_start + k_local] = True
+
+    return attend
+
+
 def _accumulate_interval_counts(
     counts: list[list[list[int]]],
     batch_idx: int,
@@ -1272,10 +1412,120 @@ def _build_forward_hsa_block_sparse_tensors(
     q_block_size: int,
     k_block_size: int,
 ) -> HSABlockSparseTensors:
+    sparse_tensors, _ = _build_forward_hsa_tile_masks(
+        schedule,
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+    )
+    return sparse_tensors
+
+
+def _set_interval_block_mask_bits(
+    block_masks: dict[tuple[int, int, int], list[list[int]]],
+    *,
+    batch_idx: int,
+    q_idx: int,
+    start: int,
+    end: int,
+    q_block_size: int,
+    k_block_size: int,
+    words_per_row: int,
+):
+    q_block = q_idx // q_block_size
+    q_local = q_idx - q_block * q_block_size
+    cursor = start
+    while cursor < end:
+        k_block = cursor // k_block_size
+        block_words = block_masks.setdefault(
+            (batch_idx, q_block, k_block),
+            [[0 for _ in range(words_per_row)] for _ in range(q_block_size)],
+        )
+        block_end = min(end, (k_block + 1) * k_block_size)
+        for k_idx in range(cursor, block_end):
+            _set_block_mask_bit(
+                block_words,
+                q_local=q_local,
+                k_local=k_idx - k_block * k_block_size,
+            )
+        cursor = block_end
+
+
+def _get_block_mask_bit(
+    block_words: list[list[int]],
+    *,
+    row_idx: int,
+    bit_idx: int,
+) -> int:
+    word_idx = bit_idx // 32
+    return (block_words[row_idx][word_idx] >> (bit_idx % 32)) & 1
+
+
+def _row_prefix_len_if_contiguous(
+    block_words: list[list[int]],
+    *,
+    row_idx: int,
+    k_len: int,
+) -> Optional[int]:
+    prefix_len = 0
+    while prefix_len < k_len and _get_block_mask_bit(block_words, row_idx=row_idx, bit_idx=prefix_len):
+        prefix_len += 1
+    for bit_idx in range(prefix_len, k_len):
+        if _get_block_mask_bit(block_words, row_idx=row_idx, bit_idx=bit_idx):
+            return None
+    return prefix_len
+
+
+def _find_affine_prefix_base(prefix_lengths: list[int], *, k_len: int) -> Optional[int]:
+    lower = -10**9
+    upper = 10**9
+    for row_idx, prefix_len in enumerate(prefix_lengths):
+        if prefix_len <= 0:
+            upper = min(upper, -row_idx)
+        elif prefix_len >= k_len:
+            lower = max(lower, k_len - row_idx)
+        else:
+            affine_base = prefix_len - row_idx
+            lower = max(lower, affine_base)
+            upper = min(upper, affine_base)
+    return lower if lower <= upper else None
+
+
+def _classify_forward_partial_block(
+    block_words: list[list[int]],
+    *,
+    q_len: int,
+    k_len: int,
+    words_per_row: int,
+) -> tuple[int, int, list[int], list[int]]:
+    prefix_lengths: list[int] = []
+    for row_idx in range(q_len):
+        prefix_len = _row_prefix_len_if_contiguous(block_words, row_idx=row_idx, k_len=k_len)
+        if prefix_len is None:
+            bitmap_words = [
+                _as_signed_int32(block_words[row_idx][word_idx])
+                for row_idx in range(q_len)
+                for word_idx in range(words_per_row)
+            ]
+            return _HSA_FWD_TILE_BITMAP, 0, [], bitmap_words
+        prefix_lengths.append(prefix_len)
+
+    affine_base = _find_affine_prefix_base(prefix_lengths, k_len=k_len)
+    if affine_base is not None:
+        return _HSA_FWD_TILE_AFFINE_PREFIX, affine_base, [], []
+    return _HSA_FWD_TILE_ROW_PREFIX, 0, prefix_lengths, []
+
+
+def _build_forward_hsa_tile_masks(
+    schedule: HSASchedule,
+    *,
+    q_block_size: int,
+    k_block_size: int,
+) -> tuple[HSABlockSparseTensors, HSAForwardTileMasks]:
     bsz, seqlen = schedule.batch_size, schedule.seqlen
     num_q_blocks = (seqlen + q_block_size - 1) // q_block_size
     num_k_blocks = (seqlen + k_block_size - 1) // k_block_size
-    counts = [[[0 for _ in range(num_k_blocks)] for _ in range(num_q_blocks)] for _ in range(bsz)]
+    words_per_row = (k_block_size + 31) // 32
+    block_masks: dict[tuple[int, int, int], list[list[int]]] = {}
 
     sentence_start = schedule.sentence_start.detach().cpu().tolist()
     sentence_len = schedule.sentence_len.detach().cpu().tolist()
@@ -1286,39 +1536,162 @@ def _build_forward_hsa_block_sparse_tensors(
 
     for flat_row in range(schedule.num_rows):
         batch_idx, q_idx = divmod(flat_row, seqlen)
-        q_block = q_idx // q_block_size
 
         sent_len = sentence_len[flat_row]
         if sent_len > 0:
             sent_start = sentence_start[flat_row]
-            _accumulate_interval_counts(
-                counts,
-                batch_idx,
-                q_block,
-                sent_start,
-                sent_start + sent_len,
-                k_block_size,
+            _set_interval_block_mask_bits(
+                block_masks,
+                batch_idx=batch_idx,
+                q_idx=q_idx,
+                start=sent_start,
+                end=sent_start + sent_len,
+                q_block_size=q_block_size,
+                k_block_size=k_block_size,
+                words_per_row=words_per_row,
             )
 
         for offset in range(section_row_ptr[flat_row], section_row_ptr[flat_row + 1]):
-            counts[batch_idx][q_block][section_col_idx[offset] // k_block_size] += 1
+            key_idx = section_col_idx[offset]
+            _set_interval_block_mask_bits(
+                block_masks,
+                batch_idx=batch_idx,
+                q_idx=q_idx,
+                start=key_idx,
+                end=key_idx + 1,
+                q_block_size=q_block_size,
+                k_block_size=k_block_size,
+                words_per_row=words_per_row,
+            )
         for offset in range(document_row_ptr[flat_row], document_row_ptr[flat_row + 1]):
-            counts[batch_idx][q_block][document_col_idx[offset] // k_block_size] += 1
+            key_idx = document_col_idx[offset]
+            _set_interval_block_mask_bits(
+                block_masks,
+                batch_idx=batch_idx,
+                q_idx=q_idx,
+                start=key_idx,
+                end=key_idx + 1,
+                q_block_size=q_block_size,
+                k_block_size=k_block_size,
+                words_per_row=words_per_row,
+            )
 
-    valid_counts = [
-        [
-            min(q_block_size, seqlen - q_block * q_block_size)
-            * min(k_block_size, seqlen - k_block * k_block_size)
-            for k_block in range(num_k_blocks)
-        ]
-        for q_block in range(num_q_blocks)
-    ]
-    return _counts_to_block_sparse_tensors(
-        counts,
-        valid_counts,
-        block_size=(q_block_size, k_block_size),
+    mask_block_cnt = torch.zeros((bsz, 1, num_q_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
+    mask_block_idx = torch.zeros(
+        (bsz, 1, num_q_blocks, num_k_blocks),
+        dtype=torch.int32,
         device=schedule.sentence_start.device,
     )
+    full_block_cnt = torch.zeros((bsz, 1, num_q_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
+    full_block_idx = torch.zeros(
+        (bsz, 1, num_q_blocks, num_k_blocks),
+        dtype=torch.int32,
+        device=schedule.sentence_start.device,
+    )
+
+    block_id_table = torch.zeros(
+        (bsz, num_q_blocks, num_k_blocks),
+        dtype=torch.int32,
+        device=schedule.sentence_start.device,
+    )
+    tile_kind = [_HSA_FWD_TILE_NONE]
+    affine_base = [0]
+    row_prefix_row_ptr = [0]
+    row_prefix_len: list[int] = [0 for _ in range(q_block_size)]
+    bitmap_word_row_ptr = [0]
+    bitmap_words: list[int] = [0 for _ in range(q_block_size * words_per_row)]
+
+    for batch_idx in range(bsz):
+        for q_block in range(num_q_blocks):
+            mask_indices: list[int] = []
+            full_indices: list[int] = []
+            k_blocks = sorted(
+                k_block
+                for (batch, query_block, k_block) in block_masks.keys()
+                if batch == batch_idx and query_block == q_block
+            )
+            q_len = min(q_block_size, seqlen - q_block * q_block_size)
+            for k_block in k_blocks:
+                block_words = block_masks[(batch_idx, q_block, k_block)]
+                k_len = min(k_block_size, seqlen - k_block * k_block_size)
+                valid_count = q_len * k_len
+                allowed_count = 0
+                for row_idx in range(q_len):
+                    for word_idx, word in enumerate(block_words[row_idx][: (k_len + 31) // 32]):
+                        allowed_count += int(word & 0xFFFFFFFF).bit_count()
+
+                if allowed_count == valid_count:
+                    full_indices.append(k_block)
+                    continue
+
+                mask_indices.append(k_block)
+                kind, affine, prefix_vals, bitmap_vals = _classify_forward_partial_block(
+                    block_words,
+                    q_len=q_len,
+                    k_len=k_len,
+                    words_per_row=words_per_row,
+                )
+                block_id = len(tile_kind)
+                block_id_table[batch_idx, q_block, k_block] = block_id
+                tile_kind.append(kind)
+                affine_base.append(affine)
+                row_prefix_row_ptr.append(len(row_prefix_len))
+                bitmap_word_row_ptr.append(len(bitmap_words))
+                prefix_slot = [0 for _ in range(q_block_size)]
+                bitmap_slot = [0 for _ in range(q_block_size * words_per_row)]
+                if kind == _HSA_FWD_TILE_ROW_PREFIX:
+                    prefix_slot[: len(prefix_vals)] = prefix_vals
+                elif kind == _HSA_FWD_TILE_BITMAP:
+                    bitmap_slot[: len(bitmap_vals)] = bitmap_vals
+                row_prefix_len.extend(prefix_slot)
+                bitmap_words.extend(bitmap_slot)
+
+            mask_block_cnt[batch_idx, 0, q_block] = len(mask_indices)
+            full_block_cnt[batch_idx, 0, q_block] = len(full_indices)
+            if mask_indices:
+                mask_block_idx[batch_idx, 0, q_block, : len(mask_indices)] = torch.tensor(
+                    mask_indices,
+                    dtype=torch.int32,
+                    device=schedule.sentence_start.device,
+                )
+            if full_indices:
+                full_block_idx[batch_idx, 0, q_block, : len(full_indices)] = torch.tensor(
+                    full_indices,
+                    dtype=torch.int32,
+                    device=schedule.sentence_start.device,
+                )
+
+    row_prefix_row_ptr.append(len(row_prefix_len))
+    bitmap_word_row_ptr.append(len(bitmap_words))
+
+    sparse_tensors = HSABlockSparseTensors(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_block_size, k_block_size),
+    )
+    tile_masks = HSAForwardTileMasks(
+        block_id_table=block_id_table,
+        tile_kind=torch.tensor(tile_kind, dtype=torch.int32, device=schedule.sentence_start.device),
+        affine_base=torch.tensor(affine_base, dtype=torch.int32, device=schedule.sentence_start.device),
+        row_prefix_row_ptr=torch.tensor(row_prefix_row_ptr, dtype=torch.int32, device=schedule.sentence_start.device),
+        row_prefix_len=torch.tensor(row_prefix_len, dtype=torch.int32, device=schedule.sentence_start.device)
+        if row_prefix_len
+        else _empty_int32(schedule.sentence_start.device),
+        bitmap_word_row_ptr=torch.tensor(
+            bitmap_word_row_ptr,
+            dtype=torch.int32,
+            device=schedule.sentence_start.device,
+        ),
+        bitmap_words=torch.tensor(bitmap_words, dtype=torch.int32, device=schedule.sentence_start.device)
+        if bitmap_words
+        else _empty_int32(schedule.sentence_start.device),
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+        words_per_row=words_per_row,
+    )
+    return sparse_tensors, tile_masks
 
 
 def _set_block_mask_bit(
@@ -2848,6 +3221,12 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
     if cache is not None and cache_key in cache:
         return cache[cache_key]
 
+    forward_sparse, forward_tile_masks = _build_forward_hsa_tile_masks(
+        schedule,
+        q_block_size=forward_block_q,
+        k_block_size=block_k,
+    )
+
     backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
         schedule,
         q_block_size=backward_block_q,
@@ -2855,14 +3234,11 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
     )
 
     runtime = HSABlockSparseRuntime(
-        forward_sparse=_build_forward_hsa_block_sparse_tensors(
-            schedule,
-            q_block_size=forward_block_q,
-            k_block_size=block_k,
-        ),
+        forward_sparse=forward_sparse,
+        forward_tile_masks=forward_tile_masks,
         backward_sparse=backward_sparse,
         backward_packed_masks=backward_packed_masks,
-        forward_aux_tensors=_build_hsa_schedule_aux_tensors(schedule),
+        forward_aux_tensors=_build_hsa_forward_tile_mask_aux_tensors(forward_tile_masks),
         backward_aux_tensors=[
             _tag_aux_tensor(backward_packed_masks.block_id_table),
             _tag_aux_tensor(backward_packed_masks.mask_words),
@@ -2938,6 +3314,56 @@ def get_hsa_schedule_mask_mod():
         return in_bounds & (same_sentence | same_section | same_document)
 
     return _hsa_schedule_mask
+
+
+@lru_cache(maxsize=None)
+def get_hsa_forward_tile_mask_mod(q_block_size: int, k_block_size: int):
+    """Return the CuTe mask_mod for exact HSA forward partial tiles."""
+    cutlass, cute, utils, fast_sampling, _, _, _ = _lazy_cute_imports()
+    words_per_row = (k_block_size + 31) // 32
+
+    @fast_sampling
+    @cute.jit
+    def _hsa_forward_tile_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        block_id_table = aux_tensors[0]
+        tile_kind = aux_tensors[1]
+        affine_base = aux_tensors[2]
+        row_prefix_row_ptr = aux_tensors[3]
+        row_prefix_len = aux_tensors[4]
+        bitmap_word_row_ptr = aux_tensors[5]
+        bitmap_words = aux_tensors[6]
+
+        b = utils.ssa_to_scalar(batch)
+        q_idx = utils.ssa_to_scalar(m_idx)
+        kv_idx = utils.ssa_to_scalar(n_idx)
+        safe_q_idx = q_idx % seqlen_info.seqlen_q
+        safe_kv_idx = kv_idx % seqlen_info.seqlen_k
+        in_bounds = (q_idx < seqlen_info.seqlen_q) & (kv_idx < seqlen_info.seqlen_k)
+
+        q_block = safe_q_idx // q_block_size
+        k_block = safe_kv_idx // k_block_size
+        q_local = safe_q_idx % q_block_size
+        k_local = safe_kv_idx % k_block_size
+        word_idx = k_local // 32
+        bit_idx = k_local % 32
+
+        block_id = block_id_table[b, q_block, k_block]
+        kind = utils.scalar_to_ssa(tile_kind[block_id], cutlass.Int32)
+
+        affine_prefix = utils.scalar_to_ssa(affine_base[block_id], cutlass.Int32) + q_local
+        prefix_offset = row_prefix_row_ptr[block_id] + q_local
+        row_prefix = utils.scalar_to_ssa(row_prefix_len[prefix_offset], cutlass.Int32)
+        word_offset = bitmap_word_row_ptr[block_id] + q_local * words_per_row + word_idx
+        word = cutlass.Uint32(bitmap_words[word_offset])
+        bit = utils.shr_u32(word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+
+        affine_allowed = (kind == _HSA_FWD_TILE_AFFINE_PREFIX) & (k_local < affine_prefix)
+        row_prefix_allowed = (kind == _HSA_FWD_TILE_ROW_PREFIX) & (k_local < row_prefix)
+        bitmap_allowed = (kind == _HSA_FWD_TILE_BITMAP) & (bit != cutlass.Uint32(0))
+
+        return in_bounds & (affine_allowed | row_prefix_allowed | bitmap_allowed)
+
+    return _hsa_forward_tile_mask
 
 
 @lru_cache(maxsize=1)
@@ -3763,7 +4189,7 @@ def _run_hsa_blocksparse_forward(
         softmax_scale=softmax_scale,
         causal=False,
         pack_gqa=False,
-        mask_mod=get_hsa_schedule_mask_mod(),
+        mask_mod=get_hsa_forward_tile_mask_mod(runtime.forward_tile_masks.q_block_size, runtime.forward_tile_masks.k_block_size),
         aux_tensors=runtime.forward_aux_tensors,
         block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.forward_sparse),
         return_lse=True,

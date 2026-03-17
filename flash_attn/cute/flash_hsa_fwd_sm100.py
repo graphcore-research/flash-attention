@@ -271,6 +271,7 @@ def _run_hsa_fwd_sm100_direct(
     aux_tensors = runtime.forward_aux_tensors
     aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     compile_key = (
+        "tile_mask_v1",
         q.dtype,
         head_dim,
         head_dim_v,
@@ -293,7 +294,10 @@ def _run_hsa_fwd_sm100_direct(
             qhead_per_kvhead=qhead_per_kvhead,
             q_stage=q_stage,
             q_subtile_factor=q_subtile_factor,
-            mask_mod=hsa_mod.get_hsa_schedule_mask_mod(),
+            mask_mod=hsa_mod.get_hsa_forward_tile_mask_mod(
+                runtime.forward_tile_masks.q_block_size,
+                runtime.forward_tile_masks.k_block_size,
+            ),
         )
         _run_hsa_fwd_sm100_direct.compile_cache[compile_key] = hsa_mod._lazy_cute_imports()[1].compile(
             fa_fwd,

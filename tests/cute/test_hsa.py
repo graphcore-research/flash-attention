@@ -14,6 +14,7 @@ try:
         flash_attn_hsa_sparse_func,
         fused_forward_to_attend_mask,
         forward_descriptors_to_attend_mask,
+        forward_tile_masks_to_attend_mask,
         get_hsa_mask_mod,
         hsa_reference_attention,
         schedule_to_attend_mask,
@@ -29,6 +30,7 @@ except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     flash_attn_hsa_sparse_func = None
     fused_forward_to_attend_mask = None
     forward_descriptors_to_attend_mask = None
+    forward_tile_masks_to_attend_mask = None
     hybrid_backward_to_attend_mask = None
     get_hsa_mask_mod = None
     hsa_reference_attention = None
@@ -253,6 +255,24 @@ def test_hsa_fused_forward_schedule_reconstructs_dense_mask():
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_forward_tile_masks_reconstruct_dense_mask():
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=193, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    sparse_tensors, tile_masks = hsa_module._build_forward_hsa_tile_masks(
+        schedule,
+        q_block_size=256,
+        k_block_size=128,
+    )
+    dense_mask = forward_tile_masks_to_attend_mask(schedule, sparse_tensors, tile_masks)
+    ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
+
+    assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_backward_descriptors_reconstruct_dense_mask():
     device = "cuda"
     keep_ids, hash_ids = _make_hsa_metadata(batch_size=1, seqlen=97, device=device)
@@ -367,6 +387,11 @@ def test_hsa_sparse_fused_forward_matches_reference(monkeypatch):
         hsa_module,
         "_run_hsa_fused_forward",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("python fused forward helper used")),
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "get_hsa_schedule_mask_mod",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("global schedule mask_mod used")),
     )
 
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)

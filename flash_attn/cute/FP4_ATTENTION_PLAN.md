@@ -26,7 +26,12 @@
 - Q/K scale staging is manual cooperative GMEM->SMEM in v1.
   - No scale TMA is used in this landing.
   - MMA copies staged scales from SMEM to TMEM with `copy_scale_smem_to_tmem(...)` before each FP4 QK instruction.
-- `use_2cta_instrs` is forced off for FP4 QK.
+- FP4 QK scheduling is now shape-gated instead of globally forcing `use_2cta_instrs=False`.
+  - d128 MHA uses the faster schedule and is the current QK-only win.
+  - The remaining laggard is noncausal `GQA (6q,2kv), d128`, which still defaults to the stable grouped-KV path.
+- An experimental CTA-local packed GQA kernel path was prototyped but is not enabled by default.
+  - Current blocker: CuTe rejects direct logical-FP4 universal copies into the packed SMEM destination.
+  - The next kernel step is a raw packed-byte Q gather + recast path rather than more scheduler-only tuning.
 
 ## Tests
 - Root-level smoke script was replaced by pytest coverage in `tests/cute/test_fp4_flash_attn.py`.
@@ -39,8 +44,11 @@
   - runtime GPU comparisons against a dequantized BF16 reference for dense MHA and GQA
 
 ## Next Step
-- Add an explicit FP4 PV path.
-- Expected follow-up API additions:
-  - `use_fp4_pv`
-  - `v_scale`
-- That work will quantize `P` on the fly at the softmax/PV handoff while keeping the current QK FP4 path intact.
+- Finish the last QK-only laggard first: noncausal `GQA (6q,2kv), d128`.
+  - Implement a raw packed-byte CTA-local Q gather for the experimental packed GQA path.
+  - Re-enable that path as the default only after it beats BF16 at `seqlen=512` and `2048`.
+- FP4 PV remains the follow-up after the QK-only d128 GQA path has a real win.
+  - Expected later API additions:
+    - `use_fp4_pv`
+    - `v_scale`
+  - That work will quantize `P` on the fly at the softmax/PV handoff while keeping the current QK FP4 path intact.

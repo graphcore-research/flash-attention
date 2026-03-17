@@ -55,6 +55,7 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, pack_gqa_layout_seqmajor
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -93,6 +94,7 @@ class FP4FlashAttentionForwardSm100:
         use_fp4_qk: bool = True,
         fp4_sf_dtype: str = "e4m3",   # "e4m3" (NVFP4) or "e8m0" (MXFP4)
         fp4_sf_vec_size: int = 16,     # 16 for NVFP4, 32 for MXFP4
+        pack_gqa_local: bool = False,
         group_qheads_by_kv: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
@@ -144,13 +146,20 @@ class FP4FlashAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
-        self.pack_gqa_seqmajor = self.pack_gqa and self.mma_tiler_qk[0] % self.qhead_per_kvhead != 0
+        self.pack_gqa_local = pack_gqa_local
+        self.pack_gqa_effective = self.pack_gqa or self.pack_gqa_local
+        self.pack_gqa_seqmajor = (
+            self.pack_gqa_effective and self.mma_tiler_qk[0] % self.qhead_per_kvhead != 0
+        )
         self.group_qheads_by_kv = group_qheads_by_kv
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
-        assert not (self.group_qheads_by_kv and self.pack_gqa), (
+        assert not (self.pack_gqa and self.pack_gqa_local), (
+            "The explicit and local packed-GQA paths are mutually exclusive"
+        )
+        assert not (self.group_qheads_by_kv and self.pack_gqa_effective), (
             "KV-grouped GQA scheduling is only supported on the unpacked path"
         )
         self.score_mod = score_mod
@@ -284,7 +293,7 @@ class FP4FlashAttentionForwardSm100:
     def kv_head_idx(self, head_idx: Int32):
         return (
             head_idx
-            if const_expr(self.group_qheads_by_kv or self.pack_gqa)
+            if const_expr(self.group_qheads_by_kv or self.pack_gqa_effective)
             else head_idx // self.qhead_per_kvhead
         )
 
@@ -430,7 +439,7 @@ class FP4FlashAttentionForwardSm100:
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
-        if const_expr(self.pack_gqa):
+        if const_expr(self.pack_gqa_effective):
             nheads_kv = mK.shape[2]
             pack_gqa_layout_fn = (
                 pack_gqa_layout_seqmajor if const_expr(self.pack_gqa_seqmajor) else pack_gqa_layout
@@ -471,6 +480,7 @@ class FP4FlashAttentionForwardSm100:
             self.arch >= Arch.sm_90
             and mCuSeqlensQ is None
             and mSeqUsedQ is None
+            and not self.pack_gqa_local
             and not self.pack_gqa_seqmajor
         )
         # This can be tuned
@@ -483,7 +493,7 @@ class FP4FlashAttentionForwardSm100:
             if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
                 self.ex2_emu_freq = 12
             if const_expr(
-                self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
+                self.pack_gqa_effective and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
             if const_expr(self.head_dim_padded > 64 and self.is_causal):
@@ -617,14 +627,17 @@ class FP4FlashAttentionForwardSm100:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mQ,
-            cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            cta_layout_vmnk.shape,
-        )
+        if const_expr(not self.pack_gqa_local):
+            tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mQ,
+                cute.select(sQ_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+        else:
+            tma_atom_Q = None
 
         tma_atom_K = None
         tma_atom_V = None
@@ -677,6 +690,31 @@ class FP4FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
+        if const_expr(self.pack_gqa_local):
+            q_copy_bits = 32
+            q_copy_elems = q_copy_bits // self.q_dtype.width
+            q_threads_per_row = self.head_dim_padded // q_copy_elems
+            atom_q_copy = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                self.q_dtype,
+                num_bits_per_copy=q_copy_bits,
+            )
+            tQ_layout = cute.make_ordered_layout(
+                (cute.arch.WARP_SIZE // q_threads_per_row, q_threads_per_row),
+                order=(1, 0),
+            )
+            vQ_layout = cute.make_layout((1, q_copy_elems))
+            gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_q_copy, tQ_layout, vQ_layout)
+            gmem_tiled_copy_Q_scale = fa_copy_utils.tiled_copy_2d(
+                self.fp4_sf_dtype,
+                self.head_dim_padded // self.fp4_sf_vec_size,
+                cute.arch.WARP_SIZE,
+                is_async=False,
+            )
+        else:
+            gmem_tiled_copy_Q = None
+            gmem_tiled_copy_Q_scale = None
+
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
         else:
@@ -710,7 +748,7 @@ class FP4FlashAttentionForwardSm100:
             tile_shape_mn=self.cta_tiler[:2],
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
             # The causal LPT scheduler estimates K/V residency in bytes. FP4 Q/K uses a logical
             # 4-bit CuTe dtype, so width // 8 would become 0 and break scheduler compilation.
             # Use packed-byte granularity for the FP4 K estimate in that path.
@@ -788,10 +826,12 @@ class FP4FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
+        fastdiv_mods = utils.compute_fastdiv_mods(
+            mQ, mK, self.qhead_per_kvhead, self.pack_gqa_effective, aux_tensors, mPageTable
+        )
 
         head_divmod = None
-        if cutlass.const_expr(self.pack_gqa):
+        if cutlass.const_expr(self.pack_gqa_effective):
             head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
@@ -814,6 +854,8 @@ class FP4FlashAttentionForwardSm100:
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
+            gmem_tiled_copy_Q,
+            gmem_tiled_copy_Q_scale,
             # FP4: scale factor tensors (raw pointers, no TMA)
             mQ_scale,
             mK_scale,
@@ -862,10 +904,12 @@ class FP4FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
+        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
+        gmem_tiled_copy_Q_scale: Optional[cute.TiledCopy],
         # FP4: scale factor tensors (raw pointers, no TMA)
         mQ_scale: Optional[cute.Tensor],
         mK_scale: Optional[cute.Tensor],
@@ -974,15 +1018,28 @@ class FP4FlashAttentionForwardSm100:
         softmax_correction_threads_cluster = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.softmax0_warp_ids + self.correction_warp_ids) * self.cta_group_size
         )
-        pipeline_q = pipeline_custom.PipelineTmaUmma.create(
-            barrier_storage=storage.mbar_load_Q.data_ptr(),
-            num_stages=self.q_stage,
-            producer_group=tma_warp,
-            consumer_group=mma_warp,
-            tx_count=self.tma_copy_bytes["Q"],
-            cta_layout_vmnk=cta_layout_vmnk,
-            defer_sync=True,
-        )
+        if const_expr(not self.pack_gqa_local):
+            pipeline_q = pipeline_custom.PipelineTmaUmma.create(
+                barrier_storage=storage.mbar_load_Q.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=tma_warp,
+                consumer_group=mma_warp,
+                tx_count=self.tma_copy_bytes["Q"],
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+        else:
+            q_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, len(self.load_warp_ids) * cute.arch.WARP_SIZE
+            )
+            pipeline_q = pipeline_custom.PipelineAsyncUmma.create(
+                barrier_storage=storage.mbar_load_Q.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=q_producer_group,
+                consumer_group=mma_warp,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
         if const_expr(self.use_tma_KV):
             pipeline_kv = pipeline_custom.PipelineTmaUmma.create(
                 barrier_storage=storage.mbar_load_KV.data_ptr(),
@@ -1127,13 +1184,13 @@ class FP4FlashAttentionForwardSm100:
             self.is_split_kv,
             window_size_left,
             window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=(
                 mQ.shape[0]
-                if const_expr(not self.pack_gqa)
+                if const_expr(not self.pack_gqa_effective)
                 else (mQ.shape[0][0] if const_expr(self.pack_gqa_seqmajor) else mQ.shape[0][1])
             ),
             seqlen_k_static=mK.shape[0]
@@ -1150,7 +1207,7 @@ class FP4FlashAttentionForwardSm100:
             self.n_block_size,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -1185,6 +1242,8 @@ class FP4FlashAttentionForwardSm100:
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
+                gmem_tiled_copy_Q,
+                gmem_tiled_copy_Q_scale,
                 pipeline_q,
                 pipeline_kv,
                 block_info,
@@ -1363,9 +1422,11 @@ class FP4FlashAttentionForwardSm100:
         sSFA: Optional[cute.Tensor],
         sSFK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
+        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
+        gmem_tiled_copy_Q_scale: Optional[cute.TiledCopy],
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
         block_info: BlockInfo,
@@ -1380,6 +1441,13 @@ class FP4FlashAttentionForwardSm100:
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
+        )
+        pack_gqa = PackGQA(
+            self.m_block_size,
+            self.head_dim_padded,
+            self.check_hdim_oob,
+            self.qhead_per_kvhead,
+            seqmajor_layout=self.pack_gqa_seqmajor,
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1442,9 +1510,12 @@ class FP4FlashAttentionForwardSm100:
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
-            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
-            )
+            if const_expr(not self.pack_gqa_local):
+                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
+                )
+            else:
+                load_Q_fn = None
 
             if const_expr(self.use_tma_KV):
                 tKsK, tKgK = cpasync.tma_partition(
@@ -1527,27 +1598,65 @@ class FP4FlashAttentionForwardSm100:
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
                         # load_Q(block=0, stage=0)  # Q0
-                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                        # pipeline_q.sync_object_empty.wait(0, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
-                        # tma_bar_ptr = pipeline_kv.producer_get_barrier(kv_producer_state)
-                        load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
-                        if const_expr(self.use_fp4_qk):
-                            self.load_scale_stage(
-                                gQ_scale[None, None, 0],
-                                sSFA[None, None, None, 0],
+                        if const_expr(not self.pack_gqa_local):
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+                            load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 0],
+                                    sSFA[None, None, None, 0],
+                                )
+                        else:
+                            assert gmem_tiled_copy_Q is not None
+                            self.load_Q_packed_local(
+                                pack_gqa,
+                                mQ_cur,
+                                sQ[None, None, None, 0],
+                                gmem_tiled_copy_Q,
+                                pipeline_q,
+                                block=0,
+                                stage=0,
+                                phase=q_producer_phase,
+                                seqlen=seqlen.seqlen_q,
                             )
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 0],
+                                    sSFA[None, None, None, 0],
+                                )
+                            pipeline_q.producer_commit_w_index(0)
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
                         # load_Q(block=1, stage=1)  # Q1
-                        pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
-                        load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
-                        if const_expr(self.use_fp4_qk):
-                            self.load_scale_stage(
-                                gQ_scale[None, None, 1],
-                                sSFA[None, None, None, 1],
+                        if const_expr(not self.pack_gqa_local):
+                            pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
+                            tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
+                            load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 1],
+                                    sSFA[None, None, None, 1],
+                                )
+                        else:
+                            assert gmem_tiled_copy_Q is not None
+                            self.load_Q_packed_local(
+                                pack_gqa,
+                                mQ_cur,
+                                sQ[None, None, None, 1],
+                                gmem_tiled_copy_Q,
+                                pipeline_q,
+                                block=1,
+                                stage=1,
+                                phase=q_producer_phase,
+                                seqlen=seqlen.seqlen_q,
                             )
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 1],
+                                    sSFA[None, None, None, 1],
+                                )
+                            pipeline_q.producer_commit_w_index(1)
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     kv_producer_state.advance()
@@ -1584,7 +1693,7 @@ class FP4FlashAttentionForwardSm100:
                     pipeline_kv,
                     self.q_stage,
                     q_producer_phase,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
@@ -1595,7 +1704,9 @@ class FP4FlashAttentionForwardSm100:
 
         pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail
-        if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
+        if const_expr(not self.pack_gqa_local) and (
+            const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]
+        ):
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
 
     @cute.jit
@@ -1758,7 +1869,7 @@ class FP4FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -2149,7 +2260,7 @@ class FP4FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 has_work = tile_block_count > Int32(0)
@@ -2218,7 +2329,7 @@ class FP4FlashAttentionForwardSm100:
                     self.q_stage,
                     Int32(stage),
                     check_m_boundary,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
@@ -2551,7 +2662,7 @@ class FP4FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa_effective) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 has_work = total_block_count > Int32(0)
@@ -2601,7 +2712,7 @@ class FP4FlashAttentionForwardSm100:
                 # Similarly we can write to stage 1 of sO without additional sync.
                 learnable_sink_val = [None] * self.q_stage
                 if const_expr(learnable_sink is not None):
-                    if const_expr(not self.pack_gqa):
+                    if const_expr(not self.pack_gqa_effective):
                         sink_val = Float32(learnable_sink[q_head_idx])
                         learnable_sink_val = [sink_val] * self.q_stage
                     else:  # Each thread might have a different sink value due to different q_head
@@ -2678,7 +2789,7 @@ class FP4FlashAttentionForwardSm100:
                         self.q_stage,
                         self.m_block_size,
                         self.qhead_per_kvhead,
-                        self.pack_gqa,
+                        self.pack_gqa_effective,
                         self.is_split_kv,
                         learnable_sink,
                         mLSE,
@@ -2713,7 +2824,7 @@ class FP4FlashAttentionForwardSm100:
                         mLSE_cur = mLSE[None, q_head_idx, batch_idx]
                 else:
                     offset = seqlen.offset_q
-                    if const_expr(self.pack_gqa):
+                    if const_expr(self.pack_gqa_effective):
                         offset = (
                             (seqlen.offset_q, 0)
                             if const_expr(self.pack_gqa_seqmajor)
@@ -2737,7 +2848,7 @@ class FP4FlashAttentionForwardSm100:
                     )
                     seqlen_q = (
                         seqlen.seqlen_q
-                        if const_expr(not self.pack_gqa)
+                        if const_expr(not self.pack_gqa_effective)
                         else seqlen.seqlen_q * self.qhead_per_kvhead
                     )
                     if tidx < seqlen_q - m_tile_idx * self.m_block_size:
@@ -2924,7 +3035,7 @@ class FP4FlashAttentionForwardSm100:
         tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
         cute.autovec_copy(tOsO, tOrO)
         # copy acc O from rmem to gmem
-        if const_expr(not self.pack_gqa):
+        if const_expr(not self.pack_gqa_effective):
             for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
                 if (
                     t0OcO[0, rest_m, 0][0] < seqlen_q - m_tile_idx * self.m_block_size - tOcO[0][0]
@@ -3024,6 +3135,53 @@ class FP4FlashAttentionForwardSm100:
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
+
+    @cute.jit
+    def load_Q_packed_local(
+        self,
+        pack_gqa: PackGQA,
+        mQ_cur: cute.Tensor,
+        sQ_stage: cute.Tensor,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        pipeline_q: pipeline.PipelineAsync,
+        block: Int32,
+        stage: Int32,
+        phase: Int32,
+        seqlen: Int32,
+    ):
+        pipeline_q.producer_acquire_w_index_phase(stage, phase)
+        sQ_stage = cute.group_modes(sQ_stage, 0, cute.rank(sQ_stage) - 1)
+        pack_gqa.load_Q(mQ_cur, sQ_stage, gmem_tiled_copy_Q, cute.arch.lane_idx(), block, seqlen)
+        cute.arch.sync_warp()
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
+
+    @cute.jit
+    def load_scale_packed_local(
+        self,
+        pack_gqa: PackGQA,
+        mQ_scale_cur: cute.Tensor,
+        sSFA_stage: cute.Tensor,
+        gmem_tiled_copy_Q_scale: cute.TiledCopy,
+        block: Int32,
+        seqlen: Int32,
+    ):
+        sSFA_stage = cute.group_modes(sSFA_stage, 0, cute.rank(sSFA_stage) - 1)
+        pack_gqa.load_tensor(
+            mQ_scale_cur,
+            sSFA_stage,
+            gmem_tiled_copy_Q_scale,
+            cute.arch.lane_idx(),
+            block,
+            seqlen,
+        )
+        cute.arch.sync_warp()
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
 
     @cute.jit
     def load_KV(
@@ -3131,7 +3289,7 @@ class FP4FlashAttentionForwardSm100:
         q_idx_logical = tScS_t2r[0][0]
 
         # For Pack-GQA, compute the logical head index for this tile
-        if cutlass.const_expr(self.pack_gqa):
+        if cutlass.const_expr(self.pack_gqa_effective):
             assert head_divmod is not None
             # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
             q_physical = q_idx_logical
@@ -3155,5 +3313,5 @@ class FP4FlashAttentionForwardSm100:
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,
-            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa_effective) else 1,
         )

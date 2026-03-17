@@ -274,6 +274,7 @@ def test_fp4_gqa_d128_noncausal_explicit_pack_gqa_uses_2cta(monkeypatch):
         )
 
     assert kernel_kwargs["pack_gqa"] is True
+    assert kernel_kwargs["pack_gqa_local"] is False
     assert kernel_kwargs["q_stage"] == 1
     assert kernel_kwargs["use_2cta_instrs"] is True
 
@@ -310,6 +311,7 @@ def test_fp4_gqa_d128_noncausal_default_uses_grouped_kv_reuse(monkeypatch):
         )
 
     assert kernel_kwargs["pack_gqa"] is False
+    assert kernel_kwargs["pack_gqa_local"] is False
     assert kernel_kwargs["group_qheads_by_kv"] is True
     assert kernel_kwargs["m_block_size"] == 128
     assert kernel_kwargs["n_block_size"] == 128

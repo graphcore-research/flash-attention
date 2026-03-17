@@ -125,6 +125,53 @@ class PackGQA:
         return tPrPtr
 
     @cute.jit
+    def load_tensor(
+        self,
+        mX: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), cols)
+        sX: cute.Tensor,  # (m_block_size, cols) in the destination smem layout
+        gmem_tiled_copy: cute.TiledCopy,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        cX = cute.make_identity_tensor((self.m_block_size, mX.shape[1]))
+        tXsX = gmem_thr_copy.partition_D(sX)
+        tXcX = gmem_thr_copy.partition_S(cX)
+        t0XcX = gmem_thr_copy.get_slice(0).partition_S(cX)
+        tXpX = utils.predicate_k(tXcX, limit=mX.shape[1])
+        tXcX_row = tXcX[0, None, 0]
+        threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0]
+        if cutlass.const_expr(isinstance(threads_per_row, tuple)):
+            threads_per_row = threads_per_row[0]
+        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
+        num_threads = gmem_tiled_copy.size
+        tPrXPtr = self.compute_ptr(mX[None, 0], tXcX_row, tidx, block, threads_per_row, num_threads)
+        for m in cutlass.range_constexpr(cute.size(tXsX.shape[1])):
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
+            )
+            x_gmem_ptr = cute.make_ptr(
+                mX.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            if (
+                t0XcX[0, m, 0][0]
+                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tXcX_row[0][0]
+            ):
+                mX_cur = cute.make_tensor(x_gmem_ptr, (mX.shape[1],))
+                elems_per_load = cute.size(tXsX.shape[0][0])
+                mX_cur_copy = cute.tiled_divide(mX_cur, (elems_per_load,))
+                for k in cutlass.range_constexpr(cute.size(tXsX.shape[2])):
+                    ki = tXcX[0, 0, k][1] // elems_per_load
+                    cute.copy(
+                        gmem_thr_copy,
+                        mX_cur_copy[None, ki],
+                        tXsX[None, m, k],
+                        pred=tXpX[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                    )
+            # We don't need to clear the destination smem tiles since we'll only consume valid rows.
+
+    @cute.jit
     def load_Q(
         self,
         mQ: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), headdim)
@@ -134,40 +181,7 @@ class PackGQA:
         block: cutlass.Int32,
         seqlen: cutlass.Int32,
     ):
-        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
-        cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
-        tQsQ = gmem_thr_copy.partition_D(sQ)
-        tQcQ = gmem_thr_copy.partition_S(cQ)
-        t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
-        tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[1])
-        tQcQ_row = tQcQ[0, None, 0]
-        threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
-        assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
-        num_threads = gmem_tiled_copy.size
-        tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
-        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-            q_ptr_i64 = utils.shuffle_sync(
-                tPrQPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row
-            )
-            q_gmem_ptr = cute.make_ptr(
-                mQ.element_type, q_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
-            )
-            if (
-                t0QcQ[0, m, 0][0]
-                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - tQcQ_row[0][0]
-            ):
-                mQ_cur = cute.make_tensor(q_gmem_ptr, (self.head_dim_padded,))
-                elems_per_load = cute.size(tQsQ.shape[0][0])
-                mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
-                for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
-                    ki = tQcQ[0, 0, k][1] // elems_per_load
-                    cute.copy(
-                        gmem_thr_copy,
-                        mQ_cur_copy[None, ki],
-                        tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
-                    )
-            # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+        self.load_tensor(mQ, sQ, gmem_tiled_copy, tidx, block, seqlen)
 
     @cute.jit
     def store_LSE(

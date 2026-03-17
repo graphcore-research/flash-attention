@@ -652,6 +652,7 @@ def _flash_attn_fwd(
     fp4_q_stage = 1
     fp4_use_2cta_instrs = False
     fp4_group_qheads_by_kv = False
+    fp4_pack_gqa_local = False
     fp4_is_persistent = False
     if is_fp4_qk:
         _, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_qk_format)
@@ -672,13 +673,21 @@ def _flash_attn_fwd(
             and pack_gqa
             and qhead_per_kvhead == 3
         )
+        # The CTA-local packed Q gather is not ready to ship yet: CuTe rejects
+        # direct logical-FP4 universal copies into the packed SMEM destination,
+        # so we keep the stable grouped-KV schedule as the default for now.
+        fp4_pack_gqa_local = False and (
+            fp4_speed_shape
+            and not pack_gqa
+            and qhead_per_kvhead == 3
+        )
         fp4_group_qheads_by_kv = (
             fp4_speed_shape
             and not pack_gqa
             and qhead_per_kvhead == 3
         )
         fp4_is_persistent = not causal and not local
-        if not fp4_group_qheads_by_kv:
+        if not fp4_pack_gqa_local and not fp4_group_qheads_by_kv:
             fp4_use_2cta_instrs = (
                 fp4_speed_shape
                 and seqlen_q_packgqa > 2 * tile_m
@@ -858,6 +867,7 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         use_2cta_instrs,
+        fp4_pack_gqa_local if is_fp4_qk else False,
         fp4_group_qheads_by_kv if is_fp4_qk else False,
         fp4_is_persistent if is_fp4_qk else None,
         q_subtile_factor,
@@ -978,6 +988,7 @@ def _flash_attn_fwd(
                     use_fp4_qk=True,
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,
+                    pack_gqa_local=fp4_pack_gqa_local,
                     group_qheads_by_kv=fp4_group_qheads_by_kv,
                 )
                 if compile_start_time is not None:

@@ -297,6 +297,41 @@ def _validate_fp4_qk_inputs(
     return head_dim, sf_vec_size
 
 
+def _should_enable_fp4_q3_local_pack_experiment(
+    *,
+    fp4_qk_format: Optional[str],
+    arch: int,
+    head_dim: int,
+    head_dim_v: int,
+    qhead_per_kvhead: int,
+    causal: bool,
+    local: bool,
+    num_splits: int,
+    page_size: Optional[int],
+    cu_seqlens_q: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    use_block_sparsity: bool,
+    pack_gqa: bool,
+) -> bool:
+    if os.environ.get("FLASH_ATTN_FP4_Q3_LOCAL_PACK", "0") != "1":
+        return False
+    return (
+        fp4_qk_format == "nvfp4"
+        and arch // 10 in [10, 11]
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 3
+        and not causal
+        and not local
+        and num_splits == 1
+        and page_size in [None, 128]
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not use_block_sparsity
+        and not pack_gqa
+    )
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -673,18 +708,26 @@ def _flash_attn_fwd(
             and pack_gqa
             and qhead_per_kvhead == 3
         )
-        # The CTA-local packed Q gather is not ready to ship yet: CuTe rejects
-        # direct logical-FP4 universal copies into the packed SMEM destination,
-        # so we keep the stable grouped-KV schedule as the default for now.
-        fp4_pack_gqa_local = False and (
-            fp4_speed_shape
-            and not pack_gqa
-            and qhead_per_kvhead == 3
+        fp4_pack_gqa_local = _should_enable_fp4_q3_local_pack_experiment(
+            fp4_qk_format=fp4_qk_format,
+            arch=arch,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            causal=causal,
+            local=local,
+            num_splits=num_splits,
+            page_size=page_size,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_q=seqused_q,
+            use_block_sparsity=use_block_sparsity,
+            pack_gqa=pack_gqa,
         )
         fp4_group_qheads_by_kv = (
             fp4_speed_shape
             and not pack_gqa
             and qhead_per_kvhead == 3
+            and not fp4_pack_gqa_local
         )
         fp4_is_persistent = not causal and not local
         if not fp4_pack_gqa_local and not fp4_group_qheads_by_kv:
@@ -910,11 +953,13 @@ def _flash_attn_fwd(
             k_tensor = to_cute_fp4_tensor(k)
             q_scale_tensor = to_cute_tensor(q_scale)
             k_scale_tensor = to_cute_tensor(k_scale)
+            q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:
             q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
             q_scale_tensor, k_scale_tensor = None, None
+            q_storage_tensor = None
         v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (v, out if not is_split_kv else out_partial)
         ]
@@ -1051,6 +1096,7 @@ def _flash_attn_fwd(
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
                 q_tensor,
+                q_storage_tensor,
                 k_tensor,
                 v_tensor,
                 o_tensor,
@@ -1114,6 +1160,7 @@ def _flash_attn_fwd(
             k_runtime = to_tvm_ffi_fp4x2_tensor(k.detach())
             _flash_attn_fwd.compile_cache[compile_key](
                 q_runtime,
+                q.detach() if fp4_pack_gqa_local else None,
                 k_runtime,
                 v.detach(),
                 out.detach(),

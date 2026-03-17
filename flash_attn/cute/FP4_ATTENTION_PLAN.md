@@ -29,9 +29,14 @@
 - FP4 QK scheduling is now shape-gated instead of globally forcing `use_2cta_instrs=False`.
   - d128 MHA uses the faster schedule and is the current QK-only win.
   - The remaining laggard is noncausal `GQA (6q,2kv), d128`, which still defaults to the stable grouped-KV path.
-- An experimental CTA-local packed GQA kernel path was prototyped but is not enabled by default.
-  - Current blocker: CuTe rejects direct logical-FP4 universal copies into the packed SMEM destination.
-  - The next kernel step is a raw packed-byte Q gather + recast path rather than more scheduler-only tuning.
+- An experimental CTA-local packed GQA kernel path now exists behind the internal
+  `FLASH_ATTN_FP4_Q3_LOCAL_PACK=1` selector.
+  - The failing logical-FP4 copy was replaced with a raw packed-byte CTA-local Q gather into an aliased byte view of `sQ`.
+  - The path compiles and runs for noncausal `GQA (6q,2kv), d128`, but it is not enabled by default.
+  - Current measurement with the raw-byte gather:
+    - `seqlen=512`: FP4/BF16 `1.307x`
+    - `seqlen=2048`: FP4/BF16 `1.787x`
+  - Because it misses the promotion gate, the grouped-KV default stays in place.
 
 ## Tests
 - Root-level smoke script was replaced by pytest coverage in `tests/cute/test_fp4_flash_attn.py`.
@@ -40,13 +45,15 @@
   - head dims `64` and `128`
   - causal and noncausal dense forward
   - compile-cache separation between BF16, `nvfp4`, and `mxfp4`
+  - internal selector coverage for the experimental raw-byte local-pack path
   - validation errors for missing scales, wrong dtypes/shapes, and unsupported features
   - runtime GPU comparisons against a dequantized BF16 reference for dense MHA and GQA
 
 ## Next Step
 - Finish the last QK-only laggard first: noncausal `GQA (6q,2kv), d128`.
-  - Implement a raw packed-byte CTA-local Q gather for the experimental packed GQA path.
-  - Re-enable that path as the default only after it beats BF16 at `seqlen=512` and `2048`.
+  - Keep the grouped-KV schedule as the default until a faster CTA-local KV-reuse path is ready.
+  - The raw-byte local-pack path is now a correctness/bring-up reference, not the next default.
+  - The next real optimization target is widening the raw-byte gather back toward an efficient vectorized load path without re-triggering CuTe's verifier failures.
 - FP4 PV remains the follow-up after the QK-only d128 GQA path has a real win.
   - Expected later API additions:
     - `use_fp4_pv`

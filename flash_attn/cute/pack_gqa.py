@@ -125,6 +125,28 @@ class PackGQA:
         return tPrPtr
 
     @cute.jit
+    def compute_ptr_unpacked_bytes(
+        self,
+        tensor: cute.Tensor,
+        kv_head_idx: cutlass.Int32,
+        cRows: cute.Tensor,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        threads_per_row: cutlass.Constexpr[int],
+        num_threads: cutlass.Constexpr[int],
+    ):
+        num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
+        tPrPtr = cute.make_fragment(num_ptr_per_thread, cutlass.Int64)
+        for i in cutlass.range_constexpr(num_ptr_per_thread):
+            row = i * num_threads + cRows[tidx % threads_per_row][0]
+            idx = block * self.m_block_size + row
+            m_idx = idx // self.qhead_per_kvhead
+            h_idx = idx - m_idx * self.qhead_per_kvhead
+            q_head_idx = kv_head_idx * self.qhead_per_kvhead + h_idx
+            tPrPtr[i] = utils.elem_pointer(tensor, (m_idx, 0, q_head_idx)).toint()
+        return tPrPtr
+
+    @cute.jit
     def load_tensor(
         self,
         mX: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), cols)
@@ -182,6 +204,32 @@ class PackGQA:
         seqlen: cutlass.Int32,
     ):
         self.load_tensor(mQ, sQ, gmem_tiled_copy, tidx, block, seqlen)
+
+    @cute.jit
+    def load_Q_unpacked_bytes(
+        self,
+        mQ: cute.Tensor,  # (seqlen_q, packed_headdim, nheads_q)
+        kv_head_idx: cutlass.Int32,
+        sQ: cute.Tensor,  # (m_block_size, packed_headdim)
+        gmem_tiled_copy: cute.TiledCopy,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+    ):
+        del gmem_tiled_copy
+        packed_cols = cute.size(sQ.shape[1])
+        row_limit = seqlen * self.qhead_per_kvhead
+        cols_per_thread = cute.ceil_div(packed_cols, cute.arch.WARP_SIZE)
+        for row in cutlass.range_constexpr(self.m_block_size):
+            packed_row = block * self.m_block_size + row
+            if packed_row < row_limit:
+                seqlen_idx = packed_row // self.qhead_per_kvhead
+                subhead_idx = packed_row - seqlen_idx * self.qhead_per_kvhead
+                q_head = kv_head_idx * self.qhead_per_kvhead + subhead_idx
+                for col_i in cutlass.range_constexpr(cols_per_thread):
+                    col = tidx + col_i * cute.arch.WARP_SIZE
+                    if col < packed_cols:
+                        sQ[row, col] = mQ[seqlen_idx, col, q_head]
 
     @cute.jit
     def store_LSE(

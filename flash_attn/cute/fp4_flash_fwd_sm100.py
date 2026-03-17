@@ -364,6 +364,7 @@ class FP4FlashAttentionForwardSm100:
     def __call__(
         self,
         mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mQ_storage: Optional[cute.Tensor],
         mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
@@ -399,16 +400,26 @@ class FP4FlashAttentionForwardSm100:
         """
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
+        self.q_storage_dtype = self.q_dtype
+        if const_expr(self.pack_gqa_local):
+            assert mQ_storage is not None, "pack_gqa_local requires raw packed Q storage"
+            self.q_storage_dtype = mQ_storage.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        if const_expr(self.pack_gqa_local):
+            mQ_storage = assume_tensor_aligned(mQ_storage)
         # FP4: align and transpose scale tensors alongside Q/K
         if const_expr(self.use_fp4_qk and mQ_scale is not None):
             mQ_scale = assume_tensor_aligned(mQ_scale)
             mK_scale = assume_tensor_aligned(mK_scale)
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
+        if const_expr(self.pack_gqa_local):
+            mQ_storage = cute.make_tensor(
+                mQ_storage.iterator, cute.select(mQ_storage.layout, mode=Q_layout_transpose)
+            )
         # FP4: transpose scale tensors the same way as Q/K
         if const_expr(self.use_fp4_qk and mQ_scale is not None):
             mQ_scale = cute.make_tensor(mQ_scale.iterator, cute.select(mQ_scale.layout, mode=Q_layout_transpose))
@@ -691,12 +702,13 @@ class FP4FlashAttentionForwardSm100:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         if const_expr(self.pack_gqa_local):
-            q_copy_bits = 32
-            q_copy_elems = q_copy_bits // self.q_dtype.width
-            q_threads_per_row = self.head_dim_padded // q_copy_elems
+            q_copy_bits = 16
+            q_copy_elems = q_copy_bits // self.q_storage_dtype.width
+            q_storage_row_elems = self.head_dim_padded * self.q_dtype.width // self.q_storage_dtype.width
+            q_threads_per_row = q_storage_row_elems // q_copy_elems
             atom_q_copy = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
-                self.q_dtype,
+                self.q_storage_dtype,
                 num_bits_per_copy=q_copy_bits,
             )
             tQ_layout = cute.make_ordered_layout(
@@ -841,6 +853,7 @@ class FP4FlashAttentionForwardSm100:
         # Launch the kernel synchronously
         self.kernel(
             mQ,
+            mQ_storage,
             mK,
             mV,
             mO,
@@ -895,6 +908,7 @@ class FP4FlashAttentionForwardSm100:
     def kernel(
         self,
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
+        mQ_storage: Optional[cute.Tensor],  # (s_q, d_packed, h, b) raw packed-byte Q storage
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
         mO: cute.Tensor,
@@ -1229,6 +1243,7 @@ class FP4FlashAttentionForwardSm100:
                 thr_mma_qk,
                 thr_mma_pv,
                 mQ,
+                mQ_storage,
                 mK,
                 mV,
                 mQ_scale,
@@ -1412,6 +1427,7 @@ class FP4FlashAttentionForwardSm100:
         thr_mma_qk: cute.core.ThrMma,
         thr_mma_pv: cute.core.ThrMma,
         mQ: cute.Tensor,
+        mQ_storage: Optional[cute.Tensor],
         mK: cute.Tensor,
         mV: cute.Tensor,
         mQ_scale: Optional[cute.Tensor],
@@ -1458,6 +1474,11 @@ class FP4FlashAttentionForwardSm100:
             q_head_idx = self.q_head_idx(head_idx, split_idx)
             kv_head_idx = self.kv_head_idx(head_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, q_head_idx]
+            if const_expr(self.pack_gqa_local):
+                assert mQ_storage is not None
+                mQ_storage_cur = seqlen.offset_batch_Q(mQ_storage, batch_idx, dim=3)
+            else:
+                mQ_storage_cur = None
             tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
             gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
             gQ = layout_utils.select(
@@ -1609,9 +1630,11 @@ class FP4FlashAttentionForwardSm100:
                                 )
                         else:
                             assert gmem_tiled_copy_Q is not None
+                            assert mQ_storage_cur is not None
                             self.load_Q_packed_local(
                                 pack_gqa,
-                                mQ_cur,
+                                mQ_storage_cur,
+                                kv_head_idx,
                                 sQ[None, None, None, 0],
                                 gmem_tiled_copy_Q,
                                 pipeline_q,
@@ -1640,9 +1663,11 @@ class FP4FlashAttentionForwardSm100:
                                 )
                         else:
                             assert gmem_tiled_copy_Q is not None
+                            assert mQ_storage_cur is not None
                             self.load_Q_packed_local(
                                 pack_gqa,
-                                mQ_cur,
+                                mQ_storage_cur,
+                                kv_head_idx,
                                 sQ[None, None, None, 1],
                                 gmem_tiled_copy_Q,
                                 pipeline_q,
@@ -3140,7 +3165,8 @@ class FP4FlashAttentionForwardSm100:
     def load_Q_packed_local(
         self,
         pack_gqa: PackGQA,
-        mQ_cur: cute.Tensor,
+        mQ_storage_cur: cute.Tensor,
+        kv_head_idx: Int32,
         sQ_stage: cute.Tensor,
         gmem_tiled_copy_Q: cute.TiledCopy,
         pipeline_q: pipeline.PipelineAsync,
@@ -3151,7 +3177,19 @@ class FP4FlashAttentionForwardSm100:
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
         sQ_stage = cute.group_modes(sQ_stage, 0, cute.rank(sQ_stage) - 1)
-        pack_gqa.load_Q(mQ_cur, sQ_stage, gmem_tiled_copy_Q, cute.arch.lane_idx(), block, seqlen)
+        sQ_stage_bytes = cute.make_tensor(
+            cute.recast_ptr(sQ_stage.iterator, dtype=self.q_storage_dtype),
+            cute.recast_layout(self.q_storage_dtype.width, sQ_stage.element_type.width, sQ_stage.layout),
+        )
+        pack_gqa.load_Q_unpacked_bytes(
+            mQ_storage_cur,
+            kv_head_idx,
+            sQ_stage_bytes,
+            gmem_tiled_copy_Q,
+            cute.arch.lane_idx(),
+            block,
+            seqlen,
+        )
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,

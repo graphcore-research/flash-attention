@@ -103,17 +103,13 @@ def _make_inputs(
         dtype=torch.uint8,
         generator=generator,
     )
-    v = (
-        torch.randn(
-            batch_size,
-            seqlen,
-            num_heads_kv,
-            head_dim,
-            device="cuda",
-            dtype=torch.bfloat16,
-            generator=generator,
-        )
-        * 0.25
+    v_packed = torch.randint(
+        0,
+        256,
+        (batch_size, seqlen, num_heads_kv, head_dim // 2),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
     q_scale = torch.full(
         (batch_size, seqlen, num_heads, head_dim // 16),
@@ -127,9 +123,16 @@ def _make_inputs(
         device="cuda",
         dtype=torch.float8_e4m3fn,
     )
+    v_scale = torch.full(
+        (batch_size, seqlen, num_heads_kv, head_dim // 16),
+        scale_value,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
     q_ref = _dequantize_fp4(q_packed, q_scale, 16).to(torch.bfloat16)
     k_ref = _dequantize_fp4(k_packed, k_scale, 16).to(torch.bfloat16)
-    return q_packed, k_packed, v, q_scale, k_scale, q_ref, k_ref
+    v_ref = _dequantize_fp4(v_packed, v_scale, 16).to(torch.bfloat16)
+    return q_packed, k_packed, v_packed, q_scale, k_scale, v_scale, q_ref, k_ref, v_ref
 
 
 def _time_ms(fn, *, warmup: int, iters: int) -> float:
@@ -159,7 +162,7 @@ def _benchmark_case(
     warmup: int,
     iters: int,
 ):
-    q_packed, k_packed, v, q_scale, k_scale, q_ref, k_ref = _make_inputs(
+    q_packed, k_packed, v_packed, q_scale, k_scale, v_scale, q_ref, k_ref, v_ref = _make_inputs(
         kind=kind,
         seqlen=seqlen,
         head_dim=head_dim,
@@ -174,7 +177,7 @@ def _benchmark_case(
         return _flash_attn_fwd(
             q_packed,
             k_packed,
-            v,
+            v_ref,
             causal=causal,
             return_lse=True,
             fp4_qk_format="nvfp4",
@@ -182,11 +185,25 @@ def _benchmark_case(
             k_scale=k_scale,
         )
 
+    def run_fp4_pv():
+        return _flash_attn_fwd(
+            q_packed,
+            k_packed,
+            v_packed,
+            causal=causal,
+            return_lse=True,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
     def run_bf16_direct():
         return _flash_attn_fwd(
             q_ref,
             k_ref,
-            v,
+            v_ref,
             causal=causal,
             return_lse=True,
         )
@@ -195,12 +212,13 @@ def _benchmark_case(
         return flash_attn_func(
             q_ref,
             k_ref,
-            v,
+            v_ref,
             causal=causal,
             return_lse=True,
         )
 
     out_fp4, lse_fp4 = run_fp4()
+    out_fp4_pv, lse_fp4_pv = run_fp4_pv()
     out_bf16, lse_bf16 = run_bf16_direct()
     out_public, lse_public = run_bf16_public()
     torch.cuda.synchronize()
@@ -209,13 +227,24 @@ def _benchmark_case(
         raise RuntimeError(f"FP4 output contains NaN or Inf for {kind}, d={head_dim}, s={seqlen}, causal={causal}.")
     if not torch.isfinite(lse_fp4.float()).all().item():
         raise RuntimeError(f"FP4 LSE contains NaN or Inf for {kind}, d={head_dim}, s={seqlen}, causal={causal}.")
+    if not torch.isfinite(out_fp4_pv.float()).all().item():
+        raise RuntimeError(
+            f"FP4 PV output contains NaN or Inf for {kind}, d={head_dim}, s={seqlen}, causal={causal}."
+        )
+    if not torch.isfinite(lse_fp4_pv.float()).all().item():
+        raise RuntimeError(
+            f"FP4 PV LSE contains NaN or Inf for {kind}, d={head_dim}, s={seqlen}, causal={causal}."
+        )
 
     torch.testing.assert_close(out_fp4.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
     torch.testing.assert_close(lse_fp4.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
+    torch.testing.assert_close(out_fp4_pv.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
+    torch.testing.assert_close(lse_fp4_pv.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
     torch.testing.assert_close(out_public.float(), out_bf16.float(), atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(lse_public.float(), lse_bf16.float(), atol=1e-3, rtol=1e-3)
 
     fp4_ms = _time_ms(run_fp4, warmup=warmup, iters=iters)
+    fp4_pv_ms = _time_ms(run_fp4_pv, warmup=warmup, iters=iters)
     bf16_ms = _time_ms(run_bf16_direct, warmup=warmup, iters=iters)
     public_ms = _time_ms(run_bf16_public, warmup=warmup, iters=iters)
 
@@ -227,18 +256,25 @@ def _benchmark_case(
         "d": head_dim,
         "causal": causal,
         "seqlen": seqlen,
-        "fp4_ms": fp4_ms,
+        "qk_fp4_ms": fp4_ms,
+        "qk_pv_fp4_ms": fp4_pv_ms,
         "bf16_ms": bf16_ms,
         "public_ms": public_ms,
-        "fp4_over_bf16": fp4_ms / bf16_ms,
-        "fp4_over_public": fp4_ms / public_ms,
-        "out_max": (out_fp4.float() - out_bf16.float()).abs().max().item(),
-        "lse_max": (lse_fp4.float() - lse_bf16.float()).abs().max().item(),
+        "qk_fp4_over_bf16": fp4_ms / bf16_ms,
+        "qk_pv_fp4_over_bf16": fp4_pv_ms / bf16_ms,
+        "qk_fp4_over_public": fp4_ms / public_ms,
+        "qk_pv_fp4_over_public": fp4_pv_ms / public_ms,
+        "qk_out_max": (out_fp4.float() - out_bf16.float()).abs().max().item(),
+        "qk_lse_max": (lse_fp4.float() - lse_bf16.float()).abs().max().item(),
+        "pv_out_max": (out_fp4_pv.float() - out_bf16.float()).abs().max().item(),
+        "pv_lse_max": (lse_fp4_pv.float() - lse_bf16.float()).abs().max().item(),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark NVFP4 QK forward against BF16 Cute FA4.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark NVFP4 QK-only and QK+PV forward against BF16 Cute FA4."
+    )
     parser.add_argument("--kinds", default="mha,gqa", help="Comma-separated benchmark kinds: mha,gqa")
     parser.add_argument("--head-dims", default="64,128", help="Comma-separated head dims.")
     parser.add_argument("--seqlens", default="128,512,2048", help="Comma-separated sequence lengths.")
@@ -260,7 +296,12 @@ def main():
     seqlens = _parse_csv_ints(args.seqlens)
     causal_values = _parse_csv_bools(args.causal_values)
 
-    print("kind,hq,hkv,d,causal,seqlen,fp4_ms,bf16_ms,public_ms,fp4_over_bf16,fp4_over_public,out_max,lse_max")
+    print(
+        "kind,hq,hkv,d,causal,seqlen,"
+        "qk_fp4_ms,qk_pv_fp4_ms,bf16_ms,public_ms,"
+        "qk_fp4_over_bf16,qk_pv_fp4_over_bf16,qk_fp4_over_public,qk_pv_fp4_over_public,"
+        "qk_out_max,qk_lse_max,pv_out_max,pv_lse_max"
+    )
     for kind in kinds:
         for head_dim in head_dims:
             for causal in causal_values:
@@ -278,9 +319,12 @@ def main():
                     print(
                         f"{result['kind']},{result['hq']},{result['hkv']},{result['d']},"
                         f"{result['causal']},{result['seqlen']},"
-                        f"{result['fp4_ms']:.5f},{result['bf16_ms']:.5f},{result['public_ms']:.5f},"
-                        f"{result['fp4_over_bf16']:.3f},{result['fp4_over_public']:.3f},"
-                        f"{result['out_max']:.6f},{result['lse_max']:.6f}"
+                        f"{result['qk_fp4_ms']:.5f},{result['qk_pv_fp4_ms']:.5f},"
+                        f"{result['bf16_ms']:.5f},{result['public_ms']:.5f},"
+                        f"{result['qk_fp4_over_bf16']:.3f},{result['qk_pv_fp4_over_bf16']:.3f},"
+                        f"{result['qk_fp4_over_public']:.3f},{result['qk_pv_fp4_over_public']:.3f},"
+                        f"{result['qk_out_max']:.6f},{result['qk_lse_max']:.6f},"
+                        f"{result['pv_out_max']:.6f},{result['pv_lse_max']:.6f}"
                     )
 
 

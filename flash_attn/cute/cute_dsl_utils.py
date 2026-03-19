@@ -184,13 +184,38 @@ def to_cute_fp4_tensor(
     del fully_dynamic, enable_tvm_ffi
     if leading_dim == -1:
         leading_dim = t.ndim - 1
-    assert leading_dim == t.ndim - 1, "Packed FP4 tensors must keep the packed dimension innermost."
     assert t.stride(leading_dim) == 1, "Packed FP4 tensors must be contiguous in the packed dimension."
+    logical_shape = list(t.shape)
+    logical_shape[leading_dim] *= 2
+    logical_stride = []
+    for dim, stride in enumerate(t.stride()):
+        logical_stride.append(1 if dim == leading_dim else stride * 2)
+    return make_fake_tensor(
+        cutlass.Float4E2M1FN,
+        tuple(logical_shape),
+        tuple(logical_stride),
+        assumed_align=assumed_align,
+    )
 
-    logical_shape = (*t.shape[:-1], t.shape[-1] * 2)
-    logical_stride = tuple(
-        stride if dim == leading_dim else stride * 2
-        for dim, stride in enumerate(t.stride())
+
+def to_cute_fp4_vt_tensor(
+    t,
+    assumed_align=16,
+):
+    """Build a logical FP4 Vt tensor spec from packed `(B, H, S, D/2)` storage.
+
+    The returned logical view is `(D, S, H, B)`, which is the operand-B shape
+    used by the PV MMA path, while the underlying storage remains packed with
+    the FP4 axis innermost/contiguous.
+    """
+    assert t.ndim == 4, "FP4 Vt helper expects packed storage shaped (B, H, S, D/2)."
+    assert t.stride(-1) == 1, "Packed FP4 V storage must keep the packed D dimension contiguous."
+    logical_shape = (t.shape[3] * 2, t.shape[2], t.shape[1], t.shape[0])
+    logical_stride = (
+        1,
+        t.stride(2) * 2,
+        t.stride(1) * 2,
+        t.stride(0) * 2,
     )
     return make_fake_tensor(
         cutlass.Float4E2M1FN,

@@ -225,8 +225,10 @@ def _validate_fp4_qk_inputs(
     v: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
     fp4_qk_format: str,
     *,
+    use_fp4_pv: bool,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     seqused_q: Optional[torch.Tensor],
@@ -246,31 +248,39 @@ def _validate_fp4_qk_inputs(
 ) -> Tuple[int, int]:
     _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
     if fp4_qk_format != "nvfp4":
-        raise NotImplementedError("FP4 QK bring-up currently only supports fp4_qk_format='nvfp4'.")
+        raise NotImplementedError(
+            "FP4 QK/PV bring-up currently only supports fp4_qk_format='nvfp4'."
+        )
     if arch // 10 not in [10, 11]:
-        raise NotImplementedError("FP4 QK forward is only supported on SM100/SM110 in this milestone.")
+        raise NotImplementedError(
+            "FP4 QK/PV forward is only supported on SM100/SM110 in this milestone."
+        )
     if cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None:
-        raise NotImplementedError("FP4 QK forward does not support varlen or seqused inputs in this milestone.")
+        raise NotImplementedError(
+            "FP4 QK/PV forward does not support varlen or seqused inputs in this milestone."
+        )
     if page_table is not None:
-        raise NotImplementedError("FP4 QK forward does not support paged KV in this milestone.")
+        raise NotImplementedError("FP4 QK/PV forward does not support paged KV in this milestone.")
     if block_sparse_tensors is not None:
-        raise NotImplementedError("FP4 QK forward does not support block sparsity in this milestone.")
+        raise NotImplementedError(
+            "FP4 QK/PV forward does not support block sparsity in this milestone."
+        )
     if num_splits != 1:
-        raise NotImplementedError("FP4 QK forward does not support SplitKV in this milestone.")
+        raise NotImplementedError("FP4 QK/PV forward does not support SplitKV in this milestone.")
     if window_size_left is not None or window_size_right is not None:
-        raise NotImplementedError("FP4 QK forward does not support local/sliding-window attention in this milestone.")
+        raise NotImplementedError(
+            "FP4 QK/PV forward does not support local/sliding-window attention in this milestone."
+        )
     if score_mod is not None or mask_mod is not None:
-        raise NotImplementedError("FP4 QK bring-up does not support custom score_mod or mask_mod.")
+        raise NotImplementedError("FP4 QK/PV bring-up does not support custom score_mod or mask_mod.")
     if softcap is not None and softcap != 0.0:
-        raise NotImplementedError("FP4 QK bring-up does not support softcap.")
+        raise NotImplementedError("FP4 QK/PV bring-up does not support softcap.")
     if aux_tensors is not None:
-        raise NotImplementedError("FP4 QK bring-up does not support aux_tensors.")
+        raise NotImplementedError("FP4 QK/PV bring-up does not support aux_tensors.")
     if learnable_sink is not None:
-        raise NotImplementedError("FP4 QK bring-up does not support learnable_sink.")
+        raise NotImplementedError("FP4 QK/PV bring-up does not support learnable_sink.")
     if q.dtype != torch.uint8 or k.dtype != torch.uint8:
         raise TypeError("FP4 QK expects packed uint8 Q/K tensors.")
-    if v.dtype != torch.bfloat16:
-        raise NotImplementedError("FP4 QK bring-up currently only supports BF16 V.")
     if q_scale is None or k_scale is None:
         raise ValueError("FP4 QK requires both q_scale and k_scale tensors.")
     if q_scale.dtype != sf_dtype or k_scale.dtype != sf_dtype:
@@ -278,7 +288,20 @@ def _validate_fp4_qk_inputs(
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
     head_dim = q.shape[-1] * 2
-    if head_dim not in (64, 128) or v.shape[-1] != head_dim:
+    head_dim_v = v.shape[-1] * 2 if use_fp4_pv else v.shape[-1]
+    if use_fp4_pv:
+        if v.dtype != torch.uint8:
+            raise TypeError("FP4 PV expects packed uint8 V tensors.")
+        if v_scale is None:
+            raise ValueError("FP4 PV requires v_scale when use_fp4_pv=True.")
+        if v_scale.dtype != sf_dtype:
+            raise TypeError(f"{fp4_qk_format} expects v_scale dtype {sf_dtype}.")
+    else:
+        if v.dtype != torch.bfloat16:
+            raise NotImplementedError("FP4 QK bring-up currently only supports BF16 V.")
+        if v_scale is not None:
+            raise ValueError("v_scale requires use_fp4_pv=True.")
+    if head_dim not in (64, 128) or head_dim_v != head_dim:
         raise NotImplementedError(
             "FP4 QK bring-up currently only supports head_dim=head_dim_v in {64, 128}."
         )
@@ -294,6 +317,17 @@ def _validate_fp4_qk_inputs(
         raise ValueError(
             f"k_scale shape {tuple(k_scale.shape)} != expected {expected_k_scale_shape} for {fp4_qk_format}."
         )
+    if use_fp4_pv:
+        expected_v_shape = (q.shape[0], k.shape[-3], k.shape[-2], head_dim_v // 2)
+        if v.shape != expected_v_shape:
+            raise ValueError(
+                f"FP4 PV expects packed V shape {expected_v_shape}, got {tuple(v.shape)}."
+            )
+        expected_v_scale_shape = (q.shape[0], k.shape[-3], k.shape[-2], head_dim_v // sf_vec_size)
+        if v_scale.shape != expected_v_scale_shape:
+            raise ValueError(
+                f"v_scale shape {tuple(v_scale.shape)} != expected {expected_v_scale_shape} for {fp4_qk_format}."
+            )
     return head_dim, sf_vec_size
 
 
@@ -330,6 +364,23 @@ def _should_enable_fp4_q3_local_pack_experiment(
         and not use_block_sparsity
         and not pack_gqa
     )
+
+
+def _get_env_optional_bool(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Unsupported boolean override {name}={value!r}")
+
+
+def _get_env_optional_int(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    return None if value is None else int(value)
 
 
 torch2cute_dtype_map = {
@@ -456,6 +507,8 @@ def _flash_attn_fwd(
     fp4_qk_format: Optional[Literal["nvfp4", "mxfp4"]] = None,
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    use_fp4_pv: bool = False,
+    v_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -470,10 +523,17 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
-    q, k, v, q_scale, k_scale = [maybe_contiguous(t) for t in (q, k, v, q_scale, k_scale)]
+    q, k, v, q_scale, k_scale, v_scale = [
+        maybe_contiguous(t) for t in (q, k, v, q_scale, k_scale, v_scale)
+    ]
     is_fp4_qk = fp4_qk_format is not None
+    is_fp4_pv = use_fp4_pv
     if not is_fp4_qk and (q_scale is not None or k_scale is not None):
         raise ValueError("q_scale and k_scale require fp4_qk_format to be set.")
+    if not is_fp4_qk and is_fp4_pv:
+        raise ValueError("use_fp4_pv requires fp4_qk_format to be set.")
+    if not is_fp4_pv and v_scale is not None:
+        raise ValueError("v_scale requires use_fp4_pv=True.")
     num_head = q.shape[-2]
     head_dim = q.shape[-1] * 2 if is_fp4_qk else q.shape[-1]
     if cu_seqlens_q is None:
@@ -495,20 +555,29 @@ def _flash_attn_fwd(
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
+    head_dim_v = v.shape[-1] * 2 if is_fp4_pv else v.shape[-1]
     if cu_seqlens_k is None:
         if page_table is None:
             expected_k_shape = (batch_size, seqlen_k, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
             assert k.shape == expected_k_shape
-            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+            if is_fp4_pv:
+                assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v // 2)
+            else:
+                assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
             expected_k_shape = (num_pages, page_size, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
             assert k.shape == expected_k_shape
-            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
+            if is_fp4_pv:
+                assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v // 2)
+            else:
+                assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
         expected_k_shape = (seqlen_k, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
         assert k.shape == expected_k_shape
-        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        if is_fp4_pv:
+            assert v.shape == (seqlen_k, num_head_kv, head_dim_v // 2)
+        else:
+            assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
@@ -552,6 +621,7 @@ def _flash_attn_fwd(
             learnable_sink,
             q_scale,
             k_scale,
+            v_scale,
         )
     ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
@@ -563,7 +633,9 @@ def _flash_attn_fwd(
             v,
             q_scale,
             k_scale,
+            v_scale,
             fp4_qk_format,
+            use_fp4_pv=is_fp4_pv,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
@@ -594,11 +666,13 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = v.dtype if is_fp4_qk else q.dtype
+    out_torch_dtype = torch.bfloat16 if is_fp4_pv else (v.dtype if is_fp4_qk else q.dtype)
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    if is_fp4_qk and requires_grad:
+        raise NotImplementedError("FP4 QK/PV forward does not support autograd/backward in this milestone.")
 
     if out is None:
         out = torch.empty(
@@ -722,7 +796,7 @@ def _flash_attn_fwd(
             seqused_q=seqused_q,
             use_block_sparsity=use_block_sparsity,
             pack_gqa=pack_gqa,
-        )
+        ) if not is_fp4_pv else False
         fp4_group_qheads_by_kv = (
             fp4_speed_shape
             and not pack_gqa
@@ -730,8 +804,14 @@ def _flash_attn_fwd(
             and not fp4_pack_gqa_local
         )
         fp4_is_persistent = not causal and not local
+        if is_fp4_pv:
+            fp4_use_2cta_instrs = False
+            fp4_q_stage = 1
+            fp4_pack_gqa_local = False
         if not fp4_pack_gqa_local and not fp4_group_qheads_by_kv:
             fp4_use_2cta_instrs = (
+                not is_fp4_pv
+                and
                 fp4_speed_shape
                 and seqlen_q_packgqa > 2 * tile_m
                 and _fp4_qk_max_kv_stages(
@@ -753,6 +833,8 @@ def _flash_attn_fwd(
                 )
             )
             if (
+                not is_fp4_pv
+                and
                 fp4_speed_shape
                 and seqlen_q_packgqa > tile_m
                 and _fp4_qk_max_kv_stages(
@@ -774,6 +856,25 @@ def _flash_attn_fwd(
                 )
             ):
                 fp4_q_stage = 2
+        env_pack_local = _get_env_optional_bool("FLASH_ATTN_FP4_FORCE_LOCAL_PACK")
+        env_group_qheads = _get_env_optional_bool("FLASH_ATTN_FP4_FORCE_GROUP_QHEADS_BY_KV")
+        env_use_2cta = _get_env_optional_bool("FLASH_ATTN_FP4_FORCE_2CTA")
+        env_is_persistent = _get_env_optional_bool("FLASH_ATTN_FP4_FORCE_PERSISTENT")
+        env_q_stage = _get_env_optional_int("FLASH_ATTN_FP4_FORCE_Q_STAGE")
+        if env_pack_local is not None and not is_fp4_pv:
+            fp4_pack_gqa_local = env_pack_local
+            if fp4_pack_gqa_local:
+                fp4_group_qheads_by_kv = False
+        if env_group_qheads is not None:
+            fp4_group_qheads_by_kv = env_group_qheads
+            if fp4_group_qheads_by_kv:
+                fp4_pack_gqa_local = False
+        if env_use_2cta is not None and not is_fp4_pv:
+            fp4_use_2cta_instrs = env_use_2cta
+        if env_is_persistent is not None:
+            fp4_is_persistent = env_is_persistent
+        if env_q_stage is not None and not is_fp4_pv:
+            fp4_q_stage = env_q_stage
         q_stage = fp4_q_stage
     elif arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
@@ -881,6 +982,7 @@ def _flash_attn_fwd(
 
     compile_key = (
         is_fp4_qk,
+        is_fp4_pv,
         fp4_qk_format,
         dtype,
         head_dim,
@@ -913,11 +1015,14 @@ def _flash_attn_fwd(
         fp4_pack_gqa_local if is_fp4_qk else False,
         fp4_group_qheads_by_kv if is_fp4_qk else False,
         fp4_is_persistent if is_fp4_qk else None,
+        _get_env_optional_int("FLASH_ATTN_FP4_FORCE_KV_STAGE") if is_fp4_qk else None,
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
         get_broadcast_dims(q_scale) if is_fp4_qk else None,
         get_broadcast_dims(k_scale) if is_fp4_qk else None,
+        get_broadcast_dims(v_scale) if is_fp4_pv else None,
+        _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -953,16 +1058,18 @@ def _flash_attn_fwd(
             k_tensor = to_cute_fp4_tensor(k)
             q_scale_tensor = to_cute_tensor(q_scale)
             k_scale_tensor = to_cute_tensor(k_scale)
-            q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local else None
+            v_scale_tensor = to_cute_tensor(v_scale) if is_fp4_pv else None
+            q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
+            v_storage_tensor = to_cute_tensor(v) if is_fp4_pv else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:
             q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
-            q_scale_tensor, k_scale_tensor = None, None
+            q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
             q_storage_tensor = None
-        v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (v, out if not is_split_kv else out_partial)
-        ]
+            v_storage_tensor = None
+        v_tensor = to_cute_fp4_tensor(v) if is_fp4_pv else to_cute_tensor(v)
+        o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         if compile_start_time is not None:
             fa_logging.fa_log(1, "FP4 V/O tensor conversion done")
         if is_split_kv:
@@ -1031,6 +1138,7 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_fp4_qk=True,
+                    use_fp4_pv=is_fp4_pv,
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,
                     pack_gqa_local=fp4_pack_gqa_local,
@@ -1099,6 +1207,7 @@ def _flash_attn_fwd(
                 q_storage_tensor,
                 k_tensor,
                 v_tensor,
+                v_storage_tensor,
                 o_tensor,
                 lse_tensor,
                 softmax_scale,
@@ -1115,6 +1224,7 @@ def _flash_attn_fwd(
                 cute_aux_tensors,
                 q_scale_tensor,
                 k_scale_tensor,
+                v_scale_tensor,
                 options="--enable-tvm-ffi",
             )
         else:
@@ -1158,11 +1268,13 @@ def _flash_attn_fwd(
                 )
             q_runtime = to_tvm_ffi_fp4x2_tensor(q.detach())
             k_runtime = to_tvm_ffi_fp4x2_tensor(k.detach())
+            v_runtime = to_tvm_ffi_fp4x2_tensor(v.detach()) if is_fp4_pv else v.detach()
             _flash_attn_fwd.compile_cache[compile_key](
                 q_runtime,
-                q.detach() if fp4_pack_gqa_local else None,
+                q.detach() if fp4_pack_gqa_local and not is_fp4_pv else None,
                 k_runtime,
-                v.detach(),
+                v_runtime,
+                v.detach() if is_fp4_pv else None,
                 out.detach(),
                 lse,
                 softmax_scale,
@@ -1179,6 +1291,7 @@ def _flash_attn_fwd(
                 aux_tensors,
                 q_scale,
                 k_scale,
+                v_scale,
             )
             if launch_start_time is not None:
                 fa_logging.fa_log(
@@ -2169,10 +2282,16 @@ def flash_attn_func(
     fp4_qk_format: Optional[Literal["nvfp4", "mxfp4"]] = None,
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
+    use_fp4_pv: bool = False,
+    v_scale: Optional[torch.Tensor] = None,
 ):
+    if use_fp4_pv and fp4_qk_format is None:
+        raise ValueError("use_fp4_pv requires fp4_qk_format to be set.")
     if fp4_qk_format is not None:
         if q.requires_grad or k.requires_grad or v.requires_grad:
-            raise NotImplementedError("FP4 QK forward does not support autograd/backward in this milestone.")
+            raise NotImplementedError(
+                "FP4 QK/PV forward does not support autograd/backward in this milestone."
+            )
         block_sparse_tensors = None
         if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
             block_sparse_tensors = BlockSparseTensorsTorch(
@@ -2200,6 +2319,8 @@ def flash_attn_func(
             fp4_qk_format=fp4_qk_format,
             q_scale=q_scale,
             k_scale=k_scale,
+            use_fp4_pv=use_fp4_pv,
+            v_scale=v_scale,
         )
     return FlashAttnFunc.apply(
         q,

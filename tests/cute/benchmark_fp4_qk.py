@@ -73,6 +73,54 @@ def _dequantize_fp4(packed: torch.Tensor, scale: torch.Tensor, sf_vec_size: int)
     ).flatten(start_dim=-2)
 
 
+def _swizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+    out = torch.empty_like(scale_vt)
+    flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+    flat_out = out.view(batch_size, num_heads, -1)
+    for d in range(head_dim):
+        tile_m, row_in_tile = divmod(d, 64)
+        quad, row_mod16 = divmod(row_in_tile, 16)
+        for seq_group in range(seqlen_groups):
+            offset = (
+                tile_m * 64 * seqlen_groups
+                + (seq_group // 4) * 256
+                + (seq_group % 4)
+                + quad * 4
+                + row_mod16 * 16
+            )
+            flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+    return out
+
+
+def _unswizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+    out = torch.empty_like(scale_vt)
+    flat_in = scale_vt.view(batch_size, num_heads, -1)
+    logical = out.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+    for d in range(head_dim):
+        tile_m, row_in_tile = divmod(d, 64)
+        quad, row_mod16 = divmod(row_in_tile, 16)
+        for seq_group in range(seqlen_groups):
+            offset = (
+                tile_m * 64 * seqlen_groups
+                + (seq_group // 4) * 256
+                + (seq_group % 4)
+                + quad * 4
+                + row_mod16 * 16
+            )
+            logical[:, :, d, seq_group] = flat_in[:, :, offset]
+    return out
+
+
+def _dequantize_fp4_vt(packed_vt: torch.Tensor, scale_vt: torch.Tensor, sf_vec_size: int) -> torch.Tensor:
+    values = FP4_GRID[_unpack_fp4(packed_vt).long()]
+    logical_scale_vt = _unswizzle_fp4_vt_scale(scale_vt)
+    values = values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+    values = values * logical_scale_vt.to(torch.float32).unsqueeze(-1)
+    return values.flatten(start_dim=2, end_dim=3).permute(0, 3, 1, 2).contiguous()
+
+
 def _make_inputs(
     *,
     kind: str,
@@ -83,6 +131,7 @@ def _make_inputs(
     scale_value: float,
 ):
     num_heads, num_heads_kv = KIND_TO_HEADS[kind]
+    seqlen_padded = ((seqlen + 127) // 128) * 128
     seed = 17_000 + seqlen * 13 + head_dim * 101 + (1 if causal else 0) + num_heads * 7 + num_heads_kv
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
@@ -106,7 +155,7 @@ def _make_inputs(
     v_packed = torch.randint(
         0,
         256,
-        (batch_size, seqlen, num_heads_kv, head_dim // 2),
+        (batch_size, num_heads_kv, head_dim, seqlen_padded // 2),
         device="cuda",
         dtype=torch.uint8,
         generator=generator,
@@ -124,14 +173,15 @@ def _make_inputs(
         dtype=torch.float8_e4m3fn,
     )
     v_scale = torch.full(
-        (batch_size, seqlen, num_heads_kv, head_dim // 16),
+        (batch_size, num_heads_kv, head_dim, seqlen_padded // 16),
         scale_value,
         device="cuda",
         dtype=torch.float8_e4m3fn,
     )
+    v_scale = _swizzle_fp4_vt_scale(v_scale)
     q_ref = _dequantize_fp4(q_packed, q_scale, 16).to(torch.bfloat16)
     k_ref = _dequantize_fp4(k_packed, k_scale, 16).to(torch.bfloat16)
-    v_ref = _dequantize_fp4(v_packed, v_scale, 16).to(torch.bfloat16)
+    v_ref = _dequantize_fp4_vt(v_packed, v_scale, 16)[:, :seqlen].to(torch.bfloat16)
     return q_packed, k_packed, v_packed, q_scale, k_scale, v_scale, q_ref, k_ref, v_ref
 
 

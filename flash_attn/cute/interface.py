@@ -49,7 +49,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_fp4_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
+    to_cute_tensor, to_cute_fp4_tensor, to_cute_fp4_vt_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
     get_aux_tensor_metadata, get_broadcast_dims,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
@@ -288,10 +288,11 @@ def _validate_fp4_qk_inputs(
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
     head_dim = q.shape[-1] * 2
-    head_dim_v = v.shape[-1] * 2 if use_fp4_pv else v.shape[-1]
+    head_dim_v = v.shape[-2] if use_fp4_pv else v.shape[-1]
     if use_fp4_pv:
+        seqlen_k_padded = math.ceil(k.shape[-3] / 128) * 128
         if v.dtype != torch.uint8:
-            raise TypeError("FP4 PV expects packed uint8 V tensors.")
+            raise TypeError("FP4 PV expects packed uint8 Vt tensors.")
         if v_scale is None:
             raise ValueError("FP4 PV requires v_scale when use_fp4_pv=True.")
         if v_scale.dtype != sf_dtype:
@@ -318,15 +319,17 @@ def _validate_fp4_qk_inputs(
             f"k_scale shape {tuple(k_scale.shape)} != expected {expected_k_scale_shape} for {fp4_qk_format}."
         )
     if use_fp4_pv:
-        expected_v_shape = (q.shape[0], k.shape[-3], k.shape[-2], head_dim_v // 2)
+        if k.shape[-3] % 2 != 0:
+            raise NotImplementedError("FP4 PV currently requires even seqlen_k for packed transposed Vt.")
+        expected_v_shape = (q.shape[0], k.shape[-2], head_dim_v, seqlen_k_padded // 2)
         if v.shape != expected_v_shape:
             raise ValueError(
-                f"FP4 PV expects packed V shape {expected_v_shape}, got {tuple(v.shape)}."
+                f"FP4 PV expects packed transposed Vt shape {expected_v_shape} (128-token padded), got {tuple(v.shape)}."
             )
-        expected_v_scale_shape = (q.shape[0], k.shape[-3], k.shape[-2], head_dim_v // sf_vec_size)
+        expected_v_scale_shape = (q.shape[0], k.shape[-2], head_dim_v, seqlen_k_padded // sf_vec_size)
         if v_scale.shape != expected_v_scale_shape:
             raise ValueError(
-                f"v_scale shape {tuple(v_scale.shape)} != expected {expected_v_scale_shape} for {fp4_qk_format}."
+                f"v_scale shape {tuple(v_scale.shape)} != expected colwise transposed SFVt storage shape {expected_v_scale_shape} (128-token padded) for {fp4_qk_format}."
             )
     return head_dim, sf_vec_size
 
@@ -555,28 +558,25 @@ def _flash_attn_fwd(
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1] * 2 if is_fp4_pv else v.shape[-1]
+    head_dim_v = v.shape[-2] if is_fp4_pv else v.shape[-1]
     if cu_seqlens_k is None:
         if page_table is None:
             expected_k_shape = (batch_size, seqlen_k, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
             assert k.shape == expected_k_shape
             if is_fp4_pv:
-                assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v // 2)
+                seqlen_k_padded = math.ceil(seqlen_k / 128) * 128
+                assert v.shape == (batch_size, num_head_kv, head_dim_v, seqlen_k_padded // 2)
             else:
                 assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
             expected_k_shape = (num_pages, page_size, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
             assert k.shape == expected_k_shape
-            if is_fp4_pv:
-                assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v // 2)
-            else:
+            if not is_fp4_pv:
                 assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
         expected_k_shape = (seqlen_k, num_head_kv, k.shape[-1] if is_fp4_qk else head_dim)
         assert k.shape == expected_k_shape
-        if is_fp4_pv:
-            assert v.shape == (seqlen_k, num_head_kv, head_dim_v // 2)
-        else:
+        if not is_fp4_pv:
             assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
@@ -979,6 +979,21 @@ def _flash_attn_fwd(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    v_packed_vt = None
+    v_scale_vt = None
+    if is_fp4_pv:
+        # FP4 PV consumes pretransposed packed operand-B data:
+        #   external v       : (B, H_k, D_v, S_k_padded // 2)
+        #   internal packed  : (D_v, S_k_padded // 2, H_k, B)
+        #   external v_scale : (B, H_k, D_v, S_k_padded // sf_vec) in colwise-SFVt storage
+        #   internal storage : (D_v, S_k_padded // sf_vec, H_k, B)
+        # Keep the stride-carrying transposed views instead of materializing them.
+        # FP4 PV consumes pretransposed packed Vt / SFVt:
+        #   v       : (B, H_k, D_v, S_k_padded // 2)
+        #   v_scale : (B, H_k, D_v, S_k_padded // sf_vec)
+        # After permute, the packed/scale sequence axes live on mode 1.
+        v_packed_vt = v.permute(2, 3, 1, 0)
+        v_scale_vt = v_scale.permute(2, 3, 1, 0) if v_scale is not None else None
 
     compile_key = (
         is_fp4_qk,
@@ -1022,6 +1037,7 @@ def _flash_attn_fwd(
         get_broadcast_dims(q_scale) if is_fp4_qk else None,
         get_broadcast_dims(k_scale) if is_fp4_qk else None,
         get_broadcast_dims(v_scale) if is_fp4_pv else None,
+        "vt_packed_seq" if is_fp4_pv else None,
         _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None,
         fa_logging.get_fa_log_level(),
     )
@@ -1058,9 +1074,9 @@ def _flash_attn_fwd(
             k_tensor = to_cute_fp4_tensor(k)
             q_scale_tensor = to_cute_tensor(q_scale)
             k_scale_tensor = to_cute_tensor(k_scale)
-            v_scale_tensor = to_cute_tensor(v_scale) if is_fp4_pv else None
+            v_scale_tensor = to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
             q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
-            v_storage_tensor = to_cute_tensor(v) if is_fp4_pv else None
+            v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:
@@ -1068,7 +1084,7 @@ def _flash_attn_fwd(
             q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
             q_storage_tensor = None
             v_storage_tensor = None
-        v_tensor = to_cute_fp4_tensor(v) if is_fp4_pv else to_cute_tensor(v)
+        v_tensor = to_cute_fp4_vt_tensor(v_packed_vt) if is_fp4_pv else to_cute_tensor(v)
         o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
         if compile_start_time is not None:
             fa_logging.fa_log(1, "FP4 V/O tensor conversion done")
@@ -1268,13 +1284,13 @@ def _flash_attn_fwd(
                 )
             q_runtime = to_tvm_ffi_fp4x2_tensor(q.detach())
             k_runtime = to_tvm_ffi_fp4x2_tensor(k.detach())
-            v_runtime = to_tvm_ffi_fp4x2_tensor(v.detach()) if is_fp4_pv else v.detach()
+            v_runtime = to_tvm_ffi_fp4x2_tensor(v_packed_vt.detach()) if is_fp4_pv else v.detach()
             _flash_attn_fwd.compile_cache[compile_key](
                 q_runtime,
                 q.detach() if fp4_pack_gqa_local and not is_fp4_pv else None,
                 k_runtime,
                 v_runtime,
-                v.detach() if is_fp4_pv else None,
+                v_packed_vt.detach() if is_fp4_pv else None,
                 out.detach(),
                 lse,
                 softmax_scale,
@@ -1291,7 +1307,7 @@ def _flash_attn_fwd(
                 aux_tensors,
                 q_scale,
                 k_scale,
-                v_scale,
+                v_scale_vt,
             )
             if launch_start_time is not None:
                 fa_logging.fa_log(

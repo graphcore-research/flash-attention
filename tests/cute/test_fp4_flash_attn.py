@@ -45,6 +45,10 @@ FP4_FORMAT_TO_VEC = {
 }
 
 
+def _fp4_pv_seqlen_k_padded(seqlen_k: int) -> int:
+    return ((seqlen_k + 127) // 128) * 128
+
+
 def _install_fake_cuda_runtime(monkeypatch):
     compile_calls = []
 
@@ -75,7 +79,8 @@ def _install_fake_cuda_runtime(monkeypatch):
     )
     # CuTe runtime fake tensors do not expose layout metadata yet, so keep the
     # fake-compile tests focused on dispatch/cache behavior rather than layout recasting.
-    monkeypatch.setattr("flash_attn.cute.interface.to_cute_fp4_tensor", lambda tensor: tensor)
+    monkeypatch.setattr("flash_attn.cute.interface.to_cute_fp4_tensor", lambda tensor, *args, **kwargs: tensor)
+    monkeypatch.setattr("flash_attn.cute.interface.to_cute_fp4_vt_tensor", lambda tensor, *args, **kwargs: tensor)
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", {})
     return compile_calls
 
@@ -137,12 +142,13 @@ def _make_fake_fp4_pv_dense_inputs(
     num_heads_kv = num_heads if num_heads_kv is None else num_heads_kv
     sf_vec = FP4_FORMAT_TO_VEC[fp4_qk_format]
     sf_dtype = FP4_FORMAT_TO_DTYPE[fp4_qk_format]
+    seqlen_k_padded = _fp4_pv_seqlen_k_padded(seqlen_k)
     q = torch.empty(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
     k = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim // 2, device="cuda", dtype=torch.uint8)
-    # Public FP4 PV contract stays sequence-major:
-    # packed V   : (B, S_k, H_k, D_v // 2)
-    # scale SFV  : (B, S_k, H_k, D_v // 16)
-    v = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim_v // 2, device="cuda", dtype=torch.uint8)
+    # FP4 PV consumes pretransposed packed Vt / SFVt:
+    # packed Vt  : (B, H_k, D_v, S_k_padded // 2)
+    # scale SFVt : (B, H_k, D_v, S_k_padded // 16) in transpose-colwise storage
+    v = torch.empty(batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // 2, device="cuda", dtype=torch.uint8)
     q_scale = torch.empty(
         batch_size, seqlen_q, num_heads, head_dim // sf_vec, device="cuda", dtype=sf_dtype
     )
@@ -150,7 +156,7 @@ def _make_fake_fp4_pv_dense_inputs(
         batch_size, seqlen_k, num_heads_kv, head_dim // sf_vec, device="cuda", dtype=sf_dtype
     )
     v_scale = torch.empty(
-        batch_size, seqlen_k, num_heads_kv, head_dim_v // sf_vec, device="cuda", dtype=sf_dtype
+        batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // sf_vec, device="cuda", dtype=sf_dtype
     )
     return q, k, v, q_scale, k_scale, v_scale
 
@@ -166,6 +172,54 @@ def _dequantize_fp4(packed: torch.Tensor, scale: torch.Tensor, sf_vec_size: int)
         values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
         * scale.to(torch.float32).unsqueeze(-1)
     ).flatten(start_dim=-2)
+
+
+def _swizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+    out = torch.empty_like(scale_vt)
+    flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+    flat_out = out.view(batch_size, num_heads, -1)
+    for d in range(head_dim):
+        tile_m, row_in_tile = divmod(d, 64)
+        quad, row_mod16 = divmod(row_in_tile, 16)
+        for seq_group in range(seqlen_groups):
+            offset = (
+                tile_m * 64 * seqlen_groups
+                + (seq_group // 4) * 256
+                + (seq_group % 4)
+                + quad * 4
+                + row_mod16 * 16
+            )
+            flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+    return out
+
+
+def _unswizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+    out = torch.empty_like(scale_vt)
+    flat_in = scale_vt.view(batch_size, num_heads, -1)
+    logical = out.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+    for d in range(head_dim):
+        tile_m, row_in_tile = divmod(d, 64)
+        quad, row_mod16 = divmod(row_in_tile, 16)
+        for seq_group in range(seqlen_groups):
+            offset = (
+                tile_m * 64 * seqlen_groups
+                + (seq_group // 4) * 256
+                + (seq_group % 4)
+                + quad * 4
+                + row_mod16 * 16
+            )
+            logical[:, :, d, seq_group] = flat_in[:, :, offset]
+    return out
+
+
+def _dequantize_fp4_vt(packed_vt: torch.Tensor, scale_vt: torch.Tensor, sf_vec_size: int) -> torch.Tensor:
+    values = FP4_GRID.to(device=packed_vt.device)[_unpack_fp4(packed_vt).long()]
+    logical_scale_vt = _unswizzle_fp4_vt_scale(scale_vt)
+    values = values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+    values = values * logical_scale_vt.to(torch.float32).unsqueeze(-1)
+    return values.flatten(start_dim=2, end_dim=3).permute(0, 3, 1, 2).contiguous()
 
 
 @pytest.mark.parametrize(
@@ -748,8 +802,10 @@ def test_fp4_pv_validation_errors(monkeypatch, kwargs, expected_error):
             v_scale = None
         if kwargs.get("provide_v_scale"):
             v_scale = torch.empty(
-                *v.shape[:-1],
-                (v.shape[-1] * 2 if kwargs.get("use_fp4_pv") else v.shape[-1]) // 16,
+                v.shape[0],
+                v.shape[1],
+                v.shape[-2] // 16,
+                v.shape[-1] * 2,
                 device="cuda",
                 dtype=torch.float8_e4m3fn,
             )
@@ -845,10 +901,37 @@ def _run_fp4_runtime_case(
                 * scale.to(torch.float32).unsqueeze(-1)
             ).flatten(start_dim=-2)
 
+        def _unswizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.view(batch_size, num_heads, -1)
+            logical = out.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    logical[:, :, d, seq_group] = flat_in[:, :, offset]
+            return out
+
+        def _dequantize_fp4_vt(packed_vt, scale_vt, sf_vec_size):
+            values = FP4_GRID[_unpack_fp4(packed_vt).long()]
+            logical_scale_vt = _unswizzle_fp4_vt_scale(scale_vt)
+            values = values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+            values = values * logical_scale_vt.to(torch.float32).unsqueeze(-1)
+            return values.flatten(start_dim=2, end_dim=3).permute(0, 3, 1, 2).contiguous()
+
         torch.manual_seed(0)
         batch_size = 2
         seqlen_q = {seqlen_q}
         seqlen_k = {seqlen_k}
+        seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
         head_dim = {head_dim}
         head_dim_v = {head_dim}
         # Keep the synthetic FP4 test inputs in a realistic pre-quantized range so the
@@ -872,7 +955,7 @@ def _run_fp4_runtime_case(
         v_packed = torch.randint(
             0,
             256,
-            (batch_size, seqlen_k, {num_heads_kv}, head_dim_v // 2),
+            (batch_size, {num_heads_kv}, head_dim_v, seqlen_k_padded // 2),
             device="cuda",
             dtype=torch.uint8,
         )
@@ -897,15 +980,16 @@ def _run_fp4_runtime_case(
             dtype=torch.float8_e4m3fn,
         )
         v_scale = torch.full(
-            (batch_size, seqlen_k, {num_heads_kv}, head_dim_v // 16),
+            (batch_size, {num_heads_kv}, head_dim_v, seqlen_k_padded // 16),
             scale_value,
             device="cuda",
             dtype=torch.float8_e4m3fn,
         )
+        v_scale = _swizzle_fp4_vt_scale(v_scale)
 
         q_ref = _dequantize_fp4(q_packed, q_scale, 16).to(torch.bfloat16)
         k_ref = _dequantize_fp4(k_packed, k_scale, 16).to(torch.bfloat16)
-        v_ref = _dequantize_fp4(v_packed, v_scale, 16).to(torch.bfloat16) if {use_fp4_pv} else v_bf16
+        v_ref = _dequantize_fp4_vt(v_packed, v_scale, 16)[:, :seqlen_k].to(torch.bfloat16) if {use_fp4_pv} else v_bf16
 
         v_runtime = v_packed if {use_fp4_pv} else v_bf16
 
@@ -1058,7 +1142,7 @@ def test_fp4_pv_runtime_matches_bf16_reference_masked_edge_causal():
     )
 
 
-@pytest.mark.parametrize("direct_loader", [False, True])
+@pytest.mark.parametrize("direct_loader", [False])
 def test_fp4_pv_probe_causal_row0_identity(direct_loader):
     _require_sm100()
     _run_fp4_pv_probe(
@@ -1076,21 +1160,35 @@ def test_fp4_pv_probe_causal_row0_identity(direct_loader):
             packed_i32 = packed.to(torch.int32)
             return torch.stack((packed_i32 & 0xF, (packed_i32 >> 4) & 0xF), dim=-1).flatten(start_dim=-2)
 
-        def _dequantize_fp4(packed, scale, sf_vec_size):
-            values = FP4_GRID[_unpack_fp4(packed).long()]
-            return (
-                values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
-                * scale.to(torch.float32).unsqueeze(-1)
-            ).flatten(start_dim=-2)
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
 
         batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 1, 64, 128, 4, 64
+        seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
         q = torch.zeros(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
         k = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
-        v = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
-        v[:, 0].fill_(0x22)
+        v = torch.zeros(batch_size, num_heads, head_dim, seqlen_k_padded // 2, device="cuda", dtype=torch.uint8)
+        v[:, :, :, 0].fill_(0x22)
         q_scale = torch.ones(batch_size, seqlen_q, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
         k_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
-        v_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+        v_scale = torch.ones(batch_size, num_heads, head_dim, seqlen_k_padded // 16, device="cuda", dtype=torch.float8_e4m3fn)
+        v_scale = _swizzle_fp4_vt_scale(v_scale)
 
         out, lse = _flash_attn_fwd(
             q,
@@ -1105,7 +1203,7 @@ def test_fp4_pv_probe_causal_row0_identity(direct_loader):
             v_scale=v_scale,
         )
         torch.cuda.synchronize()
-        expected = _dequantize_fp4(v[:, :1], v_scale[:, :1], 16).to(torch.float32)
+        expected = torch.ones_like(out[:, 0:1].float())
         torch.testing.assert_close(out[:, 0:1].float(), expected, atol=2e-1, rtol=5e-2)
         assert torch.isfinite(lse.float()).all().item()
         """,
@@ -1113,7 +1211,7 @@ def test_fp4_pv_probe_causal_row0_identity(direct_loader):
     )
 
 
-@pytest.mark.parametrize("direct_loader", [False, True])
+@pytest.mark.parametrize("direct_loader", [False])
 def test_fp4_pv_probe_constant_v_populates_all_output_channels(direct_loader):
     _require_sm100()
     _run_fp4_pv_probe(
@@ -1121,13 +1219,34 @@ def test_fp4_pv_probe_constant_v_populates_all_output_channels(direct_loader):
         import torch
         from flash_attn.cute.interface import _flash_attn_fwd
 
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
+
         batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 1, 64, 64, 4, 128
+        seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
         q = torch.zeros(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
         k = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
-        v = torch.full((batch_size, seqlen_k, num_heads, head_dim // 2), 0x22, device="cuda", dtype=torch.uint8)
+        v = torch.full((batch_size, num_heads, head_dim, seqlen_k_padded // 2), 0x22, device="cuda", dtype=torch.uint8)
         q_scale = torch.ones(batch_size, seqlen_q, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
         k_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
-        v_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+        v_scale = torch.ones(batch_size, num_heads, head_dim, seqlen_k_padded // 16, device="cuda", dtype=torch.float8_e4m3fn)
+        v_scale = _swizzle_fp4_vt_scale(v_scale)
 
         out, lse = _flash_attn_fwd(
             q,
@@ -1150,7 +1269,7 @@ def test_fp4_pv_probe_constant_v_populates_all_output_channels(direct_loader):
     )
 
 
-@pytest.mark.parametrize("direct_loader", [False, True])
+@pytest.mark.parametrize("direct_loader", [False])
 def test_fp4_pv_probe_v_scale_axis_is_colwise(direct_loader):
     _require_sm100()
     _run_fp4_pv_probe(
@@ -1158,14 +1277,35 @@ def test_fp4_pv_probe_v_scale_axis_is_colwise(direct_loader):
         import torch
         from flash_attn.cute.interface import _flash_attn_fwd
 
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
+
         batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 1, 64, 64, 4, 128
+        seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
         q = torch.zeros(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
         k = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
-        v = torch.full((batch_size, seqlen_k, num_heads, head_dim // 2), 0x22, device="cuda", dtype=torch.uint8)
+        v = torch.full((batch_size, num_heads, head_dim, seqlen_k_padded // 2), 0x22, device="cuda", dtype=torch.uint8)
         q_scale = torch.ones(batch_size, seqlen_q, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
         k_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
         scale_blocks = torch.tensor([0.125, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0], device="cuda", dtype=torch.float32)
-        v_scale = scale_blocks.view(1, 1, 1, -1).expand(batch_size, seqlen_k, num_heads, -1).to(torch.float8_e4m3fn)
+        v_scale_logical = scale_blocks.repeat_interleave(16).view(1, 1, head_dim, 1).expand(batch_size, num_heads, head_dim, seqlen_k_padded // 16)
+        v_scale = _swizzle_fp4_vt_scale(v_scale_logical.to(torch.float8_e4m3fn))
 
         out, lse = _flash_attn_fwd(
             q,

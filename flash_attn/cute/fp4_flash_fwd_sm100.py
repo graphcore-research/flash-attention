@@ -100,23 +100,23 @@ def tile_atom_to_shape_sfv_vt(shape, sf_vec_size: int):
 
 
 def make_public_fp4_vt_tensor(mV: cute.Tensor):
-    """Interpret public packed `V` storage `(B, S, H, D)` as logical operand-B `Vt = (D, S, H, B)`."""
+    """Interpret packed transposed `Vt` storage `(B, H, D, S)` as logical `(D, S, H, B)`."""
     return cute.make_tensor(
         mV.iterator,
         cute.make_layout(
-            (mV.shape[3], mV.shape[1], mV.shape[2], mV.shape[0]),
-            stride=(mV.stride[3], mV.stride[1], mV.stride[2], mV.stride[0]),
+            (mV.shape[2], mV.shape[3], mV.shape[1], mV.shape[0]),
+            stride=(mV.stride[2], mV.stride[3], mV.stride[1], mV.stride[0]),
         ),
     )
 
 
 def make_public_fp4_v_storage_vt_tensor(mV_storage: cute.Tensor):
-    """Interpret public packed-byte `V` storage `(B, S, H, D_packed)` as `(D_packed, S, H, B)`."""
+    """Interpret packed transposed-byte `Vt` storage `(B, H, D, S_packed)` as `(D, S_packed, H, B)`."""
     return cute.make_tensor(
         mV_storage.iterator,
         cute.make_layout(
-            (mV_storage.shape[3], mV_storage.shape[1], mV_storage.shape[2], mV_storage.shape[0]),
-            stride=(mV_storage.stride[3], mV_storage.stride[1], mV_storage.stride[2], mV_storage.stride[0]),
+            (mV_storage.shape[2], mV_storage.shape[3], mV_storage.shape[1], mV_storage.shape[0]),
+            stride=(mV_storage.stride[2], mV_storage.stride[3], mV_storage.stride[1], mV_storage.stride[0]),
         ),
     )
 
@@ -167,6 +167,51 @@ def float_to_ue4m3_byte(x: Float32, *, loc=None, ip=None):
     return cutlass.Uint8(
         llvm.trunc(T.i8(), packed_i16, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
     )
+
+
+@dsl_user_op
+def pack_float8_to_e2m1_word(
+    f0: Float32,
+    f1: Float32,
+    f2: Float32,
+    f3: Float32,
+    f4: Float32,
+    f5: Float32,
+    f6: Float32,
+    f7: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+            Float32(f2).ir_value(loc=loc, ip=ip),
+            Float32(f3).ir_value(loc=loc, ip=ip),
+            Float32(f4).ir_value(loc=loc, ip=ip),
+            Float32(f5).ir_value(loc=loc, ip=ip),
+            Float32(f6).ir_value(loc=loc, ip=ip),
+            Float32(f7).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        ".reg .b8 byte1;\n\t"
+        ".reg .b8 byte2;\n\t"
+        ".reg .b8 byte3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, $2, $1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, $4, $3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte2, $6, $5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $7;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(packed_i32)
 
 
 class FP4FlashAttentionForwardSm100:
@@ -625,15 +670,10 @@ class FP4FlashAttentionForwardSm100:
             else None
         )
         if const_expr(self.use_fp4_pv):
-            # FP4 PV keeps the public contract all the way into the kernel:
-            #   mV      : packed logical V = (b, s_k, h_k, d)
-            #   mV_scale: compact public scales = (b, s_k, h_k, d // sf_vec)
+            # FP4 PV consumes pretransposed packed operand-B inputs directly:
+            #   mV      : logical Vt = (d, s_k, h_k, b)
+            #   mV_scale: compact transposed SFVt groups = (d // sf_vec, s_k, h_k, b)
             assert mCuSeqlensK is None, "FP4 PV currently only supports dense fixed-length inputs"
-            if const_expr(not self.fp4_pv_direct_loader):
-                # Default path: rebuild logical Vt for the existing tiled V loader.
-                # V scales stay in the public compact layout and are staged through
-                # a dedicated logical sSFV writer so the output-channel groups remain colwise.
-                mV = make_public_fp4_vt_tensor(mV)
         else:
             # (s, d, h, b) -> (d, s, h, b)
             V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
@@ -1855,6 +1895,7 @@ class FP4FlashAttentionForwardSm100:
                 load_V = partial(
                     self.load_vt_fp4_pv_stage,
                     mV,
+                    mV_storage,
                     mV_scale,
                     thr_mma_pv,
                     batch_idx,
@@ -1865,19 +1906,15 @@ class FP4FlashAttentionForwardSm100:
                     pipeline_kv=pipeline_kv,
                 )
             elif const_expr(self.use_fp4_pv):
-                assert mV_storage is not None
                 load_V = partial(
-                    self.load_v_fp4_pv_stage_public,
-                    mV,
-                    mV_storage,
-                    mV_scale,
-                    thr_mma_pv,
-                    batch_idx,
-                    kv_head_idx,
+                    self.load_KV,
+                    tma_atom_V,
+                    tVgV,
+                    tVsV,
+                    paged_kv_manager,
                     sV,
-                    sSFV,
-                    seqlen_k=seqlen.seqlen_k,
                     pipeline_kv=pipeline_kv,
+                    K_or_V="V",
                 )
             else:
                 load_V = partial(
@@ -1933,6 +1970,15 @@ class FP4FlashAttentionForwardSm100:
                             )
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                    if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader) and warp_idx == self.load_warp_ids[0]:
+                        self.load_v_scale_stage_public(
+                            mV_scale,
+                            batch_idx,
+                            kv_head_idx,
+                            sSFV[None, None, None, kv_producer_state.index],
+                            n_block_max - 1,
+                            seqlen.seqlen_k,
+                        )
                     kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
@@ -1952,6 +1998,15 @@ class FP4FlashAttentionForwardSm100:
                             )
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                        if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader) and warp_idx == self.load_warp_ids[0]:
+                            self.load_v_scale_stage_public(
+                                mV_scale,
+                                batch_idx,
+                                kv_head_idx,
+                                sSFV[None, None, None, kv_producer_state.index],
+                                n_block,
+                                seqlen.seqlen_k,
+                            )
                         kv_producer_state.advance()
 
             else:
@@ -2016,7 +2071,26 @@ class FP4FlashAttentionForwardSm100:
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
-        tOrV = tiled_mma_pv.make_fragment_B(sV)
+        if const_expr(self.use_fp4_pv):
+            # FP4 PV operand-B needs an explicit swizzled SMEM->RMEM copy that
+            # matches the real blockscaled consumer layout. Relying on
+            # make_fragment_B(sV) alone leaves later output-channel blocks
+            # unmapped even when the staged shared-memory bytes are present.
+            thr_mma_pv = tiled_mma_pv.get_slice(cute.arch.thread_idx()[0])
+            sVt0 = layout_utils.transpose_view(sV[None, None, None, 0])
+            tOrV = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt0))
+            smem_copy_atom_V = copy_utils.get_smem_load_atom(
+                100,
+                sV.element_type,
+                transpose=True,
+            )
+            smem_tiled_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv)
+            smem_thr_copy_V = smem_tiled_copy_V.get_slice(cute.arch.thread_idx()[0])
+            tOrV_copy_view = smem_thr_copy_V.retile(tOrV)
+        else:
+            tOrV = tiled_mma_pv.make_fragment_B(sV)
+            smem_tiled_copy_V = None
+            tOrV_copy_view = None
         if const_expr(self.use_fp4_qk):
             assert sSFA is not None and sSFK is not None
             assert tCtSFA is not None and tCtSFK is not None
@@ -2239,7 +2313,18 @@ class FP4FlashAttentionForwardSm100:
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                    tOrVi = tOrV[None, None, None, Vi_index]
+                    if const_expr(self.use_fp4_pv):
+                        sV_cur = sV[None, None, None, Vi_index]
+                        if const_expr(self.uneven_kv_smem):
+                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                        sVt_cur = layout_utils.transpose_view(sV_cur)
+                        tOsVi = smem_thr_copy_V.partition_S(
+                            copy_utils.as_position_independent_swizzle_tensor(sVt_cur)
+                        )
+                        tOrVi = tOrV
+                    else:
+                        tOrVi = tOrV[None, None, None, Vi_index]
+                        tOsVi = None
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
@@ -2255,6 +2340,7 @@ class FP4FlashAttentionForwardSm100:
                         if const_expr(self.use_fp4_pv):
                             self.debug_print_fp4_pv_stage_state(
                                 sV_cur,
+                                sSFP[None, None, None, stage],
                                 sSFV[None, None, None, Vi_index],
                                 batch_idx,
                                 kv_head_idx,
@@ -2273,6 +2359,9 @@ class FP4FlashAttentionForwardSm100:
                             gemm_Pi[stage](
                                 tCrB=tOrVi,
                                 zero_init=not O_should_accumulate,
+                                smem_tiled_copy_B=smem_tiled_copy_V,
+                                tCsB=tOsVi,
+                                tCrB_copy_view=tOrV_copy_view,
                             )
                         else:
                             gemm_Pi[stage](
@@ -2341,7 +2430,18 @@ class FP4FlashAttentionForwardSm100:
                 # 1. wait for V0
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                tOrVi = tOrV[None, None, None, Vi_index]
+                if const_expr(self.use_fp4_pv):
+                    sV_cur = sV[None, None, None, Vi_index]
+                    if const_expr(self.uneven_kv_smem):
+                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                    sVt_cur = layout_utils.transpose_view(sV_cur)
+                    tOsVi = smem_thr_copy_V.partition_S(
+                        copy_utils.as_position_independent_swizzle_tensor(sVt_cur)
+                    )
+                    tOrVi = tOrV
+                else:
+                    tOrVi = tOrV[None, None, None, Vi_index]
+                    tOsVi = None
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
@@ -2354,6 +2454,7 @@ class FP4FlashAttentionForwardSm100:
                     if const_expr(self.use_fp4_pv):
                         self.debug_print_fp4_pv_stage_state(
                             sV_cur,
+                            sSFP[None, None, None, stage],
                             sSFV[None, None, None, Vi_index],
                             batch_idx,
                             kv_head_idx,
@@ -2372,6 +2473,9 @@ class FP4FlashAttentionForwardSm100:
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             zero_init=not O_should_accumulate,
+                            smem_tiled_copy_B=smem_tiled_copy_V,
+                            tCsB=tOsVi,
+                            tCrB_copy_view=tOrV_copy_view,
                         )
                     else:
                         gemm_Pi[stage](
@@ -2414,11 +2518,21 @@ class FP4FlashAttentionForwardSm100:
         tCtSFV: cute.Tensor,
         tCrB: cute.Tensor,
         zero_init: bool | Boolean = False,
+        smem_tiled_copy_B: Optional[cute.TiledCopy] = None,
+        tCsB: Optional[cute.Tensor] = None,
+        tCrB_copy_view: Optional[cute.Tensor] = None,
     ) -> None:
         mma_atom = cute.make_mma_atom(tiled_mma_pv.op)
         mma_atom.set(tcgen05.Field.SFA, tCtSFP.iterator)
         mma_atom.set(tcgen05.Field.SFB, tCtSFV.iterator)
         for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+            if const_expr(smem_tiled_copy_B is not None):
+                assert tCsB is not None and tCrB_copy_view is not None
+                cute.copy(
+                    smem_tiled_copy_B,
+                    tCsB[None, None, None, k],
+                    tCrB_copy_view[None, None, None, k],
+                )
             mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
             cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB[None, None, k], acc)
 
@@ -2619,16 +2733,35 @@ class FP4FlashAttentionForwardSm100:
             conv_layout,
         )
         tSrP_conv_quant_f32_flat = cute.flatten(tSrP_conv_quant_f32)
-        tSrP_r2t_flat = cute.flatten(tSrP_r2t)
-        frg_tile = 32
-        frg_cnt = cute.size(tSrP_conv_quant_f32_flat) // frg_tile
-        tSrP_conv_quant_f32_frg = cute.logical_divide(
-            tSrP_conv_quant_f32_flat, cute.make_layout(frg_tile)
+        if cute.arch.lane_idx() == 0 and cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0:
+            fa_logging.fa_printf(
+                2,
+                "FP4 PV quant P f32[0:8]: %f %f %f %f %f %f %f %f\n",
+                tSrP_conv_quant_f32_flat[Int32(0)],
+                tSrP_conv_quant_f32_flat[Int32(1)],
+                tSrP_conv_quant_f32_flat[Int32(2)],
+                tSrP_conv_quant_f32_flat[Int32(3)],
+                tSrP_conv_quant_f32_flat[Int32(4)],
+                tSrP_conv_quant_f32_flat[Int32(5)],
+                tSrP_conv_quant_f32_flat[Int32(6)],
+                tSrP_conv_quant_f32_flat[Int32(7)],
+            )
+        num_packed_words = cute.size(tSrP_conv_quant_f32_flat) // 8
+        tSrP_r2t_words = cute.make_tensor(
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((num_packed_words,)),
         )
-        tSrP_r2t_frg = cute.logical_divide(tSrP_r2t_flat, cute.make_layout(frg_tile))
-        for j in cutlass.range_constexpr(frg_cnt):
-            tSrP_r2t_frg[None, j].store(
-                tSrP_conv_quant_f32_frg[None, j].load().to(self.p_dtype)
+        for j in cutlass.range_constexpr(num_packed_words):
+            base = j * 8
+            tSrP_r2t_words[j] = pack_float8_to_e2m1_word(
+                tSrP_conv_quant_f32_flat[base + 0],
+                tSrP_conv_quant_f32_flat[base + 1],
+                tSrP_conv_quant_f32_flat[base + 2],
+                tSrP_conv_quant_f32_flat[base + 3],
+                tSrP_conv_quant_f32_flat[base + 4],
+                tSrP_conv_quant_f32_flat[base + 5],
+                tSrP_conv_quant_f32_flat[base + 6],
+                tSrP_conv_quant_f32_flat[base + 7],
             )
         return tSrP_r2t
 
@@ -3790,21 +3923,25 @@ class FP4FlashAttentionForwardSm100:
     @cute.jit
     def load_v_scale_stage_public(
         self,
-        mV_scale: cute.Tensor,
+        mV_scale: cute.Tensor,  # public colwise-SFVt storage: (b, h_k, d, s_k // sf_vec)
         batch_idx: Int32,
         kv_head_idx: Int32,
         sSFV_stage: cute.Tensor,
         block: Int32,
         seqlen_k: Int32,
     ):
-        del seqlen_k
+        # FP4-PV consumes pretransposed colwise SFVt in the same swizzled GMEM
+        # layout used by TK/Sage. `mV_scale` arrives in its public storage
+        # shape `(b, h, d, s_k // sf_vec)`; rebuild the logical `(d, s_k, h, b)`
+        # block-scaled view from the raw iterator, then tile it exactly like
+        # operand-B expects for the PV MMA.
         mSFVt = cute.make_tensor(
             mV_scale.iterator,
             tile_atom_to_shape_sfv_vt(
                 (
-                    mV_scale.shape[3] * self.fp4_sf_vec_size,
-                    mV_scale.shape[1],
                     mV_scale.shape[2],
+                    seqlen_k,
+                    mV_scale.shape[1],
                     mV_scale.shape[0],
                 ),
                 self.fp4_sf_vec_size,
@@ -3926,6 +4063,12 @@ class FP4FlashAttentionForwardSm100:
                         ]
         else:
             valid_packed_cols = mV_storage.shape[3]
+            mV_storage_vt = make_public_fp4_v_storage_vt_tensor(mV_storage)
+            gV_block_bytes = cute.local_tile(
+                mV_storage_vt[None, None, kv_head_idx, batch_idx],
+                (valid_packed_cols, self.n_block_size),
+                (0, block),
+            )
             for idx in cutlass.range(
                 tidx, self.n_block_size * valid_packed_cols, num_load_threads, unroll=1
             ):
@@ -3935,20 +4078,9 @@ class FP4FlashAttentionForwardSm100:
                 if seqlen_idx < seqlen_k:
                     row_pair = row // 2
                     row_parity = row - row_pair * 2
-                    packed_hi = packed_col // 16
-                    packed_local = packed_col - packed_hi * 16
-                    packed_group = packed_local // 4
-                    packed_bit0 = packed_local & 1
-                    packed_bit1 = (packed_local // 2) & 1
-                    raw_offset = (
-                        row_pair * 64
-                        + packed_group * 256
-                        + packed_bit0 * 64
-                        + packed_bit1 * 16
-                        + row_parity * 32
-                        + packed_hi * 1024
-                    )
-                    sV_stage_bytes_flat[raw_offset] = mV_storage[batch_idx, seqlen_idx, kv_head_idx, packed_col]
+                    sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = gV_block_bytes[
+                        packed_col, row
+                    ]
 
         if (
             cute.arch.lane_idx() == 0
@@ -4135,6 +4267,7 @@ class FP4FlashAttentionForwardSm100:
     def debug_print_fp4_pv_stage_state(
         self,
         sV_stage: cute.Tensor,
+        sSFP_stage: cute.Tensor,
         sSFV_stage: cute.Tensor,
         batch_idx: Int32,
         kv_head_idx: Int32,
@@ -4167,6 +4300,24 @@ class FP4FlashAttentionForwardSm100:
             )
             sSFV_stage_u8_flat = cute.group_modes(
                 cute.filter_zeros(sSFV_stage_u8), 0, cute.rank(sSFV_stage_u8)
+            )
+            sSFP_logical = cute.make_tensor(
+                sSFP_stage.iterator,
+                bs_layout.tile_atom_to_shape_SF(
+                    (self.m_block_size, self.n_block_size, 1),
+                    self.fp4_sf_vec_size,
+                ),
+            )
+            sSFP_logical_u8 = cute.make_tensor(
+                cute.recast_ptr(utils.elem_pointer(sSFP_logical, (0, 0, 0)), dtype=cutlass.Uint8),
+                sSFP_logical.layout,
+            )
+            sSFP_stage_u8 = cute.make_tensor(
+                cute.recast_ptr(sSFP_stage.iterator, dtype=cutlass.Uint8),
+                sSFP_stage.layout,
+            )
+            sSFP_stage_u8_flat = cute.group_modes(
+                cute.filter_zeros(sSFP_stage_u8), 0, cute.rank(sSFP_stage_u8)
             )
             fa_logging.fa_printf(
                 2,
@@ -4314,6 +4465,30 @@ class FP4FlashAttentionForwardSm100:
                 sSFV_stage_u8_flat[Int32(6)],
                 sSFV_stage_u8_flat[Int32(7)],
             )
+            fa_logging.fa_printf(
+                2,
+                "FP4 PV staged sSFP row0 bytes[0:8]: %d %d %d %d %d %d %d %d\n",
+                sSFP_logical_u8[Int32(0), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(1), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(2), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(3), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(4), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(5), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(6), Int32(0), Int32(0)],
+                sSFP_logical_u8[Int32(7), Int32(0), Int32(0)],
+            )
+            fa_logging.fa_printf(
+                2,
+                "FP4 PV staged sSFP compact bytes[0:8]: %d %d %d %d %d %d %d %d\n",
+                sSFP_stage_u8_flat[Int32(0)],
+                sSFP_stage_u8_flat[Int32(1)],
+                sSFP_stage_u8_flat[Int32(2)],
+                sSFP_stage_u8_flat[Int32(3)],
+                sSFP_stage_u8_flat[Int32(4)],
+                sSFP_stage_u8_flat[Int32(5)],
+                sSFP_stage_u8_flat[Int32(6)],
+                sSFP_stage_u8_flat[Int32(7)],
+            )
 
     def debug_print_fp4_pv_acc(
         self,
@@ -4385,6 +4560,7 @@ class FP4FlashAttentionForwardSm100:
     def load_vt_fp4_pv_stage(
         self,
         mV: cute.Tensor,          # public packed logical V: (b, s_k, h_k, d)
+        mV_storage: cute.Tensor,  # public packed-byte V: (b, s_k, h_k, d_packed)
         mV_scale: cute.Tensor,    # public compact V scales: (b, s_k, h_k, d // sf_vec)
         thr_mma_pv: cute.core.ThrMma,
         batch_idx: Int32,
@@ -4419,22 +4595,33 @@ class FP4FlashAttentionForwardSm100:
         sSFV_logical_u8_flat = cute.group_modes(
             cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
         )
-        mV_vt = make_public_fp4_vt_tensor(mV)
-        mV_vt_cur = mV_vt[None, None, kv_head_idx, batch_idx]
-        gV = cute.local_tile(mV_vt_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, block))
-        gV_block = gV
-        gV_block_bytes = self.as_packed_byte_tensor(gV_block, storage_dtype=self.v_storage_dtype)
-        sV_block_bytes = self.as_packed_byte_tensor(sV_stage[None, None, 0], storage_dtype=self.v_storage_dtype)
+        mV_storage_vt = make_public_fp4_v_storage_vt_tensor(mV_storage)
+        valid_packed_cols = self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width
+        gV_block_bytes = cute.local_tile(
+            mV_storage_vt[None, None, kv_head_idx, batch_idx],
+            (valid_packed_cols, self.n_block_size),
+            (0, block),
+        )
+        sV_stage_packed = self.as_packed_byte_tensor(
+            sV_stage,
+            storage_dtype=self.v_storage_dtype,
+        )
 
         lane_idx = cute.arch.lane_idx()
         one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
         del thr_mma_pv
-        for row in cutlass.range(lane_idx, self.n_block_size, cute.arch.WARP_SIZE, unroll=1):
+        for idx in cutlass.range(lane_idx, self.n_block_size * valid_packed_cols, cute.arch.WARP_SIZE, unroll=1):
+            packed_col = idx // self.n_block_size
+            row = idx - packed_col * self.n_block_size
             seqlen_idx = block * self.n_block_size + row
+            row_pair = row // 2
+            row_parity = row - row_pair * 2
             if seqlen_idx < seqlen_k:
-                cute.autovec_copy(gV_block_bytes[None, row], sV_block_bytes[None, row])
+                sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = gV_block_bytes[
+                    packed_col, row
+                ]
 
-        for idx in cutlass.range(lane_idx, cute.size(sSFV_logical_u8_flat.shape), cute.arch.WARP_SIZE, unroll=1):
+        for idx in cutlass.range(cute.arch.lane_idx(), cute.size(sSFV_logical_u8_flat.shape), cute.arch.WARP_SIZE, unroll=1):
             sSFV_logical_u8_flat[idx] = one_scale_u8
 
         num_d_groups = self.head_dim_v_padded // self.fp4_sf_vec_size
@@ -4445,7 +4632,7 @@ class FP4FlashAttentionForwardSm100:
             ),
             mV_scale.layout,
         )
-        for idx in cutlass.range(lane_idx, self.n_block_size * num_d_groups, cute.arch.WARP_SIZE, unroll=1):
+        for idx in cutlass.range(cute.arch.lane_idx(), self.n_block_size * num_d_groups, cute.arch.WARP_SIZE, unroll=1):
             row = idx // num_d_groups
             d_group = idx - row * num_d_groups
             seqlen_idx = block * self.n_block_size + row

@@ -202,20 +202,22 @@ def to_cute_fp4_vt_tensor(
     t,
     assumed_align=16,
 ):
-    """Build a logical FP4 Vt tensor spec from packed `(B, H, S, D/2)` storage.
+    """Build a logical FP4 Vt tensor spec from packed transposed storage.
 
-    The returned logical view is `(D, S, H, B)`, which is the operand-B shape
-    used by the PV MMA path, while the underlying storage remains packed with
-    the FP4 axis innermost/contiguous.
+    FP4 PV consumes operand-B as logical ``Vt = (D, S_k, H_k, B)``. The public
+    packed runtime contract for that operand is ``(D, S_k // 2, H_k, B)``, where
+    mode ``1`` packs pairs of sequence positions after transpose. This
+    helper keeps the packed storage untouched while exposing the logical FP4 Vt
+    view expected by the PV MMA path.
     """
-    assert t.ndim == 4, "FP4 Vt helper expects packed storage shaped (B, H, S, D/2)."
-    assert t.stride(-1) == 1, "Packed FP4 V storage must keep the packed D dimension contiguous."
-    logical_shape = (t.shape[3] * 2, t.shape[2], t.shape[1], t.shape[0])
+    assert t.ndim == 4, "FP4 Vt helper expects packed storage shaped (D, S/2, H, B)."
+    assert t.stride(1) == 1, "Packed FP4 Vt storage must keep the packed sequence dimension contiguous."
+    logical_shape = (t.shape[0], t.shape[1] * 2, t.shape[2], t.shape[3])
     logical_stride = (
+        t.stride(0) * 2,
         1,
         t.stride(2) * 2,
-        t.stride(1) * 2,
-        t.stride(0) * 2,
+        t.stride(3) * 2,
     )
     return make_fake_tensor(
         cutlass.Float4E2M1FN,

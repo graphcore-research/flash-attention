@@ -205,6 +205,8 @@ class FP4FlashAttentionForwardSm100:
         self.use_fp4_qk = use_fp4_qk
         self.use_fp4_pv = use_fp4_pv
         self.fp4_pv_direct_loader = os.getenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "0") == "1"
+        raw_debug_offset = os.getenv("FLASH_ATTN_FP4_PV_RAW_BYTE_OFFSET")
+        self.fp4_pv_raw_byte_offset = int(raw_debug_offset) if raw_debug_offset is not None else -1
         self.fp4_sf_dtype = Float8E4M3FN if fp4_sf_dtype == "e4m3" else Float8E8M0FNU
         self.fp4_sf_vec_size = fp4_sf_vec_size
         # self.dtype = dtype
@@ -3880,7 +3882,6 @@ class FP4FlashAttentionForwardSm100:
         producer_state: pipeline.PipelineState,
         page_idx: Optional[Int32] = None,
     ):
-        del mV, thr_mma_pv
         del page_idx
         stage, phase = producer_state.index, producer_state.phase
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
@@ -3912,19 +3913,42 @@ class FP4FlashAttentionForwardSm100:
         ):
             sV_stage_bytes_flat[idx] = zero_v
 
-        valid_packed_cols = mV_storage.shape[3]
-        for idx in cutlass.range(
-            tidx, self.n_block_size * valid_packed_cols, num_load_threads, unroll=1
-        ):
-            packed_col = idx // self.n_block_size
-            row = idx - packed_col * self.n_block_size
-            seqlen_idx = block * self.n_block_size + row
-            if seqlen_idx < seqlen_k:
-                row_pair = row // 2
-                row_parity = row - row_pair * 2
-                sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = mV_storage[
-                    batch_idx, seqlen_idx, kv_head_idx, packed_col
-                ]
+        if const_expr(self.fp4_pv_raw_byte_offset >= 0):
+            for row in cutlass.range(tidx, self.n_block_size, num_load_threads, unroll=1):
+                seqlen_idx = block * self.n_block_size + row
+                if seqlen_idx < seqlen_k:
+                    row_pair = row // 2
+                    row_parity = row - row_pair * 2
+                    raw_offset = row_pair * 64 + row_parity * 32 + self.fp4_pv_raw_byte_offset
+                    if raw_offset < cute.size(sV_stage_bytes_flat.shape):
+                        sV_stage_bytes_flat[raw_offset] = mV_storage[
+                            batch_idx, seqlen_idx, kv_head_idx, Int32(0)
+                        ]
+        else:
+            valid_packed_cols = mV_storage.shape[3]
+            for idx in cutlass.range(
+                tidx, self.n_block_size * valid_packed_cols, num_load_threads, unroll=1
+            ):
+                packed_col = idx // self.n_block_size
+                row = idx - packed_col * self.n_block_size
+                seqlen_idx = block * self.n_block_size + row
+                if seqlen_idx < seqlen_k:
+                    row_pair = row // 2
+                    row_parity = row - row_pair * 2
+                    packed_hi = packed_col // 16
+                    packed_local = packed_col - packed_hi * 16
+                    packed_group = packed_local // 4
+                    packed_bit0 = packed_local & 1
+                    packed_bit1 = (packed_local // 2) & 1
+                    raw_offset = (
+                        row_pair * 64
+                        + packed_group * 256
+                        + packed_bit0 * 64
+                        + packed_bit1 * 16
+                        + row_parity * 32
+                        + packed_hi * 1024
+                    )
+                    sV_stage_bytes_flat[raw_offset] = mV_storage[batch_idx, seqlen_idx, kv_head_idx, packed_col]
 
         if (
             cute.arch.lane_idx() == 0

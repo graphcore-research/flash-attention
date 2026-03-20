@@ -2936,6 +2936,7 @@ class FlashAttentionBackwardSm100:
         # Need to group into 1 mode to be compatible w thr_copy_r2s
         sdS_layout = cute.make_layout((sdS_layout.shape,), stride=(sdS_layout.stride,))
         sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
+        tRS_cdS = thr_copy_r2s.partition_S(cute.make_identity_tensor((self.tile_n, self.tile_m)))
         tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
 
         if const_expr(self.use_2cta_instrs):
@@ -3233,7 +3234,11 @@ class FlashAttentionBackwardSm100:
                         else:
                             cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
                     else:
-                        cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
+                        if const_expr(self.tile_n == 64):
+                            tdPrdS_store = cute.make_tensor(tdPrdS_cvt.iterator, tRS_cdS[None, stage].shape)
+                            cute.copy(thr_copy_r2s, tdPrdS_store, tRS_sdS[None, stage])
+                        else:
+                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
 
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
@@ -3438,10 +3443,17 @@ class FlashAttentionBackwardSm100:
         is_tma_warp = warp_idx == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         # TMEM -> RMEM
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol_t2r)), Float32
-        )
-        thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
+        if const_expr(self.tile_m == 64 and not self.use_2cta_instrs):
+            dQ_tmem_load_ncol = self.dQ_reduce_ncol_t2r // 2
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(dQ_tmem_load_ncol)), Float32
+            )
+            thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom).get_slice(tidx)
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol_t2r)), Float32
+            )
+            thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
         tdQtdQ_t2r = thr_copy_t2r.partition_S(tdQtdQ)
         tdQcdQ = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
         tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
@@ -3887,10 +3899,6 @@ class FlashAttentionBackwardSm100:
                 self.num_epi_stages if const_expr(K_or_V == "K") else self.num_epi_stages_v
             )
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
-        )
-
         read_flag = const_expr(not deterministic_KV)
 
         pipeline_dKV.consumer_wait(consumer_state_dKV)
@@ -3904,7 +3912,17 @@ class FlashAttentionBackwardSm100:
 
         for epi_stage in cutlass.range_constexpr(num_epi_stages):
             # TMEM -> RMEM -- setup
-            thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV).get_slice(tidx)
+            if const_expr(self.tile_n == 64 and not self.use_2cta_instrs and not self.dKV_postprocess):
+                dKV_tmem_load_ncol = self.dK_reduce_ncol // 2
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(dKV_tmem_load_ncol)), Float32
+                )
+                thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom).get_slice(tidx)
+            else:
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
+                )
+                thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV).get_slice(tidx)
             tdKVtdKV_t2r_p = thr_copy_t2r.partition_S(tdKVtdKV)
             tdKVtdKV_t2r = self.split_wg(tdKVtdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
             if const_expr(num_epi_stages > 1):

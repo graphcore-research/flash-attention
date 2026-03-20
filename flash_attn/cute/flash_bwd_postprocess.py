@@ -19,6 +19,7 @@ from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute import utils
+from flash_attn.cute import copy_utils as fa_copy_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -515,11 +516,19 @@ class FlashAttentionBackwardPostprocess:
                     tdQcdQ = thr_mma.partition_C(
                         cute.make_identity_tensor((self.tile_m, self.tile_hdim))
                     )
-                    tmem_load_atom = cute.make_copy_atom(
-                        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)),
-                        Float32,
-                    )
-                    tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
+                    if const_expr(self.tile_m == 64 and not self.use_2cta_instrs):
+                        dQ_tmem_load_ncol = self.dQ_reduce_ncol // 2
+                        tmem_load_atom = cute.make_copy_atom(
+                            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(dQ_tmem_load_ncol)),
+                            Float32,
+                        )
+                        tiled_copy_t2r = fa_copy_utils.make_tmem_copy(tmem_load_atom)
+                    else:
+                        tmem_load_atom = cute.make_copy_atom(
+                            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)),
+                            Float32,
+                        )
+                        tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                     thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                     tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
                     acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
@@ -531,37 +540,57 @@ class FlashAttentionBackwardPostprocess:
 
                 # Step 3: Copy dQ from register to smem
                 cute.arch.barrier()  # make sure all threads have finished loading dQaccum
+                cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
                 if const_expr(self.arch in [80, 90]):
                     copy_atom_r2s_dQ = utils.get_smem_store_atom(
                         self.arch, self.dtype, transpose=self.dQ_swapAB
                     )
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
-                else:
-                    # copy_atom_r2s_dQ = sm100_utils_basic.get_smem_store_op(
-                    #     LayoutEnum.ROW_MAJOR, self.dtype, Float32, tiled_copy_t2r,
-                    # )
-                    # tiled_copy_r2s_dQ = cute.make_tiled_copy_D(copy_atom_r2s_dQ, tiled_copy_t2r)
-                    thr_layout_r2s_dQ = cute.make_layout((self.num_threads, 1))  # 128 threads
-                    val_layout_r2s_dQ = cute.make_layout((1, 128 // self.dtype.width))
-                    copy_atom_r2s_dQ = cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
-                        self.dtype,
-                        num_bits_per_copy=128,
-                    )
-                    tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(
-                        copy_atom_r2s_dQ, thr_layout_r2s_dQ, val_layout_r2s_dQ
-                    )
-                thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
-                cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
-                if const_expr(self.arch in [80, 90]):
+                    thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
                     taccdQrdQ = thr_copy_r2s_dQ.retile(rdQ)
+                    taccdQsdQ = thr_copy_r2s_dQ.partition_D(
+                        sdQ if const_expr(not self.dQ_swapAB) else sdQt
+                    )
+                    cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
                 else:
-                    taccdQcdQ_shape = thr_copy_r2s_dQ.partition_S(cdQ).shape
-                    taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQcdQ_shape)
-                taccdQsdQ = thr_copy_r2s_dQ.partition_D(
-                    sdQ if const_expr(not self.dQ_swapAB) else sdQt
-                )
-                cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
+                    if const_expr(self.tile_m == 64 and not self.use_2cta_instrs):
+                        copy_atom_r2s_dQ = sm100_utils_basic.get_smem_store_op(
+                            LayoutEnum.ROW_MAJOR, self.dtype, Float32, tiled_copy_t2r
+                        )
+                        tiled_copy_r2s_dQ = cute.make_tiled_copy(
+                            copy_atom_r2s_dQ,
+                            layout_tv=tiled_copy_t2r.layout_dst_tv_tiled,
+                            tiler_mn=tiled_copy_t2r.tiler_mn,
+                        )
+                        taccdQsdQ = thr_copy_t2r.partition_D(
+                            thr_mma.partition_C(
+                                sdQ if const_expr(not self.dQ_swapAB) else sdQt,
+                            )
+                        )
+                        taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQsdQ.shape)
+                        cute.copy(
+                            tiled_copy_r2s_dQ,
+                            taccdQrdQ,
+                            taccdQsdQ,
+                        )
+                    else:
+                        thr_layout_r2s_dQ = cute.make_layout((self.num_threads, 1))  # 128 threads
+                        val_layout_r2s_dQ = cute.make_layout((1, 128 // self.dtype.width))
+                        copy_atom_r2s_dQ = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            self.dtype,
+                            num_bits_per_copy=128,
+                        )
+                        tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(
+                            copy_atom_r2s_dQ, thr_layout_r2s_dQ, val_layout_r2s_dQ
+                        )
+                        thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
+                        taccdQcdQ = thr_copy_r2s_dQ.partition_S(cdQ)
+                        taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQcdQ.shape)
+                        taccdQsdQ = thr_copy_r2s_dQ.partition_D(
+                            sdQ if const_expr(not self.dQ_swapAB) else sdQt
+                        )
+                        cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
             cute.arch.barrier()  # make sure all smem stores are done

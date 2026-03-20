@@ -155,8 +155,9 @@ class HSABlockSparseRuntime:
     forward_aux_tensors: list[torch.Tensor]
     backward_aux_tensors: list[torch.Tensor]
     forward_block_q: int
+    forward_block_k: int
     backward_block_q: int
-    block_k: int
+    backward_block_k: int
     backward_subtile_factor: int
 
     def to(self, device: torch.device | str):
@@ -176,8 +177,9 @@ class HSABlockSparseRuntime:
             forward_aux_tensors=[_move_aux(tensor) for tensor in self.forward_aux_tensors],
             backward_aux_tensors=[_move_aux(tensor) for tensor in self.backward_aux_tensors],
             forward_block_q=self.forward_block_q,
+            forward_block_k=self.forward_block_k,
             backward_block_q=self.backward_block_q,
-            block_k=self.block_k,
+            backward_block_k=self.backward_block_k,
             backward_subtile_factor=self.backward_subtile_factor,
         )
 
@@ -188,6 +190,7 @@ class HSABwdPackedMasks:
 
     block_id_table: torch.Tensor
     mask_words: torch.Tensor
+    row_group_nonempty: torch.Tensor
     q_block_size: int
     k_block_size: int
     words_per_row: int
@@ -196,6 +199,7 @@ class HSABwdPackedMasks:
         return HSABwdPackedMasks(
             block_id_table=self.block_id_table.to(device=device),
             mask_words=self.mask_words.to(device=device),
+            row_group_nonempty=self.row_group_nonempty.to(device=device),
             q_block_size=self.q_block_size,
             k_block_size=self.k_block_size,
             words_per_row=self.words_per_row,
@@ -282,22 +286,26 @@ class HSAMonolithicBackwardSchedule:
     sentence_full_kblock_row_ptr: torch.Tensor
     sentence_full_q_start: torch.Tensor
     sentence_full_q_len: torch.Tensor
+    sentence_full_q_group_mask: torch.Tensor
     sentence_full_k_local_start: torch.Tensor
     sentence_full_k_len: torch.Tensor
     sentence_tail_kblock_row_ptr: torch.Tensor
     sentence_tail_q_start: torch.Tensor
     sentence_tail_q_len: torch.Tensor
+    sentence_tail_q_group_mask: torch.Tensor
     sentence_tail_k_local_start: torch.Tensor
     sentence_tail_k_len: torch.Tensor
     sentence_tail_row0_prefix_len: torch.Tensor
     anchor_full_kblock_row_ptr: torch.Tensor
     anchor_full_q_row_start: torch.Tensor
     anchor_full_q_row_count: torch.Tensor
+    anchor_full_q_group_mask: torch.Tensor
     anchor_full_k_local_start: torch.Tensor
     anchor_full_k_len: torch.Tensor
     anchor_tail_kblock_row_ptr: torch.Tensor
     anchor_tail_q_row_start: torch.Tensor
     anchor_tail_q_row_count: torch.Tensor
+    anchor_tail_q_group_mask: torch.Tensor
     anchor_tail_k_local_start: torch.Tensor
     anchor_tail_k_len: torch.Tensor
     anchor_tail_prefix_row_start: torch.Tensor
@@ -312,22 +320,26 @@ class HSAMonolithicBackwardSchedule:
             sentence_full_kblock_row_ptr=self.sentence_full_kblock_row_ptr.to(device=device),
             sentence_full_q_start=self.sentence_full_q_start.to(device=device),
             sentence_full_q_len=self.sentence_full_q_len.to(device=device),
+            sentence_full_q_group_mask=self.sentence_full_q_group_mask.to(device=device),
             sentence_full_k_local_start=self.sentence_full_k_local_start.to(device=device),
             sentence_full_k_len=self.sentence_full_k_len.to(device=device),
             sentence_tail_kblock_row_ptr=self.sentence_tail_kblock_row_ptr.to(device=device),
             sentence_tail_q_start=self.sentence_tail_q_start.to(device=device),
             sentence_tail_q_len=self.sentence_tail_q_len.to(device=device),
+            sentence_tail_q_group_mask=self.sentence_tail_q_group_mask.to(device=device),
             sentence_tail_k_local_start=self.sentence_tail_k_local_start.to(device=device),
             sentence_tail_k_len=self.sentence_tail_k_len.to(device=device),
             sentence_tail_row0_prefix_len=self.sentence_tail_row0_prefix_len.to(device=device),
             anchor_full_kblock_row_ptr=self.anchor_full_kblock_row_ptr.to(device=device),
             anchor_full_q_row_start=self.anchor_full_q_row_start.to(device=device),
             anchor_full_q_row_count=self.anchor_full_q_row_count.to(device=device),
+            anchor_full_q_group_mask=self.anchor_full_q_group_mask.to(device=device),
             anchor_full_k_local_start=self.anchor_full_k_local_start.to(device=device),
             anchor_full_k_len=self.anchor_full_k_len.to(device=device),
             anchor_tail_kblock_row_ptr=self.anchor_tail_kblock_row_ptr.to(device=device),
             anchor_tail_q_row_start=self.anchor_tail_q_row_start.to(device=device),
             anchor_tail_q_row_count=self.anchor_tail_q_row_count.to(device=device),
+            anchor_tail_q_group_mask=self.anchor_tail_q_group_mask.to(device=device),
             anchor_tail_k_local_start=self.anchor_tail_k_local_start.to(device=device),
             anchor_tail_k_len=self.anchor_tail_k_len.to(device=device),
             anchor_tail_prefix_row_start=self.anchor_tail_prefix_row_start.to(device=device),
@@ -1774,6 +1786,7 @@ def _build_backward_hsa_packed_masks(
     partial_mask_words: list[list[list[int]]] = [
         [[0 for _ in range(words_per_row)] for _ in range(q_block_size)]
     ]
+    partial_row_group_nonempty: list[int] = [0]
 
     for batch_idx in range(bsz):
         for k_block in range(num_k_blocks):
@@ -1807,6 +1820,17 @@ def _build_backward_hsa_packed_masks(
                 mask_indices.append(q_block)
                 block_id_table[batch_idx, k_block, q_block] = len(partial_mask_words)
                 partial_mask_words.append(block_words)
+                row_group_bits = 0
+                half_rows = q_block_size // 2
+                for q_local in range(min(q_len, half_rows)):
+                    if any(block_words[q_local]):
+                        row_group_bits |= 1
+                        break
+                for q_local in range(half_rows, q_len):
+                    if any(block_words[q_local]):
+                        row_group_bits |= 2
+                        break
+                partial_row_group_nonempty.append(row_group_bits)
 
             mask_block_cnt[batch_idx, 0, k_block] = len(mask_indices)
             full_block_cnt[batch_idx, 0, k_block] = len(full_indices)
@@ -1837,6 +1861,11 @@ def _build_backward_hsa_packed_masks(
                 [[_as_signed_int32(word) for word in row] for row in block_words]
                 for block_words in partial_mask_words
             ],
+            dtype=torch.int32,
+            device=schedule.sentence_start.device,
+        ),
+        row_group_nonempty=torch.tensor(
+            partial_row_group_nonempty,
             dtype=torch.int32,
             device=schedule.sentence_start.device,
         ),
@@ -2232,16 +2261,27 @@ def _build_hsa_monolithic_backward_schedule(
 ) -> HSAMonolithicBackwardSchedule:
     k_block_size = hybrid_schedule.k_block_size
     num_k_blocks = hybrid_schedule.num_k_blocks
+    q_desc_rows = hybrid_schedule.anchor_row_panel_size
+
+    def _q_group_mask(row_count: int) -> int:
+        mask = 0
+        if row_count > 0:
+            mask |= 0b01
+        if row_count > 32:
+            mask |= 0b10
+        return mask
 
     sentence_full_kblock_row_ptr = [0]
     sentence_full_q_start: list[int] = []
     sentence_full_q_len: list[int] = []
+    sentence_full_q_group_mask: list[int] = []
     sentence_full_k_local_start: list[int] = []
     sentence_full_k_len: list[int] = []
 
     sentence_tail_kblock_row_ptr = [0]
     sentence_tail_q_start: list[int] = []
     sentence_tail_q_len: list[int] = []
+    sentence_tail_q_group_mask: list[int] = []
     sentence_tail_k_local_start: list[int] = []
     sentence_tail_k_len: list[int] = []
     sentence_tail_row0_prefix_len: list[int] = []
@@ -2249,12 +2289,14 @@ def _build_hsa_monolithic_backward_schedule(
     anchor_full_kblock_row_ptr = [0]
     anchor_full_q_row_start: list[int] = []
     anchor_full_q_row_count: list[int] = []
+    anchor_full_q_group_mask: list[int] = []
     anchor_full_k_local_start: list[int] = []
     anchor_full_k_len: list[int] = []
 
     anchor_tail_kblock_row_ptr = [0]
     anchor_tail_q_row_start: list[int] = []
     anchor_tail_q_row_count: list[int] = []
+    anchor_tail_q_group_mask: list[int] = []
     anchor_tail_k_local_start: list[int] = []
     anchor_tail_k_len: list[int] = []
     anchor_tail_prefix_row_start: list[int] = []
@@ -2277,16 +2319,28 @@ def _build_hsa_monolithic_backward_schedule(
             row0_prefix_len = max(0, min(k_len, q_start - k_start + 1))
             tail_rows = min(q_len, max(0, k_len - row0_prefix_len))
             if tail_rows > 0:
-                sentence_tail_q_start.append(q_start)
-                sentence_tail_q_len.append(tail_rows)
-                sentence_tail_k_local_start.append(k_local_start)
-                sentence_tail_k_len.append(k_len)
-                sentence_tail_row0_prefix_len.append(row0_prefix_len)
+                chunk_start = 0
+                while chunk_start < tail_rows:
+                    chunk_len = min(q_desc_rows, tail_rows - chunk_start)
+                    sentence_tail_q_start.append(q_start + chunk_start)
+                    sentence_tail_q_len.append(chunk_len)
+                    sentence_tail_q_group_mask.append(_q_group_mask(chunk_len))
+                    sentence_tail_k_local_start.append(k_local_start)
+                    sentence_tail_k_len.append(k_len)
+                    sentence_tail_row0_prefix_len.append(row0_prefix_len + chunk_start)
+                    chunk_start += chunk_len
             if q_len > tail_rows:
-                sentence_full_q_start.append(q_start + tail_rows)
-                sentence_full_q_len.append(q_len - tail_rows)
-                sentence_full_k_local_start.append(k_local_start)
-                sentence_full_k_len.append(k_len)
+                full_q_start = q_start + tail_rows
+                full_q_len = q_len - tail_rows
+                chunk_start = 0
+                while chunk_start < full_q_len:
+                    chunk_len = min(q_desc_rows, full_q_len - chunk_start)
+                    sentence_full_q_start.append(full_q_start + chunk_start)
+                    sentence_full_q_len.append(chunk_len)
+                    sentence_full_q_group_mask.append(_q_group_mask(chunk_len))
+                    sentence_full_k_local_start.append(k_local_start)
+                    sentence_full_k_len.append(k_len)
+                    chunk_start += chunk_len
         sentence_full_kblock_row_ptr.append(len(sentence_full_q_start))
         sentence_tail_kblock_row_ptr.append(len(sentence_tail_q_start))
 
@@ -2339,19 +2393,29 @@ def _build_hsa_monolithic_backward_schedule(
 
                     tail_prefix_rows = local_prefix_rows[positive_start:full_start]
                     if tail_prefix_rows:
-                        anchor_tail_q_row_start.append(q_row_start + positive_start)
-                        anchor_tail_q_row_count.append(len(tail_prefix_rows))
-                        anchor_tail_k_local_start.append(k_local_start)
-                        anchor_tail_k_len.append(k_len)
-                        anchor_tail_prefix_row_start.append(len(anchor_prefix_len))
-                        anchor_prefix_len.extend(tail_prefix_rows)
+                        chunk_start = 0
+                        while chunk_start < len(tail_prefix_rows):
+                            chunk_rows = tail_prefix_rows[chunk_start : chunk_start + q_desc_rows]
+                            anchor_tail_q_row_start.append(q_row_start + positive_start + chunk_start)
+                            anchor_tail_q_row_count.append(len(chunk_rows))
+                            anchor_tail_q_group_mask.append(_q_group_mask(len(chunk_rows)))
+                            anchor_tail_k_local_start.append(k_local_start)
+                            anchor_tail_k_len.append(k_len)
+                            anchor_tail_prefix_row_start.append(len(anchor_prefix_len))
+                            anchor_prefix_len.extend(chunk_rows)
+                            chunk_start += len(chunk_rows)
 
                     full_count = q_row_count - full_start
                     if full_count > 0:
-                        anchor_full_q_row_start.append(q_row_start + full_start)
-                        anchor_full_q_row_count.append(full_count)
-                        anchor_full_k_local_start.append(k_local_start)
-                        anchor_full_k_len.append(k_len)
+                        chunk_start = 0
+                        while chunk_start < full_count:
+                            chunk_len = min(q_desc_rows, full_count - chunk_start)
+                            anchor_full_q_row_start.append(q_row_start + full_start + chunk_start)
+                            anchor_full_q_row_count.append(chunk_len)
+                            anchor_full_q_group_mask.append(_q_group_mask(chunk_len))
+                            anchor_full_k_local_start.append(k_local_start)
+                            anchor_full_k_len.append(k_len)
+                            chunk_start += chunk_len
 
                 run_start = run_end
         anchor_full_kblock_row_ptr.append(len(anchor_full_q_row_start))
@@ -2367,22 +2431,26 @@ def _build_hsa_monolithic_backward_schedule(
         sentence_full_kblock_row_ptr=torch.tensor(sentence_full_kblock_row_ptr, dtype=torch.int32, device=device),
         sentence_full_q_start=_tensor(sentence_full_q_start),
         sentence_full_q_len=_tensor(sentence_full_q_len),
+        sentence_full_q_group_mask=_tensor(sentence_full_q_group_mask),
         sentence_full_k_local_start=_tensor(sentence_full_k_local_start),
         sentence_full_k_len=_tensor(sentence_full_k_len),
         sentence_tail_kblock_row_ptr=torch.tensor(sentence_tail_kblock_row_ptr, dtype=torch.int32, device=device),
         sentence_tail_q_start=_tensor(sentence_tail_q_start),
         sentence_tail_q_len=_tensor(sentence_tail_q_len),
+        sentence_tail_q_group_mask=_tensor(sentence_tail_q_group_mask),
         sentence_tail_k_local_start=_tensor(sentence_tail_k_local_start),
         sentence_tail_k_len=_tensor(sentence_tail_k_len),
         sentence_tail_row0_prefix_len=_tensor(sentence_tail_row0_prefix_len),
         anchor_full_kblock_row_ptr=torch.tensor(anchor_full_kblock_row_ptr, dtype=torch.int32, device=device),
         anchor_full_q_row_start=_tensor(anchor_full_q_row_start),
         anchor_full_q_row_count=_tensor(anchor_full_q_row_count),
+        anchor_full_q_group_mask=_tensor(anchor_full_q_group_mask),
         anchor_full_k_local_start=_tensor(anchor_full_k_local_start),
         anchor_full_k_len=_tensor(anchor_full_k_len),
         anchor_tail_kblock_row_ptr=torch.tensor(anchor_tail_kblock_row_ptr, dtype=torch.int32, device=device),
         anchor_tail_q_row_start=_tensor(anchor_tail_q_row_start),
         anchor_tail_q_row_count=_tensor(anchor_tail_q_row_count),
+        anchor_tail_q_group_mask=_tensor(anchor_tail_q_group_mask),
         anchor_tail_k_local_start=_tensor(anchor_tail_k_local_start),
         anchor_tail_k_len=_tensor(anchor_tail_k_len),
         anchor_tail_prefix_row_start=_tensor(anchor_tail_prefix_row_start),
@@ -3215,22 +3283,23 @@ def _get_hsa_fused_forward_batches(
 def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> HSABlockSparseRuntime:
     cache = getattr(schedule, "_hsa_block_sparse_runtime_cache", None)
     forward_block_q = _get_hsa_forward_q_block_size(q, k)
-    backward_block_q = 128
-    block_k = 128
-    cache_key = (str(q.device), forward_block_q, backward_block_q, block_k)
+    backward_block_q = 64
+    forward_block_k = 128
+    backward_block_k = 128
+    cache_key = (str(q.device), forward_block_q, forward_block_k, backward_block_q, backward_block_k)
     if cache is not None and cache_key in cache:
         return cache[cache_key]
 
     forward_sparse, forward_tile_masks = _build_forward_hsa_tile_masks(
         schedule,
         q_block_size=forward_block_q,
-        k_block_size=block_k,
+        k_block_size=forward_block_k,
     )
 
     backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
         schedule,
         q_block_size=backward_block_q,
-        k_block_size=block_k,
+        k_block_size=backward_block_k,
     )
 
     runtime = HSABlockSparseRuntime(
@@ -3242,10 +3311,12 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         backward_aux_tensors=[
             _tag_aux_tensor(backward_packed_masks.block_id_table),
             _tag_aux_tensor(backward_packed_masks.mask_words),
+            _tag_aux_tensor(backward_packed_masks.row_group_nonempty),
         ],
         forward_block_q=forward_block_q,
+        forward_block_k=forward_block_k,
         backward_block_q=backward_block_q,
-        block_k=block_k,
+        backward_block_k=backward_block_k,
         backward_subtile_factor=1,
     )
     if cache is None:
@@ -3366,8 +3437,8 @@ def get_hsa_forward_tile_mask_mod(q_block_size: int, k_block_size: int):
     return _hsa_forward_tile_mask
 
 
-@lru_cache(maxsize=1)
-def get_hsa_backward_packed_mask_mod():
+@lru_cache(maxsize=None)
+def get_hsa_backward_packed_mask_mod(q_block_size: int, k_block_size: int):
     """Return the CuTe mask_mod for packed backward HSA partial blocks."""
     cutlass, cute, utils, fast_sampling, _, _, _ = _lazy_cute_imports()
 
@@ -3384,10 +3455,10 @@ def get_hsa_backward_packed_mask_mod():
         safe_kv_idx = kv_idx % seqlen_info.seqlen_k
         in_bounds = (q_idx < seqlen_info.seqlen_q) & (kv_idx < seqlen_info.seqlen_k)
 
-        q_block = safe_q_idx // 128
-        k_block = safe_kv_idx // 128
-        q_local = safe_q_idx % 128
-        k_local = safe_kv_idx % 128
+        q_block = safe_q_idx // q_block_size
+        k_block = safe_kv_idx // k_block_size
+        q_local = safe_q_idx % q_block_size
+        k_local = safe_kv_idx % k_block_size
         word_idx = k_local // 32
         bit_idx = k_local % 32
 
@@ -4223,7 +4294,9 @@ def _run_hsa_packed_mask_backward(
         causal=False,
         pack_gqa=False,
         deterministic=deterministic,
-        mask_mod=get_hsa_backward_packed_mask_mod(),
+        m_block_size=runtime.backward_block_q,
+        n_block_size=runtime.backward_block_k,
+        mask_mod=get_hsa_backward_packed_mask_mod(runtime.backward_block_q, runtime.backward_block_k),
         aux_tensors=runtime.backward_aux_tensors,
         block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.backward_sparse),
         subtile_factor_override=runtime.backward_subtile_factor,

@@ -635,6 +635,11 @@ def _flash_attn_bwd(
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
+    requested_m_block_size = m_block_size
+    requested_n_block_size = n_block_size
+    requested_AtomLayoutNdKV = AtomLayoutNdKV
+    requested_AtomLayoutMdQ = AtomLayoutMdQ
+
     num_head, head_dim = q.shape[-2:]
 
     if causal:
@@ -723,6 +728,16 @@ def _flash_attn_bwd(
     if arch // 10 == 9 and head_dim <= 64:
         m_block_size = 64
         dQ_swapAB = False
+    if arch // 10 in [10, 11] and use_block_sparsity:
+        # Keep dense SM100/SM110 defaults unchanged, but let sparse callers request
+        # a smaller M block so exact sparse paths can use finer query granularity.
+        m_block_size = requested_m_block_size
+        n_block_size = requested_n_block_size
+        AtomLayoutNdKV = requested_AtomLayoutNdKV
+        AtomLayoutMdQ = requested_AtomLayoutMdQ
+        dQ_swapAB = False
+        cluster_size = 1
+        use_2cta_instrs = False
 
     subtile_factor = subtile_factor_override if subtile_factor_override is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size

@@ -1012,11 +1012,6 @@ def test_hsa_monolithic_anchor_full_family_uses_mma_and_matches_reference(monkey
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_bwd_sentence_full_kernel_slice",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full scalar kernel slice used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
         "_run_hsa_bwd_anchor_full_scalar",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_full scalar helper used")),
     )
@@ -1110,11 +1105,6 @@ def test_hsa_monolithic_anchor_tail_family_uses_mma_and_matches_reference(monkey
         hsa_bwd_module,
         "_run_hsa_bwd_monolithic_main_torch",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Torch monolithic fallback used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_sentence_full_kernel_slice",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full scalar kernel slice used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
@@ -1214,28 +1204,18 @@ def test_hsa_monolithic_backward_matches_reference(monkeypatch, n_kv_heads):
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_bwd_sentence_full_kernel_slice",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full scalar kernel slice used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
         "_run_hsa_monolithic_mma_batches",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("host-side monolithic MMA prepass used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_sentence_full_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full family prepass used")),
+        "_run_hsa_bwd_anchor_full_scalar",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_full scalar helper used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_sentence_full_fa4_fastpath",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full FA4 fastpath used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_sentence_tail_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_tail family prepass used")),
+        "_run_hsa_bwd_anchor_tail_scalar",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_tail scalar helper used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,

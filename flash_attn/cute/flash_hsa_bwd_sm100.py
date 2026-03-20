@@ -51,6 +51,10 @@ except Exception:  # pragma: no cover - import guard for CPU-only schedule tests
             def block_idx():
                 return (0, 0, 0)
 
+            @staticmethod
+            def barrier():
+                return None
+
         @staticmethod
         def jit(fn):
             return fn
@@ -1015,6 +1019,458 @@ def _run_hsa_bwd_anchor_full_scalar(
 
 
 @cute.jit
+def _accumulate_hsa_bwd_qhead_key_atomic(
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    global_q_row: Int32,
+    kv_head: Int32,
+    q_head: Int32,
+    key_row: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    head_dim: cutlass.Constexpr[int],
+    head_dim_v: cutlass.Constexpr[int],
+):
+    lse_log2 = Float32(mLSElog2[global_q_row, q_head])
+    dpsum = Float32(mdPsum[global_q_row, q_head])
+    score = Float32.zero
+    for d in cutlass.range(head_dim, unroll=1):
+        score += Float32(mQ[global_q_row, q_head, d]) * Float32(mK[key_row, kv_head, d])
+    prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+    dprob = Float32.zero
+    for dv_idx in cutlass.range(head_dim_v, unroll=1):
+        dprob += Float32(mdO[global_q_row, q_head, dv_idx]) * Float32(mV[key_row, kv_head, dv_idx])
+    ds = prob * (dprob - dpsum)
+    ds_scaled = ds * softmax_scale
+    for d in cutlass.range(head_dim, unroll=1):
+        utils.atomic_add_fp32(
+            ds_scaled * Float32(mK[key_row, kv_head, d]),
+            utils.elem_pointer(mdQaccum, (global_q_row, q_head, d)),
+        )
+        utils.atomic_add_fp32(
+            ds_scaled * Float32(mQ[global_q_row, q_head, d]),
+            utils.elem_pointer(mdK, (key_row, kv_head, d)),
+        )
+    for dv_idx in cutlass.range(head_dim_v, unroll=1):
+        utils.atomic_add_fp32(
+            prob * Float32(mdO[global_q_row, q_head, dv_idx]),
+            utils.elem_pointer(mdV, (key_row, kv_head, dv_idx)),
+        )
+
+
+@cute.jit
+def _accumulate_hsa_bwd_qhead_key_serial_dkv(
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    global_q_row: Int32,
+    kv_head: Int32,
+    q_head: Int32,
+    key_row: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    head_dim: cutlass.Constexpr[int],
+    head_dim_v: cutlass.Constexpr[int],
+):
+    lse_log2 = Float32(mLSElog2[global_q_row, q_head])
+    dpsum = Float32(mdPsum[global_q_row, q_head])
+    score = Float32.zero
+    for d in cutlass.range(head_dim, unroll=1):
+        score += Float32(mQ[global_q_row, q_head, d]) * Float32(mK[key_row, kv_head, d])
+    prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+    dprob = Float32.zero
+    for dv_idx in cutlass.range(head_dim_v, unroll=1):
+        dprob += Float32(mdO[global_q_row, q_head, dv_idx]) * Float32(mV[key_row, kv_head, dv_idx])
+    ds = prob * (dprob - dpsum)
+    ds_scaled = ds * softmax_scale
+    for d in cutlass.range(head_dim, unroll=1):
+        utils.atomic_add_fp32(
+            ds_scaled * Float32(mK[key_row, kv_head, d]),
+            utils.elem_pointer(mdQaccum, (global_q_row, q_head, d)),
+        )
+        mdK[key_row, kv_head, d] = Float32(mdK[key_row, kv_head, d]) + ds_scaled * Float32(
+            mQ[global_q_row, q_head, d]
+        )
+    for dv_idx in cutlass.range(head_dim_v, unroll=1):
+        mdV[key_row, kv_head, dv_idx] = Float32(mdV[key_row, kv_head, dv_idx]) + prob * Float32(
+            mdO[global_q_row, q_head, dv_idx]
+        )
+
+
+@cute.jit
+def _run_hsa_bwd_anchor_descriptor_group_panel(
+    self,
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    q_row_start: Int32,
+    q_rel_start: Int32,
+    q_rel_end: Int32,
+    key_row_base: Int32,
+    k_len: Int32,
+    prefix_row_start: Int32,
+    anchor_q_indices: cute.Tensor,
+    anchor_prefix_len: cute.Tensor,
+    kv_head: Int32,
+    qhead_start: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
+    use_tail_prefix: cutlass.Constexpr[bool],
+):
+    tasks_per_row = Int32(self.qhead_per_kvhead) * k_len
+    total_tasks = (q_rel_end - q_rel_start) * tasks_per_row
+    for task_idx in cutlass.range(tidx, total_tasks, num_threads, unroll=1):
+        row_task = task_idx // k_len
+        k_rel = task_idx - row_task * k_len
+        local_row = row_task // Int32(self.qhead_per_kvhead)
+        qh_offset = row_task - local_row * Int32(self.qhead_per_kvhead)
+        q_rel = q_rel_start + local_row
+        prefix = k_len
+        if use_tail_prefix:
+            prefix = anchor_prefix_len[prefix_row_start + q_rel]
+        if k_rel < prefix:
+            _accumulate_hsa_bwd_qhead_key_atomic(
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_q_indices[q_row_start + q_rel],
+                kv_head,
+                qhead_start + qh_offset,
+                key_row_base + k_rel,
+                softmax_scale,
+                scale_log2,
+                self.head_dim,
+                    self.head_dim_v,
+                )
+
+
+@cute.jit
+def _run_hsa_bwd_anchor_descriptor_group_panel_small_reduced(
+    self,
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    q_row_start: Int32,
+    q_rel_start: Int32,
+    q_rel_end: Int32,
+    key_row_base: Int32,
+    k_len: Int32,
+    prefix_row_start: Int32,
+    anchor_q_indices: cute.Tensor,
+    anchor_prefix_len: cute.Tensor,
+    kv_head: Int32,
+    qhead_start: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    use_tail_prefix: cutlass.Constexpr[bool],
+):
+    for k_rel in cutlass.range(k_len, unroll=1):
+        key_row = key_row_base + k_rel
+        dK_acc = cute.make_fragment(self.head_dim, Float32)
+        dV_acc = cute.make_fragment(self.head_dim_v, Float32)
+        dK_acc.fill(0.0)
+        dV_acc.fill(0.0)
+        for q_rel in cutlass.range(q_rel_start, q_rel_end, unroll=1):
+            prefix = k_len
+            if use_tail_prefix:
+                prefix = anchor_prefix_len[prefix_row_start + q_rel]
+            if k_rel < prefix:
+                global_q_row = anchor_q_indices[q_row_start + q_rel]
+                for qh_offset in cutlass.range(self.qhead_per_kvhead, unroll=1):
+                    q_head = qhead_start + qh_offset
+                    lse_log2 = Float32(mLSElog2[global_q_row, q_head])
+                    dpsum = Float32(mdPsum[global_q_row, q_head])
+                    score = Float32.zero
+                    for d in cutlass.range(self.head_dim, unroll=1):
+                        score += Float32(mQ[global_q_row, q_head, d]) * Float32(mK[key_row, kv_head, d])
+                    prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+                    dprob = Float32.zero
+                    for dv_idx in cutlass.range(self.head_dim_v, unroll=1):
+                        dprob += Float32(mdO[global_q_row, q_head, dv_idx]) * Float32(
+                            mV[key_row, kv_head, dv_idx]
+                        )
+                    ds = prob * (dprob - dpsum)
+                    ds_scaled = ds * softmax_scale
+                    for d in cutlass.range(self.head_dim, unroll=1):
+                        utils.atomic_add_fp32(
+                            ds_scaled * Float32(mK[key_row, kv_head, d]),
+                            utils.elem_pointer(mdQaccum, (global_q_row, q_head, d)),
+                        )
+                        dK_acc[d] = Float32(dK_acc[d]) + ds_scaled * Float32(mQ[global_q_row, q_head, d])
+                    for dv_idx in cutlass.range(self.head_dim_v, unroll=1):
+                        dV_acc[dv_idx] = Float32(dV_acc[dv_idx]) + prob * Float32(mdO[global_q_row, q_head, dv_idx])
+        for d in cutlass.range(self.head_dim, unroll=1):
+            utils.atomic_add_fp32(
+                Float32(dK_acc[d]),
+                utils.elem_pointer(mdK, (key_row, kv_head, d)),
+            )
+        for dv_idx in cutlass.range(self.head_dim_v, unroll=1):
+            utils.atomic_add_fp32(
+                Float32(dV_acc[dv_idx]),
+                utils.elem_pointer(mdV, (key_row, kv_head, dv_idx)),
+            )
+
+
+@cute.jit
+def _run_hsa_bwd_anchor_descriptor_panel_serial(
+    self,
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    q_row_start: Int32,
+    q_row_count: Int32,
+    q_group_mask: Int32,
+    key_row_base: Int32,
+    k_len: Int32,
+    prefix_row_start: Int32,
+    anchor_q_indices: cute.Tensor,
+    anchor_prefix_len: cute.Tensor,
+    kv_head: Int32,
+    qhead_start: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    use_tail_prefix: cutlass.Constexpr[bool],
+):
+    if (q_group_mask & Int32(1)) != Int32(0):
+        first_group_end = min(Int32(32), q_row_count)
+        for q_rel in cutlass.range(first_group_end, unroll=1):
+            prefix = k_len
+            if use_tail_prefix:
+                prefix = anchor_prefix_len[prefix_row_start + q_rel]
+            global_q_row = anchor_q_indices[q_row_start + q_rel]
+            for qh_offset in cutlass.range(self.qhead_per_kvhead, unroll=1):
+                q_head = qhead_start + qh_offset
+                for k_rel in cutlass.range(prefix, unroll=1):
+                    _accumulate_hsa_bwd_qhead_key_serial_dkv(
+                        mQ,
+                        mK,
+                        mV,
+                        mdO,
+                        mLSElog2,
+                        mdPsum,
+                        mdQaccum,
+                        mdK,
+                        mdV,
+                        global_q_row,
+                        kv_head,
+                        q_head,
+                        key_row_base + k_rel,
+                        softmax_scale,
+                        scale_log2,
+                        self.head_dim,
+                        self.head_dim_v,
+                    )
+    if (q_group_mask & Int32(2)) != Int32(0):
+        for q_rel in cutlass.range(Int32(32), q_row_count, unroll=1):
+            prefix = k_len
+            if use_tail_prefix:
+                prefix = anchor_prefix_len[prefix_row_start + q_rel]
+            global_q_row = anchor_q_indices[q_row_start + q_rel]
+            for qh_offset in cutlass.range(self.qhead_per_kvhead, unroll=1):
+                q_head = qhead_start + qh_offset
+                for k_rel in cutlass.range(prefix, unroll=1):
+                    _accumulate_hsa_bwd_qhead_key_serial_dkv(
+                        mQ,
+                        mK,
+                        mV,
+                        mdO,
+                        mLSElog2,
+                        mdPsum,
+                        mdQaccum,
+                        mdK,
+                        mdV,
+                        global_q_row,
+                        kv_head,
+                        q_head,
+                        key_row_base + k_rel,
+                        softmax_scale,
+                        scale_log2,
+                        self.head_dim,
+                        self.head_dim_v,
+                    )
+
+
+@cute.jit
+def _run_hsa_bwd_anchor_descriptor_panel(
+    self,
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mdO: cute.Tensor,
+    mLSElog2: cute.Tensor,
+    mdPsum: cute.Tensor,
+    mdQaccum: cute.Tensor,
+    mdK: cute.Tensor,
+    mdV: cute.Tensor,
+    q_row_start: Int32,
+    q_row_count: Int32,
+    q_group_mask: Int32,
+    key_row_base: Int32,
+    k_len: Int32,
+    prefix_row_start: Int32,
+    anchor_q_indices: cute.Tensor,
+    anchor_prefix_len: cute.Tensor,
+    kv_head: Int32,
+    qhead_start: Int32,
+    softmax_scale: Float32,
+    scale_log2: Float32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
+    use_tail_prefix: cutlass.Constexpr[bool],
+):
+    total_tasks = q_row_count * Int32(self.qhead_per_kvhead) * k_len
+    if total_tasks <= Int32(32) and num_threads == 1:
+        if (q_group_mask & Int32(1)) != Int32(0):
+            _run_hsa_bwd_anchor_descriptor_group_panel_small_reduced(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                q_row_start,
+                Int32(0),
+                min(Int32(32), q_row_count),
+                key_row_base,
+                k_len,
+                prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                use_tail_prefix,
+            )
+        if (q_group_mask & Int32(2)) != Int32(0):
+            _run_hsa_bwd_anchor_descriptor_group_panel_small_reduced(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                q_row_start,
+                Int32(32),
+                q_row_count,
+                key_row_base,
+                k_len,
+                prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                use_tail_prefix,
+            )
+    else:
+        if (q_group_mask & Int32(1)) != Int32(0):
+            _run_hsa_bwd_anchor_descriptor_group_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                q_row_start,
+                Int32(0),
+                min(Int32(32), q_row_count),
+                key_row_base,
+                k_len,
+                prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                num_threads,
+                use_tail_prefix,
+            )
+        if (q_group_mask & Int32(2)) != Int32(0):
+            _run_hsa_bwd_anchor_descriptor_group_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                q_row_start,
+                Int32(32),
+                q_row_count,
+                key_row_base,
+                k_len,
+                prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                num_threads,
+                use_tail_prefix,
+            )
+
+
+@cute.jit
 def _run_hsa_bwd_anchor_full_kernel_slice(
     self,
     mQ: cute.Tensor,
@@ -1039,19 +1495,49 @@ def _run_hsa_bwd_anchor_full_kernel_slice(
     block_flat_start: Int32,
     softmax_scale: Float32,
     scale_log2: Float32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
 ):
     anchor_full_start = anchor_full_kblock_row_ptr[global_k_block]
     anchor_full_end = anchor_full_kblock_row_ptr[global_k_block + 1]
-    for desc_idx in cutlass.range(anchor_full_start, anchor_full_end, unroll=1):
-        q_row_start = anchor_full_q_row_start[desc_idx]
-        q_row_count = anchor_full_q_row_count[desc_idx]
-        q_group_mask = anchor_full_q_group_mask[desc_idx]
-        key_row_base = block_flat_start + anchor_full_k_local_start[desc_idx]
-        prefix = anchor_full_k_len[desc_idx]
-        if (q_group_mask & Int32(1)) != Int32(0):
-            first_group_end = min(Int32(32), q_row_count)
-            for q_rel in cutlass.range(first_group_end, unroll=1):
-                _accumulate_hsa_bwd_row(
+    desc_count = anchor_full_end - anchor_full_start
+    if self.qhead_per_kvhead > 1:
+        lane = tidx % Int32(32)
+        warp_idx = tidx // Int32(32)
+        num_warps = Int32(num_threads // 32)
+        for desc_idx in cutlass.range(anchor_full_start + warp_idx, anchor_full_end, num_warps, unroll=1):
+            _run_hsa_bwd_anchor_descriptor_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_full_q_row_start[desc_idx],
+                anchor_full_q_row_count[desc_idx],
+                anchor_full_q_group_mask[desc_idx],
+                block_flat_start + anchor_full_k_local_start[desc_idx],
+                anchor_full_k_len[desc_idx],
+                Int32(0),
+                anchor_q_indices,
+                anchor_q_indices,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                lane,
+                32,
+                False,
+            )
+    elif desc_count <= Int32(6):
+        if tidx == 0:
+            for desc_idx in cutlass.range(anchor_full_start, anchor_full_end, unroll=1):
+                _run_hsa_bwd_anchor_descriptor_panel_serial(
+                    self,
                     mQ,
                     mK,
                     mV,
@@ -1061,40 +1547,49 @@ def _run_hsa_bwd_anchor_full_kernel_slice(
                     mdQaccum,
                     mdK,
                     mdV,
-                    anchor_q_indices[q_row_start + q_rel],
+                    anchor_full_q_row_start[desc_idx],
+                    anchor_full_q_row_count[desc_idx],
+                    anchor_full_q_group_mask[desc_idx],
+                    block_flat_start + anchor_full_k_local_start[desc_idx],
+                    anchor_full_k_len[desc_idx],
+                    Int32(0),
+                    anchor_q_indices,
+                    anchor_q_indices,
                     kv_head,
                     qhead_start,
-                    key_row_base,
-                    prefix,
                     softmax_scale,
                     scale_log2,
-                    self.qhead_per_kvhead,
-                    self.head_dim,
-                    self.head_dim_v,
+                    False,
                 )
-        if (q_group_mask & Int32(2)) != Int32(0):
-            for q_rel in cutlass.range(Int32(32), q_row_count, unroll=1):
-                _accumulate_hsa_bwd_row(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
-                    mLSElog2,
-                    mdPsum,
-                    mdQaccum,
-                    mdK,
-                    mdV,
-                    anchor_q_indices[q_row_start + q_rel],
-                    kv_head,
-                    qhead_start,
-                    key_row_base,
-                    prefix,
-                    softmax_scale,
-                    scale_log2,
-                    self.qhead_per_kvhead,
-                    self.head_dim,
-                    self.head_dim_v,
-                )
+    else:
+        for desc_idx in cutlass.range(anchor_full_start + tidx, anchor_full_end, num_threads, unroll=1):
+            _run_hsa_bwd_anchor_descriptor_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_full_q_row_start[desc_idx],
+                anchor_full_q_row_count[desc_idx],
+                anchor_full_q_group_mask[desc_idx],
+                block_flat_start + anchor_full_k_local_start[desc_idx],
+                anchor_full_k_len[desc_idx],
+                Int32(0),
+                anchor_q_indices,
+                anchor_q_indices,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                Int32(0),
+                1,
+                False,
+            )
 
 
 @cute.jit
@@ -1209,19 +1704,49 @@ def _run_hsa_bwd_anchor_tail_kernel_slice(
     block_flat_start: Int32,
     softmax_scale: Float32,
     scale_log2: Float32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
 ):
     anchor_tail_start = anchor_tail_kblock_row_ptr[global_k_block]
     anchor_tail_end = anchor_tail_kblock_row_ptr[global_k_block + 1]
-    for desc_idx in cutlass.range(anchor_tail_start, anchor_tail_end, unroll=1):
-        q_row_start = anchor_tail_q_row_start[desc_idx]
-        q_row_count = anchor_tail_q_row_count[desc_idx]
-        q_group_mask = anchor_tail_q_group_mask[desc_idx]
-        key_row_base = block_flat_start + anchor_tail_k_local_start[desc_idx]
-        prefix_row_start = anchor_tail_prefix_row_start[desc_idx]
-        if (q_group_mask & Int32(1)) != Int32(0):
-            first_group_end = min(Int32(32), q_row_count)
-            for q_rel in cutlass.range(first_group_end, unroll=1):
-                _accumulate_hsa_bwd_row(
+    desc_count = anchor_tail_end - anchor_tail_start
+    if self.qhead_per_kvhead > 1:
+        lane = tidx % Int32(32)
+        warp_idx = tidx // Int32(32)
+        num_warps = Int32(num_threads // 32)
+        for desc_idx in cutlass.range(anchor_tail_start + warp_idx, anchor_tail_end, num_warps, unroll=1):
+            _run_hsa_bwd_anchor_descriptor_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_tail_q_row_start[desc_idx],
+                anchor_tail_q_row_count[desc_idx],
+                anchor_tail_q_group_mask[desc_idx],
+                block_flat_start + anchor_tail_k_local_start[desc_idx],
+                anchor_tail_k_len[desc_idx],
+                anchor_tail_prefix_row_start[desc_idx],
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                lane,
+                32,
+                True,
+            )
+    elif desc_count <= Int32(6):
+        if tidx == 0:
+            for desc_idx in cutlass.range(anchor_tail_start, anchor_tail_end, unroll=1):
+                _run_hsa_bwd_anchor_descriptor_panel_serial(
+                    self,
                     mQ,
                     mK,
                     mV,
@@ -1231,40 +1756,49 @@ def _run_hsa_bwd_anchor_tail_kernel_slice(
                     mdQaccum,
                     mdK,
                     mdV,
-                    anchor_q_indices[q_row_start + q_rel],
+                    anchor_tail_q_row_start[desc_idx],
+                    anchor_tail_q_row_count[desc_idx],
+                    anchor_tail_q_group_mask[desc_idx],
+                    block_flat_start + anchor_tail_k_local_start[desc_idx],
+                    anchor_tail_k_len[desc_idx],
+                    anchor_tail_prefix_row_start[desc_idx],
+                    anchor_q_indices,
+                    anchor_prefix_len,
                     kv_head,
                     qhead_start,
-                    key_row_base,
-                    anchor_prefix_len[prefix_row_start + q_rel],
                     softmax_scale,
                     scale_log2,
-                    self.qhead_per_kvhead,
-                    self.head_dim,
-                    self.head_dim_v,
+                    True,
                 )
-        if (q_group_mask & Int32(2)) != Int32(0):
-            for q_rel in cutlass.range(Int32(32), q_row_count, unroll=1):
-                _accumulate_hsa_bwd_row(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
-                    mLSElog2,
-                    mdPsum,
-                    mdQaccum,
-                    mdK,
-                    mdV,
-                    anchor_q_indices[q_row_start + q_rel],
-                    kv_head,
-                    qhead_start,
-                    key_row_base,
-                    anchor_prefix_len[prefix_row_start + q_rel],
-                    softmax_scale,
-                    scale_log2,
-                    self.qhead_per_kvhead,
-                    self.head_dim,
-                    self.head_dim_v,
-                )
+    else:
+        for desc_idx in cutlass.range(anchor_tail_start + tidx, anchor_tail_end, num_threads, unroll=1):
+            _run_hsa_bwd_anchor_descriptor_panel(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_tail_q_row_start[desc_idx],
+                anchor_tail_q_row_count[desc_idx],
+                anchor_tail_q_group_mask[desc_idx],
+                block_flat_start + anchor_tail_k_local_start[desc_idx],
+                anchor_tail_k_len[desc_idx],
+                anchor_tail_prefix_row_start[desc_idx],
+                anchor_q_indices,
+                anchor_prefix_len,
+                kv_head,
+                qhead_start,
+                softmax_scale,
+                scale_log2,
+                Int32(0),
+                1,
+                True,
+            )
 
 
 @cute.jit
@@ -1651,58 +2185,64 @@ class FlashHSABackwardSm100(FlashAttentionBackwardSm100):
                 softmax_scale,
                 scale_log2,
             )
-            _run_hsa_bwd_anchor_full_kernel_slice(
-                self,
-                mQ,
-                mK,
-                mV,
-                mdO,
-                mLSElog2,
-                mdPsum,
-                mdQaccum,
-                mdK,
-                mdV,
-                anchor_full_kblock_row_ptr,
-                anchor_full_q_row_start,
-                anchor_full_q_row_count,
-                anchor_full_q_group_mask,
-                anchor_full_k_local_start,
-                anchor_full_k_len,
-                anchor_q_indices,
-                global_k_block,
-                kv_head,
-                qhead_start,
-                block_flat_start,
-                softmax_scale,
-                scale_log2,
-            )
-            _run_hsa_bwd_anchor_tail_kernel_slice(
-                self,
-                mQ,
-                mK,
-                mV,
-                mdO,
-                mLSElog2,
-                mdPsum,
-                mdQaccum,
-                mdK,
-                mdV,
-                anchor_tail_kblock_row_ptr,
-                anchor_tail_q_row_start,
-                anchor_tail_q_row_count,
-                anchor_tail_q_group_mask,
-                anchor_tail_k_local_start,
-                anchor_tail_k_len,
-                anchor_tail_prefix_row_start,
-                anchor_q_indices,
-                anchor_prefix_len,
-                global_k_block,
-                kv_head,
-                qhead_start,
-                block_flat_start,
-                softmax_scale,
-                scale_log2,
-            )
+        cute.arch.barrier()
+        _run_hsa_bwd_anchor_full_kernel_slice(
+            self,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSElog2,
+            mdPsum,
+            mdQaccum,
+            mdK,
+            mdV,
+            anchor_full_kblock_row_ptr,
+            anchor_full_q_row_start,
+            anchor_full_q_row_count,
+            anchor_full_q_group_mask,
+            anchor_full_k_local_start,
+            anchor_full_k_len,
+            anchor_q_indices,
+            global_k_block,
+            kv_head,
+            qhead_start,
+            block_flat_start,
+            softmax_scale,
+            scale_log2,
+            tidx,
+            self.num_threads,
+        )
+        cute.arch.barrier()
+        _run_hsa_bwd_anchor_tail_kernel_slice(
+            self,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSElog2,
+            mdPsum,
+            mdQaccum,
+            mdK,
+            mdV,
+            anchor_tail_kblock_row_ptr,
+            anchor_tail_q_row_start,
+            anchor_tail_q_row_count,
+            anchor_tail_q_group_mask,
+            anchor_tail_k_local_start,
+            anchor_tail_k_len,
+            anchor_tail_prefix_row_start,
+            anchor_q_indices,
+            anchor_prefix_len,
+            global_k_block,
+            kv_head,
+            qhead_start,
+            block_flat_start,
+            softmax_scale,
+            scale_log2,
+            tidx,
+            self.num_threads,
+        )
 
 
 @cute.jit

@@ -2072,23 +2072,12 @@ class FP4FlashAttentionForwardSm100:
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         if const_expr(self.use_fp4_pv):
-            thr_mma_pv = tiled_mma_pv.get_slice(cute.arch.thread_idx()[0])
-            tOrV_frg = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sV[None, None, None, 0]))
-            tOrV_bytes = cute.make_rmem_tensor(
-                cute.recast_layout(self.v_storage_dtype.width, self.v_dtype.width, tOrV_frg.layout),
-                self.v_storage_dtype,
-            )
-            tOrV = cute.make_tensor(
-                cute.recast_ptr(tOrV_bytes.iterator, dtype=self.v_dtype),
-                cute.recast_layout(self.v_dtype.width, self.v_storage_dtype.width, tOrV_bytes.layout),
-            )
-            tOrV = cute.group_modes(tOrV, 1, 3)
-            cV = cute.make_identity_tensor(cute.select(self.mma_tiler_pv, mode=[1, 2]))
-            tOcV = thr_mma_pv.partition_B(cV)
-            tOcV = cute.group_modes(tOcV, 1, 3)
+            # FP4 PV must consume operand-B from the native swizzled Vt shared-memory
+            # layout. Use the tiled MMA fragment directly instead of rebuilding a
+            # per-thread RMEM alias from byte copies.
+            tOrV = tiled_mma_pv.make_fragment_B(sV)
         else:
             tOrV = tiled_mma_pv.make_fragment_B(sV)
-            tOcV = None
         if const_expr(self.use_fp4_qk):
             assert sSFA is not None and sSFK is not None
             assert tCtSFA is not None and tCtSFK is not None
@@ -2311,10 +2300,7 @@ class FP4FlashAttentionForwardSm100:
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                    if const_expr(self.use_fp4_pv):
-                        tOrVi = tOrV
-                    else:
-                        tOrVi = tOrV[None, None, None, Vi_index]
+                    tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
@@ -2328,7 +2314,6 @@ class FP4FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         if const_expr(self.use_fp4_pv):
-                            assert tOcV is not None
                             self.debug_print_fp4_pv_stage_state(
                                 sV_cur,
                                 sSFP[None, None, None, stage],
@@ -2346,17 +2331,6 @@ class FP4FlashAttentionForwardSm100:
                                 tiled_copy_s2t_sfv,
                                 tCsSFV_compact_s2t[(None, None, None, None, Vi_index)],
                                 tCtSFV_compact_s2t,
-                            )
-                            tOsVi = thr_mma_pv.partition_B(
-                                copy_utils.as_position_independent_swizzle_tensor(sV_cur)
-                            )
-                            tOsVi = cute.group_modes(tOsVi, 1, 3)
-                            self.copy_partitioned_fp4_bytes(
-                                tOsVi,
-                                tOrVi,
-                                tOcV,
-                                Int32(self.n_block_size),
-                                Int32(self.head_dim_v_padded),
                             )
                             gemm_Pi[stage](
                                 tCrB=tOrVi,
@@ -2429,14 +2403,7 @@ class FP4FlashAttentionForwardSm100:
                 # 1. wait for V0
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                if const_expr(self.use_fp4_pv):
-                    sV_cur = sV[None, None, None, Vi_index]
-                    if const_expr(self.uneven_kv_smem):
-                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    sVt_cur = layout_utils.transpose_view(sV_cur)
-                    tOrVi = tOrV
-                else:
-                    tOrVi = tOrV[None, None, None, Vi_index]
+                tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
@@ -2447,7 +2414,6 @@ class FP4FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                     if const_expr(self.use_fp4_pv):
-                        assert tOcV is not None
                         self.debug_print_fp4_pv_stage_state(
                             sV_cur,
                             sSFP[None, None, None, stage],
@@ -2465,17 +2431,6 @@ class FP4FlashAttentionForwardSm100:
                             tiled_copy_s2t_sfv,
                             tCsSFV_compact_s2t[(None, None, None, None, Vi_index)],
                             tCtSFV_compact_s2t,
-                        )
-                        tOsVi = thr_mma_pv.partition_B(
-                            copy_utils.as_position_independent_swizzle_tensor(sV_cur)
-                        )
-                        tOsVi = cute.group_modes(tOsVi, 1, 3)
-                        self.copy_partitioned_fp4_bytes(
-                            tOsVi,
-                            tOrVi,
-                            tOcV,
-                            Int32(self.n_block_size),
-                            Int32(self.head_dim_v_padded),
                         )
                         gemm_Pi[stage](
                             tCrB=tOrVi,
@@ -2526,14 +2481,15 @@ class FP4FlashAttentionForwardSm100:
         mma_atom = cute.make_mma_atom(tiled_mma_pv.op)
         mma_atom.set(tcgen05.Field.SFA, tCtSFP.iterator)
         mma_atom.set(tcgen05.Field.SFB, tCtSFV.iterator)
-        for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
-            mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
+        num_kblocks = cute.size(tCrA, mode=[2])
+        for kblock_idx in cutlass.range_constexpr(num_kblocks):
+            mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or kblock_idx != 0)
             tCrB_k = (
-                tCrB[None, None, None, k]
+                tCrB[None, None, None, kblock_idx]
                 if const_expr(cute.rank(tCrB) == 4)
-                else tCrB[None, None, k]
+                else tCrB[None, None, kblock_idx]
             )
-            cute.gemm(mma_atom, acc, tCrA[None, None, k], tCrB_k, acc)
+            cute.gemm(mma_atom, acc, tCrA[None, None, kblock_idx], tCrB_k, acc)
 
     @cute.jit
     def load_scale_stage(self, gScale: cute.Tensor, sScale: cute.Tensor):
@@ -4489,6 +4445,7 @@ class FP4FlashAttentionForwardSm100:
                 sSFP_stage_u8_flat[Int32(7)],
             )
 
+    @cute.jit
     def debug_print_fp4_pv_acc(
         self,
         acc: cute.Tensor,

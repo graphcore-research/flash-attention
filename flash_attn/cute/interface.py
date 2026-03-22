@@ -631,6 +631,7 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     subtile_factor_override: Optional[int] = None,
+    force_2cta_sm100_varlen: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
@@ -714,6 +715,7 @@ def _flash_attn_bwd(
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+    qhead_per_kvhead = num_head // num_head_kv
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -738,6 +740,27 @@ def _flash_attn_bwd(
         dQ_swapAB = False
         cluster_size = 1
         use_2cta_instrs = False
+
+    enable_forced_varlen_2cta = (
+        force_2cta_sm100_varlen
+        and arch // 10 in [10, 11]
+        and causal
+        and not local
+        and not use_block_sparsity
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and seqused_q is None
+        and seqused_k is None
+        and qhead_per_kvhead == 1
+        and head_dim == 64
+        and head_dim_v == 64
+    )
+    if enable_forced_varlen_2cta:
+        cluster_size = 2
+        use_2cta_instrs = True
 
     subtile_factor = subtile_factor_override if subtile_factor_override is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
@@ -787,7 +810,6 @@ def _flash_attn_bwd(
     _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd

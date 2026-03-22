@@ -116,6 +116,424 @@ def _use_hsa_sentence_full_kernel_fastpath() -> bool:
     return os.getenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", "0") == "1"
 
 
+def _use_hsa_true_fused_bwd() -> bool:
+    return os.getenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
+
+
+def _use_hsa_sentence_varlen_2cta() -> bool:
+    return os.getenv("FLASH_ATTN_HSA_USE_SENTENCE_VARLEN_2CTA", "0") == "1"
+
+
+def _should_force_hsa_sentence_varlen_2cta(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    use_true_fused: bool,
+    monolithic_schedule,
+) -> bool:
+    if not _use_hsa_sentence_varlen_2cta():
+        return False
+    if not use_true_fused:
+        return False
+    if q.shape[-1] != 64 or k.shape[-1] != 64:
+        return False
+    if monolithic_schedule.anchor_full_q_row_start.numel() != 0:
+        return False
+    if monolithic_schedule.anchor_tail_q_row_start.numel() != 0:
+        return False
+    if q.shape[2] != k.shape[2]:
+        return False
+    return True
+
+
+def _get_hsa_anchor_kernel_threads(qhead_per_kvhead: int) -> int:
+    override = os.getenv("FLASH_ATTN_HSA_ANCHOR_KERNEL_THREADS")
+    if override is not None:
+        return int(override)
+    return 128 if qhead_per_kvhead > 1 else 256
+
+
+def _monolithic_has_sentence_full_desc(monolithic_schedule) -> bool:
+    return monolithic_schedule.sentence_full_q_start.numel() != 0
+
+
+def _monolithic_has_sentence_tail_desc(monolithic_schedule) -> bool:
+    return monolithic_schedule.sentence_tail_q_start.numel() != 0
+
+
+def _monolithic_has_anchor_full_desc(monolithic_schedule) -> bool:
+    return monolithic_schedule.anchor_full_q_row_start.numel() != 0
+
+
+def _monolithic_has_anchor_tail_desc(monolithic_schedule) -> bool:
+    return monolithic_schedule.anchor_tail_q_row_start.numel() != 0
+
+
+class FlashHSASentencePackOutputsSm100:
+    """Pack sentence-stream out / weighted-dout on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mSentenceLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mOutPacked: cute.Tensor,
+        mdOutPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_q_heads = mOut.shape[1]
+        head_dim_v = mOut.shape[2]
+        total_tasks = num_stream_rows * num_q_heads * head_dim_v
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mOut,
+            mdOut,
+            mTotalLSE,
+            mSentenceLSE,
+            mRowIdx,
+            mOutPacked,
+            mdOutPacked,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mSentenceLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mOutPacked: cute.Tensor,
+        mdOutPacked: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_q_heads = Int32(mOut.shape[1])
+            head_dim_v = Int32(mOut.shape[2])
+            elems_per_row = num_q_heads * head_dim_v
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            q_head = rem // head_dim_v
+            dv_idx = rem - q_head * head_dim_v
+            global_row = mRowIdx[stream_row]
+            weight = cute.math.exp2(
+                (Float32(mSentenceLSE[q_head, stream_row]) - Float32(mTotalLSE[global_row, q_head]))
+                * Float32(math.log2(math.e)),
+                fastmath=True,
+            )
+            mOutPacked[stream_row, q_head, dv_idx] = mOut[global_row, q_head, dv_idx]
+            mdOutPacked[stream_row, q_head, dv_idx] = (
+                weight * Float32(mdOut[global_row, q_head, dv_idx])
+            ).to(mdOutPacked.element_type)
+
+
+class FlashHSASentenceScatterRowsSm100:
+    """Scatter packed sentence grads into row accumulators on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcPacked: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcPacked.shape[1]
+        head_dim = mSrcPacked.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcPacked,
+            mRowIdx,
+            mDstRows,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcPacked: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstRows: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcPacked.shape[1])
+            head_dim = Int32(mSrcPacked.shape[2])
+            elems_per_row = num_heads * head_dim
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            global_row = mRowIdx[stream_row]
+            mDstRows[global_row, head_idx, dim_idx] = Float32(
+                mSrcPacked[stream_row, head_idx, dim_idx]
+            ).to(mDstRows.element_type)
+
+
+class FlashHSAPackRowsSm100:
+    """Pack selected rows from a flat tensor into a compact stream tensor."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcRows.shape[1]
+        head_dim = mSrcRows.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcRows,
+            mRowIdx,
+            mDstPacked,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcRows.shape[1])
+            head_dim = Int32(mSrcRows.shape[2])
+            elems_per_row = num_heads * head_dim
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            global_row = mRowIdx[stream_row]
+            mDstPacked[stream_row, head_idx, dim_idx] = mSrcRows[
+                global_row, head_idx, dim_idx
+            ].to(mDstPacked.element_type)
+
+
+class FlashHSACastRowsSm100:
+    """Cast flat row accumulators into output dtype on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcRows: cute.Tensor,
+        mDstRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        total_rows = mSrcRows.shape[0]
+        num_heads = mSrcRows.shape[1]
+        head_dim = mSrcRows.shape[2]
+        total_tasks = total_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcRows,
+            mDstRows,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcRows: cute.Tensor,
+        mDstRows: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcRows.shape[1])
+            head_dim = Int32(mSrcRows.shape[2])
+            elems_per_row = num_heads * head_dim
+            row_idx = task_idx // elems_per_row
+            rem = task_idx - row_idx * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            mDstRows[row_idx, head_idx, dim_idx] = Float32(
+                mSrcRows[row_idx, head_idx, dim_idx]
+            ).to(mDstRows.element_type)
+
+
+class FlashHSAPackLSESm100:
+    """Pack [B, H, T] LSE into flat [B*T, H] rows on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mLSE: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch_size = mLSE.shape[0]
+        num_q_heads = mLSE.shape[1]
+        seqlen = mLSE.shape[2]
+        total_tasks = batch_size * num_q_heads * seqlen
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mLSE,
+            mTotalLSE,
+            total_tasks,
+            seqlen,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mLSE: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        total_tasks: Int32,
+        seqlen: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_q_heads = Int32(mLSE.shape[1])
+            row_idx = task_idx // num_q_heads
+            q_head = task_idx - row_idx * num_q_heads
+            batch_idx = row_idx // seqlen
+            token_idx = row_idx - batch_idx * seqlen
+            mTotalLSE[row_idx, q_head] = Float32(mLSE[batch_idx, q_head, token_idx]).to(mTotalLSE.element_type)
+
+
+class FlashHSAPrepareAuxSm100:
+    """Prepare flat total_lse / lse_log2 / dPsum on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mLSE: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        mdPsum: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch_size = mLSE.shape[0]
+        num_q_heads = mLSE.shape[1]
+        seqlen = mLSE.shape[2]
+        total_tasks = batch_size * num_q_heads * seqlen
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mOut,
+            mdOut,
+            mLSE,
+            mTotalLSE,
+            mLSElog2,
+            mdPsum,
+            total_tasks,
+            seqlen,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mLSE: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        mdPsum: cute.Tensor,
+        total_tasks: Int32,
+        seqlen: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_q_heads = Int32(mLSE.shape[1])
+            head_dim_v = Int32(mOut.shape[3])
+            row_idx = task_idx // num_q_heads
+            q_head = task_idx - row_idx * num_q_heads
+            batch_idx = row_idx // seqlen
+            token_idx = row_idx - batch_idx * seqlen
+            lse_val = Float32(mLSE[batch_idx, q_head, token_idx])
+            dpsum = Float32.zero
+            for dv_idx in cutlass.range(head_dim_v, unroll=1):
+                dpsum += Float32(mOut[batch_idx, token_idx, q_head, dv_idx]) * Float32(
+                    mdOut[batch_idx, token_idx, q_head, dv_idx]
+                )
+            mTotalLSE[row_idx, q_head] = lse_val.to(mTotalLSE.element_type)
+            mLSElog2[row_idx, q_head] = (lse_val * Float32(math.log2(math.e))).to(mLSElog2.element_type)
+            mdPsum[row_idx, q_head] = dpsum.to(mdPsum.element_type)
+
+
 @cute.jit
 def _accumulate_hsa_bwd_row_masked(
     mQ: cute.Tensor,
@@ -874,6 +1292,8 @@ def _run_hsa_bwd_sentence_tail_kernel_slice(
     seqlen: Int32,
     softmax_scale: Float32,
     scale_log2: Float32,
+    tidx: Int32,
+    num_threads: cutlass.Constexpr[int],
 ):
     sent_tail_start = sentence_tail_kblock_row_ptr[global_k_block]
     sent_tail_end = sentence_tail_kblock_row_ptr[global_k_block + 1]
@@ -886,9 +1306,9 @@ def _run_hsa_bwd_sentence_tail_kernel_slice(
         row0_prefix_len = sentence_tail_row0_prefix_len[desc_idx]
         if (q_group_mask & Int32(1)) != Int32(0):
             first_group_end = min(Int32(32), q_len)
-            for q_off in cutlass.range(first_group_end, unroll=1):
+            for q_off in cutlass.range(tidx, first_group_end, num_threads, unroll=1):
                 prefix = min(k_len, row0_prefix_len + q_off)
-                _accumulate_hsa_bwd_row(
+                _accumulate_hsa_bwd_row_atomic_dkv(
                     mQ,
                     mK,
                     mV,
@@ -910,9 +1330,9 @@ def _run_hsa_bwd_sentence_tail_kernel_slice(
                     self.head_dim_v,
                 )
         if (q_group_mask & Int32(2)) != Int32(0):
-            for q_off in cutlass.range(Int32(32), q_len, unroll=1):
+            for q_off in cutlass.range(Int32(32) + tidx, q_len, num_threads, unroll=1):
                 prefix = min(k_len, row0_prefix_len + q_off)
-                _accumulate_hsa_bwd_row(
+                _accumulate_hsa_bwd_row_atomic_dkv(
                     mQ,
                     mK,
                     mV,
@@ -1907,13 +2327,304 @@ def _run_hsa_bwd_monolithic_scalar_kernel_body(
             scale_log2,
         )
 
+
+class FlashHSAAnchorBackwardSm100:
+    """Anchor-only HSA backward kernel for the mixed monolithic fast path."""
+
+    arch = 100
+
+    def __init__(
+        self,
+        head_dim: int,
+        head_dim_v: int,
+        *,
+        qhead_per_kvhead: int,
+        k_block_size: int,
+    ):
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.k_block_size = k_block_size
+        self.num_threads = _get_hsa_anchor_kernel_threads(qhead_per_kvhead)
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mdQaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        anchor_full_kblock_row_ptr: cute.Tensor,
+        anchor_full_q_row_start: cute.Tensor,
+        anchor_full_q_row_count: cute.Tensor,
+        anchor_full_q_group_mask: cute.Tensor,
+        anchor_full_k_local_start: cute.Tensor,
+        anchor_full_k_len: cute.Tensor,
+        anchor_tail_kblock_row_ptr: cute.Tensor,
+        anchor_tail_q_row_start: cute.Tensor,
+        anchor_tail_q_row_count: cute.Tensor,
+        anchor_tail_q_group_mask: cute.Tensor,
+        anchor_tail_k_local_start: cute.Tensor,
+        anchor_tail_k_len: cute.Tensor,
+        anchor_tail_prefix_row_start: cute.Tensor,
+        anchor_q_indices: cute.Tensor,
+        anchor_prefix_len: cute.Tensor,
+        blocks_per_batch: Int32,
+        seqlen: Int32,
+        softmax_scale: Float32,
+        stream: cuda.CUstream,
+    ):
+        batch_size = mQ.shape[0] // seqlen
+        num_kv_heads = mK.shape[1]
+        self.kernel(
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSElog2,
+            mdPsum,
+            mdQaccum,
+            mdK,
+            mdV,
+            anchor_full_kblock_row_ptr,
+            anchor_full_q_row_start,
+            anchor_full_q_row_count,
+            anchor_full_q_group_mask,
+            anchor_full_k_local_start,
+            anchor_full_k_len,
+            anchor_tail_kblock_row_ptr,
+            anchor_tail_q_row_start,
+            anchor_tail_q_row_count,
+            anchor_tail_q_group_mask,
+            anchor_tail_k_local_start,
+            anchor_tail_k_len,
+            anchor_tail_prefix_row_start,
+            anchor_q_indices,
+            anchor_prefix_len,
+            blocks_per_batch,
+            seqlen,
+            softmax_scale,
+        ).launch(
+            grid=[blocks_per_batch, num_kv_heads, batch_size],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mdQaccum: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        anchor_full_kblock_row_ptr: cute.Tensor,
+        anchor_full_q_row_start: cute.Tensor,
+        anchor_full_q_row_count: cute.Tensor,
+        anchor_full_q_group_mask: cute.Tensor,
+        anchor_full_k_local_start: cute.Tensor,
+        anchor_full_k_len: cute.Tensor,
+        anchor_tail_kblock_row_ptr: cute.Tensor,
+        anchor_tail_q_row_start: cute.Tensor,
+        anchor_tail_q_row_count: cute.Tensor,
+        anchor_tail_q_group_mask: cute.Tensor,
+        anchor_tail_k_local_start: cute.Tensor,
+        anchor_tail_k_len: cute.Tensor,
+        anchor_tail_prefix_row_start: cute.Tensor,
+        anchor_q_indices: cute.Tensor,
+        anchor_prefix_len: cute.Tensor,
+        blocks_per_batch: Int32,
+        seqlen: Int32,
+        softmax_scale: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        k_block_idx, kv_head, batch_idx = cute.arch.block_idx()
+        global_k_block = batch_idx * blocks_per_batch + k_block_idx
+        block_flat_start = batch_idx * seqlen + k_block_idx * self.k_block_size
+        qhead_start = kv_head * self.qhead_per_kvhead
+        scale_log2 = Float32(softmax_scale * math.log2(math.e))
+        anchor_full_has_work = anchor_full_kblock_row_ptr[global_k_block] != anchor_full_kblock_row_ptr[global_k_block + 1]
+        anchor_tail_has_work = anchor_tail_kblock_row_ptr[global_k_block] != anchor_tail_kblock_row_ptr[global_k_block + 1]
+        if anchor_full_has_work:
+            _run_hsa_bwd_anchor_full_kernel_slice(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_full_kblock_row_ptr,
+                anchor_full_q_row_start,
+                anchor_full_q_row_count,
+                anchor_full_q_group_mask,
+                anchor_full_k_local_start,
+                anchor_full_k_len,
+                anchor_q_indices,
+                global_k_block,
+                kv_head,
+                qhead_start,
+                block_flat_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                self.num_threads,
+            )
+        if anchor_full_has_work and anchor_tail_has_work:
+            cute.arch.barrier()
+        if anchor_tail_has_work:
+            _run_hsa_bwd_anchor_tail_kernel_slice(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_tail_kblock_row_ptr,
+                anchor_tail_q_row_start,
+                anchor_tail_q_row_count,
+                anchor_tail_q_group_mask,
+                anchor_tail_k_local_start,
+                anchor_tail_k_len,
+                anchor_tail_prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                global_k_block,
+                kv_head,
+                qhead_start,
+                block_flat_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                self.num_threads,
+            )
+
+
+class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
+    """Sentence-only HSA backward specialization.
+
+    This is the fast sentence-first bring-up path for the true-fused rollout:
+    it keeps sentence-family execution on the real FA4 varlen backward kernel,
+    with broad 2CTA enabled for sentence-only D64 schedules, while mixed blocks
+    continue to use the split sentence+anchor fallback until the mixed fused
+    kernel clears the performance gate.
+    """
+
+    arch = 100
+
+    def __init__(
+        self,
+        head_dim: int,
+        head_dim_v: int,
+        *,
+        qhead_per_kvhead: int,
+        deterministic: bool,
+        use_2cta_instrs: bool,
+    ):
+        super().__init__(
+            head_dim,
+            head_dim_v,
+            is_causal=True,
+            is_local=False,
+            qhead_per_kvhead=qhead_per_kvhead,
+            tile_m=64,
+            tile_n=128,
+            is_persistent=True,
+            deterministic=deterministic,
+            cluster_size=2 if use_2cta_instrs else 1,
+            use_2cta_instrs=use_2cta_instrs,
+            score_mod=None,
+            score_mod_bwd=None,
+            mask_mod=None,
+            has_aux_tensors=False,
+            subtile_factor=1,
+        )
+        self.force_2cta_sm100_varlen = bool(self.use_2cta_instrs and self.tile_hdim == 64)
+
+    def run_rows(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        dout: torch.Tensor,
+        lse: torch.Tensor,
+        schedule,
+        monolithic_schedule,
+        softmax_scale: float,
+        prepared: Optional["HSABwdPreparedTensors"] = None,
+        runtime_state=None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
+        return _run_hsa_bwd_sentence_rows_core(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            self.deterministic,
+            prepared=prepared,
+            runtime_state=runtime_state,
+            force_2cta_sm100_varlen=self.force_2cta_sm100_varlen,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        dout: torch.Tensor,
+        lse: torch.Tensor,
+        schedule,
+        monolithic_schedule,
+        softmax_scale: float,
+        prepared: Optional["HSABwdPreparedTensors"] = None,
+        runtime_state=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        (dq_accum_rows, dk_accum_rows, dv_accum_rows), _ = self.run_rows(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            prepared=prepared,
+            runtime_state=runtime_state,
+        )
+        return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
+
+
 class FlashHSABackwardSm100(FlashAttentionBackwardSm100):
     """Port target for the true fused HSA MMA backward kernel on SM100/SM110.
 
     This class locks the real kernel configuration the HSA path needs and serves
-    as the integration surface for the ongoing FA4-style port. The current
-    env-gated monolithic path still uses ``FlashHSABackwardSm100ScalarReference``
-    until the fused kernel body is finished and validated.
+    as the integration surface for the ongoing FA4-style port. The default
+    env-gated monolithic path still keeps the split sentence/anchor fallback
+    active, while ``FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD=1`` forces execution
+    through this kernel for all descriptor families.
     """
 
     arch = 100
@@ -2128,36 +2839,41 @@ class FlashHSABackwardSm100(FlashAttentionBackwardSm100):
         qhead_start = kv_head * self.qhead_per_kvhead
         block_flat_start = batch_idx * seqlen + k_block_idx * self.k_block_size
         scale_log2 = Float32(softmax_scale * math.log2(math.e))
-        _run_hsa_bwd_sentence_full_kernel_slice(
-            self,
-            mQ,
-            mK,
-            mV,
-            mdO,
-            mLSElog2,
-            mdPsum,
-            mdQaccum,
-            mdK,
-            mdV,
-            sentence_full_kblock_row_ptr,
-            sentence_full_q_start,
-            sentence_full_q_len,
-            sentence_full_q_group_mask,
-            sentence_full_k_local_start,
-            sentence_full_k_len,
-            global_k_block,
-            batch_idx,
-            kv_head,
-            qhead_start,
-            block_flat_start,
-            seqlen,
-            softmax_scale,
-            scale_log2,
-            tidx,
-            self.num_threads,
-        )
-        cute.arch.barrier()
-        if tidx == 0:
+        sentence_full_has_work = sentence_full_kblock_row_ptr[global_k_block] != sentence_full_kblock_row_ptr[global_k_block + 1]
+        sentence_tail_has_work = sentence_tail_kblock_row_ptr[global_k_block] != sentence_tail_kblock_row_ptr[global_k_block + 1]
+        anchor_full_has_work = anchor_full_kblock_row_ptr[global_k_block] != anchor_full_kblock_row_ptr[global_k_block + 1]
+        anchor_tail_has_work = anchor_tail_kblock_row_ptr[global_k_block] != anchor_tail_kblock_row_ptr[global_k_block + 1]
+        if sentence_full_has_work:
+            _run_hsa_bwd_sentence_full_kernel_slice(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                sentence_full_kblock_row_ptr,
+                sentence_full_q_start,
+                sentence_full_q_len,
+                sentence_full_q_group_mask,
+                sentence_full_k_local_start,
+                sentence_full_k_len,
+                global_k_block,
+                batch_idx,
+                kv_head,
+                qhead_start,
+                block_flat_start,
+                seqlen,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                self.num_threads,
+            )
+            cute.arch.barrier()
+        if sentence_tail_has_work:
             _run_hsa_bwd_sentence_tail_kernel_slice(
                 self,
                 mQ,
@@ -2184,65 +2900,70 @@ class FlashHSABackwardSm100(FlashAttentionBackwardSm100):
                 seqlen,
                 softmax_scale,
                 scale_log2,
+                tidx,
+                self.num_threads,
             )
-        cute.arch.barrier()
-        _run_hsa_bwd_anchor_full_kernel_slice(
-            self,
-            mQ,
-            mK,
-            mV,
-            mdO,
-            mLSElog2,
-            mdPsum,
-            mdQaccum,
-            mdK,
-            mdV,
-            anchor_full_kblock_row_ptr,
-            anchor_full_q_row_start,
-            anchor_full_q_row_count,
-            anchor_full_q_group_mask,
-            anchor_full_k_local_start,
-            anchor_full_k_len,
-            anchor_q_indices,
-            global_k_block,
-            kv_head,
-            qhead_start,
-            block_flat_start,
-            softmax_scale,
-            scale_log2,
-            tidx,
-            self.num_threads,
-        )
-        cute.arch.barrier()
-        _run_hsa_bwd_anchor_tail_kernel_slice(
-            self,
-            mQ,
-            mK,
-            mV,
-            mdO,
-            mLSElog2,
-            mdPsum,
-            mdQaccum,
-            mdK,
-            mdV,
-            anchor_tail_kblock_row_ptr,
-            anchor_tail_q_row_start,
-            anchor_tail_q_row_count,
-            anchor_tail_q_group_mask,
-            anchor_tail_k_local_start,
-            anchor_tail_k_len,
-            anchor_tail_prefix_row_start,
-            anchor_q_indices,
-            anchor_prefix_len,
-            global_k_block,
-            kv_head,
-            qhead_start,
-            block_flat_start,
-            softmax_scale,
-            scale_log2,
-            tidx,
-            self.num_threads,
-        )
+            cute.arch.barrier()
+        if anchor_full_has_work:
+            _run_hsa_bwd_anchor_full_kernel_slice(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_full_kblock_row_ptr,
+                anchor_full_q_row_start,
+                anchor_full_q_row_count,
+                anchor_full_q_group_mask,
+                anchor_full_k_local_start,
+                anchor_full_k_len,
+                anchor_q_indices,
+                global_k_block,
+                kv_head,
+                qhead_start,
+                block_flat_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                self.num_threads,
+            )
+        if anchor_full_has_work and anchor_tail_has_work:
+            cute.arch.barrier()
+        if anchor_tail_has_work:
+            _run_hsa_bwd_anchor_tail_kernel_slice(
+                self,
+                mQ,
+                mK,
+                mV,
+                mdO,
+                mLSElog2,
+                mdPsum,
+                mdQaccum,
+                mdK,
+                mdV,
+                anchor_tail_kblock_row_ptr,
+                anchor_tail_q_row_start,
+                anchor_tail_q_row_count,
+                anchor_tail_q_group_mask,
+                anchor_tail_k_local_start,
+                anchor_tail_k_len,
+                anchor_tail_prefix_row_start,
+                anchor_q_indices,
+                anchor_prefix_len,
+                global_k_block,
+                kv_head,
+                qhead_start,
+                block_flat_start,
+                softmax_scale,
+                scale_log2,
+                tidx,
+                self.num_threads,
+            )
 
 
 @cute.jit
@@ -2331,8 +3052,387 @@ class HSAMonolithicBackwardLaunchPlan:
     dV_semaphore_shape: Optional[tuple[int, ...]] = None
 
 
+@dataclass
+class HSABwdPreparedTensors:
+    q_flat: torch.Tensor
+    k_flat: torch.Tensor
+    v_flat: torch.Tensor
+    out_flat: torch.Tensor
+    dout_flat: torch.Tensor
+    total_lse_flat: torch.Tensor
+    dout_float_flat: Optional[torch.Tensor] = None
+    lse_log2_flat: Optional[torch.Tensor] = None
+    dpsum_flat: Optional[torch.Tensor] = None
+
+
+@dataclass
+class HSABwdPrepareBuffers:
+    total_lse_flat: torch.Tensor
+    lse_log2_flat: torch.Tensor
+    dpsum_flat: torch.Tensor
+
+
+@dataclass
+class HSABwdSentenceBuffers:
+    q_stream: torch.Tensor
+    k_stream: torch.Tensor
+    v_stream: torch.Tensor
+    out_stream: torch.Tensor
+    dout_stream: torch.Tensor
+    dq_accum_rows: torch.Tensor
+    dk_accum_rows: torch.Tensor
+    dv_accum_rows: torch.Tensor
+
+
 def _round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
+
+
+def _zero_tensor_list_(tensors: list[Optional[torch.Tensor]]) -> None:
+    live_tensors = [tensor for tensor in tensors if tensor is not None]
+    if not live_tensors:
+        return
+    foreach_zero = getattr(torch, "_foreach_zero_", None)
+    if foreach_zero is not None:
+        foreach_zero(live_tensors)
+    else:
+        for tensor in live_tensors:
+            tensor.zero_()
+
+
+def _get_hsa_bwd_sentence_buffers(
+    runtime_state,
+    prepared: HSABwdPreparedTensors,
+) -> HSABwdSentenceBuffers:
+    cache = getattr(runtime_state, "_hsa_bwd_sentence_buffer_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(runtime_state, "_hsa_bwd_sentence_buffer_cache", cache)
+
+    q_flat = prepared.q_flat
+    k_flat = prepared.k_flat
+    v_flat = prepared.v_flat
+    sentence_stream = runtime_state["sentence_stream"]
+    sentence_q_rows = int(sentence_stream.query_indices.numel())
+    sentence_k_rows = int(sentence_stream.key_indices.numel())
+    cache_key = (
+        str(q_flat.device),
+        q_flat.dtype,
+        q_flat.shape[0],
+        q_flat.shape[1],
+        q_flat.shape[2],
+        k_flat.shape[1],
+        v_flat.shape[2],
+        sentence_q_rows,
+        sentence_k_rows,
+    )
+    buffers = cache.get(cache_key)
+    if buffers is None:
+        total_rows = q_flat.shape[0]
+        num_q_heads = q_flat.shape[1]
+        head_dim = q_flat.shape[2]
+        num_kv_heads = k_flat.shape[1]
+        head_dim_v = v_flat.shape[2]
+        buffers = HSABwdSentenceBuffers(
+            q_stream=torch.empty((sentence_q_rows, num_q_heads, head_dim), dtype=q_flat.dtype, device=q_flat.device),
+            k_stream=torch.empty((sentence_k_rows, num_kv_heads, head_dim), dtype=k_flat.dtype, device=k_flat.device),
+            v_stream=torch.empty((sentence_k_rows, num_kv_heads, head_dim_v), dtype=v_flat.dtype, device=v_flat.device),
+            out_stream=torch.empty((sentence_q_rows, num_q_heads, head_dim_v), dtype=prepared.out_flat.dtype, device=q_flat.device),
+            dout_stream=torch.empty((sentence_q_rows, num_q_heads, head_dim_v), dtype=prepared.dout_flat.dtype, device=q_flat.device),
+            dq_accum_rows=torch.empty((total_rows, num_q_heads, head_dim), dtype=torch.float32, device=q_flat.device),
+            dk_accum_rows=torch.empty((total_rows, num_kv_heads, head_dim), dtype=torch.float32, device=q_flat.device),
+            dv_accum_rows=torch.empty((total_rows, num_kv_heads, head_dim_v), dtype=torch.float32, device=q_flat.device),
+        )
+        cache[cache_key] = buffers
+    _zero_tensor_list_([buffers.dq_accum_rows, buffers.dk_accum_rows, buffers.dv_accum_rows])
+    return buffers
+
+
+def _get_hsa_bwd_prepare_buffers(
+    q: torch.Tensor,
+    v: torch.Tensor,
+) -> HSABwdPrepareBuffers:
+    cache = run_hsa_bwd_sm100_monolithic.prepare_buffer_cache
+    batch_size, seqlen, num_q_heads = q.shape[:3]
+    head_dim_v = v.shape[3]
+    total_rows = batch_size * seqlen
+    cache_key = (
+        str(q.device),
+        total_rows,
+        num_q_heads,
+        head_dim_v,
+    )
+    buffers = cache.get(cache_key)
+    if buffers is None:
+        buffers = HSABwdPrepareBuffers(
+            total_lse_flat=torch.empty((total_rows, num_q_heads), dtype=torch.float32, device=q.device),
+            lse_log2_flat=torch.empty((total_rows, num_q_heads), dtype=torch.float32, device=q.device),
+            dpsum_flat=torch.empty((total_rows, num_q_heads), dtype=torch.float32, device=q.device),
+        )
+        cache[cache_key] = buffers
+    return buffers
+
+
+def _get_cached_hsa_bwd_monolithic_workspaces(
+    plan: HSAMonolithicBackwardLaunchPlan,
+    *,
+    device: torch.device | str,
+    cache_key,
+) -> dict[str, Optional[torch.Tensor]]:
+    cache = run_hsa_bwd_sm100_monolithic.workspace_cache
+    full_key = (str(device), cache_key)
+    workspaces = cache.get(full_key)
+    if workspaces is None:
+        workspaces = _allocate_hsa_bwd_monolithic_workspaces(plan, device=device)
+        cache[full_key] = workspaces
+    return workspaces
+
+
+def _run_hsa_sentence_pack_outputs_kernel(
+    out_flat: torch.Tensor,
+    dout_flat: torch.Tensor,
+    total_lse_flat: torch.Tensor,
+    sentence_lse: torch.Tensor,
+    sentence_row_idx: torch.Tensor,
+    out_stream: torch.Tensor,
+    dout_stream: torch.Tensor,
+) -> None:
+    if sentence_row_idx.numel() == 0:
+        return
+    compile_key = (
+        "sentence_pack_outputs",
+        out_flat.dtype,
+        out_flat.shape[1],
+        out_flat.shape[2],
+        torch.cuda.get_device_capability(out_flat.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        pack_outputs = FlashHSASentencePackOutputsSm100()
+        compile_args = [
+            to_cute_tensor(out_flat),
+            to_cute_tensor(dout_flat),
+            to_cute_tensor(total_lse_flat, assumed_align=4),
+            to_cute_tensor(sentence_lse, assumed_align=4),
+            to_cute_tensor(sentence_row_idx, assumed_align=4),
+            to_cute_tensor(out_stream),
+            to_cute_tensor(dout_stream),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            pack_outputs,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        out_flat,
+        dout_flat,
+        total_lse_flat,
+        sentence_lse,
+        sentence_row_idx,
+        out_stream,
+        dout_stream,
+        current_stream,
+    )
+
+
+def _run_hsa_sentence_scatter_rows_kernel(
+    packed_src: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_rows: torch.Tensor,
+) -> None:
+    if row_idx.numel() == 0:
+        return
+    compile_key = (
+        "sentence_scatter_rows",
+        packed_src.dtype,
+        packed_src.shape[1],
+        packed_src.shape[2],
+        dst_rows.dtype,
+        torch.cuda.get_device_capability(packed_src.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        scatter_rows = FlashHSASentenceScatterRowsSm100()
+        compile_args = [
+            to_cute_tensor(packed_src),
+            to_cute_tensor(row_idx, assumed_align=4),
+            to_cute_tensor(dst_rows),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            scatter_rows,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        packed_src,
+        row_idx,
+        dst_rows,
+        current_stream,
+    )
+
+
+def _run_hsa_pack_rows_kernel(
+    src_rows: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_packed: torch.Tensor,
+) -> None:
+    if row_idx.numel() == 0:
+        return
+    compile_key = (
+        "pack_rows",
+        src_rows.dtype,
+        src_rows.shape[1],
+        src_rows.shape[2],
+        dst_packed.dtype,
+        torch.cuda.get_device_capability(src_rows.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        pack_rows = FlashHSAPackRowsSm100()
+        compile_args = [
+            to_cute_tensor(src_rows),
+            to_cute_tensor(row_idx, assumed_align=4),
+            to_cute_tensor(dst_packed),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            pack_rows,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        src_rows,
+        row_idx,
+        dst_packed,
+        current_stream,
+    )
+
+
+def _run_hsa_pack_lse_kernel(
+    lse: torch.Tensor,
+    total_lse_flat: torch.Tensor,
+) -> None:
+    compile_key = (
+        "pack_lse",
+        lse.dtype,
+        lse.shape[1],
+        lse.shape[2],
+        total_lse_flat.dtype,
+        torch.cuda.get_device_capability(lse.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        pack_lse = FlashHSAPackLSESm100()
+        compile_args = [
+            to_cute_tensor(lse),
+            to_cute_tensor(total_lse_flat, assumed_align=4),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            pack_lse,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        lse,
+        total_lse_flat,
+        current_stream,
+    )
+
+
+def _run_hsa_prepare_aux_kernel(
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    total_lse_flat: torch.Tensor,
+    lse_log2_flat: torch.Tensor,
+    dpsum_flat: torch.Tensor,
+) -> None:
+    compile_key = (
+        "prepare_aux",
+        out.dtype,
+        out.shape[2],
+        out.shape[3],
+        total_lse_flat.dtype,
+        torch.cuda.get_device_capability(out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        prepare_aux = FlashHSAPrepareAuxSm100()
+        compile_args = [
+            to_cute_tensor(out),
+            to_cute_tensor(dout),
+            to_cute_tensor(lse),
+            to_cute_tensor(total_lse_flat, assumed_align=4),
+            to_cute_tensor(lse_log2_flat, assumed_align=4),
+            to_cute_tensor(dpsum_flat, assumed_align=4),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            prepare_aux,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        out,
+        dout,
+        lse,
+        total_lse_flat,
+        lse_log2_flat,
+        dpsum_flat,
+        current_stream,
+    )
+
+
+def _run_hsa_cast_rows_kernel(
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+) -> None:
+    compile_key = (
+        "cast_rows",
+        src_rows.dtype,
+        src_rows.shape[1],
+        src_rows.shape[2],
+        dst_rows.dtype,
+        torch.cuda.get_device_capability(src_rows.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        cast_rows = FlashHSACastRowsSm100()
+        compile_args = [
+            to_cute_tensor(src_rows),
+            to_cute_tensor(dst_rows),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            cast_rows,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        src_rows,
+        dst_rows,
+        current_stream,
+    )
+
+
+def _cast_hsa_row_accums_to_outputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dq_accum_rows: torch.Tensor,
+    dk_accum_rows: torch.Tensor,
+    dv_accum_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    _run_hsa_cast_rows_kernel(dq_accum_rows, dq.view_as(q).reshape_as(dq_accum_rows))
+    _run_hsa_cast_rows_kernel(dk_accum_rows, dk.view_as(k).reshape_as(dk_accum_rows))
+    _run_hsa_cast_rows_kernel(dv_accum_rows, dv.view_as(v).reshape_as(dv_accum_rows))
+    return dq, dk, dv
 
 
 def _build_hsa_bwd_monolithic_launch_plan(
@@ -2415,15 +3515,15 @@ def _allocate_hsa_bwd_monolithic_workspaces(
         "dV_semaphore": None,
     }
     if plan.dk_accum_shape is not None:
-        workspaces["dk_accum"] = torch.zeros(plan.dk_accum_shape, dtype=torch.float32, device=device)
+        workspaces["dk_accum"] = torch.empty(plan.dk_accum_shape, dtype=torch.float32, device=device)
     if plan.dv_accum_shape is not None:
-        workspaces["dv_accum"] = torch.zeros(plan.dv_accum_shape, dtype=torch.float32, device=device)
+        workspaces["dv_accum"] = torch.empty(plan.dv_accum_shape, dtype=torch.float32, device=device)
     if plan.dQ_semaphore_shape is not None:
-        workspaces["dQ_semaphore"] = torch.zeros(plan.dQ_semaphore_shape, dtype=torch.int32, device=device)
+        workspaces["dQ_semaphore"] = torch.empty(plan.dQ_semaphore_shape, dtype=torch.int32, device=device)
     if plan.dK_semaphore_shape is not None:
-        workspaces["dK_semaphore"] = torch.zeros(plan.dK_semaphore_shape, dtype=torch.int32, device=device)
+        workspaces["dK_semaphore"] = torch.empty(plan.dK_semaphore_shape, dtype=torch.int32, device=device)
     if plan.dV_semaphore_shape is not None:
-        workspaces["dV_semaphore"] = torch.zeros(plan.dV_semaphore_shape, dtype=torch.int32, device=device)
+        workspaces["dV_semaphore"] = torch.empty(plan.dV_semaphore_shape, dtype=torch.int32, device=device)
     return workspaces
 
 
@@ -2436,19 +3536,22 @@ def _prepare_hsa_bwd_monolithic_workspaces(
     assert workspaces["dq_accum"] is not None
     assert workspaces["dpsum"] is not None
     assert workspaces["lse_log2"] is not None
-    workspaces["dq_accum"].zero_()
-    workspaces["dpsum"].zero_()
-    workspaces["lse_log2"].zero_()
-    if workspaces["dk_accum"] is not None:
-        workspaces["dk_accum"].zero_()
-    if workspaces["dv_accum"] is not None:
-        workspaces["dv_accum"].zero_()
-    if workspaces["dQ_semaphore"] is not None:
-        workspaces["dQ_semaphore"].zero_()
-    if workspaces["dK_semaphore"] is not None:
-        workspaces["dK_semaphore"].zero_()
-    if workspaces["dV_semaphore"] is not None:
-        workspaces["dV_semaphore"].zero_()
+    _zero_tensor_list_(
+        [
+            workspaces["dq_accum"],
+            workspaces["dpsum"],
+            workspaces["lse_log2"],
+            workspaces["dk_accum"],
+            workspaces["dv_accum"],
+        ]
+    )
+    _zero_tensor_list_(
+        [
+            workspaces["dQ_semaphore"],
+            workspaces["dK_semaphore"],
+            workspaces["dV_semaphore"],
+        ]
+    )
 
     seqlen = out.shape[1]
     dpsum = (out.float() * dout.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
@@ -2807,6 +3910,11 @@ def _build_hsa_bwd_monolithic_compile_key(
     qhead_per_kvhead = num_q_heads // num_kv_heads
     return (
         q.dtype,
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        k.shape[1],
+        k.shape[2],
         q.shape[-1],
         v.shape[-1],
         qhead_per_kvhead,
@@ -2933,11 +4041,7 @@ def _run_hsa_bwd_rowgroup_main_cute(
         softmax_scale,
         current_stream,
     )
-    return (
-        dq_accum_rows.view_as(q).to(dtype=q.dtype),
-        dk_accum_rows.view_as(k).to(dtype=k.dtype),
-        dv_accum_rows.view_as(v).to(dtype=v.dtype),
-    )
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
 
 def _run_hsa_bwd_monolithic_main_cute(
@@ -2971,44 +4075,46 @@ def _run_hsa_bwd_monolithic_main_cute(
     lse_log2_flat = (
         workspaces["lse_log2"][:, :, :seqlen].permute(0, 2, 1).contiguous().view(total_rows, num_q_heads)
     )
+    use_true_fused = _use_hsa_true_fused_bwd()
     if precomputed_row_accums is None:
         dq_accum_rows = torch.zeros((total_rows, num_q_heads, head_dim), dtype=torch.float32, device=q.device)
         dk_accum_rows = torch.zeros((total_rows, num_kv_heads, head_dim), dtype=torch.float32, device=q.device)
         dv_accum_rows = torch.zeros((total_rows, num_kv_heads, head_dim_v), dtype=torch.float32, device=q.device)
-        panel_batches = _build_hsa_monolithic_panel_batches(schedule, monolithic_schedule)
         sentence_full_done = False
         sentence_tail_done = False
-        if panel_batches["sentence_full"] is not None:
-            if _use_hsa_sentence_full_kernel_fastpath():
-                sentence_full_done = _run_hsa_sentence_full_kernel_fa4_slice(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    out_flat,
-                    dout_flat,
-                    lse_log2_flat / math.log2(math.e),
-                    panel_batches["sentence_full"],
-                    softmax_scale,
-                    launch_plan.deterministic,
-                    dq_accum_rows,
-                    dk_accum_rows,
-                    dv_accum_rows,
-                )
-            else:
-                sentence_full_done = _run_hsa_sentence_full_fa4_fastpath(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    out_flat,
-                    dout_flat,
-                    lse_log2_flat / math.log2(math.e),
-                    panel_batches["sentence_full"],
-                    softmax_scale,
-                    launch_plan.deterministic,
-                    dq_accum_rows,
-                    dk_accum_rows,
-                    dv_accum_rows,
-                )
+        if not use_true_fused:
+            panel_batches = _build_hsa_monolithic_panel_batches(schedule, monolithic_schedule)
+            if panel_batches["sentence_full"] is not None:
+                if _use_hsa_sentence_full_kernel_fastpath():
+                    sentence_full_done = _run_hsa_sentence_full_kernel_fa4_slice(
+                        q_flat,
+                        k_flat,
+                        v_flat,
+                        out_flat,
+                        dout_flat,
+                        lse_log2_flat / math.log2(math.e),
+                        panel_batches["sentence_full"],
+                        softmax_scale,
+                        launch_plan.deterministic,
+                        dq_accum_rows,
+                        dk_accum_rows,
+                        dv_accum_rows,
+                    )
+                else:
+                    sentence_full_done = _run_hsa_sentence_full_fa4_fastpath(
+                        q_flat,
+                        k_flat,
+                        v_flat,
+                        out_flat,
+                        dout_flat,
+                        lse_log2_flat / math.log2(math.e),
+                        panel_batches["sentence_full"],
+                        softmax_scale,
+                        launch_plan.deterministic,
+                        dq_accum_rows,
+                        dk_accum_rows,
+                        dv_accum_rows,
+                    )
     else:
         dq_accum_rows, dk_accum_rows, dv_accum_rows = precomputed_row_accums
         sentence_full_done = "sentence_full" in precomputed_done_families
@@ -3021,18 +4127,89 @@ def _run_hsa_bwd_monolithic_main_cute(
         sentence_tail_kblock_row_ptr = torch.zeros_like(sentence_tail_kblock_row_ptr)
     anchor_full_kblock_row_ptr = monolithic_schedule.anchor_full_kblock_row_ptr
     anchor_tail_kblock_row_ptr = monolithic_schedule.anchor_tail_kblock_row_ptr
-    if (
-        int(sentence_full_kblock_row_ptr[-1].item()) == 0
-        and int(sentence_tail_kblock_row_ptr[-1].item()) == 0
-        and int(anchor_full_kblock_row_ptr[-1].item()) == 0
-        and int(anchor_tail_kblock_row_ptr[-1].item()) == 0
-    ):
-        return (
-            dq_accum_rows.view_as(q).to(dtype=q.dtype),
-            dk_accum_rows.view_as(k).to(dtype=k.dtype),
-            dv_accum_rows.view_as(v).to(dtype=v.dtype),
-        )
+    sentence_full_active = (not sentence_full_done) and _monolithic_has_sentence_full_desc(monolithic_schedule)
+    sentence_tail_active = (not sentence_tail_done) and _monolithic_has_sentence_tail_desc(monolithic_schedule)
+    anchor_full_active = _monolithic_has_anchor_full_desc(monolithic_schedule)
+    anchor_tail_active = _monolithic_has_anchor_tail_desc(monolithic_schedule)
+    if not (sentence_full_active or sentence_tail_active or anchor_full_active or anchor_tail_active):
+        return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if not use_true_fused and not sentence_full_active and not sentence_tail_active:
+        compile_key = ("anchor_only",) + compile_key
+        if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+            anchor_bwd = FlashHSAAnchorBackwardSm100(
+                q.shape[-1],
+                v.shape[-1],
+                qhead_per_kvhead=q.shape[2] // k.shape[2],
+                k_block_size=monolithic_schedule.k_block_size,
+            )
+            compile_args = [
+                to_cute_tensor(q_flat),
+                to_cute_tensor(k_flat),
+                to_cute_tensor(v_flat),
+                to_cute_tensor(dout_flat),
+                to_cute_tensor(lse_log2_flat, assumed_align=4),
+                to_cute_tensor(dpsum_flat, assumed_align=4),
+                to_cute_tensor(dq_accum_rows),
+                to_cute_tensor(dk_accum_rows),
+                to_cute_tensor(dv_accum_rows),
+                to_cute_tensor(anchor_full_kblock_row_ptr, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_full_q_row_start, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_full_q_row_count, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_full_q_group_mask, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_full_k_local_start, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_full_k_len, assumed_align=4),
+                to_cute_tensor(anchor_tail_kblock_row_ptr, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_q_row_start, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_q_row_count, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_q_group_mask, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_k_local_start, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_k_len, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_tail_prefix_row_start, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_q_indices, assumed_align=4),
+                to_cute_tensor(monolithic_schedule.anchor_prefix_len, assumed_align=4),
+                int(monolithic_schedule.blocks_per_batch),
+                int(schedule.seqlen),
+                softmax_scale,
+                current_stream,
+            ]
+            run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+                anchor_bwd,
+                *compile_args,
+                options="--enable-tvm-ffi",
+            )
+
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+            q_flat,
+            k_flat,
+            v_flat,
+            dout_flat,
+            lse_log2_flat,
+            dpsum_flat,
+            dq_accum_rows,
+            dk_accum_rows,
+            dv_accum_rows,
+            anchor_full_kblock_row_ptr,
+            monolithic_schedule.anchor_full_q_row_start,
+            monolithic_schedule.anchor_full_q_row_count,
+            monolithic_schedule.anchor_full_q_group_mask,
+            monolithic_schedule.anchor_full_k_local_start,
+            monolithic_schedule.anchor_full_k_len,
+            anchor_tail_kblock_row_ptr,
+            monolithic_schedule.anchor_tail_q_row_start,
+            monolithic_schedule.anchor_tail_q_row_count,
+            monolithic_schedule.anchor_tail_q_group_mask,
+            monolithic_schedule.anchor_tail_k_local_start,
+            monolithic_schedule.anchor_tail_k_len,
+            monolithic_schedule.anchor_tail_prefix_row_start,
+            monolithic_schedule.anchor_q_indices,
+            monolithic_schedule.anchor_prefix_len,
+            int(monolithic_schedule.blocks_per_batch),
+            int(schedule.seqlen),
+            softmax_scale,
+            current_stream,
+        )
+        return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
     if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
         fa_bwd = FlashHSABackwardSm100(
@@ -3138,11 +4315,114 @@ def _run_hsa_bwd_monolithic_main_cute(
         current_stream,
     )
 
-    return (
-        dq_accum_rows.view_as(q).to(dtype=q.dtype),
-        dk_accum_rows.view_as(k).to(dtype=k.dtype),
-        dv_accum_rows.view_as(v).to(dtype=v.dtype),
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
+
+
+def _run_hsa_bwd_anchor_only_main_cute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    monolithic_schedule,
+    softmax_scale: float,
+    compile_key,
+    precomputed_row_accums: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    prepared: Optional[HSABwdPreparedTensors] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prepared = (
+        prepared if prepared is not None else _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
     )
+    q_flat = prepared.q_flat
+    k_flat = prepared.k_flat
+    v_flat = prepared.v_flat
+    dout_flat = prepared.dout_flat
+    dpsum_flat = prepared.dpsum_flat
+    lse_log2_flat = prepared.lse_log2_flat
+    assert dpsum_flat is not None
+    assert lse_log2_flat is not None
+    dq_accum_rows, dk_accum_rows, dv_accum_rows = precomputed_row_accums
+    anchor_full_kblock_row_ptr = monolithic_schedule.anchor_full_kblock_row_ptr
+    anchor_tail_kblock_row_ptr = monolithic_schedule.anchor_tail_kblock_row_ptr
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compile_key = ("anchor_only", _get_hsa_anchor_kernel_threads(q.shape[2] // k.shape[2])) + compile_key
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        anchor_bwd = FlashHSAAnchorBackwardSm100(
+            q.shape[-1],
+            v.shape[-1],
+            qhead_per_kvhead=q.shape[2] // k.shape[2],
+            k_block_size=monolithic_schedule.k_block_size,
+        )
+        compile_args = [
+            to_cute_tensor(q_flat),
+            to_cute_tensor(k_flat),
+            to_cute_tensor(v_flat),
+            to_cute_tensor(dout_flat),
+            to_cute_tensor(lse_log2_flat, assumed_align=4),
+            to_cute_tensor(dpsum_flat, assumed_align=4),
+            to_cute_tensor(dq_accum_rows),
+            to_cute_tensor(dk_accum_rows),
+            to_cute_tensor(dv_accum_rows),
+            to_cute_tensor(anchor_full_kblock_row_ptr, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_full_q_row_start, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_full_q_row_count, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_full_q_group_mask, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_full_k_local_start, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_full_k_len, assumed_align=4),
+            to_cute_tensor(anchor_tail_kblock_row_ptr, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_q_row_start, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_q_row_count, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_q_group_mask, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_k_local_start, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_k_len, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_tail_prefix_row_start, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_q_indices, assumed_align=4),
+            to_cute_tensor(monolithic_schedule.anchor_prefix_len, assumed_align=4),
+            int(monolithic_schedule.blocks_per_batch),
+            int(schedule.seqlen),
+            softmax_scale,
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            anchor_bwd,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        q_flat,
+        k_flat,
+        v_flat,
+        dout_flat,
+        lse_log2_flat,
+        dpsum_flat,
+        dq_accum_rows,
+        dk_accum_rows,
+        dv_accum_rows,
+        anchor_full_kblock_row_ptr,
+        monolithic_schedule.anchor_full_q_row_start,
+        monolithic_schedule.anchor_full_q_row_count,
+        monolithic_schedule.anchor_full_q_group_mask,
+        monolithic_schedule.anchor_full_k_local_start,
+        monolithic_schedule.anchor_full_k_len,
+        anchor_tail_kblock_row_ptr,
+        monolithic_schedule.anchor_tail_q_row_start,
+        monolithic_schedule.anchor_tail_q_row_count,
+        monolithic_schedule.anchor_tail_q_group_mask,
+        monolithic_schedule.anchor_tail_k_local_start,
+        monolithic_schedule.anchor_tail_k_len,
+        monolithic_schedule.anchor_tail_prefix_row_start,
+        monolithic_schedule.anchor_q_indices,
+        monolithic_schedule.anchor_prefix_len,
+        int(monolithic_schedule.blocks_per_batch),
+        int(schedule.seqlen),
+        softmax_scale,
+        current_stream,
+    )
+
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
 
 def run_hsa_bwd_sm100_monolithic(
@@ -3163,7 +4443,51 @@ def run_hsa_bwd_sm100_monolithic(
     monolithic_schedule = hsa_mod._get_hsa_monolithic_backward_schedule(schedule)
     precomputed_row_accums = None
     precomputed_done_families = frozenset()
-    if _use_hsa_sentence_full_kernel_fastpath():
+    prepared = None
+    runtime_state = None
+    use_true_fused = _use_hsa_true_fused_bwd()
+    use_sentence_varlen_2cta = _should_force_hsa_sentence_varlen_2cta(
+        q,
+        k,
+        use_true_fused=use_true_fused,
+        monolithic_schedule=monolithic_schedule,
+    )
+    sentence_bwd = FlashHSASentenceBackwardSm100(
+        q.shape[-1],
+        v.shape[-1],
+        qhead_per_kvhead=q.shape[2] // k.shape[2],
+        deterministic=deterministic,
+        use_2cta_instrs=use_sentence_varlen_2cta,
+    )
+    if use_true_fused:
+        if not _monolithic_has_remaining_anchor_families(monolithic_schedule):
+            return sentence_bwd.run(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                schedule,
+                monolithic_schedule,
+                softmax_scale,
+            )
+        prepared = _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
+        runtime_state = _materialize_runtime_state(schedule)
+        precomputed_row_accums, precomputed_done_families = sentence_bwd.run_rows(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            prepared=prepared,
+            runtime_state=runtime_state,
+        )
+    if not use_true_fused and _use_hsa_sentence_full_kernel_fastpath():
         if not _monolithic_has_remaining_anchor_families(monolithic_schedule):
             return _run_hsa_bwd_sentence_families_direct(
                 q,
@@ -3177,10 +4501,11 @@ def run_hsa_bwd_sm100_monolithic(
                 softmax_scale,
                 deterministic,
             )
-        if (
-            int(monolithic_schedule.sentence_full_kblock_row_ptr[-1].item()) != 0
-            or int(monolithic_schedule.sentence_tail_kblock_row_ptr[-1].item()) != 0
+        if _monolithic_has_sentence_full_desc(monolithic_schedule) or _monolithic_has_sentence_tail_desc(
+            monolithic_schedule
         ):
+            prepared = _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
+            runtime_state = _materialize_runtime_state(schedule)
             precomputed_row_accums, precomputed_done_families = _run_hsa_bwd_sentence_families_direct_rows(
                 q,
                 k,
@@ -3192,8 +4517,38 @@ def run_hsa_bwd_sm100_monolithic(
                 monolithic_schedule,
                 softmax_scale,
                 deterministic,
+                prepared=prepared,
+                runtime_state=runtime_state,
             )
     compile_key = _build_hsa_bwd_monolithic_compile_key(q, k, v, monolithic_schedule, deterministic)
+    sentence_full_done = (
+        not _monolithic_has_sentence_full_desc(monolithic_schedule)
+        or "sentence_full" in precomputed_done_families
+    )
+    sentence_tail_done = (
+        not _monolithic_has_sentence_tail_desc(monolithic_schedule)
+        or "sentence_tail" in precomputed_done_families
+    )
+    if (
+        precomputed_row_accums is not None
+        and sentence_full_done
+        and sentence_tail_done
+        and _monolithic_has_remaining_anchor_families(monolithic_schedule)
+    ):
+        return _run_hsa_bwd_anchor_only_main_cute(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            compile_key,
+            precomputed_row_accums,
+            prepared=prepared,
+        )
     if compile_key not in run_hsa_bwd_sm100_monolithic.launch_plan_cache:
         run_hsa_bwd_sm100_monolithic.launch_plan_cache[compile_key] = _build_hsa_bwd_monolithic_launch_plan(
             q,
@@ -3203,7 +4558,11 @@ def run_hsa_bwd_sm100_monolithic(
             deterministic,
         )
     launch_plan = run_hsa_bwd_sm100_monolithic.launch_plan_cache[compile_key]
-    workspaces = _allocate_hsa_bwd_monolithic_workspaces(launch_plan, device=q.device)
+    workspaces = _get_cached_hsa_bwd_monolithic_workspaces(
+        launch_plan,
+        device=q.device,
+        cache_key=compile_key,
+    )
     _prepare_hsa_bwd_monolithic_workspaces(out, dout, lse, workspaces)
     return _run_hsa_bwd_monolithic_main_cute(
         q,
@@ -3224,6 +4583,8 @@ def run_hsa_bwd_sm100_monolithic(
 
 run_hsa_bwd_sm100_monolithic.compile_cache = get_jit_cache("hsa_bwd_monolithic")
 run_hsa_bwd_sm100_monolithic.launch_plan_cache = {}
+run_hsa_bwd_sm100_monolithic.workspace_cache = {}
+run_hsa_bwd_sm100_monolithic.prepare_buffer_cache = {}
 
 
 def _gather_batch_tensors(
@@ -3383,10 +4744,14 @@ def _build_hsa_monolithic_panel_batches(schedule, monolithic_schedule):
     all_entries = []
     for name in ("sentence_full", "sentence_tail", "anchor_full", "anchor_tail"):
         all_entries.extend(families[name])
+    sentence_family_entries = []
+    for name in ("sentence_full", "sentence_tail"):
+        sentence_family_entries.extend(families[name])
     remaining_entries = []
     for name in ("sentence_tail", "anchor_full", "anchor_tail"):
         remaining_entries.extend(families[name])
     batches["all"] = _make_hsa_batch(all_entries, device=device)
+    batches["sentence_families"] = _make_hsa_batch(sentence_family_entries, device=device)
     batches["remaining"] = _make_hsa_batch(remaining_entries, device=device)
     if cache is None:
         cache = {}
@@ -3554,24 +4919,168 @@ def _run_hsa_sentence_full_kernel_fa4_slice(
 
 
 def _monolithic_has_remaining_non_sentence_full(monolithic_schedule) -> bool:
-    return any(
-        int(ptr[-1].item()) != 0
-        for ptr in (
-            monolithic_schedule.sentence_tail_kblock_row_ptr,
-            monolithic_schedule.anchor_full_kblock_row_ptr,
-            monolithic_schedule.anchor_tail_kblock_row_ptr,
-        )
+    return (
+        _monolithic_has_sentence_tail_desc(monolithic_schedule)
+        or _monolithic_has_anchor_full_desc(monolithic_schedule)
+        or _monolithic_has_anchor_tail_desc(monolithic_schedule)
     )
 
 
 def _monolithic_has_remaining_anchor_families(monolithic_schedule) -> bool:
-    return any(
-        int(ptr[-1].item()) != 0
-        for ptr in (
-            monolithic_schedule.anchor_full_kblock_row_ptr,
-            monolithic_schedule.anchor_tail_kblock_row_ptr,
-        )
+    return _monolithic_has_anchor_full_desc(monolithic_schedule) or _monolithic_has_anchor_tail_desc(
+        monolithic_schedule
     )
+
+
+def _prepare_hsa_bwd_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    with_anchor_aux: bool = False,
+) -> HSABwdPreparedTensors:
+    total_rows = q.shape[0] * q.shape[1]
+    num_q_heads = q.shape[2]
+    num_kv_heads = k.shape[2]
+    head_dim = q.shape[-1]
+    head_dim_v = v.shape[-1]
+    q_flat = q.reshape(total_rows, num_q_heads, head_dim).contiguous()
+    k_flat = k.reshape(total_rows, num_kv_heads, head_dim).contiguous()
+    v_flat = v.reshape(total_rows, num_kv_heads, head_dim_v).contiguous()
+    out_flat = out.reshape(total_rows, num_q_heads, head_dim_v).contiguous()
+    dout_flat = dout.reshape(total_rows, num_q_heads, head_dim_v).contiguous()
+    aux_buffers = _get_hsa_bwd_prepare_buffers(q, v)
+    total_lse_flat = aux_buffers.total_lse_flat
+    lse_log2_flat = None
+    dpsum_flat = None
+    if with_anchor_aux:
+        lse_log2_flat = aux_buffers.lse_log2_flat
+        dpsum_flat = aux_buffers.dpsum_flat
+        _run_hsa_prepare_aux_kernel(
+            out,
+            dout,
+            lse,
+            total_lse_flat,
+            lse_log2_flat,
+            dpsum_flat,
+        )
+    else:
+        _run_hsa_pack_lse_kernel(
+            lse,
+            total_lse_flat,
+        )
+    return HSABwdPreparedTensors(
+        q_flat=q_flat,
+        k_flat=k_flat,
+        v_flat=v_flat,
+        out_flat=out_flat,
+        dout_flat=dout_flat,
+        dout_float_flat=None,
+        total_lse_flat=total_lse_flat,
+        lse_log2_flat=lse_log2_flat,
+        dpsum_flat=dpsum_flat,
+    )
+
+
+def _run_hsa_bwd_sentence_rows_core(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    monolithic_schedule,
+    softmax_scale: float,
+    deterministic: bool,
+    prepared: Optional[HSABwdPreparedTensors] = None,
+    runtime_state=None,
+    *,
+    force_2cta_sm100_varlen: bool = False,
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
+    hsa_mod = _load_hsa_module()
+    _, _, _, _, _, flash_attn_fwd, flash_attn_bwd = _lazy_cute_imports()
+
+    prepared = prepared if prepared is not None else _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse)
+    q_flat = prepared.q_flat
+    k_flat = prepared.k_flat
+    v_flat = prepared.v_flat
+    out_flat = prepared.out_flat
+    dout_flat = prepared.dout_flat
+    total_lse_flat = prepared.total_lse_flat
+
+    runtime_state = runtime_state if runtime_state is not None else _materialize_runtime_state(schedule)
+    buffers = _get_hsa_bwd_sentence_buffers(runtime_state, prepared)
+    dq_accum_rows = buffers.dq_accum_rows
+    dk_accum_rows = buffers.dk_accum_rows
+    dv_accum_rows = buffers.dv_accum_rows
+    done_families = set()
+    sentence_stream = runtime_state["sentence_stream"]
+    if not sentence_stream.is_empty:
+        sentence_q_idx = runtime_state.get("sentence_stream_indices_long")
+        if sentence_q_idx is None:
+            sentence_q_idx = sentence_stream.query_indices.long()
+        sentence_k_idx = runtime_state.get("sentence_stream_key_indices_long")
+        if sentence_k_idx is None:
+            sentence_k_idx = sentence_stream.key_indices.long()
+        sentence_row_idx = runtime_state.get("sentence_stream_row_indices_long")
+        if sentence_row_idx is None:
+            sentence_row_idx = sentence_stream.row_indices.long()
+        q_stream = buffers.q_stream
+        k_stream = buffers.k_stream
+        v_stream = buffers.v_stream
+        _run_hsa_pack_rows_kernel(q_flat, sentence_q_idx, q_stream)
+        _run_hsa_pack_rows_kernel(k_flat, sentence_k_idx, k_stream)
+        _run_hsa_pack_rows_kernel(v_flat, sentence_k_idx, v_stream)
+        _, sentence_lse = flash_attn_fwd(
+            q_stream,
+            k_stream,
+            v_stream,
+            cu_seqlens_q=sentence_stream.cu_seqlens_q,
+            cu_seqlens_k=sentence_stream.cu_seqlens_k,
+            max_seqlen_q=sentence_stream.max_seqlen_q,
+            max_seqlen_k=sentence_stream.max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_lse=True,
+        )
+        if sentence_row_idx.numel() > 0:
+            out_stream = buffers.out_stream
+            dout_stream = buffers.dout_stream
+            _run_hsa_sentence_pack_outputs_kernel(
+                out_flat,
+                dout_flat,
+                total_lse_flat,
+                sentence_lse,
+                sentence_stream.row_indices,
+                out_stream,
+                dout_stream,
+            )
+            dq, dk, dv = flash_attn_bwd(
+                q_stream,
+                k_stream,
+                v_stream,
+                out_stream,
+                dout_stream,
+                sentence_lse,
+                softmax_scale=softmax_scale,
+                causal=True,
+                cu_seqlens_q=sentence_stream.cu_seqlens_q,
+                cu_seqlens_k=sentence_stream.cu_seqlens_k,
+                max_seqlen_q=sentence_stream.max_seqlen_q,
+                max_seqlen_k=sentence_stream.max_seqlen_k,
+                deterministic=deterministic,
+                force_2cta_sm100_varlen=force_2cta_sm100_varlen,
+            )
+            _run_hsa_sentence_scatter_rows_kernel(dq, sentence_q_idx, dq_accum_rows)
+            _run_hsa_sentence_scatter_rows_kernel(dk, sentence_k_idx, dk_accum_rows)
+            _run_hsa_sentence_scatter_rows_kernel(dv, sentence_k_idx, dv_accum_rows)
+            done_families.add("sentence_full")
+            done_families.add("sentence_tail")
+    return (dq_accum_rows, dk_accum_rows, dv_accum_rows), frozenset(done_families)
 
 
 def _run_hsa_bwd_sentence_families_direct_rows(
@@ -3585,60 +5094,24 @@ def _run_hsa_bwd_sentence_families_direct_rows(
     monolithic_schedule,
     softmax_scale: float,
     deterministic: bool,
+    prepared: Optional[HSABwdPreparedTensors] = None,
+    runtime_state=None,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
-    total_rows = schedule.num_rows
-    num_q_heads = q.shape[2]
-    num_kv_heads = k.shape[2]
-    head_dim = q.shape[-1]
-    head_dim_v = v.shape[-1]
-
-    q_flat = q.reshape(total_rows, num_q_heads, head_dim).contiguous()
-    k_flat = k.reshape(total_rows, num_kv_heads, head_dim).contiguous()
-    v_flat = v.reshape(total_rows, num_kv_heads, head_dim_v).contiguous()
-    out_flat = out.reshape(total_rows, num_q_heads, head_dim_v).contiguous()
-    dout_flat = dout.reshape(total_rows, num_q_heads, head_dim_v).contiguous()
-    lse_flat = lse.permute(0, 2, 1).contiguous().view(total_rows, num_q_heads).float()
-    panel_batches = _build_hsa_monolithic_panel_batches(schedule, monolithic_schedule)
-
-    dq_accum_rows = torch.zeros((total_rows, num_q_heads, head_dim), dtype=torch.float32, device=q.device)
-    dk_accum_rows = torch.zeros((total_rows, num_kv_heads, head_dim), dtype=torch.float32, device=q.device)
-    dv_accum_rows = torch.zeros((total_rows, num_kv_heads, head_dim_v), dtype=torch.float32, device=q.device)
-    done_families = set()
-    sentence_full_batch = panel_batches["sentence_full"]
-    if sentence_full_batch is not None and sentence_full_batch.q_indices.numel() > 0:
-        _run_hsa_sentence_full_kernel_fa4_slice(
-            q_flat,
-            k_flat,
-            v_flat,
-            out_flat,
-            dout_flat,
-            lse_flat,
-            sentence_full_batch,
-            softmax_scale,
-            deterministic,
-            dq_accum_rows,
-            dk_accum_rows,
-            dv_accum_rows,
-        )
-        done_families.add("sentence_full")
-    sentence_tail_batch = panel_batches["sentence_tail"]
-    if sentence_tail_batch is not None and sentence_tail_batch.q_indices.numel() > 0:
-        _run_hsa_sentence_tail_mma_batches(
-            q_flat,
-            k_flat,
-            v_flat,
-            out_flat,
-            dout_flat,
-            lse_flat,
-            sentence_tail_batch,
-            softmax_scale,
-            deterministic,
-            dq_accum_rows,
-            dk_accum_rows,
-            dv_accum_rows,
-        )
-        done_families.add("sentence_tail")
-    return (dq_accum_rows, dk_accum_rows, dv_accum_rows), frozenset(done_families)
+    return _run_hsa_bwd_sentence_rows_core(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        schedule,
+        monolithic_schedule,
+        softmax_scale,
+        deterministic,
+        prepared=prepared,
+        runtime_state=runtime_state,
+        force_2cta_sm100_varlen=_use_hsa_sentence_varlen_2cta(),
+    )
 
 
 def _run_hsa_bwd_sentence_full_direct_rows(
@@ -3692,11 +5165,7 @@ def _run_hsa_bwd_sentence_families_direct(
         softmax_scale,
         deterministic,
     )
-    return (
-        dq_accum_rows.view_as(q).to(dtype=q.dtype),
-        dk_accum_rows.view_as(k).to(dtype=k.dtype),
-        dv_accum_rows.view_as(v).to(dtype=v.dtype),
-    )
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
 
 def _run_hsa_bwd_sentence_full_direct(
@@ -3723,11 +5192,7 @@ def _run_hsa_bwd_sentence_full_direct(
         softmax_scale,
         deterministic,
     )
-    return (
-        dq_accum_rows.view_as(q).to(dtype=q.dtype),
-        dk_accum_rows.view_as(k).to(dtype=k.dtype),
-        dv_accum_rows.view_as(v).to(dtype=v.dtype),
-    )
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
 
 def _run_hsa_sentence_full_fa4_fastpath(
@@ -3972,11 +5437,7 @@ def run_hsa_bwd_sm100_packed(
         dk_acc.index_add_(0, k_indices[k_valid].long(), dk[k_valid].float())
         dv_acc.index_add_(0, k_indices[k_valid].long(), dv[k_valid].float())
 
-    return (
-        dq_acc.view_as(q).to(dtype=q.dtype),
-        dk_acc.view_as(k).to(dtype=k.dtype),
-        dv_acc.view_as(v).to(dtype=v.dtype),
-    )
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_acc, dk_acc, dv_acc)
 
 
 def run_hsa_bwd_sm100_exact(
@@ -4119,11 +5580,7 @@ def run_hsa_bwd_sm100_exact(
         softmax_scale,
     )
 
-    return (
-        dq_acc.view_as(q).to(dtype=q.dtype),
-        dk_acc.view_as(k).to(dtype=k.dtype),
-        dv_acc.view_as(v).to(dtype=v.dtype),
-    )
+    return _cast_hsa_row_accums_to_outputs(q, k, v, dq_acc, dk_acc, dv_acc)
 
 
 def run_hsa_bwd_sm100_blocksparse(

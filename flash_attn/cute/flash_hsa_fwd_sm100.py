@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
 import torch
@@ -20,6 +21,32 @@ def _load_hsa_module():
     import flash_attn.cute.hsa as hsa_mod
 
     return hsa_mod
+
+
+@dataclass
+class HSARuntimeState:
+    sentence_stream: object
+    sentence_stream_indices_long: torch.Tensor
+    sentence_stream_key_indices_long: torch.Tensor
+    sentence_stream_row_indices_long: torch.Tensor
+    section_prefix_stream: object
+    section_prefix_query_indices_long: torch.Tensor
+    section_prefix_key_indices_long: torch.Tensor
+    section_prefix_row_indices_long: torch.Tensor
+    document_prefix_stream: object
+    document_prefix_query_indices_long: torch.Tensor
+    document_prefix_key_indices_long: torch.Tensor
+    document_prefix_row_indices_long: torch.Tensor
+    section_self_indices: torch.Tensor
+    section_self_indices_long: torch.Tensor
+    document_self_indices: torch.Tensor
+    document_self_indices_long: torch.Tensor
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def _materialize_runtime_state(schedule):
@@ -74,25 +101,40 @@ def _materialize_runtime_state(schedule):
             device=schedule.sentence_start.device,
         )
 
-    runtime_state = {
-        "sentence_stream": sentence_stream,
-        "section_prefix_stream": _materialize_prefix_stream(
-            schedule.section_segment_ptr,
-            schedule.section_segment_pos,
-        ),
-        "document_prefix_stream": _materialize_prefix_stream(
-            schedule.document_segment_ptr,
-            schedule.document_segment_pos,
-        ),
-        "section_self_indices": torch.nonzero(
-            schedule.section_self_allowed,
-            as_tuple=False,
-        ).flatten().to(dtype=torch.int32, device=schedule.sentence_start.device),
-        "document_self_indices": torch.nonzero(
-            schedule.document_self_allowed,
-            as_tuple=False,
-        ).flatten().to(dtype=torch.int32, device=schedule.sentence_start.device),
-    }
+    section_prefix_stream = _materialize_prefix_stream(
+        schedule.section_segment_ptr,
+        schedule.section_segment_pos,
+    )
+    document_prefix_stream = _materialize_prefix_stream(
+        schedule.document_segment_ptr,
+        schedule.document_segment_pos,
+    )
+    section_self_indices = torch.nonzero(
+        schedule.section_self_allowed,
+        as_tuple=False,
+    ).flatten().to(dtype=torch.int32, device=schedule.sentence_start.device)
+    document_self_indices = torch.nonzero(
+        schedule.document_self_allowed,
+        as_tuple=False,
+    ).flatten().to(dtype=torch.int32, device=schedule.sentence_start.device)
+    runtime_state = HSARuntimeState(
+        sentence_stream=sentence_stream,
+        sentence_stream_indices_long=sentence_stream.query_indices.long(),
+        sentence_stream_key_indices_long=sentence_stream.key_indices.long(),
+        sentence_stream_row_indices_long=sentence_stream.row_indices.long(),
+        section_prefix_stream=section_prefix_stream,
+        section_prefix_query_indices_long=section_prefix_stream.query_indices.long(),
+        section_prefix_key_indices_long=section_prefix_stream.key_indices.long(),
+        section_prefix_row_indices_long=section_prefix_stream.row_indices.long(),
+        document_prefix_stream=document_prefix_stream,
+        document_prefix_query_indices_long=document_prefix_stream.query_indices.long(),
+        document_prefix_key_indices_long=document_prefix_stream.key_indices.long(),
+        document_prefix_row_indices_long=document_prefix_stream.row_indices.long(),
+        section_self_indices=section_self_indices,
+        section_self_indices_long=section_self_indices.long(),
+        document_self_indices=document_self_indices,
+        document_self_indices_long=document_self_indices.long(),
+    )
     if cache is None:
         cache = {}
         setattr(schedule, "_hsa_runtime_cache", cache)

@@ -395,6 +395,111 @@ class FlashHSASentenceScatterRowsSm100:
             ).to(mDstRows.element_type)
 
 
+class FlashHSASentenceScatterTripletRowsSm100:
+    """Scatter packed sentence dQ/dK/dV into row accumulators in one launch."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mDQPacked: cute.Tensor,
+        mDKPacked: cute.Tensor,
+        mDVPacked: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mDQRows: cute.Tensor,
+        mDKRows: cute.Tensor,
+        mDVRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        total_dq_tasks = mQRowIdx.shape[0] * mDQPacked.shape[1] * mDQPacked.shape[2]
+        total_dk_tasks = mKRowIdx.shape[0] * mDKPacked.shape[1] * mDKPacked.shape[2]
+        total_dv_tasks = mKRowIdx.shape[0] * mDVPacked.shape[1] * mDVPacked.shape[2]
+        total_tasks = total_dq_tasks + total_dk_tasks + total_dv_tasks
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mDQPacked,
+            mDKPacked,
+            mDVPacked,
+            mQRowIdx,
+            mKRowIdx,
+            mDQRows,
+            mDKRows,
+            mDVRows,
+            total_dq_tasks,
+            total_dk_tasks,
+            total_dv_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mDQPacked: cute.Tensor,
+        mDKPacked: cute.Tensor,
+        mDVPacked: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mDQRows: cute.Tensor,
+        mDKRows: cute.Tensor,
+        mDVRows: cute.Tensor,
+        total_dq_tasks: Int32,
+        total_dk_tasks: Int32,
+        total_dv_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        total_tasks = total_dq_tasks + total_dk_tasks + total_dv_tasks
+        if task_idx < total_tasks:
+            if task_idx < total_dq_tasks:
+                num_heads = Int32(mDQPacked.shape[1])
+                head_dim = Int32(mDQPacked.shape[2])
+                elems_per_row = num_heads * head_dim
+                stream_row = task_idx // elems_per_row
+                rem = task_idx - stream_row * elems_per_row
+                head_idx = rem // head_dim
+                dim_idx = rem - head_idx * head_dim
+                global_row = mQRowIdx[stream_row]
+                mDQRows[global_row, head_idx, dim_idx] = Float32(
+                    mDQPacked[stream_row, head_idx, dim_idx]
+                ).to(mDQRows.element_type)
+            else:
+                task_after_dq = task_idx - total_dq_tasks
+                if task_after_dq < total_dk_tasks:
+                    num_heads = Int32(mDKPacked.shape[1])
+                    head_dim = Int32(mDKPacked.shape[2])
+                    elems_per_row = num_heads * head_dim
+                    stream_row = task_after_dq // elems_per_row
+                    rem = task_after_dq - stream_row * elems_per_row
+                    head_idx = rem // head_dim
+                    dim_idx = rem - head_idx * head_dim
+                    global_row = mKRowIdx[stream_row]
+                    mDKRows[global_row, head_idx, dim_idx] = Float32(
+                        mDKPacked[stream_row, head_idx, dim_idx]
+                    ).to(mDKRows.element_type)
+                else:
+                    task_after_dk = task_after_dq - total_dk_tasks
+                    num_heads = Int32(mDVPacked.shape[1])
+                    head_dim = Int32(mDVPacked.shape[2])
+                    elems_per_row = num_heads * head_dim
+                    stream_row = task_after_dk // elems_per_row
+                    rem = task_after_dk - stream_row * elems_per_row
+                    head_idx = rem // head_dim
+                    dim_idx = rem - head_idx * head_dim
+                    global_row = mKRowIdx[stream_row]
+                    mDVRows[global_row, head_idx, dim_idx] = Float32(
+                        mDVPacked[stream_row, head_idx, dim_idx]
+                    ).to(mDVRows.element_type)
+
+
 class FlashHSAPackRowsSm100:
     """Pack selected rows from a flat tensor into a compact stream tensor."""
 
@@ -2758,6 +2863,7 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
             sentence_k_stream=sentence_k_stream,
             sentence_v_stream=sentence_v_stream,
             sentence_out_stream=sentence_out_stream,
+            use_combined_sentence_scatter=True,
             force_2cta_sm100_varlen=self.force_2cta_sm100_varlen,
         )
 
@@ -3495,6 +3601,66 @@ def _run_hsa_sentence_scatter_rows_kernel(
         packed_src,
         row_idx,
         dst_rows,
+        current_stream,
+    )
+
+
+def _run_hsa_sentence_scatter_triplet_rows_kernel(
+    dq_packed: torch.Tensor,
+    dk_packed: torch.Tensor,
+    dv_packed: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    k_row_idx: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+) -> None:
+    if q_row_idx.numel() == 0 and k_row_idx.numel() == 0:
+        return
+    compile_key = (
+        "sentence_scatter_triplet_rows",
+        dq_packed.dtype,
+        dq_packed.shape[1],
+        dq_packed.shape[2],
+        dk_packed.dtype,
+        dk_packed.shape[1],
+        dk_packed.shape[2],
+        dv_packed.dtype,
+        dv_packed.shape[1],
+        dv_packed.shape[2],
+        dq_rows.dtype,
+        dk_rows.dtype,
+        dv_rows.dtype,
+        torch.cuda.get_device_capability(dq_packed.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        scatter_rows = FlashHSASentenceScatterTripletRowsSm100()
+        compile_args = [
+            to_cute_tensor(dq_packed),
+            to_cute_tensor(dk_packed),
+            to_cute_tensor(dv_packed),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(k_row_idx, assumed_align=4),
+            to_cute_tensor(dq_rows),
+            to_cute_tensor(dk_rows),
+            to_cute_tensor(dv_rows),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            scatter_rows,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        dq_packed,
+        dk_packed,
+        dv_packed,
+        q_row_idx,
+        k_row_idx,
+        dq_rows,
+        dk_rows,
+        dv_rows,
         current_stream,
     )
 
@@ -5408,6 +5574,7 @@ def _run_hsa_bwd_sentence_rows_core(
     sentence_k_stream: Optional[torch.Tensor] = None,
     sentence_v_stream: Optional[torch.Tensor] = None,
     sentence_out_stream: Optional[torch.Tensor] = None,
+    use_combined_sentence_scatter: bool = False,
     *,
     force_2cta_sm100_varlen: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
@@ -5516,9 +5683,21 @@ def _run_hsa_bwd_sentence_rows_core(
                 deterministic=deterministic,
                 force_2cta_sm100_varlen=force_2cta_sm100_varlen,
             )
-            _run_hsa_sentence_scatter_rows_kernel(dq, sentence_q_idx, dq_accum_rows)
-            _run_hsa_sentence_scatter_rows_kernel(dk, sentence_k_idx, dk_accum_rows)
-            _run_hsa_sentence_scatter_rows_kernel(dv, sentence_k_idx, dv_accum_rows)
+            if use_combined_sentence_scatter:
+                _run_hsa_sentence_scatter_triplet_rows_kernel(
+                    dq,
+                    dk,
+                    dv,
+                    sentence_q_idx,
+                    sentence_k_idx,
+                    dq_accum_rows,
+                    dk_accum_rows,
+                    dv_accum_rows,
+                )
+            else:
+                _run_hsa_sentence_scatter_rows_kernel(dq, sentence_q_idx, dq_accum_rows)
+                _run_hsa_sentence_scatter_rows_kernel(dk, sentence_k_idx, dk_accum_rows)
+                _run_hsa_sentence_scatter_rows_kernel(dv, sentence_k_idx, dv_accum_rows)
             done_families.add("sentence_full")
             done_families.add("sentence_tail")
     return (dq_accum_rows, dk_accum_rows, dv_accum_rows), frozenset(done_families)

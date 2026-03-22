@@ -833,6 +833,11 @@ def test_hsa_true_fused_sentence_only_matches_reference(monkeypatch, n_kv_heads)
     )
     monkeypatch.setattr(
         hsa_bwd_module,
+        "_run_hsa_sentence_scatter_rows_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy per-tensor sentence scatter used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
         "_run_hsa_descriptor_mma_batches",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
     )
@@ -1525,6 +1530,11 @@ def test_hsa_true_fused_backward_matches_reference(monkeypatch, n_kv_heads):
     )
     monkeypatch.setattr(
         hsa_bwd_module,
+        "_run_hsa_sentence_scatter_rows_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy per-tensor sentence scatter used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
         "_run_hsa_descriptor_mma_batches",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
     )
@@ -1557,6 +1567,11 @@ def test_hsa_true_fused_backward_matches_reference(monkeypatch, n_kv_heads):
         hsa_bwd_module,
         "_prepare_hsa_bwd_monolithic_workspaces",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic workspaces prepared")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_build_hsa_monolithic_panel_batches",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy monolithic panel batches built")),
     )
 
     q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)

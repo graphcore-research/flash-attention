@@ -405,7 +405,24 @@ def run_hsa_fwd_sm100_blocksparse(
     schedule,
     softmax_scale: float,
 ):
+    sentence_lse = torch.empty(0, dtype=torch.float32, device=q.device)
+    if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
+        hsa_mod = _load_hsa_module()
+        runtime_state = _materialize_runtime_state(schedule)
+        total_rows = schedule.num_rows
+        q_flat = q.reshape(total_rows, q.shape[2], q.shape[3])
+        k_flat = k.reshape(total_rows, k.shape[2], k.shape[3])
+        v_flat = v.reshape(total_rows, v.shape[2], v.shape[3])
+        _, sentence_lse = hsa_mod._run_varlen_fa4_stream(
+            q_flat,
+            k_flat,
+            v_flat,
+            runtime_state["sentence_stream"],
+            softmax_scale,
+        )
     if os.environ.get("FLASH_ATTN_HSA_USE_FUSED_FWD", "0") == "1":
-        return run_hsa_fwd_sm100_fused(q, k, v, schedule, softmax_scale)
+        out, lse = run_hsa_fwd_sm100_fused(q, k, v, schedule, softmax_scale)
+        return out, lse, sentence_lse
     hsa_mod = _load_hsa_module()
-    return hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)
+    out, lse = hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)
+    return out, lse, sentence_lse

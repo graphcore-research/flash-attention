@@ -1,17 +1,52 @@
 import time
 import os
+import subprocess
+import sys
+import warnings
 from dataclasses import dataclass
 from contextlib import contextmanager
 
 import torch
 
-from flash_attn.cute import (
-    build_hsa_schedule,
-    flash_attn_func,
-    flash_attn_hsa_func,
-    flash_attn_hsa_sparse_func,
-    hsa_reference_attention,
-)
+_FLASH_ATTN_IMPORTS = None
+
+
+def _lazy_flash_attn_imports():
+    global _FLASH_ATTN_IMPORTS
+    if _FLASH_ATTN_IMPORTS is None:
+        from flash_attn.cute import (
+            build_hsa_schedule,
+            flash_attn_func,
+            flash_attn_hsa_sparse_func,
+            hsa_reference_attention,
+        )
+
+        _FLASH_ATTN_IMPORTS = (
+            build_hsa_schedule,
+            flash_attn_func,
+            flash_attn_hsa_sparse_func,
+            hsa_reference_attention,
+        )
+    return _FLASH_ATTN_IMPORTS
+
+
+def _ensure_cuda_ready(retries: int = 5, sleep_s: float = 1.0):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                    torch.cuda.set_device(0)
+                    torch.cuda.get_device_name(0)
+                    return
+        except Exception as exc:
+            last_error = exc
+        if attempt + 1 < retries:
+            time.sleep(sleep_s)
+    if last_error is not None:
+        raise RuntimeError(f"CUDA initialization failed after {retries} attempts") from last_error
+    raise RuntimeError(f"CUDA is unavailable after {retries} attempts")
 
 
 @dataclass
@@ -24,6 +59,15 @@ class BenchmarkCase:
     n_kv_heads: int | None = None
     warmup_iters: int = 5
     benchmark_iters: int = 20
+
+
+CANONICAL_CASES = (
+    BenchmarkCase(name="sentence-only", batch_size=1, seqlen=256, nheads=4, headdim=64, n_kv_heads=4),
+    BenchmarkCase(name="mixed-small", batch_size=1, seqlen=65, nheads=4, headdim=64, n_kv_heads=4),
+    BenchmarkCase(name="train-eq", batch_size=2, seqlen=1024, nheads=8, headdim=64, n_kv_heads=8),
+    BenchmarkCase(name="train-gqa", batch_size=2, seqlen=1024, nheads=8, headdim=64, n_kv_heads=2),
+    BenchmarkCase(name="longer-eq", batch_size=2, seqlen=2048, nheads=8, headdim=64, n_kv_heads=8),
+)
 
 
 def _unwrap_output(result):
@@ -117,6 +161,26 @@ def _temporary_env(**updates):
                 os.environ[key] = old_value
 
 
+def _split_monolithic_env():
+    return {
+        "FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1",
+        "FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD": None,
+        "FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL": "1",
+        "FLASH_ATTN_HSA_USE_HYBRID_BWD": None,
+        "FLASH_ATTN_HSA_USE_SENTENCE_VARLEN_2CTA": None,
+    }
+
+
+def _true_fused_env():
+    return {
+        "FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1",
+        "FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD": "1",
+        "FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL": None,
+        "FLASH_ATTN_HSA_USE_HYBRID_BWD": None,
+        "FLASH_ATTN_HSA_USE_SENTENCE_VARLEN_2CTA": None,
+    }
+
+
 def _run_sparse_attention(
     q,
     k,
@@ -125,16 +189,11 @@ def _run_sparse_attention(
     hash_ids,
     schedule,
     *,
-    use_fused_fwd=False,
-    use_packed_bwd=False,
-    use_monolithic_bwd=False,
+    env_updates=None,
 ):
-    with _temporary_env(
-        FLASH_ATTN_HSA_USE_FUSED_FWD="1" if use_fused_fwd else None,
-        FLASH_ATTN_HSA_USE_PACKED_BWD="1" if use_packed_bwd else None,
-        FLASH_ATTN_HSA_USE_MONOLITHIC_BWD="1" if use_monolithic_bwd else None,
-        FLASH_ATTN_HSA_USE_HYBRID_BWD=None,
-    ):
+    _, _, flash_attn_hsa_sparse_func, _ = _lazy_flash_attn_imports()
+    env_updates = env_updates or {}
+    with _temporary_env(**env_updates):
         return _unwrap_output(
             flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
         )
@@ -142,10 +201,11 @@ def _run_sparse_attention(
 
 def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
     env_updates = env_updates or {}
-    q = q_data.clone().requires_grad_(True)
-    k = k_data.clone().requires_grad_(True)
-    v = v_data.clone().requires_grad_(True)
-    loss = forward_fn(q, k, v).float().square().mean()
+    with _temporary_env(**env_updates):
+        q = q_data.clone().requires_grad_(True)
+        k = k_data.clone().requires_grad_(True)
+        v = v_data.clone().requires_grad_(True)
+        loss = forward_fn(q, k, v).float().square().mean()
 
     def _run():
         with _temporary_env(**env_updates):
@@ -157,22 +217,8 @@ def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, bench
         benchmark_iters,
     )
 
-
-def _measure_fwd_bwd_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
-    env_updates = env_updates or {}
-
-    def _run():
-        q = q_data.clone().requires_grad_(True)
-        k = k_data.clone().requires_grad_(True)
-        v = v_data.clone().requires_grad_(True)
-        with _temporary_env(**env_updates):
-            out = forward_fn(q, k, v)
-            out.float().square().mean().backward()
-
-    return _measure_ms(_run, warmup_iters, benchmark_iters)
-
-
 def run_case(case: BenchmarkCase):
+    build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
     device = "cuda"
     dtype = torch.bfloat16
     keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
@@ -182,172 +228,108 @@ def run_case(case: BenchmarkCase):
     k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
 
-    maskmod_forward = lambda q, k, v: _unwrap_output(flash_attn_hsa_func(q, k, v, keep_ids, hash_ids))
-    sparse_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=False, use_packed_bwd=False
+    split_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=_split_monolithic_env()
     )
-    packed_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=False, use_packed_bwd=True
-    )
-    monolithic_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=False, use_monolithic_bwd=True
-    )
-    fused_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, use_fused_fwd=True, use_packed_bwd=False
+    true_fused_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=_true_fused_env()
     )
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
-    dense_full_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=False))
     dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
 
-    out_fa4 = maskmod_forward(q_data, k_data, v_data)
-    out_sparse = sparse_forward(q_data, k_data, v_data)
-    out_packed = packed_forward(q_data, k_data, v_data)
-    out_monolithic = monolithic_forward(q_data, k_data, v_data)
-    out_fused = fused_forward(q_data, k_data, v_data)
+    out_split = split_forward(q_data, k_data, v_data)
+    out_true_fused = true_fused_forward(q_data, k_data, v_data)
     out_ref = dense_ref_forward(q_data, k_data, v_data)
-    max_diff = (out_fa4.float() - out_ref.float()).abs().max().item()
-    mean_diff = (out_fa4.float() - out_ref.float()).abs().mean().item()
-    sparse_max_diff = (out_sparse.float() - out_ref.float()).abs().max().item()
-    sparse_mean_diff = (out_sparse.float() - out_ref.float()).abs().mean().item()
-    packed_max_diff = (out_packed.float() - out_ref.float()).abs().max().item()
-    packed_mean_diff = (out_packed.float() - out_ref.float()).abs().mean().item()
-    monolithic_max_diff = (out_monolithic.float() - out_ref.float()).abs().max().item()
-    monolithic_mean_diff = (out_monolithic.float() - out_ref.float()).abs().mean().item()
-    fused_max_diff = (out_fused.float() - out_ref.float()).abs().max().item()
-    fused_mean_diff = (out_fused.float() - out_ref.float()).abs().mean().item()
+    split_max_diff = (out_split.float() - out_ref.float()).abs().max().item()
+    split_mean_diff = (out_split.float() - out_ref.float()).abs().mean().item()
+    true_fused_max_diff = (out_true_fused.float() - out_ref.float()).abs().max().item()
+    true_fused_mean_diff = (out_true_fused.float() - out_ref.float()).abs().mean().item()
 
-    fa4_ms = _measure_ms(
-        lambda: maskmod_forward(q_data, k_data, v_data),
+    split_bwd_ms = _measure_backward_ms(
+        split_forward,
+        q_data,
+        k_data,
+        v_data,
         case.warmup_iters,
         case.benchmark_iters,
+        env_updates=_split_monolithic_env(),
     )
-    sparse_ms = _measure_ms(
-        lambda: sparse_forward(q_data, k_data, v_data),
+    true_fused_bwd_ms = _measure_backward_ms(
+        true_fused_forward,
+        q_data,
+        k_data,
+        v_data,
         case.warmup_iters,
         case.benchmark_iters,
+        env_updates=_true_fused_env(),
     )
-    packed_ms = _measure_ms(
-        lambda: packed_forward(q_data, k_data, v_data),
+    dense_causal_bwd_ms = _measure_backward_ms(
+        dense_causal_forward,
+        q_data,
+        k_data,
+        v_data,
         case.warmup_iters,
         case.benchmark_iters,
-    )
-    monolithic_ms = _measure_ms(
-        lambda: monolithic_forward(q_data, k_data, v_data),
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    fused_ms = _measure_ms(
-        lambda: fused_forward(q_data, k_data, v_data),
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    dense_causal_ms = _measure_ms(
-        lambda: dense_causal_forward(q_data, k_data, v_data),
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    dense_full_ms = _measure_ms(
-        lambda: dense_full_forward(q_data, k_data, v_data),
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    ref_ms = _measure_ms(
-        lambda: dense_ref_forward(q_data, k_data, v_data),
-        max(1, case.warmup_iters // 2),
-        max(5, case.benchmark_iters // 2),
     )
 
-    maskmod_bwd_ms = _measure_backward_ms(maskmod_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
-    sparse_bwd_ms = _measure_backward_ms(sparse_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
-    packed_bwd_ms = _measure_backward_ms(
-        packed_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
-    )
-    monolithic_bwd_ms = _measure_backward_ms(
-        monolithic_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates={"FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
-    )
-    ref_bwd_ms = _measure_backward_ms(
-        dense_ref_forward,
-        q_data,
-        k_data,
-        v_data,
-        max(1, case.warmup_iters // 2),
-        max(5, case.benchmark_iters // 2),
-    )
-
-    maskmod_fwd_bwd_ms = _measure_fwd_bwd_ms(maskmod_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
-    sparse_fwd_bwd_ms = _measure_fwd_bwd_ms(sparse_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters)
-    packed_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        packed_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates={"FLASH_ATTN_HSA_USE_PACKED_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
-    )
-    monolithic_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        monolithic_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates={"FLASH_ATTN_HSA_USE_MONOLITHIC_BWD": "1", "FLASH_ATTN_HSA_USE_HYBRID_BWD": None},
-    )
-    ref_fwd_bwd_ms = _measure_fwd_bwd_ms(
-        dense_ref_forward,
-        q_data,
-        k_data,
-        v_data,
-        max(1, case.warmup_iters // 2),
-        max(5, case.benchmark_iters // 2),
-    )
-
-    speedup = ref_ms / fa4_ms if fa4_ms > 0 else float("inf")
-    sparse_speedup = ref_ms / sparse_ms if sparse_ms > 0 else float("inf")
-    packed_speedup = ref_ms / packed_ms if packed_ms > 0 else float("inf")
-    monolithic_speedup = ref_ms / monolithic_ms if monolithic_ms > 0 else float("inf")
-    fused_speedup = ref_ms / fused_ms if fused_ms > 0 else float("inf")
+    split_vs_dense = split_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+    true_fused_vs_dense = true_fused_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+    true_fused_vs_split = true_fused_bwd_ms / split_bwd_ms if split_bwd_ms > 0 else float("inf")
 
     print(
         f"{case.name}: shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
-        f"maskmod_max_diff={max_diff:.6f} maskmod_mean_diff={mean_diff:.6f} "
-        f"sparse_max_diff={sparse_max_diff:.6f} sparse_mean_diff={sparse_mean_diff:.6f} "
-        f"packed_max_diff={packed_max_diff:.6f} packed_mean_diff={packed_mean_diff:.6f} "
-        f"monolithic_max_diff={monolithic_max_diff:.6f} monolithic_mean_diff={monolithic_mean_diff:.6f} "
-        f"fused_max_diff={fused_max_diff:.6f} fused_mean_diff={fused_mean_diff:.6f} "
-        f"maskmod_ms={fa4_ms:.3f} sparse_ms={sparse_ms:.3f} packed_ms={packed_ms:.3f} monolithic_ms={monolithic_ms:.3f} fused_ms={fused_ms:.3f} "
-        f"dense_causal_ms={dense_causal_ms:.3f} dense_full_ms={dense_full_ms:.3f} ref_ms={ref_ms:.3f} "
-        f"maskmod_bwd_ms={maskmod_bwd_ms:.3f} sparse_bwd_ms={sparse_bwd_ms:.3f} packed_bwd_ms={packed_bwd_ms:.3f} monolithic_bwd_ms={monolithic_bwd_ms:.3f} ref_bwd_ms={ref_bwd_ms:.3f} "
-        f"maskmod_fwd_bwd_ms={maskmod_fwd_bwd_ms:.3f} sparse_fwd_bwd_ms={sparse_fwd_bwd_ms:.3f} "
-        f"packed_fwd_bwd_ms={packed_fwd_bwd_ms:.3f} monolithic_fwd_bwd_ms={monolithic_fwd_bwd_ms:.3f} ref_fwd_bwd_ms={ref_fwd_bwd_ms:.3f} "
-        f"maskmod_speedup={speedup:.2f}x sparse_speedup={sparse_speedup:.2f}x packed_speedup={packed_speedup:.2f}x monolithic_speedup={monolithic_speedup:.2f}x fused_speedup={fused_speedup:.2f}x"
+        f"split_max_diff={split_max_diff:.6f} split_mean_diff={split_mean_diff:.6f} "
+        f"true_fused_max_diff={true_fused_max_diff:.6f} true_fused_mean_diff={true_fused_mean_diff:.6f} "
+        f"split_bwd_ms={split_bwd_ms:.3f} true_fused_bwd_ms={true_fused_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
+        f"split_vs_dense={split_vs_dense:.2f}x true_fused_vs_dense={true_fused_vs_dense:.2f}x "
+        f"true_fused_vs_split={true_fused_vs_split:.2f}x"
     )
 
 
-def main():
-    assert torch.cuda.is_available(), "CUDA is required"
+def _run_cases_once():
+    _ensure_cuda_ready()
     print(f"device={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
-    cases = [
-        BenchmarkCase(name="small-correctness", batch_size=1, seqlen=137, nheads=4, headdim=64),
-        BenchmarkCase(name="train-eq", batch_size=2, seqlen=1024, nheads=8, headdim=64, n_kv_heads=8),
-        BenchmarkCase(name="train-gqa", batch_size=2, seqlen=1024, nheads=8, headdim=64, n_kv_heads=2),
-        BenchmarkCase(name="longer-eq", batch_size=2, seqlen=2048, nheads=8, headdim=64, n_kv_heads=8),
-    ]
-    for case in cases:
+    for case in CANONICAL_CASES:
         run_case(case)
+
+
+def main():
+    if os.environ.get("FLASH_ATTN_HSA_BENCH_CHILD", "0") == "1":
+        attempt = os.environ.get("FLASH_ATTN_HSA_BENCH_ATTEMPT", "?")
+        try:
+            _run_cases_once()
+            return
+        except Exception as exc:
+            print(
+                f"hsa benchmark bootstrap failure on attempt {attempt}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(2) from None
+
+    max_retries = int(os.environ.get("FLASH_ATTN_HSA_BENCH_MAX_RETRIES", "5"))
+    child_env = os.environ.copy()
+    child_env["FLASH_ATTN_HSA_BENCH_CHILD"] = "1"
+    child_env.pop("FLASH_ATTN_HSA_BENCH_ATTEMPT", None)
+
+    last_rc = 1
+    for attempt in range(1, max_retries + 1):
+        child_env["FLASH_ATTN_HSA_BENCH_ATTEMPT"] = str(attempt)
+        print(f"hsa benchmark attempt {attempt}/{max_retries}", file=sys.stderr, flush=True)
+        result = subprocess.run(
+            [sys.executable, __file__],
+            env=child_env,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        last_rc = result.returncode
+    print(
+        f"hsa benchmark failed after {max_retries} attempts with exit code {last_rc}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(last_rc)
 
 
 if __name__ == "__main__":

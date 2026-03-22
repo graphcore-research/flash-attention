@@ -4310,6 +4310,7 @@ def _run_hsa_blocksparse_backward(
     out: torch.Tensor,
     dout: torch.Tensor,
     lse: torch.Tensor,
+    sentence_lse: Optional[torch.Tensor],
     schedule: HSASchedule,
     softmax_scale: float,
     deterministic: bool,
@@ -4331,6 +4332,7 @@ def _run_hsa_blocksparse_backward(
                 schedule,
                 softmax_scale,
                 deterministic,
+                sentence_lse=sentence_lse,
             )
         except NotImplementedError:
             pass
@@ -4386,13 +4388,13 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
     ):
         from flash_attn.cute.flash_hsa_fwd_sm100 import run_hsa_fwd_sm100_blocksparse
 
-        out, lse = run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
+        out, lse, sentence_lse = run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
         ctx.schedule = schedule
         ctx.keep_ids = keep_ids
         ctx.hash_ids = hash_ids
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
-        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.save_for_backward(q, k, v, out, lse, sentence_lse)
         if return_lse:
             ctx.mark_non_differentiable(lse)
             return out, lse
@@ -4402,7 +4404,7 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_blocksparse
 
-        q, k, v, out, lse = ctx.saved_tensors
+        q, k, v, out, lse, sentence_lse = ctx.saved_tensors
         dq, dk, dv = run_hsa_bwd_sm100_blocksparse(
             q,
             k,
@@ -4410,6 +4412,7 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
             out,
             dout,
             lse,
+            sentence_lse if sentence_lse.numel() > 0 else None,
             ctx.schedule,
             ctx.softmax_scale,
             ctx.deterministic,

@@ -169,6 +169,26 @@ def _monolithic_has_anchor_tail_desc(monolithic_schedule) -> bool:
     return monolithic_schedule.anchor_tail_q_row_start.numel() != 0
 
 
+def _monolithic_has_sentence_families(monolithic_schedule) -> bool:
+    return _monolithic_has_sentence_full_desc(monolithic_schedule) or _monolithic_has_sentence_tail_desc(
+        monolithic_schedule
+    )
+
+
+def _normalize_sentence_lse_override(sentence_lse: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if sentence_lse is None or sentence_lse.numel() == 0:
+        return None
+    return sentence_lse
+
+
+@dataclass
+class HSAMonolithicSentenceStageResult:
+    row_accums: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    done_families: frozenset[str] = frozenset()
+    prepared: Optional["HSABwdPreparedTensors"] = None
+    runtime_state: Optional[dict] = None
+
+
 class FlashHSASentencePackOutputsSm100:
     """Pack sentence-stream out / weighted-dout on device."""
 
@@ -532,6 +552,76 @@ class FlashHSAPrepareAuxSm100:
             mTotalLSE[row_idx, q_head] = lse_val.to(mTotalLSE.element_type)
             mLSElog2[row_idx, q_head] = (lse_val * Float32(math.log2(math.e))).to(mLSElog2.element_type)
             mdPsum[row_idx, q_head] = dpsum.to(mdPsum.element_type)
+
+
+class FlashHSAPrepareMonolithicWorkspacesSm100:
+    """Prepare monolithic [B, H, T] dPsum / lse_log2 workspaces on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch_size = mLSE.shape[0]
+        num_q_heads = mLSE.shape[1]
+        seqlen = mLSE.shape[2]
+        total_tasks = batch_size * num_q_heads * seqlen
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mOut,
+            mdOut,
+            mLSE,
+            mdPsum,
+            mLSElog2,
+            total_tasks,
+            seqlen,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mOut: cute.Tensor,
+        mdOut: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mLSElog2: cute.Tensor,
+        total_tasks: Int32,
+        seqlen: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_q_heads = Int32(mLSE.shape[1])
+            head_dim_v = Int32(mOut.shape[3])
+            row_idx = task_idx // num_q_heads
+            q_head = task_idx - row_idx * num_q_heads
+            batch_idx = row_idx // seqlen
+            token_idx = row_idx - batch_idx * seqlen
+            lse_val = Float32(mLSE[batch_idx, q_head, token_idx])
+            dpsum = Float32.zero
+            for dv_idx in cutlass.range(head_dim_v, unroll=1):
+                dpsum += Float32(mOut[batch_idx, token_idx, q_head, dv_idx]) * Float32(
+                    mdOut[batch_idx, token_idx, q_head, dv_idx]
+                )
+            mdPsum[batch_idx, q_head, token_idx] = dpsum.to(mdPsum.element_type)
+            mLSElog2[batch_idx, q_head, token_idx] = (lse_val * Float32(math.log2(math.e))).to(
+                mLSElog2.element_type
+            )
 
 
 @cute.jit
@@ -2570,6 +2660,7 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
         softmax_scale: float,
         prepared: Optional["HSABwdPreparedTensors"] = None,
         runtime_state=None,
+        sentence_lse_override: Optional[torch.Tensor] = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
         return _run_hsa_bwd_sentence_rows_core(
             q,
@@ -2584,6 +2675,7 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
             self.deterministic,
             prepared=prepared,
             runtime_state=runtime_state,
+            sentence_lse_override=sentence_lse_override,
             force_2cta_sm100_varlen=self.force_2cta_sm100_varlen,
         )
 
@@ -2600,6 +2692,7 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
         softmax_scale: float,
         prepared: Optional["HSABwdPreparedTensors"] = None,
         runtime_state=None,
+        sentence_lse_override: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         (dq_accum_rows, dk_accum_rows, dv_accum_rows), _ = self.run_rows(
             q,
@@ -2613,6 +2706,7 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
             softmax_scale,
             prepared=prepared,
             runtime_state=runtime_state,
+            sentence_lse_override=sentence_lse_override,
         )
         return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
@@ -3386,6 +3480,47 @@ def _run_hsa_prepare_aux_kernel(
     )
 
 
+def _run_hsa_prepare_monolithic_workspaces_kernel(
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    dpsum_workspace: torch.Tensor,
+    lse_log2_workspace: torch.Tensor,
+) -> None:
+    compile_key = (
+        "prepare_monolithic_workspaces",
+        out.dtype,
+        out.shape[2],
+        out.shape[3],
+        dpsum_workspace.dtype,
+        torch.cuda.get_device_capability(out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        prepare_workspaces = FlashHSAPrepareMonolithicWorkspacesSm100()
+        compile_args = [
+            to_cute_tensor(out),
+            to_cute_tensor(dout),
+            to_cute_tensor(lse),
+            to_cute_tensor(dpsum_workspace, assumed_align=4),
+            to_cute_tensor(lse_log2_workspace, assumed_align=4),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            prepare_workspaces,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        out,
+        dout,
+        lse,
+        dpsum_workspace,
+        lse_log2_workspace,
+        current_stream,
+    )
+
+
 def _run_hsa_cast_rows_kernel(
     src_rows: torch.Tensor,
     dst_rows: torch.Tensor,
@@ -3539,8 +3674,6 @@ def _prepare_hsa_bwd_monolithic_workspaces(
     _zero_tensor_list_(
         [
             workspaces["dq_accum"],
-            workspaces["dpsum"],
-            workspaces["lse_log2"],
             workspaces["dk_accum"],
             workspaces["dv_accum"],
         ]
@@ -3553,10 +3686,13 @@ def _prepare_hsa_bwd_monolithic_workspaces(
         ]
     )
 
-    seqlen = out.shape[1]
-    dpsum = (out.float() * dout.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
-    workspaces["dpsum"][:, :, :seqlen].copy_(dpsum)
-    workspaces["lse_log2"][:, :, :seqlen].copy_(lse.float() * math.log2(math.e))
+    _run_hsa_prepare_monolithic_workspaces_kernel(
+        out,
+        dout,
+        lse,
+        workspaces["dpsum"],
+        workspaces["lse_log2"],
+    )
 
 
 @cute.jit
@@ -4425,7 +4561,30 @@ def _run_hsa_bwd_anchor_only_main_cute(
     return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
 
-def run_hsa_bwd_sm100_monolithic(
+def _build_hsa_sentence_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    deterministic: bool,
+    use_true_fused: bool,
+    monolithic_schedule,
+) -> FlashHSASentenceBackwardSm100:
+    return FlashHSASentenceBackwardSm100(
+        q.shape[-1],
+        v.shape[-1],
+        qhead_per_kvhead=q.shape[2] // k.shape[2],
+        deterministic=deterministic,
+        use_2cta_instrs=_should_force_hsa_sentence_varlen_2cta(
+            q,
+            k,
+            use_true_fused=use_true_fused,
+            monolithic_schedule=monolithic_schedule,
+        ),
+    )
+
+
+def _run_hsa_bwd_monolithic_sentence_only(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4433,48 +4592,82 @@ def run_hsa_bwd_sm100_monolithic(
     dout: torch.Tensor,
     lse: torch.Tensor,
     schedule,
+    monolithic_schedule,
     softmax_scale: float,
     deterministic: bool,
-):
-    if not _is_supported_packed_bwd(q, k, v):
-        raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
-
-    hsa_mod = _load_hsa_module()
-    monolithic_schedule = hsa_mod._get_hsa_monolithic_backward_schedule(schedule)
-    precomputed_row_accums = None
-    precomputed_done_families = frozenset()
-    prepared = None
-    runtime_state = None
-    use_true_fused = _use_hsa_true_fused_bwd()
-    use_sentence_varlen_2cta = _should_force_hsa_sentence_varlen_2cta(
-        q,
-        k,
-        use_true_fused=use_true_fused,
-        monolithic_schedule=monolithic_schedule,
-    )
-    sentence_bwd = FlashHSASentenceBackwardSm100(
-        q.shape[-1],
-        v.shape[-1],
-        qhead_per_kvhead=q.shape[2] // k.shape[2],
-        deterministic=deterministic,
-        use_2cta_instrs=use_sentence_varlen_2cta,
-    )
+    *,
+    use_true_fused: bool,
+    sentence_lse_override: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if _monolithic_has_remaining_anchor_families(monolithic_schedule):
+        return None
     if use_true_fused:
-        if not _monolithic_has_remaining_anchor_families(monolithic_schedule):
-            return sentence_bwd.run(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                schedule,
-                monolithic_schedule,
-                softmax_scale,
-            )
-        prepared = _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
-        runtime_state = _materialize_runtime_state(schedule)
-        precomputed_row_accums, precomputed_done_families = sentence_bwd.run_rows(
+        sentence_bwd = _build_hsa_sentence_backward(
+            q,
+            k,
+            v,
+            deterministic=deterministic,
+            use_true_fused=True,
+            monolithic_schedule=monolithic_schedule,
+        )
+        return sentence_bwd.run(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            sentence_lse_override=sentence_lse_override,
+        )
+    if _use_hsa_sentence_full_kernel_fastpath():
+        return _run_hsa_bwd_sentence_families_direct(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            deterministic,
+            sentence_lse_override=sentence_lse_override,
+        )
+    return None
+
+
+def _precompute_hsa_bwd_monolithic_sentence_stage(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    monolithic_schedule,
+    softmax_scale: float,
+    deterministic: bool,
+    *,
+    use_true_fused: bool,
+    sentence_lse_override: Optional[torch.Tensor],
+) -> HSAMonolithicSentenceStageResult:
+    if not _monolithic_has_sentence_families(monolithic_schedule):
+        return HSAMonolithicSentenceStageResult()
+    prepared = _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
+    runtime_state = _materialize_runtime_state(schedule)
+    if use_true_fused:
+        sentence_bwd = _build_hsa_sentence_backward(
+            q,
+            k,
+            v,
+            deterministic=deterministic,
+            use_true_fused=True,
+            monolithic_schedule=monolithic_schedule,
+        )
+        row_accums, done_families = sentence_bwd.run_rows(
             q,
             k,
             v,
@@ -4486,51 +4679,102 @@ def run_hsa_bwd_sm100_monolithic(
             softmax_scale,
             prepared=prepared,
             runtime_state=runtime_state,
+            sentence_lse_override=sentence_lse_override,
         )
-    if not use_true_fused and _use_hsa_sentence_full_kernel_fastpath():
-        if not _monolithic_has_remaining_anchor_families(monolithic_schedule):
-            return _run_hsa_bwd_sentence_families_direct(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                schedule,
-                monolithic_schedule,
-                softmax_scale,
-                deterministic,
-            )
-        if _monolithic_has_sentence_full_desc(monolithic_schedule) or _monolithic_has_sentence_tail_desc(
-            monolithic_schedule
-        ):
-            prepared = _prepare_hsa_bwd_tensors(q, k, v, out, dout, lse, with_anchor_aux=True)
-            runtime_state = _materialize_runtime_state(schedule)
-            precomputed_row_accums, precomputed_done_families = _run_hsa_bwd_sentence_families_direct_rows(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                schedule,
-                monolithic_schedule,
-                softmax_scale,
-                deterministic,
-                prepared=prepared,
-                runtime_state=runtime_state,
-            )
+    else:
+        row_accums, done_families = _run_hsa_bwd_sentence_families_direct_rows(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            deterministic,
+            prepared=prepared,
+            runtime_state=runtime_state,
+            sentence_lse_override=sentence_lse_override,
+        )
+    return HSAMonolithicSentenceStageResult(
+        row_accums=row_accums,
+        done_families=done_families,
+        prepared=prepared,
+        runtime_state=runtime_state,
+    )
+
+
+def run_hsa_bwd_sm100_monolithic(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule,
+    softmax_scale: float,
+    deterministic: bool,
+    sentence_lse: Optional[torch.Tensor] = None,
+):
+    if not _is_supported_packed_bwd(q, k, v):
+        raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
+
+    hsa_mod = _load_hsa_module()
+    monolithic_schedule = hsa_mod._get_hsa_monolithic_backward_schedule(schedule)
+    use_true_fused = _use_hsa_true_fused_bwd()
+    sentence_lse_override = _normalize_sentence_lse_override(sentence_lse)
+
+    # Stage 1: if sentence descriptors are the whole workload, stay on the
+    # active sentence path and return before touching anchor or legacy setup.
+    sentence_only_result = _run_hsa_bwd_monolithic_sentence_only(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        schedule,
+        monolithic_schedule,
+        softmax_scale,
+        deterministic,
+        use_true_fused=use_true_fused,
+        sentence_lse_override=sentence_lse_override,
+    )
+    if sentence_only_result is not None:
+        return sentence_only_result
+
+    # Stage 2: mixed schedules precompute sentence-family row accumulators once.
+    sentence_stage = HSAMonolithicSentenceStageResult()
+    if use_true_fused or _use_hsa_sentence_full_kernel_fastpath():
+        sentence_stage = _precompute_hsa_bwd_monolithic_sentence_stage(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            schedule,
+            monolithic_schedule,
+            softmax_scale,
+            deterministic,
+            use_true_fused=use_true_fused,
+            sentence_lse_override=sentence_lse_override,
+        )
+
     compile_key = _build_hsa_bwd_monolithic_compile_key(q, k, v, monolithic_schedule, deterministic)
     sentence_full_done = (
         not _monolithic_has_sentence_full_desc(monolithic_schedule)
-        or "sentence_full" in precomputed_done_families
+        or "sentence_full" in sentence_stage.done_families
     )
     sentence_tail_done = (
         not _monolithic_has_sentence_tail_desc(monolithic_schedule)
-        or "sentence_tail" in precomputed_done_families
+        or "sentence_tail" in sentence_stage.done_families
     )
+    # Stage 3: once sentence work is done, keep mixed execution on the narrower
+    # anchor-only kernel instead of rebuilding the full monolithic path.
     if (
-        precomputed_row_accums is not None
+        sentence_stage.row_accums is not None
         and sentence_full_done
         and sentence_tail_done
         and _monolithic_has_remaining_anchor_families(monolithic_schedule)
@@ -4546,9 +4790,10 @@ def run_hsa_bwd_sm100_monolithic(
             monolithic_schedule,
             softmax_scale,
             compile_key,
-            precomputed_row_accums,
-            prepared=prepared,
+            sentence_stage.row_accums,
+            prepared=sentence_stage.prepared,
         )
+    # Stage 4: unresolved families fall back to the legacy mixed monolithic kernel.
     if compile_key not in run_hsa_bwd_sm100_monolithic.launch_plan_cache:
         run_hsa_bwd_sm100_monolithic.launch_plan_cache[compile_key] = _build_hsa_bwd_monolithic_launch_plan(
             q,
@@ -4998,6 +5243,7 @@ def _run_hsa_bwd_sentence_rows_core(
     deterministic: bool,
     prepared: Optional[HSABwdPreparedTensors] = None,
     runtime_state=None,
+    sentence_lse_override: Optional[torch.Tensor] = None,
     *,
     force_2cta_sm100_varlen: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
@@ -5035,18 +5281,20 @@ def _run_hsa_bwd_sentence_rows_core(
         _run_hsa_pack_rows_kernel(q_flat, sentence_q_idx, q_stream)
         _run_hsa_pack_rows_kernel(k_flat, sentence_k_idx, k_stream)
         _run_hsa_pack_rows_kernel(v_flat, sentence_k_idx, v_stream)
-        _, sentence_lse = flash_attn_fwd(
-            q_stream,
-            k_stream,
-            v_stream,
-            cu_seqlens_q=sentence_stream.cu_seqlens_q,
-            cu_seqlens_k=sentence_stream.cu_seqlens_k,
-            max_seqlen_q=sentence_stream.max_seqlen_q,
-            max_seqlen_k=sentence_stream.max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=True,
-            return_lse=True,
-        )
+        sentence_lse = sentence_lse_override
+        if sentence_lse is None or sentence_lse.numel() == 0:
+            _, sentence_lse = flash_attn_fwd(
+                q_stream,
+                k_stream,
+                v_stream,
+                cu_seqlens_q=sentence_stream.cu_seqlens_q,
+                cu_seqlens_k=sentence_stream.cu_seqlens_k,
+                max_seqlen_q=sentence_stream.max_seqlen_q,
+                max_seqlen_k=sentence_stream.max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_lse=True,
+            )
         if sentence_row_idx.numel() > 0:
             out_stream = buffers.out_stream
             dout_stream = buffers.dout_stream
@@ -5096,6 +5344,7 @@ def _run_hsa_bwd_sentence_families_direct_rows(
     deterministic: bool,
     prepared: Optional[HSABwdPreparedTensors] = None,
     runtime_state=None,
+    sentence_lse_override: Optional[torch.Tensor] = None,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
     return _run_hsa_bwd_sentence_rows_core(
         q,
@@ -5110,6 +5359,7 @@ def _run_hsa_bwd_sentence_families_direct_rows(
         deterministic,
         prepared=prepared,
         runtime_state=runtime_state,
+        sentence_lse_override=sentence_lse_override,
         force_2cta_sm100_varlen=_use_hsa_sentence_varlen_2cta(),
     )
 
@@ -5152,6 +5402,7 @@ def _run_hsa_bwd_sentence_families_direct(
     monolithic_schedule,
     softmax_scale: float,
     deterministic: bool,
+    sentence_lse_override: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (dq_accum_rows, dk_accum_rows, dv_accum_rows), _ = _run_hsa_bwd_sentence_families_direct_rows(
         q,
@@ -5164,6 +5415,7 @@ def _run_hsa_bwd_sentence_families_direct(
         monolithic_schedule,
         softmax_scale,
         deterministic,
+        sentence_lse_override=sentence_lse_override,
     )
     return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
@@ -5590,6 +5842,7 @@ def run_hsa_bwd_sm100_blocksparse(
     out: torch.Tensor,
     dout: torch.Tensor,
     lse: torch.Tensor,
+    sentence_lse: Optional[torch.Tensor],
     schedule,
     softmax_scale: float,
     deterministic: bool,
@@ -5604,6 +5857,7 @@ def run_hsa_bwd_sm100_blocksparse(
         out,
         dout,
         lse,
+        sentence_lse,
         schedule,
         softmax_scale,
         deterministic,

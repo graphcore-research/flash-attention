@@ -2,6 +2,15 @@ import pytest
 import torch
 
 
+def _safe_cuda_capability():
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_capability()
+    except Exception:
+        return None
+
+
 try:
     from flash_attn.cute import (
         hybrid_backward_to_attend_mask,
@@ -38,10 +47,11 @@ except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     _IMPORT_ERROR = exc
 
 
+_CUDA_CAPABILITY = _safe_cuda_capability()
 HAS_HSA_FA4 = (
     _IMPORT_ERROR is None
-    and torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] >= 9
+    and _CUDA_CAPABILITY is not None
+    and _CUDA_CAPABILITY[0] >= 9
 )
 
 pytestmark = pytest.mark.skipif(
@@ -49,7 +59,7 @@ pytestmark = pytest.mark.skipif(
     reason=f"HSA FA4 test requires CUDA SM90+ with FA4 available ({_IMPORT_ERROR!r})",
 )
 
-HAS_HSA_SPARSE_FA4 = HAS_HSA_FA4 and torch.cuda.get_device_capability()[0] >= 10
+HAS_HSA_SPARSE_FA4 = HAS_HSA_FA4 and _CUDA_CAPABILITY[0] >= 10
 
 
 def _unwrap_output(result):
@@ -841,6 +851,29 @@ def test_hsa_true_fused_sentence_only_matches_reference(monkeypatch, n_kv_heads)
         "_run_hsa_bwd_monolithic_main_cute",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy mixed monolithic kernel used")),
     )
+    original_lazy_cute_imports = hsa_bwd_module._lazy_cute_imports
+
+    def _lazy_cute_imports_without_fwd():
+        cutlass, cute, utils, fast_sampling, flash_attn_func, _flash_attn_fwd, _flash_attn_bwd = (
+            original_lazy_cute_imports()
+        )
+        return (
+            cutlass,
+            cute,
+            utils,
+            fast_sampling,
+            flash_attn_func,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("sentence_lse backward recompute used")
+            ),
+            _flash_attn_bwd,
+        )
+
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_lazy_cute_imports",
+        _lazy_cute_imports_without_fwd,
+    )
 
     q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
     k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
@@ -957,6 +990,29 @@ def test_hsa_monolithic_sentence_families_bypass_kernel_when_no_anchors(monkeypa
         hsa_bwd_module,
         "_run_hsa_bwd_monolithic_main_cute",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic mixed-family kernel used")),
+    )
+    original_lazy_cute_imports = hsa_bwd_module._lazy_cute_imports
+
+    def _lazy_cute_imports_without_fwd():
+        cutlass, cute, utils, fast_sampling, flash_attn_func, _flash_attn_fwd, _flash_attn_bwd = (
+            original_lazy_cute_imports()
+        )
+        return (
+            cutlass,
+            cute,
+            utils,
+            fast_sampling,
+            flash_attn_func,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("sentence_lse backward recompute used")
+            ),
+            _flash_attn_bwd,
+        )
+
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_lazy_cute_imports",
+        _lazy_cute_imports_without_fwd,
     )
 
     q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)

@@ -406,6 +406,10 @@ def run_hsa_fwd_sm100_blocksparse(
     softmax_scale: float,
 ):
     sentence_lse = torch.empty(0, dtype=torch.float32, device=q.device)
+    sentence_q_stream = torch.empty(0, dtype=q.dtype, device=q.device)
+    sentence_k_stream = torch.empty(0, dtype=k.dtype, device=k.device)
+    sentence_v_stream = torch.empty(0, dtype=v.dtype, device=v.device)
+    sentence_out_stream = torch.empty(0, dtype=q.dtype, device=q.device)
     if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
         hsa_mod = _load_hsa_module()
         runtime_state = _materialize_runtime_state(schedule)
@@ -413,16 +417,32 @@ def run_hsa_fwd_sm100_blocksparse(
         q_flat = q.reshape(total_rows, q.shape[2], q.shape[3])
         k_flat = k.reshape(total_rows, k.shape[2], k.shape[3])
         v_flat = v.reshape(total_rows, v.shape[2], v.shape[3])
-        _, sentence_lse = hsa_mod._run_varlen_fa4_stream(
-            q_flat,
-            k_flat,
-            v_flat,
-            runtime_state["sentence_stream"],
-            softmax_scale,
+        cache_sentence_streams = os.environ.get("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
+        packed_q_stream = q_flat.index_select(0, runtime_state["sentence_stream_indices_long"]).contiguous()
+        packed_k_stream = k_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
+        packed_v_stream = v_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
+        _, _, _, _, _, flash_attn_fwd, _ = hsa_mod._lazy_cute_imports()
+        packed_out_stream, sentence_lse = flash_attn_fwd(
+            packed_q_stream,
+            packed_k_stream,
+            packed_v_stream,
+            cu_seqlens_q=runtime_state["sentence_stream"].cu_seqlens_q,
+            cu_seqlens_k=runtime_state["sentence_stream"].cu_seqlens_k,
+            max_seqlen_q=runtime_state["sentence_stream"].max_seqlen_q,
+            max_seqlen_k=runtime_state["sentence_stream"].max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_lse=True,
         )
+        sentence_lse = sentence_lse.detach()
+        if cache_sentence_streams:
+            sentence_q_stream = packed_q_stream.detach()
+            sentence_k_stream = packed_k_stream.detach()
+            sentence_v_stream = packed_v_stream.detach()
+            sentence_out_stream = packed_out_stream.detach()
     if os.environ.get("FLASH_ATTN_HSA_USE_FUSED_FWD", "0") == "1":
         out, lse = run_hsa_fwd_sm100_fused(q, k, v, schedule, softmax_scale)
-        return out, lse, sentence_lse
+        return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream
     hsa_mod = _load_hsa_module()
     out, lse = hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)
-    return out, lse, sentence_lse
+    return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream

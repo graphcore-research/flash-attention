@@ -181,6 +181,12 @@ def _normalize_sentence_lse_override(sentence_lse: Optional[torch.Tensor]) -> Op
     return sentence_lse
 
 
+def _normalize_sentence_stream_override(stream_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if stream_tensor is None or stream_tensor.numel() == 0:
+        return None
+    return stream_tensor
+
+
 @dataclass
 class HSAMonolithicSentenceStageResult:
     row_accums: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
@@ -259,6 +265,74 @@ class FlashHSASentencePackOutputsSm100:
                 fastmath=True,
             )
             mOutPacked[stream_row, q_head, dv_idx] = mOut[global_row, q_head, dv_idx]
+            mdOutPacked[stream_row, q_head, dv_idx] = (
+                weight * Float32(mdOut[global_row, q_head, dv_idx])
+            ).to(mdOutPacked.element_type)
+
+
+class FlashHSASentencePackWeightedDOutSm100:
+    """Pack weighted sentence-stream dOut on device."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mdOut: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mSentenceLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mdOutPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_q_heads = mdOut.shape[1]
+        head_dim_v = mdOut.shape[2]
+        total_tasks = num_stream_rows * num_q_heads * head_dim_v
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mdOut,
+            mTotalLSE,
+            mSentenceLSE,
+            mRowIdx,
+            mdOutPacked,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mdOut: cute.Tensor,
+        mTotalLSE: cute.Tensor,
+        mSentenceLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mdOutPacked: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_q_heads = Int32(mdOut.shape[1])
+            head_dim_v = Int32(mdOut.shape[2])
+            elems_per_row = num_q_heads * head_dim_v
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            q_head = rem // head_dim_v
+            dv_idx = rem - q_head * head_dim_v
+            global_row = mRowIdx[stream_row]
+            weight = cute.math.exp2(
+                (Float32(mSentenceLSE[q_head, stream_row]) - Float32(mTotalLSE[global_row, q_head]))
+                * Float32(math.log2(math.e)),
+                fastmath=True,
+            )
             mdOutPacked[stream_row, q_head, dv_idx] = (
                 weight * Float32(mdOut[global_row, q_head, dv_idx])
             ).to(mdOutPacked.element_type)
@@ -2661,6 +2735,10 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
         prepared: Optional["HSABwdPreparedTensors"] = None,
         runtime_state=None,
         sentence_lse_override: Optional[torch.Tensor] = None,
+        sentence_q_stream: Optional[torch.Tensor] = None,
+        sentence_k_stream: Optional[torch.Tensor] = None,
+        sentence_v_stream: Optional[torch.Tensor] = None,
+        sentence_out_stream: Optional[torch.Tensor] = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
         return _run_hsa_bwd_sentence_rows_core(
             q,
@@ -2676,6 +2754,10 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
             prepared=prepared,
             runtime_state=runtime_state,
             sentence_lse_override=sentence_lse_override,
+            sentence_q_stream=sentence_q_stream,
+            sentence_k_stream=sentence_k_stream,
+            sentence_v_stream=sentence_v_stream,
+            sentence_out_stream=sentence_out_stream,
             force_2cta_sm100_varlen=self.force_2cta_sm100_varlen,
         )
 
@@ -2693,6 +2775,10 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
         prepared: Optional["HSABwdPreparedTensors"] = None,
         runtime_state=None,
         sentence_lse_override: Optional[torch.Tensor] = None,
+        sentence_q_stream: Optional[torch.Tensor] = None,
+        sentence_k_stream: Optional[torch.Tensor] = None,
+        sentence_v_stream: Optional[torch.Tensor] = None,
+        sentence_out_stream: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         (dq_accum_rows, dk_accum_rows, dv_accum_rows), _ = self.run_rows(
             q,
@@ -2707,6 +2793,10 @@ class FlashHSASentenceBackwardSm100(FlashAttentionBackwardSm100):
             prepared=prepared,
             runtime_state=runtime_state,
             sentence_lse_override=sentence_lse_override,
+            sentence_q_stream=sentence_q_stream,
+            sentence_k_stream=sentence_k_stream,
+            sentence_v_stream=sentence_v_stream,
+            sentence_out_stream=sentence_out_stream,
         )
         return _cast_hsa_row_accums_to_outputs(q, k, v, dq_accum_rows, dk_accum_rows, dv_accum_rows)
 
@@ -3325,6 +3415,48 @@ def _run_hsa_sentence_pack_outputs_kernel(
         sentence_lse,
         sentence_row_idx,
         out_stream,
+        dout_stream,
+        current_stream,
+    )
+
+
+def _run_hsa_sentence_pack_weighted_dout_kernel(
+    dout_flat: torch.Tensor,
+    total_lse_flat: torch.Tensor,
+    sentence_lse: torch.Tensor,
+    sentence_row_idx: torch.Tensor,
+    dout_stream: torch.Tensor,
+) -> None:
+    if sentence_row_idx.numel() == 0:
+        return
+    compile_key = (
+        "sentence_pack_weighted_dout",
+        dout_flat.dtype,
+        dout_flat.shape[1],
+        dout_flat.shape[2],
+        torch.cuda.get_device_capability(dout_flat.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        pack_weighted_dout = FlashHSASentencePackWeightedDOutSm100()
+        compile_args = [
+            to_cute_tensor(dout_flat),
+            to_cute_tensor(total_lse_flat, assumed_align=4),
+            to_cute_tensor(sentence_lse, assumed_align=4),
+            to_cute_tensor(sentence_row_idx, assumed_align=4),
+            to_cute_tensor(dout_stream),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            pack_weighted_dout,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        dout_flat,
+        total_lse_flat,
+        sentence_lse,
+        sentence_row_idx,
         dout_stream,
         current_stream,
     )
@@ -4598,6 +4730,10 @@ def _run_hsa_bwd_monolithic_sentence_only(
     *,
     use_true_fused: bool,
     sentence_lse_override: Optional[torch.Tensor],
+    sentence_q_stream: Optional[torch.Tensor] = None,
+    sentence_k_stream: Optional[torch.Tensor] = None,
+    sentence_v_stream: Optional[torch.Tensor] = None,
+    sentence_out_stream: Optional[torch.Tensor] = None,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     if _monolithic_has_remaining_anchor_families(monolithic_schedule):
         return None
@@ -4621,6 +4757,10 @@ def _run_hsa_bwd_monolithic_sentence_only(
             monolithic_schedule,
             softmax_scale,
             sentence_lse_override=sentence_lse_override,
+            sentence_q_stream=sentence_q_stream,
+            sentence_k_stream=sentence_k_stream,
+            sentence_v_stream=sentence_v_stream,
+            sentence_out_stream=sentence_out_stream,
         )
     if _use_hsa_sentence_full_kernel_fastpath():
         return _run_hsa_bwd_sentence_families_direct(
@@ -4653,6 +4793,10 @@ def _precompute_hsa_bwd_monolithic_sentence_stage(
     *,
     use_true_fused: bool,
     sentence_lse_override: Optional[torch.Tensor],
+    sentence_q_stream: Optional[torch.Tensor] = None,
+    sentence_k_stream: Optional[torch.Tensor] = None,
+    sentence_v_stream: Optional[torch.Tensor] = None,
+    sentence_out_stream: Optional[torch.Tensor] = None,
 ) -> HSAMonolithicSentenceStageResult:
     if not _monolithic_has_sentence_families(monolithic_schedule):
         return HSAMonolithicSentenceStageResult()
@@ -4680,6 +4824,10 @@ def _precompute_hsa_bwd_monolithic_sentence_stage(
             prepared=prepared,
             runtime_state=runtime_state,
             sentence_lse_override=sentence_lse_override,
+            sentence_q_stream=sentence_q_stream,
+            sentence_k_stream=sentence_k_stream,
+            sentence_v_stream=sentence_v_stream,
+            sentence_out_stream=sentence_out_stream,
         )
     else:
         row_accums, done_families = _run_hsa_bwd_sentence_families_direct_rows(
@@ -4716,6 +4864,10 @@ def run_hsa_bwd_sm100_monolithic(
     softmax_scale: float,
     deterministic: bool,
     sentence_lse: Optional[torch.Tensor] = None,
+    sentence_q_stream: Optional[torch.Tensor] = None,
+    sentence_k_stream: Optional[torch.Tensor] = None,
+    sentence_v_stream: Optional[torch.Tensor] = None,
+    sentence_out_stream: Optional[torch.Tensor] = None,
 ):
     if not _is_supported_packed_bwd(q, k, v):
         raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
@@ -4740,6 +4892,10 @@ def run_hsa_bwd_sm100_monolithic(
         deterministic,
         use_true_fused=use_true_fused,
         sentence_lse_override=sentence_lse_override,
+        sentence_q_stream=sentence_q_stream if use_true_fused else None,
+        sentence_k_stream=sentence_k_stream if use_true_fused else None,
+        sentence_v_stream=sentence_v_stream if use_true_fused else None,
+        sentence_out_stream=sentence_out_stream if use_true_fused else None,
     )
     if sentence_only_result is not None:
         return sentence_only_result
@@ -4757,10 +4913,14 @@ def run_hsa_bwd_sm100_monolithic(
             schedule,
             monolithic_schedule,
             softmax_scale,
-            deterministic,
-            use_true_fused=use_true_fused,
-            sentence_lse_override=sentence_lse_override,
-        )
+        deterministic,
+        use_true_fused=use_true_fused,
+        sentence_lse_override=sentence_lse_override,
+        sentence_q_stream=sentence_q_stream if use_true_fused else None,
+        sentence_k_stream=sentence_k_stream if use_true_fused else None,
+        sentence_v_stream=sentence_v_stream if use_true_fused else None,
+        sentence_out_stream=sentence_out_stream if use_true_fused else None,
+    )
 
     compile_key = _build_hsa_bwd_monolithic_compile_key(q, k, v, monolithic_schedule, deterministic)
     sentence_full_done = (
@@ -5244,6 +5404,10 @@ def _run_hsa_bwd_sentence_rows_core(
     prepared: Optional[HSABwdPreparedTensors] = None,
     runtime_state=None,
     sentence_lse_override: Optional[torch.Tensor] = None,
+    sentence_q_stream: Optional[torch.Tensor] = None,
+    sentence_k_stream: Optional[torch.Tensor] = None,
+    sentence_v_stream: Optional[torch.Tensor] = None,
+    sentence_out_stream: Optional[torch.Tensor] = None,
     *,
     force_2cta_sm100_varlen: bool = False,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], frozenset[str]]:
@@ -5275,12 +5439,32 @@ def _run_hsa_bwd_sentence_rows_core(
         sentence_row_idx = runtime_state.get("sentence_stream_row_indices_long")
         if sentence_row_idx is None:
             sentence_row_idx = sentence_stream.row_indices.long()
-        q_stream = buffers.q_stream
-        k_stream = buffers.k_stream
-        v_stream = buffers.v_stream
-        _run_hsa_pack_rows_kernel(q_flat, sentence_q_idx, q_stream)
-        _run_hsa_pack_rows_kernel(k_flat, sentence_k_idx, k_stream)
-        _run_hsa_pack_rows_kernel(v_flat, sentence_k_idx, v_stream)
+        cached_q_stream = _normalize_sentence_stream_override(sentence_q_stream)
+        cached_k_stream = _normalize_sentence_stream_override(sentence_k_stream)
+        cached_v_stream = _normalize_sentence_stream_override(sentence_v_stream)
+        cached_out_stream = _normalize_sentence_stream_override(sentence_out_stream)
+        use_cached_sentence_inputs = (
+            cached_q_stream is not None
+            and cached_q_stream.shape == buffers.q_stream.shape
+            and cached_k_stream is not None
+            and cached_k_stream.shape == buffers.k_stream.shape
+            and cached_v_stream is not None
+            and cached_v_stream.shape == buffers.v_stream.shape
+        )
+        use_cached_sentence_out = (
+            cached_out_stream is not None and cached_out_stream.shape == buffers.out_stream.shape
+        )
+        if use_cached_sentence_inputs:
+            q_stream = cached_q_stream
+            k_stream = cached_k_stream
+            v_stream = cached_v_stream
+        else:
+            q_stream = buffers.q_stream
+            k_stream = buffers.k_stream
+            v_stream = buffers.v_stream
+            _run_hsa_pack_rows_kernel(q_flat, sentence_q_idx, q_stream)
+            _run_hsa_pack_rows_kernel(k_flat, sentence_k_idx, k_stream)
+            _run_hsa_pack_rows_kernel(v_flat, sentence_k_idx, v_stream)
         sentence_lse = sentence_lse_override
         if sentence_lse is None or sentence_lse.numel() == 0:
             _, sentence_lse = flash_attn_fwd(
@@ -5296,17 +5480,26 @@ def _run_hsa_bwd_sentence_rows_core(
                 return_lse=True,
             )
         if sentence_row_idx.numel() > 0:
-            out_stream = buffers.out_stream
+            out_stream = cached_out_stream if use_cached_sentence_out else buffers.out_stream
             dout_stream = buffers.dout_stream
-            _run_hsa_sentence_pack_outputs_kernel(
-                out_flat,
-                dout_flat,
-                total_lse_flat,
-                sentence_lse,
-                sentence_stream.row_indices,
-                out_stream,
-                dout_stream,
-            )
+            if use_cached_sentence_out:
+                _run_hsa_sentence_pack_weighted_dout_kernel(
+                    dout_flat,
+                    total_lse_flat,
+                    sentence_lse,
+                    sentence_row_idx,
+                    dout_stream,
+                )
+            else:
+                _run_hsa_sentence_pack_outputs_kernel(
+                    out_flat,
+                    dout_flat,
+                    total_lse_flat,
+                    sentence_lse,
+                    sentence_stream.row_indices,
+                    out_stream,
+                    dout_stream,
+                )
             dq, dk, dv = flash_attn_bwd(
                 q_stream,
                 k_stream,
@@ -5843,6 +6036,10 @@ def run_hsa_bwd_sm100_blocksparse(
     dout: torch.Tensor,
     lse: torch.Tensor,
     sentence_lse: Optional[torch.Tensor],
+    sentence_q_stream: Optional[torch.Tensor],
+    sentence_k_stream: Optional[torch.Tensor],
+    sentence_v_stream: Optional[torch.Tensor],
+    sentence_out_stream: Optional[torch.Tensor],
     schedule,
     softmax_scale: float,
     deterministic: bool,
@@ -5858,6 +6055,10 @@ def run_hsa_bwd_sm100_blocksparse(
         dout,
         lse,
         sentence_lse,
+        sentence_q_stream,
+        sentence_k_stream,
+        sentence_v_stream,
+        sentence_out_stream,
         schedule,
         softmax_scale,
         deterministic,

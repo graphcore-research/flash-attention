@@ -217,6 +217,39 @@ def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, bench
         benchmark_iters,
     )
 
+
+def _measure_forward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
+    env_updates = env_updates or {}
+
+    def _run():
+        with _temporary_env(**env_updates):
+            forward_fn(q_data, k_data, v_data)
+
+    return _measure_ms(_run, warmup_iters, benchmark_iters)
+
+
+def _measure_forward_backward_ms(
+    forward_fn,
+    q_data,
+    k_data,
+    v_data,
+    warmup_iters,
+    benchmark_iters,
+    *,
+    env_updates=None,
+):
+    env_updates = env_updates or {}
+
+    def _run():
+        with _temporary_env(**env_updates):
+            q = q_data.clone().requires_grad_(True)
+            k = k_data.clone().requires_grad_(True)
+            v = v_data.clone().requires_grad_(True)
+            loss = forward_fn(q, k, v).float().square().mean()
+            torch.autograd.grad(loss, (q, k, v))
+
+    return _measure_ms(_run, warmup_iters, benchmark_iters)
+
 def run_case(case: BenchmarkCase):
     build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
     device = "cuda"
@@ -245,6 +278,32 @@ def run_case(case: BenchmarkCase):
     true_fused_max_diff = (out_true_fused.float() - out_ref.float()).abs().max().item()
     true_fused_mean_diff = (out_true_fused.float() - out_ref.float()).abs().mean().item()
 
+    split_fwd_ms = _measure_forward_ms(
+        split_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=_split_monolithic_env(),
+    )
+    true_fused_fwd_ms = _measure_forward_ms(
+        true_fused_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=_true_fused_env(),
+    )
+    dense_causal_fwd_ms = _measure_forward_ms(
+        dense_causal_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
     split_bwd_ms = _measure_backward_ms(
         split_forward,
         q_data,
@@ -271,18 +330,59 @@ def run_case(case: BenchmarkCase):
         case.warmup_iters,
         case.benchmark_iters,
     )
+    split_fwd_bwd_ms = _measure_forward_backward_ms(
+        split_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=_split_monolithic_env(),
+    )
+    true_fused_fwd_bwd_ms = _measure_forward_backward_ms(
+        true_fused_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=_true_fused_env(),
+    )
+    dense_causal_fwd_bwd_ms = _measure_forward_backward_ms(
+        dense_causal_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
 
     split_vs_dense = split_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     true_fused_vs_dense = true_fused_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     true_fused_vs_split = true_fused_bwd_ms / split_bwd_ms if split_bwd_ms > 0 else float("inf")
+    split_fwd_vs_dense = split_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
+    true_fused_fwd_vs_dense = true_fused_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
+    true_fused_fwd_vs_split = true_fused_fwd_ms / split_fwd_ms if split_fwd_ms > 0 else float("inf")
+    split_fwd_bwd_vs_dense = split_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
+    true_fused_fwd_bwd_vs_dense = (
+        true_fused_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
+    )
+    true_fused_fwd_bwd_vs_split = true_fused_fwd_bwd_ms / split_fwd_bwd_ms if split_fwd_bwd_ms > 0 else float("inf")
 
     print(
         f"{case.name}: shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
         f"split_max_diff={split_max_diff:.6f} split_mean_diff={split_mean_diff:.6f} "
         f"true_fused_max_diff={true_fused_max_diff:.6f} true_fused_mean_diff={true_fused_mean_diff:.6f} "
+        f"split_fwd_ms={split_fwd_ms:.3f} true_fused_fwd_ms={true_fused_fwd_ms:.3f} dense_causal_fwd_ms={dense_causal_fwd_ms:.3f} "
+        f"split_fwd_vs_dense={split_fwd_vs_dense:.2f}x true_fused_fwd_vs_dense={true_fused_fwd_vs_dense:.2f}x "
+        f"true_fused_fwd_vs_split={true_fused_fwd_vs_split:.2f}x "
         f"split_bwd_ms={split_bwd_ms:.3f} true_fused_bwd_ms={true_fused_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
         f"split_vs_dense={split_vs_dense:.2f}x true_fused_vs_dense={true_fused_vs_dense:.2f}x "
-        f"true_fused_vs_split={true_fused_vs_split:.2f}x"
+        f"true_fused_vs_split={true_fused_vs_split:.2f}x "
+        f"split_fwd_bwd_ms={split_fwd_bwd_ms:.3f} true_fused_fwd_bwd_ms={true_fused_fwd_bwd_ms:.3f} "
+        f"dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} split_fwd_bwd_vs_dense={split_fwd_bwd_vs_dense:.2f}x "
+        f"true_fused_fwd_bwd_vs_dense={true_fused_fwd_bwd_vs_dense:.2f}x "
+        f"true_fused_fwd_bwd_vs_split={true_fused_fwd_bwd_vs_split:.2f}x"
     )
 
 

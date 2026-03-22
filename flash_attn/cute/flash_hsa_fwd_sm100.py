@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import torch
@@ -142,7 +143,17 @@ def _materialize_runtime_state(schedule):
     return runtime_state
 
 
-def run_hsa_fwd_sm100_exact(
+def _empty_sentence_cache_tensors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    return (
+        torch.empty(0, dtype=torch.float32, device=q.device),
+        torch.empty(0, dtype=q.dtype, device=q.device),
+        torch.empty(0, dtype=k.dtype, device=k.device),
+        torch.empty(0, dtype=v.dtype, device=v.device),
+        torch.empty(0, dtype=q.dtype, device=q.device),
+    )
+
+
+def _run_hsa_fwd_sm100_exact_core(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -240,7 +251,71 @@ def run_hsa_fwd_sm100_exact(
 
     out = total_out.to(dtype=q.dtype).view(bsz, seqlen, num_q_heads, head_dim_v)
     lse = total_lse.view(bsz, seqlen, num_q_heads).permute(0, 2, 1).contiguous()
+    return out, lse, sentence_out, sentence_lse, section_prefix_lse, document_prefix_lse, runtime_state
+
+
+def run_hsa_fwd_sm100_exact(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    schedule,
+    softmax_scale: float,
+):
+    out, lse, _, sentence_lse, section_prefix_lse, document_prefix_lse, _ = _run_hsa_fwd_sm100_exact_core(
+        q,
+        k,
+        v,
+        schedule,
+        softmax_scale,
+    )
     return out, lse, sentence_lse, section_prefix_lse, document_prefix_lse
+
+
+def _run_hsa_sentence_stream_cache_precompute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    schedule,
+    softmax_scale: float,
+    *,
+    runtime_state: Optional[HSARuntimeState] = None,
+    cache_sentence_streams: bool,
+):
+    hsa_mod = _load_hsa_module()
+    runtime_state = runtime_state if runtime_state is not None else _materialize_runtime_state(schedule)
+    total_rows = schedule.num_rows
+    q_flat = q.reshape(total_rows, q.shape[2], q.shape[3])
+    k_flat = k.reshape(total_rows, k.shape[2], k.shape[3])
+    v_flat = v.reshape(total_rows, v.shape[2], v.shape[3])
+    packed_q_stream = q_flat.index_select(0, runtime_state["sentence_stream_indices_long"]).contiguous()
+    packed_k_stream = k_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
+    packed_v_stream = v_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
+    _, _, _, _, _, flash_attn_fwd, _ = hsa_mod._lazy_cute_imports()
+    packed_out_stream, sentence_lse = flash_attn_fwd(
+        packed_q_stream,
+        packed_k_stream,
+        packed_v_stream,
+        cu_seqlens_q=runtime_state["sentence_stream"].cu_seqlens_q,
+        cu_seqlens_k=runtime_state["sentence_stream"].cu_seqlens_k,
+        max_seqlen_q=runtime_state["sentence_stream"].max_seqlen_q,
+        max_seqlen_k=runtime_state["sentence_stream"].max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_lse=True,
+    )
+    if cache_sentence_streams:
+        return (
+            sentence_lse.detach(),
+            packed_q_stream.detach(),
+            packed_k_stream.detach(),
+            packed_v_stream.detach(),
+            packed_out_stream.detach(),
+        )
+    empty_sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+        _empty_sentence_cache_tensors(q, k, v)
+    )
+    del empty_sentence_lse
+    return sentence_lse.detach(), sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream
 
 
 class FlashHSAForwardSm100(FlashAttentionForwardSm100):
@@ -405,41 +480,22 @@ def run_hsa_fwd_sm100_blocksparse(
     schedule,
     softmax_scale: float,
 ):
-    sentence_lse = torch.empty(0, dtype=torch.float32, device=q.device)
-    sentence_q_stream = torch.empty(0, dtype=q.dtype, device=q.device)
-    sentence_k_stream = torch.empty(0, dtype=k.dtype, device=k.device)
-    sentence_v_stream = torch.empty(0, dtype=v.dtype, device=v.device)
-    sentence_out_stream = torch.empty(0, dtype=q.dtype, device=q.device)
-    if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
-        hsa_mod = _load_hsa_module()
-        runtime_state = _materialize_runtime_state(schedule)
-        total_rows = schedule.num_rows
-        q_flat = q.reshape(total_rows, q.shape[2], q.shape[3])
-        k_flat = k.reshape(total_rows, k.shape[2], k.shape[3])
-        v_flat = v.reshape(total_rows, v.shape[2], v.shape[3])
-        cache_sentence_streams = os.environ.get("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
-        packed_q_stream = q_flat.index_select(0, runtime_state["sentence_stream_indices_long"]).contiguous()
-        packed_k_stream = k_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
-        packed_v_stream = v_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
-        _, _, _, _, _, flash_attn_fwd, _ = hsa_mod._lazy_cute_imports()
-        packed_out_stream, sentence_lse = flash_attn_fwd(
-            packed_q_stream,
-            packed_k_stream,
-            packed_v_stream,
-            cu_seqlens_q=runtime_state["sentence_stream"].cu_seqlens_q,
-            cu_seqlens_k=runtime_state["sentence_stream"].cu_seqlens_k,
-            max_seqlen_q=runtime_state["sentence_stream"].max_seqlen_q,
-            max_seqlen_k=runtime_state["sentence_stream"].max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=True,
-            return_lse=True,
+    sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+        _empty_sentence_cache_tensors(q, k, v)
+    )
+    use_monolithic_bwd = os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
+    use_true_fused_bwd = os.environ.get("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
+    if use_monolithic_bwd:
+        sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+            _run_hsa_sentence_stream_cache_precompute(
+                q,
+                k,
+                v,
+                schedule,
+                softmax_scale,
+                cache_sentence_streams=use_true_fused_bwd,
+            )
         )
-        sentence_lse = sentence_lse.detach()
-        if cache_sentence_streams:
-            sentence_q_stream = packed_q_stream.detach()
-            sentence_k_stream = packed_k_stream.detach()
-            sentence_v_stream = packed_v_stream.detach()
-            sentence_out_stream = packed_out_stream.detach()
     if os.environ.get("FLASH_ATTN_HSA_USE_FUSED_FWD", "0") == "1":
         out, lse = run_hsa_fwd_sm100_fused(q, k, v, schedule, softmax_scale)
         return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream

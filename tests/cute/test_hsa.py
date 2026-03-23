@@ -439,6 +439,78 @@ def test_hsa_sparse_fused_forward_matches_reference(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_true_fused_equal_head_forward_exports_sentence_cache_without_precompute(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+    import flash_attn.cute.flash_hsa_fwd_sm100 as hsa_fwd_module
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, headdim = 1, 256, 4, 64
+    keep_ids, hash_ids = _make_sentence_only_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "1")
+    monkeypatch.delenv("FLASH_ATTN_HSA_USE_FUSED_FWD", raising=False)
+    monkeypatch.setattr(
+        hsa_fwd_module,
+        "_run_hsa_sentence_stream_cache_precompute",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy sentence cache precompute used")
+        ),
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_blocksparse_forward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("blocksparse forward fallback used")
+        ),
+    )
+
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
+    out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_true_fused_equal_head_forward_export")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_true_fused_gqa_forward_keeps_blocksparse_fallback(monkeypatch):
+    import flash_attn.cute.flash_hsa_fwd_sm100 as hsa_fwd_module
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, n_kv_heads, headdim = 1, 129, 4, 2, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "1")
+    monkeypatch.delenv("FLASH_ATTN_HSA_USE_FUSED_FWD", raising=False)
+    monkeypatch.setattr(
+        hsa_fwd_module,
+        "run_hsa_fwd_sm100_fused",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("equal-head fused forward used for GQA")),
+    )
+
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    out_sparse = _unwrap_output(
+        flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+    )
+    out_ref = hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    _assert_close(out_sparse.float(), out_ref.float(), "hsa_true_fused_gqa_forward_fallback")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_sparse_fast_path_does_not_use_legacy_varlen_helpers(monkeypatch):
     import flash_attn.cute.hsa as hsa_module
     import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
@@ -835,6 +907,21 @@ def test_hsa_true_fused_sentence_only_matches_reference(monkeypatch, n_kv_heads)
         hsa_bwd_module,
         "_run_hsa_sentence_scatter_rows_kernel",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy per-tensor sentence scatter used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_run_hsa_pack_rows_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy sentence row pack used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_run_hsa_sentence_pack_outputs_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy sentence output pack used")),
+    )
+    monkeypatch.setattr(
+        hsa_bwd_module,
+        "_run_hsa_sentence_scatter_triplet_rows_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy sentence triplet scatter used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,

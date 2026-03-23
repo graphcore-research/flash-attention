@@ -3665,6 +3665,66 @@ def _run_hsa_sentence_scatter_triplet_rows_kernel(
     )
 
 
+def _run_hsa_sentence_scatter_accum_rows_kernel(
+    dq_packed: torch.Tensor,
+    dk_packed: torch.Tensor,
+    dv_packed: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    k_row_idx: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+) -> None:
+    if q_row_idx.numel() == 0 and k_row_idx.numel() == 0:
+        return
+    compile_key = (
+        "sentence_scatter_accum_rows",
+        dq_packed.dtype,
+        dq_packed.shape[1],
+        dq_packed.shape[2],
+        dk_packed.dtype,
+        dk_packed.shape[1],
+        dk_packed.shape[2],
+        dv_packed.dtype,
+        dv_packed.shape[1],
+        dv_packed.shape[2],
+        dq_rows.dtype,
+        dk_rows.dtype,
+        dv_rows.dtype,
+        torch.cuda.get_device_capability(dq_packed.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_hsa_bwd_sm100_monolithic.compile_cache:
+        scatter_rows = FlashHSASentenceScatterTripletRowsSm100()
+        compile_args = [
+            to_cute_tensor(dq_packed),
+            to_cute_tensor(dk_packed),
+            to_cute_tensor(dv_packed),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(k_row_idx, assumed_align=4),
+            to_cute_tensor(dq_rows),
+            to_cute_tensor(dk_rows),
+            to_cute_tensor(dv_rows),
+            current_stream,
+        ]
+        run_hsa_bwd_sm100_monolithic.compile_cache[compile_key] = cute.compile(
+            scatter_rows,
+            *compile_args,
+            options="--enable-tvm-ffi",
+        )
+    run_hsa_bwd_sm100_monolithic.compile_cache[compile_key](
+        dq_packed,
+        dk_packed,
+        dv_packed,
+        q_row_idx,
+        k_row_idx,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        current_stream,
+    )
+
+
 def _run_hsa_pack_rows_kernel(
     src_rows: torch.Tensor,
     row_idx: torch.Tensor,
@@ -5684,7 +5744,7 @@ def _run_hsa_bwd_sentence_rows_core(
                 force_2cta_sm100_varlen=force_2cta_sm100_varlen,
             )
             if use_combined_sentence_scatter:
-                _run_hsa_sentence_scatter_triplet_rows_kernel(
+                _run_hsa_sentence_scatter_accum_rows_kernel(
                     dq,
                     dk,
                     dv,

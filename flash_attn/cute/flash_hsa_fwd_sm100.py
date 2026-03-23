@@ -3,7 +3,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import cuda.bindings.driver as cuda
+import cutlass.cute as cute
 import torch
+from cutlass import Int32
 
 from flash_attn.cute.block_sparsity import normalize_block_sparse_config, to_cute_block_sparse_tensors
 from flash_attn.cute.cache_utils import get_jit_cache
@@ -48,6 +50,176 @@ class HSARuntimeState:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
+
+
+@dataclass
+class HSAFwdSentenceCacheBuffers:
+    q_stream: torch.Tensor
+    k_stream: torch.Tensor
+    v_stream: torch.Tensor
+    out_stream: torch.Tensor
+
+
+class FlashHSAFwdPackRowsSm100:
+    """Pack selected rows from a flat tensor into a compact stream tensor."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcRows.shape[1]
+        head_dim = mSrcRows.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcRows,
+            mRowIdx,
+            mDstPacked,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcRows.shape[1])
+            head_dim = Int32(mSrcRows.shape[2])
+            elems_per_row = num_heads * head_dim
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            global_row = mRowIdx[stream_row]
+            mDstPacked[stream_row, head_idx, dim_idx] = mSrcRows[
+                global_row, head_idx, dim_idx
+            ].to(mDstPacked.element_type)
+
+
+class FlashHSAFwdPackQKVRowsSm100:
+    """Pack Q/K/V sentence rows in one launch."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mQSrcRows: cute.Tensor,
+        mKSrcRows: cute.Tensor,
+        mVSrcRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQDstPacked: cute.Tensor,
+        mKDstPacked: cute.Tensor,
+        mVDstPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        total_q_tasks = mQRowIdx.shape[0] * mQSrcRows.shape[1] * mQSrcRows.shape[2]
+        total_k_tasks = mKRowIdx.shape[0] * mKSrcRows.shape[1] * mKSrcRows.shape[2]
+        total_v_tasks = mKRowIdx.shape[0] * mVSrcRows.shape[1] * mVSrcRows.shape[2]
+        total_tasks = total_q_tasks + total_k_tasks + total_v_tasks
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mQSrcRows,
+            mKSrcRows,
+            mVSrcRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQDstPacked,
+            mKDstPacked,
+            mVDstPacked,
+            total_q_tasks,
+            total_k_tasks,
+            total_v_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQSrcRows: cute.Tensor,
+        mKSrcRows: cute.Tensor,
+        mVSrcRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQDstPacked: cute.Tensor,
+        mKDstPacked: cute.Tensor,
+        mVDstPacked: cute.Tensor,
+        total_q_tasks: Int32,
+        total_k_tasks: Int32,
+        total_v_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        total_tasks = total_q_tasks + total_k_tasks + total_v_tasks
+        if task_idx < total_tasks:
+            if task_idx < total_q_tasks:
+                num_heads = Int32(mQSrcRows.shape[1])
+                head_dim = Int32(mQSrcRows.shape[2])
+                elems_per_row = num_heads * head_dim
+                stream_row = task_idx // elems_per_row
+                rem = task_idx - stream_row * elems_per_row
+                head_idx = rem // head_dim
+                dim_idx = rem - head_idx * head_dim
+                global_row = mQRowIdx[stream_row]
+                mQDstPacked[stream_row, head_idx, dim_idx] = mQSrcRows[
+                    global_row, head_idx, dim_idx
+                ].to(mQDstPacked.element_type)
+            else:
+                task_after_q = task_idx - total_q_tasks
+                if task_after_q < total_k_tasks:
+                    num_heads = Int32(mKSrcRows.shape[1])
+                    head_dim = Int32(mKSrcRows.shape[2])
+                    elems_per_row = num_heads * head_dim
+                    stream_row = task_after_q // elems_per_row
+                    rem = task_after_q - stream_row * elems_per_row
+                    head_idx = rem // head_dim
+                    dim_idx = rem - head_idx * head_dim
+                    global_row = mKRowIdx[stream_row]
+                    mKDstPacked[stream_row, head_idx, dim_idx] = mKSrcRows[
+                        global_row, head_idx, dim_idx
+                    ].to(mKDstPacked.element_type)
+                else:
+                    task_after_k = task_after_q - total_k_tasks
+                    num_heads = Int32(mVSrcRows.shape[1])
+                    head_dim = Int32(mVSrcRows.shape[2])
+                    elems_per_row = num_heads * head_dim
+                    stream_row = task_after_k // elems_per_row
+                    rem = task_after_k - stream_row * elems_per_row
+                    head_idx = rem // head_dim
+                    dim_idx = rem - head_idx * head_dim
+                    global_row = mKRowIdx[stream_row]
+                    mVDstPacked[stream_row, head_idx, dim_idx] = mVSrcRows[
+                        global_row, head_idx, dim_idx
+                    ].to(mVDstPacked.element_type)
 
 
 def _materialize_runtime_state(schedule):
@@ -150,6 +322,213 @@ def _empty_sentence_cache_tensors(q: torch.Tensor, k: torch.Tensor, v: torch.Ten
         torch.empty(0, dtype=k.dtype, device=k.device),
         torch.empty(0, dtype=v.dtype, device=v.device),
         torch.empty(0, dtype=q.dtype, device=q.device),
+    )
+
+
+def _runtime_state_has_only_sentence_family(runtime_state: HSARuntimeState) -> bool:
+    return (
+        runtime_state.sentence_stream is not None
+        and not runtime_state.sentence_stream.is_empty
+        and runtime_state.section_prefix_stream.is_empty
+        and runtime_state.document_prefix_stream.is_empty
+        and runtime_state.section_self_indices.numel() == 0
+        and runtime_state.document_self_indices.numel() == 0
+    )
+
+
+def _use_hsa_true_fused_bwd() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
+
+
+def _should_use_hsa_true_fused_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    use_true_fused_bwd: bool,
+) -> bool:
+    if os.environ.get("FLASH_ATTN_HSA_USE_FUSED_FWD", "0") == "1":
+        return True
+    if not use_true_fused_bwd:
+        return False
+    return q.shape[2] == k.shape[2]
+
+
+def _get_hsa_fwd_sentence_cache_buffers(
+    runtime_state: HSARuntimeState,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> HSAFwdSentenceCacheBuffers:
+    cache = getattr(runtime_state, "_hsa_fwd_sentence_cache_buffer_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(runtime_state, "_hsa_fwd_sentence_cache_buffer_cache", cache)
+
+    total_rows = q.shape[0] * q.shape[1]
+    sentence_q_rows = int(runtime_state.sentence_stream.query_indices.numel())
+    sentence_k_rows = int(runtime_state.sentence_stream.key_indices.numel())
+    cache_key = (
+        str(q.device),
+        total_rows,
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        q.shape[2],
+        k.shape[2],
+        q.shape[3],
+        v.shape[3],
+        sentence_q_rows,
+        sentence_k_rows,
+    )
+    buffers = cache.get(cache_key)
+    if buffers is None:
+        buffers = HSAFwdSentenceCacheBuffers(
+            q_stream=torch.empty((sentence_q_rows, q.shape[2], q.shape[3]), dtype=q.dtype, device=q.device),
+            k_stream=torch.empty((sentence_k_rows, k.shape[2], k.shape[3]), dtype=k.dtype, device=k.device),
+            v_stream=torch.empty((sentence_k_rows, v.shape[2], v.shape[3]), dtype=v.dtype, device=v.device),
+            out_stream=torch.empty((sentence_q_rows, q.shape[2], v.shape[3]), dtype=q.dtype, device=q.device),
+        )
+        cache[cache_key] = buffers
+    return buffers
+
+
+def _run_hsa_fwd_pack_rows_kernel(
+    src_rows: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_packed: torch.Tensor,
+) -> None:
+    if row_idx.numel() == 0:
+        return
+    compile_key = (
+        "fwd_pack_rows",
+        src_rows.dtype,
+        src_rows.shape[1],
+        src_rows.shape[2],
+        dst_packed.dtype,
+        torch.cuda.get_device_capability(src_rows.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in _run_hsa_fwd_pack_rows_kernel.compile_cache:
+        pack_rows = FlashHSAFwdPackRowsSm100()
+        _run_hsa_fwd_pack_rows_kernel.compile_cache[compile_key] = cute.compile(
+            pack_rows,
+            to_cute_tensor(src_rows),
+            to_cute_tensor(row_idx, assumed_align=4),
+            to_cute_tensor(dst_packed),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    _run_hsa_fwd_pack_rows_kernel.compile_cache[compile_key](
+        src_rows,
+        row_idx,
+        dst_packed,
+        current_stream,
+    )
+
+
+_run_hsa_fwd_pack_rows_kernel.compile_cache = get_jit_cache("hsa_fwd_pack_rows")
+
+
+def _run_hsa_fwd_pack_qkv_rows_kernel(
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    k_row_idx: torch.Tensor,
+    q_stream: torch.Tensor,
+    k_stream: torch.Tensor,
+    v_stream: torch.Tensor,
+) -> None:
+    if q_row_idx.numel() == 0 and k_row_idx.numel() == 0:
+        return
+    compile_key = (
+        "fwd_pack_qkv_rows",
+        q_flat.dtype,
+        q_flat.shape[1],
+        q_flat.shape[2],
+        k_flat.dtype,
+        k_flat.shape[1],
+        k_flat.shape[2],
+        v_flat.dtype,
+        v_flat.shape[1],
+        v_flat.shape[2],
+        torch.cuda.get_device_capability(q_flat.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in _run_hsa_fwd_pack_qkv_rows_kernel.compile_cache:
+        pack_qkv = FlashHSAFwdPackQKVRowsSm100()
+        _run_hsa_fwd_pack_qkv_rows_kernel.compile_cache[compile_key] = cute.compile(
+            pack_qkv,
+            to_cute_tensor(q_flat),
+            to_cute_tensor(k_flat),
+            to_cute_tensor(v_flat),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(k_row_idx, assumed_align=4),
+            to_cute_tensor(q_stream),
+            to_cute_tensor(k_stream),
+            to_cute_tensor(v_stream),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    _run_hsa_fwd_pack_qkv_rows_kernel.compile_cache[compile_key](
+        q_flat,
+        k_flat,
+        v_flat,
+        q_row_idx,
+        k_row_idx,
+        q_stream,
+        k_stream,
+        v_stream,
+        current_stream,
+    )
+
+
+_run_hsa_fwd_pack_qkv_rows_kernel.compile_cache = get_jit_cache("hsa_fwd_pack_qkv_rows")
+
+
+def _pack_sentence_lse_from_total_lse(lse: torch.Tensor, sentence_row_idx: torch.Tensor) -> torch.Tensor:
+    total_lse_flat = lse.permute(0, 2, 1).contiguous().view(-1, lse.shape[1])
+    return total_lse_flat.index_select(0, sentence_row_idx).transpose(0, 1).contiguous().detach()
+
+
+def _export_sentence_cache_from_total_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    runtime_state: HSARuntimeState,
+):
+    if runtime_state.sentence_stream.is_empty:
+        return _empty_sentence_cache_tensors(q, k, v)
+    total_rows = q.shape[0] * q.shape[1]
+    q_flat = q.reshape(total_rows, q.shape[2], q.shape[3]).contiguous()
+    k_flat = k.reshape(total_rows, k.shape[2], k.shape[3]).contiguous()
+    v_flat = v.reshape(total_rows, v.shape[2], v.shape[3]).contiguous()
+    out_flat = out.reshape(total_rows, out.shape[2], out.shape[3]).contiguous()
+    buffers = _get_hsa_fwd_sentence_cache_buffers(runtime_state, q, k, v)
+    _run_hsa_fwd_pack_qkv_rows_kernel(
+        q_flat,
+        k_flat,
+        v_flat,
+        runtime_state.sentence_stream_indices_long,
+        runtime_state.sentence_stream_key_indices_long,
+        buffers.q_stream,
+        buffers.k_stream,
+        buffers.v_stream,
+    )
+    _run_hsa_fwd_pack_rows_kernel(
+        out_flat,
+        runtime_state.sentence_stream_row_indices_long,
+        buffers.out_stream,
+    )
+    sentence_lse = _pack_sentence_lse_from_total_lse(lse, runtime_state.sentence_stream_row_indices_long)
+    return (
+        sentence_lse,
+        buffers.q_stream.detach(),
+        buffers.k_stream.detach(),
+        buffers.v_stream.detach(),
+        buffers.out_stream.detach(),
     )
 
 
@@ -283,13 +662,26 @@ def _run_hsa_sentence_stream_cache_precompute(
 ):
     hsa_mod = _load_hsa_module()
     runtime_state = runtime_state if runtime_state is not None else _materialize_runtime_state(schedule)
+    if runtime_state.sentence_stream.is_empty:
+        return _empty_sentence_cache_tensors(q, k, v)
     total_rows = schedule.num_rows
     q_flat = q.reshape(total_rows, q.shape[2], q.shape[3])
     k_flat = k.reshape(total_rows, k.shape[2], k.shape[3])
     v_flat = v.reshape(total_rows, v.shape[2], v.shape[3])
-    packed_q_stream = q_flat.index_select(0, runtime_state["sentence_stream_indices_long"]).contiguous()
-    packed_k_stream = k_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
-    packed_v_stream = v_flat.index_select(0, runtime_state["sentence_stream_key_indices_long"]).contiguous()
+    buffers = _get_hsa_fwd_sentence_cache_buffers(runtime_state, q, k, v)
+    packed_q_stream = buffers.q_stream
+    packed_k_stream = buffers.k_stream
+    packed_v_stream = buffers.v_stream
+    _run_hsa_fwd_pack_qkv_rows_kernel(
+        q_flat,
+        k_flat,
+        v_flat,
+        runtime_state["sentence_stream_indices_long"],
+        runtime_state["sentence_stream_key_indices_long"],
+        packed_q_stream,
+        packed_k_stream,
+        packed_v_stream,
+    )
     _, _, _, _, _, flash_attn_fwd, _ = hsa_mod._lazy_cute_imports()
     packed_out_stream, sentence_lse = flash_attn_fwd(
         packed_q_stream,
@@ -484,8 +876,21 @@ def run_hsa_fwd_sm100_blocksparse(
         _empty_sentence_cache_tensors(q, k, v)
     )
     use_monolithic_bwd = os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
-    use_true_fused_bwd = os.environ.get("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "0") == "1"
-    if use_monolithic_bwd:
+    use_true_fused_bwd = _use_hsa_true_fused_bwd()
+    runtime_state = _materialize_runtime_state(schedule) if use_monolithic_bwd else None
+    use_true_fused_forward = _should_use_hsa_true_fused_forward(
+        q,
+        k,
+        use_true_fused_bwd=use_true_fused_bwd,
+    )
+    can_export_sentence_cache_from_total = (
+        use_monolithic_bwd
+        and use_true_fused_bwd
+        and use_true_fused_forward
+        and runtime_state is not None
+        and _runtime_state_has_only_sentence_family(runtime_state)
+    )
+    if use_monolithic_bwd and not can_export_sentence_cache_from_total:
         sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             _run_hsa_sentence_stream_cache_precompute(
                 q,
@@ -493,11 +898,23 @@ def run_hsa_fwd_sm100_blocksparse(
                 v,
                 schedule,
                 softmax_scale,
+                runtime_state=runtime_state,
                 cache_sentence_streams=use_true_fused_bwd,
             )
         )
-    if os.environ.get("FLASH_ATTN_HSA_USE_FUSED_FWD", "0") == "1":
+    if use_true_fused_forward:
         out, lse = run_hsa_fwd_sm100_fused(q, k, v, schedule, softmax_scale)
+        if can_export_sentence_cache_from_total:
+            sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+                _export_sentence_cache_from_total_forward(
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    runtime_state,
+                )
+            )
         return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream
     hsa_mod = _load_hsa_module()
     out, lse = hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)

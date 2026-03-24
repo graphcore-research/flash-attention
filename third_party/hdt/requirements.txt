@@ -1,0 +1,25 @@
+# --------- pytorch --------- #
+torch>=1.10.0
+torchvision>=0.11.0
+pytorch-lightning==1.9.4
+transformers==4.38.0
+triton>=2.2.0
+torchmetrics
+nltk
+datasets
+einops
+lmdb
+datasets
+scikit-learn
+nltk
+pytrec_eval
+sklearn-contrib-lightning
+pandas
+datasets
+omegaconf
+hydra
+hydra-core
+rouge_score
+wandb
+Cython
+tensorboard

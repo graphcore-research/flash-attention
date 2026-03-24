@@ -99,7 +99,7 @@ def _load_external_hdt_attention():
 
     module_path = Path(__file__).resolve().parents[2] / "third_party" / "hdt" / "src" / "HDT" / "hsparse_attn.py"
     if not module_path.exists():
-        _EXTERNAL_HDT_STATUS = "missing_submodule"
+        _EXTERNAL_HDT_STATUS = "missing_vendor"
         return None, _EXTERNAL_HDT_STATUS
     try:
         spec = importlib.util.spec_from_file_location("external_hdt_hsparse_attn", module_path)
@@ -230,7 +230,7 @@ def _benchmark_env_for_case(case: BenchmarkCase):
 
 def _benchmark_mode_label(case: BenchmarkCase) -> str:
     if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1":
-        return "sentence_synthetic_grid" if case.name == "sentence-only" else "mixed_sparse_mask_synthetic"
+        return "sentence_true_fused" if case.name == "sentence-only" else "mixed_sparse_mask_synthetic"
     return "sentence_true_fused" if case.name == "sentence-only" else "mixed_sparse_mask"
 
 
@@ -369,13 +369,13 @@ def _run_external_hdt_attention(q, k, v, keep_ids, hash_ids):
     attention_fn, status = _load_external_hdt_attention()
     if attention_fn is None:
         raise RuntimeError(status)
+    if q.shape[1] > 1024:
+        raise RuntimeError("unsupported_seq_gt_1024")
     q_ext = q.transpose(1, 2).contiguous()
     k_ext = k.transpose(1, 2).contiguous()
     v_ext = v.transpose(1, 2).contiguous()
     if k_ext.shape[1] != q_ext.shape[1]:
-        groups = q_ext.shape[1] // k_ext.shape[1]
-        k_ext = k_ext.repeat_interleave(groups, dim=1)
-        v_ext = v_ext.repeat_interleave(groups, dim=1)
+        raise RuntimeError("unsupported_gqa")
     keep_list = [keep_ids[:, idx, :].contiguous() for idx in range(3)]
     hash_list = [hash_ids[:, idx, :].contiguous() for idx in range(3)]
     out, _ = attention_fn(q_ext, k_ext, v_ext, keep_list, hash_list, causal=True, output_attentions=False)
@@ -434,7 +434,11 @@ def _measure_external_hdt_case() -> dict[str, object]:
             }
         except Exception as exc:  # pragma: no cover - GPU benchmark guard
             torch.cuda.empty_cache()
-            result = {"status": f"failed_{type(exc).__name__}"}
+            reason = str(exc)
+            if reason.startswith(("unsupported_", "missing_", "import_failed_", "missing_loader")):
+                result = {"status": reason}
+            else:
+                result = {"status": f"failed_{type(exc).__name__}"}
     return result
 
 
@@ -758,9 +762,9 @@ def _run_long_case(case: BenchmarkCase):
     hdt_in_repo_dense_bwd_ms = None
     hdt_in_repo_dense_status = "skipped_32k_plus"
     hdt_in_repo_dense_ratio = None
-    external_hdt_bwd_ms = None
-    external_hdt_status = "skipped_32k_plus"
-    external_hdt_ratio = None
+    hdt_vendor_bwd_ms = None
+    hdt_vendor_status = "skipped_32k_plus"
+    hdt_vendor_ratio = None
     if case.name == "long-16k":
         dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
         try:
@@ -780,10 +784,10 @@ def _run_long_case(case: BenchmarkCase):
             torch.cuda.empty_cache()
             hdt_in_repo_dense_status = f"failed_{type(exc).__name__}"
         external_result = _run_external_hdt_case_subprocess(case)
-        external_hdt_status = str(external_result.get("status", "child_bad_payload"))
-        external_hdt_bwd_ms = external_result.get("bwd_ms")
-        if external_hdt_status == "measured" and isinstance(external_hdt_bwd_ms, (int, float)):
-            external_hdt_ratio = hsa_bwd_ms / external_hdt_bwd_ms if external_hdt_bwd_ms > 0 else float("inf")
+        hdt_vendor_status = str(external_result.get("status", "child_bad_payload"))
+        hdt_vendor_bwd_ms = external_result.get("bwd_ms")
+        if hdt_vendor_status == "measured" and isinstance(hdt_vendor_bwd_ms, (int, float)):
+            hdt_vendor_ratio = hsa_bwd_ms / hdt_vendor_bwd_ms if hdt_vendor_bwd_ms > 0 else float("inf")
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -803,10 +807,10 @@ def _run_long_case(case: BenchmarkCase):
         )
     else:
         line += f" hdt_in_repo_dense_bwd_status={hdt_in_repo_dense_status}"
-    if external_hdt_bwd_ms is not None and external_hdt_ratio is not None:
-        line += f" external_hdt_bwd_ms={external_hdt_bwd_ms:.3f} hsa_bwd_vs_external_hdt={external_hdt_ratio:.2f}x"
+    if hdt_vendor_bwd_ms is not None and hdt_vendor_ratio is not None:
+        line += f" hdt_vendor_bwd_ms={hdt_vendor_bwd_ms:.3f} hsa_bwd_vs_hdt_vendor={hdt_vendor_ratio:.2f}x"
     else:
-        line += f" external_hdt_bwd_status={external_hdt_status}"
+        line += f" hdt_vendor_bwd_status={hdt_vendor_status}"
     print(line)
 
 
@@ -913,10 +917,10 @@ def run_case(case: BenchmarkCase):
         case.benchmark_iters,
     )
     external_result = _run_external_hdt_case_subprocess(case)
-    external_hdt_status = str(external_result.get("status", "child_bad_payload"))
-    external_hdt_fwd_ms = external_result.get("fwd_ms")
-    external_hdt_bwd_ms = external_result.get("bwd_ms")
-    external_hdt_fwd_bwd_ms = external_result.get("fwd_bwd_ms")
+    hdt_vendor_status = str(external_result.get("status", "child_bad_payload"))
+    hdt_vendor_fwd_ms = external_result.get("fwd_ms")
+    hdt_vendor_bwd_ms = external_result.get("bwd_ms")
+    hdt_vendor_fwd_bwd_ms = external_result.get("fwd_bwd_ms")
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -929,21 +933,21 @@ def run_case(case: BenchmarkCase):
         f"hsa_fwd_bwd_ms={hsa_fwd_bwd_ms:.3f} dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} "
         f"hsa_fwd_bwd_vs_dense={hsa_fwd_bwd_vs_dense:.2f}x"
     )
-    if external_hdt_status == "measured":
+    if hdt_vendor_status == "measured":
         line += (
             f" hdt_in_repo_dense_fwd_ms={hdt_in_repo_dense_fwd_ms:.3f}"
             f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
             f" hdt_in_repo_dense_fwd_bwd_ms={hdt_in_repo_dense_fwd_bwd_ms:.3f}"
-            f" external_hdt_fwd_ms={external_hdt_fwd_ms:.3f}"
-            f" external_hdt_bwd_ms={external_hdt_bwd_ms:.3f}"
-            f" external_hdt_fwd_bwd_ms={external_hdt_fwd_bwd_ms:.3f}"
+            f" hdt_vendor_fwd_ms={hdt_vendor_fwd_ms:.3f}"
+            f" hdt_vendor_bwd_ms={hdt_vendor_bwd_ms:.3f}"
+            f" hdt_vendor_fwd_bwd_ms={hdt_vendor_fwd_bwd_ms:.3f}"
         )
     else:
         line += (
             f" hdt_in_repo_dense_fwd_ms={hdt_in_repo_dense_fwd_ms:.3f}"
             f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
             f" hdt_in_repo_dense_fwd_bwd_ms={hdt_in_repo_dense_fwd_bwd_ms:.3f}"
-            f" external_hdt_status={external_hdt_status}"
+            f" hdt_vendor_status={hdt_vendor_status}"
         )
     if synthetic_summary is not None:
         line += (
@@ -952,6 +956,14 @@ def run_case(case: BenchmarkCase):
             f" synth_avg_q_rows={synthetic_summary['avg_q_rows']:.1f}"
             f" synth_avg_k_rows={synthetic_summary['avg_k_rows']:.1f}"
             f" synth_avg_logical_pairs={synthetic_summary['avg_logical_pairs']:.1f}"
+            f" synth_fwd_tiles={synthetic_summary['forward_tiles']}"
+            f" synth_bwd_tiles={synthetic_summary['backward_tiles']}"
+            f" synth_fwd_buckets={synthetic_summary['forward_buckets']}"
+            f" synth_bwd_buckets={synthetic_summary['backward_buckets']}"
+            f" synth_fwd_avg_packed={synthetic_summary['forward_avg_packed_q']:.1f}x{synthetic_summary['forward_avg_packed_k']:.1f}"
+            f" synth_bwd_avg_packed={synthetic_summary['backward_avg_packed_q']:.1f}x{synthetic_summary['backward_avg_packed_k']:.1f}"
+            f" synth_fwd_avg_fill={synthetic_summary['forward_avg_fill']:.4f}"
+            f" synth_bwd_avg_fill={synthetic_summary['backward_avg_fill']:.4f}"
         )
     print(line)
 

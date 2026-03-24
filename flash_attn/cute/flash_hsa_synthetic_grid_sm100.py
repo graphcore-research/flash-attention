@@ -2,21 +2,90 @@ from __future__ import annotations
 
 import torch
 
+try:
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass import Float32, Int32
 
-def _ensure_runtime(schedule, runtime, q, k):
-    if runtime is None:
-        import flash_attn.cute.hsa as hsa_module
+    from flash_attn.cute.cache_utils import get_jit_cache
+    from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
-        runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    _HAS_CUTE_RUNTIME = True
+except Exception:  # pragma: no cover - CPU-only guard
+    _HAS_CUTE_RUNTIME = False
+
+    class _FakeCuda:
+        class CUstream:  # noqa: D401 - simple placeholder
+            """CPU placeholder."""
+
+    cuda = _FakeCuda()
+
+
+def _load_hsa_module():
     import flash_attn.cute.hsa as hsa_module
 
+    return hsa_module
+
+
+def _require_cute_runtime():
+    if not _HAS_CUTE_RUNTIME:
+        raise NotImplementedError("Synthetic packed CuTE path requires CUDA/CuTE runtime")
+
+
+def _ensure_runtime(schedule, runtime, q, k):
+    hsa_module = _load_hsa_module()
+    if runtime is None:
+        runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
     hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
     return runtime
 
 
+def _is_mixed_schedule(schedule) -> bool:
+    hsa_module = _load_hsa_module()
+    return not hsa_module._schedule_has_only_sentence_backward_families(schedule)
+
+
+def _mean_or_zero(tensor: torch.Tensor) -> float:
+    return float(tensor.float().mean().item()) if tensor.numel() > 0 else 0.0
+
+
+def _summarize_one_grid(metadata) -> dict[str, float | int]:
+    if metadata is None:
+        return {
+            "num_tiles": 0,
+            "num_buckets": 0,
+            "avg_q_rows": 0.0,
+            "avg_k_rows": 0.0,
+            "avg_logical_pairs": 0.0,
+            "avg_packed_q": 0.0,
+            "avg_packed_k": 0.0,
+            "avg_fill": 0.0,
+            "dense_tiles": 0,
+        }
+
+    q_rows_per_tile = metadata.tile_q_row_ptr[1:] - metadata.tile_q_row_ptr[:-1]
+    k_rows_per_tile = metadata.tile_k_row_ptr[1:] - metadata.tile_k_row_ptr[:-1]
+    logical_pairs_per_tile = metadata.tile_logical_pair_row_ptr[1:] - metadata.tile_logical_pair_row_ptr[:-1]
+    packed_area = metadata.tile_packed_q.float() * metadata.tile_packed_k.float()
+    fill = metadata.tile_allowed_pairs.float() / torch.clamp(packed_area, min=1.0)
+    return {
+        "num_tiles": metadata.num_tiles,
+        "num_buckets": int(metadata.bucket_packed_q.numel()),
+        "avg_q_rows": _mean_or_zero(q_rows_per_tile),
+        "avg_k_rows": _mean_or_zero(k_rows_per_tile),
+        "avg_logical_pairs": _mean_or_zero(logical_pairs_per_tile),
+        "avg_packed_q": _mean_or_zero(metadata.tile_packed_q),
+        "avg_packed_k": _mean_or_zero(metadata.tile_packed_k),
+        "avg_fill": _mean_or_zero(fill),
+        "dense_tiles": int(metadata.tile_dense.sum().item()) if metadata.tile_dense.numel() > 0 else 0,
+    }
+
+
 def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
-    synthetic = runtime.synthetic_grid
-    if synthetic is None:
+    backward = _summarize_one_grid(runtime.backward_synthetic_grid)
+    forward = _summarize_one_grid(runtime.forward_synthetic_grid)
+    reference = runtime.forward_synthetic_grid if runtime.forward_synthetic_grid is not None else runtime.backward_synthetic_grid
+    if reference is None:
         return {
             "logical_block_q": 0,
             "logical_block_k": 0,
@@ -26,25 +95,427 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
             "avg_q_rows": 0.0,
             "avg_k_rows": 0.0,
             "avg_logical_pairs": 0.0,
+            "forward_tiles": 0,
+            "backward_tiles": 0,
+            "forward_buckets": 0,
+            "backward_buckets": 0,
+            "forward_avg_packed_q": 0.0,
+            "forward_avg_packed_k": 0.0,
+            "backward_avg_packed_q": 0.0,
+            "backward_avg_packed_k": 0.0,
+            "forward_avg_fill": 0.0,
+            "backward_avg_fill": 0.0,
         }
 
-    q_rows_per_tile = synthetic.tile_q_row_ptr[1:] - synthetic.tile_q_row_ptr[:-1]
-    k_rows_per_tile = synthetic.tile_k_row_ptr[1:] - synthetic.tile_k_row_ptr[:-1]
-    logical_pairs_per_tile = synthetic.tile_logical_pair_row_ptr[1:] - synthetic.tile_logical_pair_row_ptr[:-1]
-
-    def _mean_or_zero(tensor: torch.Tensor) -> float:
-        return float(tensor.float().mean().item()) if tensor.numel() > 0 else 0.0
-
     return {
-        "logical_block_q": synthetic.logical_block_q,
-        "logical_block_k": synthetic.logical_block_k,
-        "physical_block_q": synthetic.physical_block_q,
-        "physical_block_k": synthetic.physical_block_k,
-        "num_tiles": synthetic.num_tiles,
-        "avg_q_rows": _mean_or_zero(q_rows_per_tile),
-        "avg_k_rows": _mean_or_zero(k_rows_per_tile),
-        "avg_logical_pairs": _mean_or_zero(logical_pairs_per_tile),
+        "logical_block_q": reference.logical_block_q,
+        "logical_block_k": reference.logical_block_k,
+        "physical_block_q": reference.physical_block_q,
+        "physical_block_k": reference.physical_block_k,
+        "num_tiles": forward["num_tiles"],
+        "avg_q_rows": forward["avg_q_rows"],
+        "avg_k_rows": forward["avg_k_rows"],
+        "avg_logical_pairs": forward["avg_logical_pairs"],
+        "forward_tiles": forward["num_tiles"],
+        "backward_tiles": backward["num_tiles"],
+        "forward_buckets": forward["num_buckets"],
+        "backward_buckets": backward["num_buckets"],
+        "forward_avg_packed_q": forward["avg_packed_q"],
+        "forward_avg_packed_k": forward["avg_packed_k"],
+        "backward_avg_packed_q": backward["avg_packed_q"],
+        "backward_avg_packed_k": backward["avg_packed_k"],
+        "forward_avg_fill": forward["avg_fill"],
+        "backward_avg_fill": backward["avg_fill"],
+        "forward_dense_tiles": forward["dense_tiles"],
+        "backward_dense_tiles": backward["dense_tiles"],
     }
+
+
+def _empty_sentence_cache(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    device = q.device
+    return (
+        torch.empty(0, dtype=torch.float32, device=device),
+        torch.empty(0, q.shape[2], q.shape[3], dtype=q.dtype, device=device),
+        torch.empty(0, k.shape[2], k.shape[3], dtype=k.dtype, device=device),
+        torch.empty(0, v.shape[2], v.shape[3], dtype=v.dtype, device=device),
+        torch.empty(0, q.shape[2], v.shape[3], dtype=q.dtype, device=device),
+    )
+
+
+class FlashHSASyntheticPackRowsSm100:
+    """Pack flat rows into a contiguous staged tensor, zeroing padded slots."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcRows.shape[1]
+        head_dim = mSrcRows.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcRows,
+            mRowIdx,
+            mDstPacked,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcRows: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstPacked: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcRows.shape[1])
+            head_dim = Int32(mSrcRows.shape[2])
+            elems_per_row = num_heads * head_dim
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            global_row = Int32(mRowIdx[stream_row])
+            value = Float32(0.0)
+            if global_row >= Int32(0):
+                value = Float32(mSrcRows[global_row, head_idx, dim_idx])
+            mDstPacked[stream_row, head_idx, dim_idx] = value.to(mDstPacked.element_type)
+
+
+class FlashHSASyntheticScatterRowsSm100:
+    """Scatter packed rows back to flat output rows, skipping padded slots."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcPacked: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcPacked.shape[1]
+        head_dim = mSrcPacked.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcPacked,
+            mRowIdx,
+            mDstRows,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcPacked: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstRows: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcPacked.shape[1])
+            head_dim = Int32(mSrcPacked.shape[2])
+            elems_per_row = num_heads * head_dim
+            stream_row = task_idx // elems_per_row
+            rem = task_idx - stream_row * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            global_row = Int32(mRowIdx[stream_row])
+            if global_row >= Int32(0):
+                mDstRows[global_row, head_idx, dim_idx] = Float32(
+                    mSrcPacked[stream_row, head_idx, dim_idx]
+                ).to(mDstRows.element_type)
+
+
+class FlashHSASyntheticScatterLSESm100:
+    """Scatter packed LSE rows back to flat [B*T, H] rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstLSE: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mRowIdx.shape[0]
+        num_heads = mSrcLSE.shape[1]
+        total_tasks = num_stream_rows * num_heads
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcLSE,
+            mRowIdx,
+            mDstLSE,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcLSE: cute.Tensor,
+        mRowIdx: cute.Tensor,
+        mDstLSE: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcLSE.shape[1])
+            stream_row = task_idx // num_heads
+            head_idx = task_idx - stream_row * num_heads
+            global_row = Int32(mRowIdx[stream_row])
+            if global_row >= Int32(0):
+                mDstLSE[global_row, head_idx] = Float32(mSrcLSE[stream_row, head_idx]).to(mDstLSE.element_type)
+
+
+def _run_synthetic_pack_rows_kernel(
+    src_rows: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_packed: torch.Tensor,
+):
+    _require_cute_runtime()
+    compile_key = (
+        "synthetic_pack_rows_v1",
+        src_rows.dtype,
+        dst_packed.dtype,
+        src_rows.shape[1],
+        src_rows.shape[2],
+        torch.cuda.get_device_capability(src_rows.device),
+    )
+    if compile_key not in _run_synthetic_pack_rows_kernel.compile_cache:
+        kernel = FlashHSASyntheticPackRowsSm100()
+        _run_synthetic_pack_rows_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(src_rows),
+            to_cute_tensor(row_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(dst_packed),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_pack_rows_kernel.compile_cache[compile_key](
+        src_rows.detach(),
+        row_idx.detach(),
+        dst_packed.detach(),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_pack_rows_kernel.compile_cache = get_jit_cache("hsa_synth_pack_rows")
+
+
+def _run_synthetic_scatter_rows_kernel(
+    src_packed: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_rows: torch.Tensor,
+):
+    _require_cute_runtime()
+    compile_key = (
+        "synthetic_scatter_rows_v1",
+        src_packed.dtype,
+        dst_rows.dtype,
+        src_packed.shape[1],
+        src_packed.shape[2],
+        torch.cuda.get_device_capability(src_packed.device),
+    )
+    if compile_key not in _run_synthetic_scatter_rows_kernel.compile_cache:
+        kernel = FlashHSASyntheticScatterRowsSm100()
+        _run_synthetic_scatter_rows_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(src_packed),
+            to_cute_tensor(row_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(dst_rows),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_scatter_rows_kernel.compile_cache[compile_key](
+        src_packed.detach(),
+        row_idx.detach(),
+        dst_rows.detach(),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_scatter_rows_kernel.compile_cache = get_jit_cache("hsa_synth_scatter_rows")
+
+
+def _run_synthetic_scatter_lse_kernel(
+    src_lse: torch.Tensor,
+    row_idx: torch.Tensor,
+    dst_lse: torch.Tensor,
+):
+    _require_cute_runtime()
+    compile_key = (
+        "synthetic_scatter_lse_v1",
+        src_lse.dtype,
+        dst_lse.dtype,
+        src_lse.shape[1],
+        torch.cuda.get_device_capability(src_lse.device),
+    )
+    if compile_key not in _run_synthetic_scatter_lse_kernel.compile_cache:
+        kernel = FlashHSASyntheticScatterLSESm100()
+        _run_synthetic_scatter_lse_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(src_lse, assumed_align=4),
+            to_cute_tensor(row_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(dst_lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_scatter_lse_kernel.compile_cache[compile_key](
+        src_lse.detach(),
+        row_idx.detach(),
+        dst_lse.detach(),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_scatter_lse_kernel.compile_cache = get_jit_cache("hsa_synth_scatter_lse")
+
+
+def _slice_bucket_flat_rows(metadata, bucket_idx: int, *, use_q_rows: bool) -> torch.Tensor:
+    ptr = metadata.bucket_q_row_idx_row_ptr if use_q_rows else metadata.bucket_k_row_idx_row_ptr
+    flat = metadata.bucket_q_row_idx if use_q_rows else metadata.bucket_k_row_idx
+    if ptr is None or flat is None:
+        raise RuntimeError("Synthetic packed metadata is missing bucket row maps")
+    start = int(ptr[bucket_idx].item())
+    end = int(ptr[bucket_idx + 1].item())
+    return flat[start:end].contiguous()
+
+
+def _slice_bucket_mask_words(metadata, bucket_idx: int) -> torch.Tensor | None:
+    if metadata.bucket_mask_word_row_ptr is None or metadata.bucket_mask_words is None:
+        return None
+    start = int(metadata.bucket_mask_word_row_ptr[bucket_idx].item())
+    end = int(metadata.bucket_mask_word_row_ptr[bucket_idx + 1].item())
+    if end <= start:
+        return None
+    return metadata.bucket_mask_words[start:end].contiguous()
+
+
+def _run_bucketed_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    schedule,
+    softmax_scale: float,
+    metadata,
+):
+    hsa_module = _load_hsa_module()
+    _flash_attn_fwd = hsa_module._lazy_cute_imports()[5]
+    total_rows = schedule.num_rows
+    num_q_heads = q.shape[2]
+    head_dim_v = v.shape[3]
+    q_flat = q.reshape(total_rows, q.shape[2], q.shape[3]).contiguous()
+    k_flat = k.reshape(total_rows, k.shape[2], k.shape[3]).contiguous()
+    v_flat = v.reshape(total_rows, v.shape[2], v.shape[3]).contiguous()
+    total_out = torch.zeros(total_rows, num_q_heads, head_dim_v, dtype=q.dtype, device=q.device)
+    total_lse = torch.full((total_rows, num_q_heads), float("-inf"), dtype=torch.float32, device=q.device)
+
+    for bucket_idx in range(int(metadata.bucket_packed_q.numel())):
+        tile_start = int(metadata.bucket_row_ptr[bucket_idx].item())
+        tile_end = int(metadata.bucket_row_ptr[bucket_idx + 1].item())
+        bucket_size = tile_end - tile_start
+        if bucket_size <= 0:
+            continue
+        packed_q = int(metadata.bucket_packed_q[bucket_idx].item())
+        packed_k = int(metadata.bucket_packed_k[bucket_idx].item())
+        tile_ids = metadata.bucket_tile_idx[tile_start:tile_end]
+        q_row_idx = _slice_bucket_flat_rows(metadata, bucket_idx, use_q_rows=True)
+        k_row_idx = _slice_bucket_flat_rows(metadata, bucket_idx, use_q_rows=False)
+
+        q_buf_flat = torch.empty((bucket_size * packed_q, q.shape[2], q.shape[3]), dtype=q.dtype, device=q.device)
+        k_buf_flat = torch.empty((bucket_size * packed_k, k.shape[2], k.shape[3]), dtype=k.dtype, device=k.device)
+        v_buf_flat = torch.empty((bucket_size * packed_k, v.shape[2], v.shape[3]), dtype=v.dtype, device=v.device)
+        _run_synthetic_pack_rows_kernel(q_flat, q_row_idx, q_buf_flat)
+        _run_synthetic_pack_rows_kernel(k_flat, k_row_idx, k_buf_flat)
+        _run_synthetic_pack_rows_kernel(v_flat, k_row_idx, v_buf_flat)
+
+        q_buf = q_buf_flat.view(bucket_size, packed_q, q.shape[2], q.shape[3])
+        k_buf = k_buf_flat.view(bucket_size, packed_k, k.shape[2], k.shape[3])
+        v_buf = v_buf_flat.view(bucket_size, packed_k, v.shape[2], v.shape[3])
+        q_length = metadata.tile_q_length.index_select(0, tile_ids).contiguous()
+        k_length = metadata.tile_k_length.index_select(0, tile_ids).contiguous()
+
+        if bool(metadata.bucket_dense[bucket_idx].item()):
+            mask_mod = hsa_module.get_hsa_synthetic_packed_dense_mask_mod()
+            aux_tensors = [q_length, k_length]
+        else:
+            words_per_row = int(metadata.bucket_words_per_row[bucket_idx].item())
+            mask_words_flat = _slice_bucket_mask_words(metadata, bucket_idx)
+            if mask_words_flat is None:
+                raise RuntimeError("Synthetic packed bitmap bucket is missing mask words")
+            mask_words = mask_words_flat.view(bucket_size, packed_q, words_per_row).contiguous()
+            mask_mod = hsa_module.get_hsa_synthetic_packed_bitmap_mask_mod(words_per_row)
+            aux_tensors = [q_length, k_length, mask_words]
+
+        out_bucket, lse_bucket = _flash_attn_fwd(
+            q_buf,
+            k_buf,
+            v_buf,
+            softmax_scale=softmax_scale,
+            causal=False,
+            m_block_size=128,
+            n_block_size=128,
+            pack_gqa=False,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            return_lse=True,
+        )
+        _run_synthetic_scatter_rows_kernel(
+            out_bucket.reshape(bucket_size * packed_q, num_q_heads, head_dim_v).contiguous(),
+            q_row_idx,
+            total_out,
+        )
+        _run_synthetic_scatter_lse_kernel(
+            lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q, num_q_heads).contiguous(),
+            q_row_idx,
+            total_lse,
+        )
+
+    out = total_out.view(q.shape[0], q.shape[1], q.shape[2], head_dim_v)
+    lse = total_lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+    return out, lse
 
 
 def run_hsa_fwd_sm100_synthetic_grid(
@@ -57,9 +528,19 @@ def run_hsa_fwd_sm100_synthetic_grid(
     runtime=None,
 ):
     runtime = _ensure_runtime(schedule, runtime, q, k)
-    from flash_attn.cute.flash_hsa_fwd_sm100 import run_hsa_fwd_sm100_blocksparse
+    if not _is_mixed_schedule(schedule) or q.shape[2] != k.shape[2]:
+        from flash_attn.cute.flash_hsa_fwd_sm100 import run_hsa_fwd_sm100_blocksparse
 
-    return run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
+        return run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
+
+    metadata = runtime.forward_synthetic_grid
+    if metadata is None:
+        raise RuntimeError("Synthetic packed forward metadata is unavailable")
+    out, lse = _run_bucketed_forward(q, k, v, schedule, softmax_scale, metadata)
+    sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = _empty_sentence_cache(
+        q, k, v
+    )
+    return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream
 
 
 def run_hsa_bwd_sm100_synthetic_grid(
@@ -82,7 +563,7 @@ def run_hsa_bwd_sm100_synthetic_grid(
     *,
     runtime=None,
 ):
-    runtime = _ensure_runtime(schedule, runtime, q, k)
+    del runtime
     from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_blocksparse
 
     return run_hsa_bwd_sm100_blocksparse(
@@ -102,5 +583,4 @@ def run_hsa_bwd_sm100_synthetic_grid(
         deterministic,
         keep_ids,
         hash_ids,
-        runtime=runtime,
     )

@@ -1,3 +1,5 @@
+import importlib.util
+import json
 import time
 import os
 import subprocess
@@ -5,10 +7,13 @@ import sys
 import warnings
 from dataclasses import dataclass
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 
 _FLASH_ATTN_IMPORTS = None
+_EXTERNAL_HDT_ATTENTION = None
+_EXTERNAL_HDT_STATUS = "uninitialized"
 
 
 def _lazy_flash_attn_imports():
@@ -85,6 +90,30 @@ LONG_CONTEXT_CASE_NAMES = frozenset(case.name for case in LONG_CONTEXT_CASES)
 
 def _unwrap_output(result):
     return result[0] if isinstance(result, tuple) else result
+
+
+def _load_external_hdt_attention():
+    global _EXTERNAL_HDT_ATTENTION, _EXTERNAL_HDT_STATUS
+    if _EXTERNAL_HDT_ATTENTION is not None or _EXTERNAL_HDT_STATUS != "uninitialized":
+        return _EXTERNAL_HDT_ATTENTION, _EXTERNAL_HDT_STATUS
+
+    module_path = Path(__file__).resolve().parents[2] / "third_party" / "hdt" / "src" / "HDT" / "hsparse_attn.py"
+    if not module_path.exists():
+        _EXTERNAL_HDT_STATUS = "missing_submodule"
+        return None, _EXTERNAL_HDT_STATUS
+    try:
+        spec = importlib.util.spec_from_file_location("external_hdt_hsparse_attn", module_path)
+        if spec is None or spec.loader is None:
+            _EXTERNAL_HDT_STATUS = "missing_loader"
+            return None, _EXTERNAL_HDT_STATUS
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _EXTERNAL_HDT_ATTENTION = module.attention_fn
+        _EXTERNAL_HDT_STATUS = "available"
+    except Exception as exc:  # pragma: no cover - benchmark-only import guard
+        _EXTERNAL_HDT_STATUS = f"import_failed_{type(exc).__name__}"
+        _EXTERNAL_HDT_ATTENTION = None
+    return _EXTERNAL_HDT_ATTENTION, _EXTERNAL_HDT_STATUS
 
 
 def _make_hsa_metadata(batch_size, seqlen, device):
@@ -200,6 +229,8 @@ def _benchmark_env_for_case(case: BenchmarkCase):
 
 
 def _benchmark_mode_label(case: BenchmarkCase) -> str:
+    if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1":
+        return "sentence_synthetic_grid" if case.name == "sentence-only" else "mixed_sparse_mask_synthetic"
     return "sentence_true_fused" if case.name == "sentence-only" else "mixed_sparse_mask"
 
 
@@ -332,6 +363,118 @@ def _run_sparse_attention(
         return _unwrap_output(
             flash_attn_hsa_sparse_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
         )
+
+
+def _run_external_hdt_attention(q, k, v, keep_ids, hash_ids):
+    attention_fn, status = _load_external_hdt_attention()
+    if attention_fn is None:
+        raise RuntimeError(status)
+    q_ext = q.transpose(1, 2).contiguous()
+    k_ext = k.transpose(1, 2).contiguous()
+    v_ext = v.transpose(1, 2).contiguous()
+    if k_ext.shape[1] != q_ext.shape[1]:
+        groups = q_ext.shape[1] // k_ext.shape[1]
+        k_ext = k_ext.repeat_interleave(groups, dim=1)
+        v_ext = v_ext.repeat_interleave(groups, dim=1)
+    keep_list = [keep_ids[:, idx, :].contiguous() for idx in range(3)]
+    hash_list = [hash_ids[:, idx, :].contiguous() for idx in range(3)]
+    out, _ = attention_fn(q_ext, k_ext, v_ext, keep_list, hash_list, causal=True, output_attentions=False)
+    return out
+
+
+def _build_case_tensors(case: BenchmarkCase):
+    build_hsa_schedule, _, _, _ = _lazy_flash_attn_imports()
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
+    q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
+    k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    return schedule, keep_ids, hash_ids, q_data, k_data, v_data
+
+
+def _measure_external_hdt_case() -> dict[str, object]:
+    by_name = {candidate.name: candidate for candidate in ALL_CASES}
+    case_name = os.environ["FLASH_ATTN_HSA_EXTERNAL_HDT_CASE"]
+    case = by_name[case_name]
+    _, keep_ids, hash_ids, q_data, k_data, v_data = _build_case_tensors(case)
+    external_hdt_forward = lambda q, k, v: _run_external_hdt_attention(q, k, v, keep_ids, hash_ids)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Logical operators 'and' and 'or' are deprecated.*")
+        warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is in prototype stage.*")
+        try:
+            result = {
+                "status": "measured",
+                "fwd_ms": _measure_forward_ms(
+                    external_hdt_forward,
+                    q_data,
+                    k_data,
+                    v_data,
+                    case.warmup_iters,
+                    case.benchmark_iters,
+                ),
+                "bwd_ms": _measure_backward_ms(
+                    external_hdt_forward,
+                    q_data,
+                    k_data,
+                    v_data,
+                    case.warmup_iters,
+                    case.benchmark_iters,
+                ),
+                "fwd_bwd_ms": _measure_forward_backward_ms(
+                    external_hdt_forward,
+                    q_data,
+                    k_data,
+                    v_data,
+                    case.warmup_iters,
+                    case.benchmark_iters,
+                ),
+            }
+        except Exception as exc:  # pragma: no cover - GPU benchmark guard
+            torch.cuda.empty_cache()
+            result = {"status": f"failed_{type(exc).__name__}"}
+    return result
+
+
+def _run_external_hdt_case_subprocess(case: BenchmarkCase) -> dict[str, object]:
+    child_env = os.environ.copy()
+    child_env["FLASH_ATTN_HSA_EXTERNAL_HDT_CHILD"] = "1"
+    child_env["FLASH_ATTN_HSA_EXTERNAL_HDT_CASE"] = case.name
+    result = subprocess.run(
+        [sys.executable, __file__],
+        env=child_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        status = f"child_exit_{result.returncode}"
+        stderr = result.stderr.strip().splitlines()
+        if stderr:
+            status = f"{status}_{stderr[-1][:120]}"
+        return {"status": status}
+
+    stdout_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not stdout_lines:
+        return {"status": "child_empty_output"}
+    try:
+        payload = json.loads(stdout_lines[-1])
+    except json.JSONDecodeError:
+        return {"status": "child_bad_output"}
+    if not isinstance(payload, dict) or "status" not in payload:
+        return {"status": "child_bad_payload"}
+    return payload
+
+
+def _get_synthetic_grid_summary(schedule, q, k):
+    import flash_attn.cute.hsa as hsa_module
+    from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import summarize_synthetic_grid
+
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+    return summarize_synthetic_grid(runtime)
 
 
 def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
@@ -593,7 +736,6 @@ def _run_long_case(case: BenchmarkCase):
 
     hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
-
     hsa_bwd_ms = _measure_backward_ms(
         hsa_forward,
         q_data,
@@ -613,13 +755,16 @@ def _run_long_case(case: BenchmarkCase):
     )
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
 
-    dense_hdt_bwd_ms = None
-    dense_hdt_status = "skipped_32k_plus"
-    dense_hdt_ratio = None
+    hdt_in_repo_dense_bwd_ms = None
+    hdt_in_repo_dense_status = "skipped_32k_plus"
+    hdt_in_repo_dense_ratio = None
+    external_hdt_bwd_ms = None
+    external_hdt_status = "skipped_32k_plus"
+    external_hdt_ratio = None
     if case.name == "long-16k":
         dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
         try:
-            dense_hdt_bwd_ms = _measure_backward_ms(
+            hdt_in_repo_dense_bwd_ms = _measure_backward_ms(
                 dense_ref_forward,
                 q_data,
                 k_data,
@@ -627,11 +772,18 @@ def _run_long_case(case: BenchmarkCase):
                 case.warmup_iters,
                 case.benchmark_iters,
             )
-            dense_hdt_ratio = hsa_bwd_ms / dense_hdt_bwd_ms if dense_hdt_bwd_ms > 0 else float("inf")
-            dense_hdt_status = "measured"
+            hdt_in_repo_dense_ratio = (
+                hsa_bwd_ms / hdt_in_repo_dense_bwd_ms if hdt_in_repo_dense_bwd_ms > 0 else float("inf")
+            )
+            hdt_in_repo_dense_status = "measured"
         except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
             torch.cuda.empty_cache()
-            dense_hdt_status = f"failed_{type(exc).__name__}"
+            hdt_in_repo_dense_status = f"failed_{type(exc).__name__}"
+        external_result = _run_external_hdt_case_subprocess(case)
+        external_hdt_status = str(external_result.get("status", "child_bad_payload"))
+        external_hdt_bwd_ms = external_result.get("bwd_ms")
+        if external_hdt_status == "measured" and isinstance(external_hdt_bwd_ms, (int, float)):
+            external_hdt_ratio = hsa_bwd_ms / external_hdt_bwd_ms if external_hdt_bwd_ms > 0 else float("inf")
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -644,10 +796,17 @@ def _run_long_case(case: BenchmarkCase):
         f"hsa_bwd_ms={hsa_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
         f"hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x"
     )
-    if dense_hdt_bwd_ms is not None and dense_hdt_ratio is not None:
-        line += f" dense_hdt_bwd_ms={dense_hdt_bwd_ms:.3f} hsa_bwd_vs_hdt={dense_hdt_ratio:.2f}x"
+    if hdt_in_repo_dense_bwd_ms is not None and hdt_in_repo_dense_ratio is not None:
+        line += (
+            f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
+            f" hsa_bwd_vs_hdt_in_repo={hdt_in_repo_dense_ratio:.2f}x"
+        )
     else:
-        line += f" dense_hdt_bwd_status={dense_hdt_status}"
+        line += f" hdt_in_repo_dense_bwd_status={hdt_in_repo_dense_status}"
+    if external_hdt_bwd_ms is not None and external_hdt_ratio is not None:
+        line += f" external_hdt_bwd_ms={external_hdt_bwd_ms:.3f} hsa_bwd_vs_external_hdt={external_hdt_ratio:.2f}x"
+    else:
+        line += f" external_hdt_bwd_status={external_hdt_status}"
     print(line)
 
 
@@ -666,11 +825,13 @@ def run_case(case: BenchmarkCase):
     hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
     dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
-
     out_hsa = hsa_forward(q_data, k_data, v_data)
     out_ref = dense_ref_forward(q_data, k_data, v_data)
     hsa_max_diff = (out_hsa.float() - out_ref.float()).abs().max().item()
     hsa_mean_diff = (out_hsa.float() - out_ref.float()).abs().mean().item()
+    synthetic_summary = None
+    if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1":
+        synthetic_summary = _get_synthetic_grid_summary(schedule, q_data, k_data)
 
     hsa_fwd_ms = _measure_forward_ms(
         hsa_forward,
@@ -727,8 +888,37 @@ def run_case(case: BenchmarkCase):
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
     hsa_fwd_bwd_vs_dense = hsa_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
+    hdt_in_repo_dense_fwd_ms = _measure_forward_ms(
+        dense_ref_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    hdt_in_repo_dense_bwd_ms = _measure_backward_ms(
+        dense_ref_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    hdt_in_repo_dense_fwd_bwd_ms = _measure_forward_backward_ms(
+        dense_ref_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    external_result = _run_external_hdt_case_subprocess(case)
+    external_hdt_status = str(external_result.get("status", "child_bad_payload"))
+    external_hdt_fwd_ms = external_result.get("fwd_ms")
+    external_hdt_bwd_ms = external_result.get("bwd_ms")
+    external_hdt_fwd_bwd_ms = external_result.get("fwd_bwd_ms")
 
-    print(
+    line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
         f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
         f"hsa_max_diff={hsa_max_diff:.6f} hsa_mean_diff={hsa_mean_diff:.6f} "
@@ -739,6 +929,31 @@ def run_case(case: BenchmarkCase):
         f"hsa_fwd_bwd_ms={hsa_fwd_bwd_ms:.3f} dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} "
         f"hsa_fwd_bwd_vs_dense={hsa_fwd_bwd_vs_dense:.2f}x"
     )
+    if external_hdt_status == "measured":
+        line += (
+            f" hdt_in_repo_dense_fwd_ms={hdt_in_repo_dense_fwd_ms:.3f}"
+            f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
+            f" hdt_in_repo_dense_fwd_bwd_ms={hdt_in_repo_dense_fwd_bwd_ms:.3f}"
+            f" external_hdt_fwd_ms={external_hdt_fwd_ms:.3f}"
+            f" external_hdt_bwd_ms={external_hdt_bwd_ms:.3f}"
+            f" external_hdt_fwd_bwd_ms={external_hdt_fwd_bwd_ms:.3f}"
+        )
+    else:
+        line += (
+            f" hdt_in_repo_dense_fwd_ms={hdt_in_repo_dense_fwd_ms:.3f}"
+            f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
+            f" hdt_in_repo_dense_fwd_bwd_ms={hdt_in_repo_dense_fwd_bwd_ms:.3f}"
+            f" external_hdt_status={external_hdt_status}"
+        )
+    if synthetic_summary is not None:
+        line += (
+            f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
+            f" synth_tiles={synthetic_summary['num_tiles']}"
+            f" synth_avg_q_rows={synthetic_summary['avg_q_rows']:.1f}"
+            f" synth_avg_k_rows={synthetic_summary['avg_k_rows']:.1f}"
+            f" synth_avg_logical_pairs={synthetic_summary['avg_logical_pairs']:.1f}"
+        )
+    print(line)
 
 
 def _run_cases_once():
@@ -762,6 +977,14 @@ def _run_cases_once():
 
 
 def main():
+    if os.environ.get("FLASH_ATTN_HSA_EXTERNAL_HDT_CHILD", "0") == "1":
+        try:
+            payload = _measure_external_hdt_case()
+        except Exception as exc:
+            payload = {"status": f"failed_{type(exc).__name__}"}
+        print(json.dumps(payload), flush=True)
+        return
+
     if os.environ.get("FLASH_ATTN_HSA_BENCH_CHILD", "0") == "1":
         attempt = os.environ.get("FLASH_ATTN_HSA_BENCH_ATTEMPT", "?")
         try:

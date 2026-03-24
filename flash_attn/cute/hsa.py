@@ -145,6 +145,46 @@ class HSAForwardTileMasks:
 
 
 @dataclass
+class HSASyntheticGridMetadata:
+    """Logical 32x32 occupancy/compaction metadata layered over physical sparse tiles."""
+
+    logical_block_q: int
+    logical_block_k: int
+    physical_block_q: int
+    physical_block_k: int
+    tile_batch_idx: torch.Tensor
+    tile_q_block_idx: torch.Tensor
+    tile_k_block_idx: torch.Tensor
+    tile_q_row_ptr: torch.Tensor
+    tile_q_rows: torch.Tensor
+    tile_k_row_ptr: torch.Tensor
+    tile_k_rows: torch.Tensor
+    tile_logical_pair_row_ptr: torch.Tensor
+    tile_logical_pairs: torch.Tensor
+
+    def to(self, device: torch.device | str):
+        return HSASyntheticGridMetadata(
+            logical_block_q=self.logical_block_q,
+            logical_block_k=self.logical_block_k,
+            physical_block_q=self.physical_block_q,
+            physical_block_k=self.physical_block_k,
+            tile_batch_idx=self.tile_batch_idx.to(device=device),
+            tile_q_block_idx=self.tile_q_block_idx.to(device=device),
+            tile_k_block_idx=self.tile_k_block_idx.to(device=device),
+            tile_q_row_ptr=self.tile_q_row_ptr.to(device=device),
+            tile_q_rows=self.tile_q_rows.to(device=device),
+            tile_k_row_ptr=self.tile_k_row_ptr.to(device=device),
+            tile_k_rows=self.tile_k_rows.to(device=device),
+            tile_logical_pair_row_ptr=self.tile_logical_pair_row_ptr.to(device=device),
+            tile_logical_pairs=self.tile_logical_pairs.to(device=device),
+        )
+
+    @property
+    def num_tiles(self) -> int:
+        return int(self.tile_batch_idx.numel())
+
+
+@dataclass
 class HSABlockSparseRuntime:
     """Cached runtime metadata for the single-call HSA block-sparse path."""
 
@@ -161,6 +201,7 @@ class HSABlockSparseRuntime:
     backward_subtile_factor: int
     forward_sparse_torch: Optional[Any] = None
     backward_sparse_torch: Optional[Any] = None
+    synthetic_grid: Optional[HSASyntheticGridMetadata] = None
 
     def to(self, device: torch.device | str):
         def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
@@ -187,6 +228,7 @@ class HSABlockSparseRuntime:
             backward_block_q=self.backward_block_q,
             backward_block_k=self.backward_block_k,
             backward_subtile_factor=self.backward_subtile_factor,
+            synthetic_grid=None if self.synthetic_grid is None else self.synthetic_grid.to(device=device),
         )
 
 
@@ -3337,6 +3379,8 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         backward_block_k=backward_block_k,
         backward_subtile_factor=backward_subtile_factor,
     )
+    if _use_hsa_synthetic_grid():
+        runtime.synthetic_grid = _build_hsa_synthetic_grid_metadata(schedule, runtime)
     if cache is None:
         cache = {}
         setattr(schedule, "_hsa_block_sparse_runtime_cache", cache)
@@ -3357,6 +3401,161 @@ def _to_block_sparse_tensors_torch(sparse_tensors: HSABlockSparseTensors):
         full_block_idx=sparse_tensors.full_block_idx,
         block_size=sparse_tensors.block_size,
     )
+
+
+def _use_hsa_synthetic_grid() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
+
+
+def _build_hsa_synthetic_grid_metadata(
+    schedule: HSASchedule,
+    runtime: HSABlockSparseRuntime,
+    *,
+    logical_block_q: int = 32,
+    logical_block_k: int = 32,
+) -> HSASyntheticGridMetadata:
+    sparse_tensors = runtime.backward_sparse
+    packed_masks = runtime.backward_packed_masks
+    q_block_size, k_block_size = sparse_tensors.block_size
+    if q_block_size % logical_block_q != 0 or k_block_size % logical_block_k != 0:
+        raise ValueError(
+            "Synthetic grid requires logical block sizes that evenly divide the physical sparse blocks"
+        )
+
+    device = sparse_tensors.mask_block_cnt.device
+    seqlen = schedule.seqlen
+    mask_block_cnt = sparse_tensors.mask_block_cnt.detach().cpu()
+    mask_block_idx = sparse_tensors.mask_block_idx.detach().cpu()
+    full_block_cnt = None if sparse_tensors.full_block_cnt is None else sparse_tensors.full_block_cnt.detach().cpu()
+    full_block_idx = None if sparse_tensors.full_block_idx is None else sparse_tensors.full_block_idx.detach().cpu()
+    block_id_table = packed_masks.block_id_table.detach().cpu()
+    mask_words = packed_masks.mask_words.detach().cpu()
+    words_per_row = packed_masks.words_per_row
+    num_batches = int(mask_block_cnt.shape[0])
+    num_k_blocks = int(mask_block_cnt.shape[2])
+
+    tile_batch_idx: list[int] = []
+    tile_q_block_idx: list[int] = []
+    tile_k_block_idx: list[int] = []
+    tile_q_row_ptr = [0]
+    tile_k_row_ptr = [0]
+    tile_logical_pair_row_ptr = [0]
+    tile_q_rows: list[int] = []
+    tile_k_rows: list[int] = []
+    tile_logical_pairs: list[list[int]] = []
+
+    def _append_tile(
+        batch_idx: int,
+        q_block_idx: int,
+        k_block_idx: int,
+        q_rows_local: list[int],
+        k_rows_local: list[int],
+        logical_pairs_local: list[tuple[int, int]],
+    ) -> None:
+        tile_batch_idx.append(batch_idx)
+        tile_q_block_idx.append(q_block_idx)
+        tile_k_block_idx.append(k_block_idx)
+        tile_q_rows.extend(q_rows_local)
+        tile_k_rows.extend(k_rows_local)
+        tile_logical_pairs.extend([[q_sub, k_sub] for q_sub, k_sub in logical_pairs_local])
+        tile_q_row_ptr.append(len(tile_q_rows))
+        tile_k_row_ptr.append(len(tile_k_rows))
+        tile_logical_pair_row_ptr.append(len(tile_logical_pairs))
+
+    for batch_idx in range(num_batches):
+        for k_block_idx in range(num_k_blocks):
+            k_start = k_block_idx * k_block_size
+            k_len = min(k_block_size, seqlen - k_start)
+            if k_len <= 0:
+                continue
+            tail_mask = (1 << (k_len % 32)) - 1 if k_len % 32 != 0 else None
+
+            full_cnt = 0 if full_block_cnt is None else int(full_block_cnt[batch_idx, 0, k_block_idx].item())
+            for offset in range(full_cnt):
+                q_block_idx = int(full_block_idx[batch_idx, 0, k_block_idx, offset].item())
+                q_start = q_block_idx * q_block_size
+                q_len = min(q_block_size, seqlen - q_start)
+                if q_len <= 0:
+                    continue
+                q_rows_local = list(range(q_len))
+                k_rows_local = list(range(k_len))
+                logical_pairs_local = [
+                    (q_sub, k_sub)
+                    for q_sub in range((q_len + logical_block_q - 1) // logical_block_q)
+                    for k_sub in range((k_len + logical_block_k - 1) // logical_block_k)
+                ]
+                _append_tile(
+                    batch_idx,
+                    q_block_idx,
+                    k_block_idx,
+                    q_rows_local,
+                    k_rows_local,
+                    logical_pairs_local,
+                )
+
+            partial_cnt = int(mask_block_cnt[batch_idx, 0, k_block_idx].item())
+            for offset in range(partial_cnt):
+                q_block_idx = int(mask_block_idx[batch_idx, 0, k_block_idx, offset].item())
+                q_start = q_block_idx * q_block_size
+                q_len = min(q_block_size, seqlen - q_start)
+                if q_len <= 0:
+                    continue
+                block_id = int(block_id_table[batch_idx, k_block_idx, q_block_idx].item())
+                active_q_rows = [False] * q_len
+                active_k_rows = [False] * k_len
+                logical_pairs_local: set[tuple[int, int]] = set()
+
+                for q_local in range(q_len):
+                    for word_idx in range(words_per_row):
+                        word = int(mask_words[block_id, q_local, word_idx].item()) & 0xFFFFFFFF
+                        if tail_mask is not None and word_idx == words_per_row - 1:
+                            word &= tail_mask
+                        while word:
+                            bit = word & -word
+                            bit_idx = bit.bit_length() - 1
+                            k_local = word_idx * 32 + bit_idx
+                            if k_local < k_len:
+                                active_q_rows[q_local] = True
+                                active_k_rows[k_local] = True
+                                logical_pairs_local.add((q_local // logical_block_q, k_local // logical_block_k))
+                            word ^= bit
+
+                q_rows_local = [idx for idx, is_active in enumerate(active_q_rows) if is_active]
+                k_rows_local = [idx for idx, is_active in enumerate(active_k_rows) if is_active]
+                if q_rows_local and k_rows_local:
+                    _append_tile(
+                        batch_idx,
+                        q_block_idx,
+                        k_block_idx,
+                        q_rows_local,
+                        k_rows_local,
+                        sorted(logical_pairs_local),
+                    )
+
+    return HSASyntheticGridMetadata(
+        logical_block_q=logical_block_q,
+        logical_block_k=logical_block_k,
+        physical_block_q=q_block_size,
+        physical_block_k=k_block_size,
+        tile_batch_idx=torch.tensor(tile_batch_idx, dtype=torch.int32, device=device),
+        tile_q_block_idx=torch.tensor(tile_q_block_idx, dtype=torch.int32, device=device),
+        tile_k_block_idx=torch.tensor(tile_k_block_idx, dtype=torch.int32, device=device),
+        tile_q_row_ptr=torch.tensor(tile_q_row_ptr, dtype=torch.int32, device=device),
+        tile_q_rows=torch.tensor(tile_q_rows, dtype=torch.int32, device=device),
+        tile_k_row_ptr=torch.tensor(tile_k_row_ptr, dtype=torch.int32, device=device),
+        tile_k_rows=torch.tensor(tile_k_rows, dtype=torch.int32, device=device),
+        tile_logical_pair_row_ptr=torch.tensor(tile_logical_pair_row_ptr, dtype=torch.int32, device=device),
+        tile_logical_pairs=torch.tensor(tile_logical_pairs, dtype=torch.int32, device=device),
+    )
+
+
+def _ensure_hsa_synthetic_grid_metadata(
+    schedule: HSASchedule,
+    runtime: HSABlockSparseRuntime,
+) -> HSASyntheticGridMetadata:
+    if runtime.synthetic_grid is None:
+        runtime.synthetic_grid = _build_hsa_synthetic_grid_metadata(schedule, runtime)
+    return runtime.synthetic_grid
 
 
 def _get_hsa_backward_subtile_factor() -> int:
@@ -4459,12 +4658,27 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         deterministic: bool,
         return_lse: bool,
     ):
-        from flash_attn.cute.flash_hsa_fwd_sm100 import run_hsa_fwd_sm100_blocksparse
-
-        out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
-            run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
-        )
         ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+        ctx.use_synthetic_grid = _use_hsa_synthetic_grid()
+        if ctx.use_synthetic_grid:
+            from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_fwd_sm100_synthetic_grid
+
+            out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+                run_hsa_fwd_sm100_synthetic_grid(
+                    q,
+                    k,
+                    v,
+                    schedule,
+                    softmax_scale,
+                    runtime=ctx.block_sparse_runtime,
+                )
+            )
+        else:
+            from flash_attn.cute.flash_hsa_fwd_sm100 import run_hsa_fwd_sm100_blocksparse
+
+            out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+                run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
+            )
         ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
         ctx.schedule = schedule
         ctx.keep_ids = keep_ids
@@ -4498,6 +4712,30 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         sentence_k_stream = sentence_k_stream if sentence_k_stream.numel() > 0 else None
         sentence_v_stream = sentence_v_stream if sentence_v_stream.numel() > 0 else None
         sentence_out_stream = sentence_out_stream if sentence_out_stream.numel() > 0 else None
+
+        if ctx.use_synthetic_grid:
+            from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
+
+            dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                sentence_lse,
+                sentence_q_stream,
+                sentence_k_stream,
+                sentence_v_stream,
+                sentence_out_stream,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                ctx.keep_ids,
+                ctx.hash_ids,
+                runtime=ctx.block_sparse_runtime,
+            )
+            return dq, dk, dv, None, None, None, None, None, None
 
         if ctx.hsa_backward_mode == "sparse_mask":
             dq, dk, dv = _run_hsa_packed_mask_backward(

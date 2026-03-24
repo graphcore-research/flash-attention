@@ -5,3 +5,6 @@
 	path = csrc/composable_kernel
 	url = https://github.com/ROCm/composable_kernel.git
 	branch = amd-master
+[submodule "third_party/hdt"]
+	path = third_party/hdt
+	url = https://github.com/autonomousvision/hdt.git

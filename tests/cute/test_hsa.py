@@ -1304,12 +1304,18 @@ def _run_mixed_sparse_mask_case(
     n_kv_heads: int,
     keep_ids: torch.Tensor,
     hash_ids: torch.Tensor,
+    q_data: torch.Tensor | None = None,
+    k_data: torch.Tensor | None = None,
+    v_data: torch.Tensor | None = None,
 ):
     device = "cuda"
     dtype = torch.bfloat16
-    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    if q_data is None:
+        q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    if k_data is None:
+        k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    if v_data is None:
+        v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
 
     q_sparse = q_data.clone().requires_grad_(True)
     k_sparse = k_data.clone().requires_grad_(True)
@@ -1505,3 +1511,106 @@ def test_hsa_mixed_sparse_mask_backward_smoke(monkeypatch, label, batch_size, se
     assert packed_mask_calls == 1
     _assert_close(out_sparse.float(), out_ref, f"{label}_output")
     _assert_finite_gradients(f"{label}_grads", q_grad, k_grad, v_grad)
+
+
+def test_benchmark_hsa_external_hdt_adapter_smoke():
+    benchmark_hsa = _load_benchmark_hsa_module()
+    attention_fn, status = benchmark_hsa._load_external_hdt_attention()
+    assert attention_fn is not None or status.startswith(("missing_", "import_failed_", "missing_loader"))
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_grid_runtime_builds_metadata(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+
+    assert runtime.synthetic_grid is not None
+    assert runtime.synthetic_grid.logical_block_q == 32
+    assert runtime.synthetic_grid.logical_block_k == 32
+    assert runtime.synthetic_grid.num_tiles > 0
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize(
+    "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
+    [
+        ("mixed_small_eq", 1, 65, 4, 64, 4),
+        ("train_eq", 2, 1024, 8, 64, 8),
+        ("train_gqa", 2, 1024, 8, 64, 2),
+    ],
+)
+def test_hsa_synthetic_grid_matches_sparse_path(
+    monkeypatch,
+    label,
+    batch_size,
+    seqlen,
+    nheads,
+    headdim,
+    n_kv_heads,
+):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    dtype = torch.bfloat16
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    monkeypatch.delenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", raising=False)
+    baseline = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+    out_base, q_base, k_base, v_base, _, _, _, _ = baseline
+
+    calls = {"fwd": 0, "bwd": 0}
+    original_fwd = synthetic_module.run_hsa_fwd_sm100_synthetic_grid
+    original_bwd = synthetic_module.run_hsa_bwd_sm100_synthetic_grid
+
+    def _tracked_fwd(*args, **kwargs):
+        calls["fwd"] += 1
+        return original_fwd(*args, **kwargs)
+
+    def _tracked_bwd(*args, **kwargs):
+        calls["bwd"] += 1
+        return original_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(synthetic_module, "run_hsa_fwd_sm100_synthetic_grid", _tracked_fwd)
+    monkeypatch.setattr(synthetic_module, "run_hsa_bwd_sm100_synthetic_grid", _tracked_bwd)
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    out_synth, q_synth, k_synth, v_synth, _, _, _, _ = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    assert calls["fwd"] == 1
+    assert calls["bwd"] == 1
+    _assert_close(out_synth.float(), out_base.float(), f"{label}_synthetic_grid_output")
+    _assert_close(q_synth.float(), q_base.float(), f"{label}_synthetic_grid_q_grad")
+    _assert_close(k_synth.float(), k_base.float(), f"{label}_synthetic_grid_k_grad")
+    _assert_close(v_synth.float(), v_base.float(), f"{label}_synthetic_grid_v_grad")

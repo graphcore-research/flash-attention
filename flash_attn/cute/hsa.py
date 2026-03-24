@@ -2,7 +2,7 @@ import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -159,6 +159,8 @@ class HSABlockSparseRuntime:
     backward_block_q: int
     backward_block_k: int
     backward_subtile_factor: int
+    forward_sparse_torch: Optional[Any] = None
+    backward_sparse_torch: Optional[Any] = None
 
     def to(self, device: torch.device | str):
         def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
@@ -169,13 +171,17 @@ class HSABlockSparseRuntime:
                 setattr(moved, "__leading_dim__", getattr(tensor, "__leading_dim__"))
             return moved
 
+        forward_sparse = self.forward_sparse.to(device=device)
+        backward_sparse = self.backward_sparse.to(device=device)
         return HSABlockSparseRuntime(
-            forward_sparse=self.forward_sparse.to(device=device),
+            forward_sparse=forward_sparse,
             forward_tile_masks=self.forward_tile_masks.to(device=device),
-            backward_sparse=self.backward_sparse.to(device=device),
+            backward_sparse=backward_sparse,
             backward_packed_masks=self.backward_packed_masks.to(device=device),
             forward_aux_tensors=[_move_aux(tensor) for tensor in self.forward_aux_tensors],
             backward_aux_tensors=[_move_aux(tensor) for tensor in self.backward_aux_tensors],
+            forward_sparse_torch=_to_block_sparse_tensors_torch(forward_sparse),
+            backward_sparse_torch=_to_block_sparse_tensors_torch(backward_sparse),
             forward_block_q=self.forward_block_q,
             forward_block_k=self.forward_block_k,
             backward_block_q=self.backward_block_q,
@@ -3283,10 +3289,20 @@ def _get_hsa_fused_forward_batches(
 def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> HSABlockSparseRuntime:
     cache = getattr(schedule, "_hsa_block_sparse_runtime_cache", None)
     forward_block_q = _get_hsa_forward_q_block_size(q, k)
-    backward_block_q = 64
+    backward_block_q = _get_hsa_backward_block_q()
     forward_block_k = 128
-    backward_block_k = 128
-    cache_key = (str(q.device), forward_block_q, forward_block_k, backward_block_q, backward_block_k)
+    backward_block_k = _get_hsa_backward_block_k()
+    backward_subtile_factor = _get_hsa_backward_subtile_factor()
+    # FA4 backward expects the sparse Q block to be subtile_factor * tile_m.
+    backward_sparse_block_q = backward_block_q * backward_subtile_factor
+    cache_key = (
+        str(q.device),
+        forward_block_q,
+        forward_block_k,
+        backward_block_q,
+        backward_block_k,
+        backward_subtile_factor,
+    )
     if cache is not None and cache_key in cache:
         return cache[cache_key]
 
@@ -3298,7 +3314,7 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
 
     backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
         schedule,
-        q_block_size=backward_block_q,
+        q_block_size=backward_sparse_block_q,
         k_block_size=backward_block_k,
     )
 
@@ -3313,11 +3329,13 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
             _tag_aux_tensor(backward_packed_masks.mask_words),
             _tag_aux_tensor(backward_packed_masks.row_group_nonempty),
         ],
+        forward_sparse_torch=_to_block_sparse_tensors_torch(forward_sparse),
+        backward_sparse_torch=_to_block_sparse_tensors_torch(backward_sparse),
         forward_block_q=forward_block_q,
         forward_block_k=forward_block_k,
         backward_block_q=backward_block_q,
         backward_block_k=backward_block_k,
-        backward_subtile_factor=1,
+        backward_subtile_factor=backward_subtile_factor,
     )
     if cache is None:
         cache = {}
@@ -3327,7 +3345,10 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
 
 
 def _to_block_sparse_tensors_torch(sparse_tensors: HSABlockSparseTensors):
-    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+    try:
+        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+    except ModuleNotFoundError:
+        return None
 
     return BlockSparseTensorsTorch(
         mask_block_cnt=sparse_tensors.mask_block_cnt,
@@ -3336,6 +3357,27 @@ def _to_block_sparse_tensors_torch(sparse_tensors: HSABlockSparseTensors):
         full_block_idx=sparse_tensors.full_block_idx,
         block_size=sparse_tensors.block_size,
     )
+
+
+def _get_hsa_backward_subtile_factor() -> int:
+    subtile_factor = int(os.environ.get("FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR", "1"))
+    if subtile_factor not in (1, 2):
+        raise ValueError("FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR must be 1 or 2")
+    return subtile_factor
+
+
+def _get_hsa_backward_block_q() -> int:
+    block_q = int(os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q", "64"))
+    if block_q not in (32, 64, 128):
+        raise ValueError("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q must be 32, 64, or 128")
+    return block_q
+
+
+def _get_hsa_backward_block_k() -> int:
+    block_k = int(os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_K", "128"))
+    if block_k not in (32, 64, 128):
+        raise ValueError("FLASH_ATTN_HSA_BACKWARD_BLOCK_K must be 32, 64, or 128")
+    return block_k
 
 
 @lru_cache(maxsize=1)
@@ -4262,7 +4304,7 @@ def _run_hsa_blocksparse_forward(
         pack_gqa=False,
         mask_mod=get_hsa_forward_tile_mask_mod(runtime.forward_tile_masks.q_block_size, runtime.forward_tile_masks.k_block_size),
         aux_tensors=runtime.forward_aux_tensors,
-        block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.forward_sparse),
+        block_sparse_tensors=runtime.forward_sparse_torch,
         return_lse=True,
     )
     return out, lse
@@ -4280,9 +4322,10 @@ def _run_hsa_packed_mask_backward(
     deterministic: bool,
     keep_ids: Optional[torch.Tensor] = None,
     hash_ids: Optional[torch.Tensor] = None,
+    runtime: Optional[HSABlockSparseRuntime] = None,
 ):
     _, _, _, _, _, _, flash_attn_bwd = _lazy_cute_imports()
-    runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+    runtime = runtime if runtime is not None else _get_hsa_block_sparse_runtime(schedule, q, k)
     return flash_attn_bwd(
         q,
         k,
@@ -4296,11 +4339,33 @@ def _run_hsa_packed_mask_backward(
         deterministic=deterministic,
         m_block_size=runtime.backward_block_q,
         n_block_size=runtime.backward_block_k,
-        mask_mod=get_hsa_backward_packed_mask_mod(runtime.backward_block_q, runtime.backward_block_k),
+        mask_mod=get_hsa_backward_packed_mask_mod(
+            runtime.backward_packed_masks.q_block_size,
+            runtime.backward_packed_masks.k_block_size,
+        ),
         aux_tensors=runtime.backward_aux_tensors,
-        block_sparse_tensors=_to_block_sparse_tensors_torch(runtime.backward_sparse),
+        block_sparse_tensors=runtime.backward_sparse_torch,
         subtile_factor_override=runtime.backward_subtile_factor,
     )
+
+
+def _schedule_has_only_sentence_backward_families(schedule: HSASchedule) -> bool:
+    monolithic_schedule = _get_hsa_monolithic_backward_schedule(schedule)
+    return monolithic_schedule.anchor_full_q_row_start.numel() == 0 and monolithic_schedule.anchor_tail_q_row_start.numel() == 0
+
+
+def _get_hsa_blocksparse_backward_mode(schedule: HSASchedule) -> str:
+    if (
+        os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
+        and _schedule_has_only_sentence_backward_families(schedule)
+    ):
+        return "monolithic_sentence"
+    if (
+        os.environ.get("FLASH_ATTN_HSA_USE_PACKED_BWD", "0") == "1"
+        or os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1"
+    ):
+        return "legacy_packed"
+    return "sparse_mask"
 
 
 def _run_hsa_blocksparse_backward(
@@ -4320,8 +4385,10 @@ def _run_hsa_blocksparse_backward(
     deterministic: bool,
     keep_ids: Optional[torch.Tensor] = None,
     hash_ids: Optional[torch.Tensor] = None,
+    runtime: Optional[HSABlockSparseRuntime] = None,
 ):
-    if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
+    backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
+    if backward_mode == "monolithic_sentence":
         del keep_ids, hash_ids
         from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_monolithic
 
@@ -4344,10 +4411,7 @@ def _run_hsa_blocksparse_backward(
             )
         except NotImplementedError:
             pass
-    if (
-        os.environ.get("FLASH_ATTN_HSA_USE_PACKED_BWD", "0") == "1"
-        or os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1"
-    ):
+    if backward_mode == "legacy_packed":
         del keep_ids, hash_ids
         from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_packed
 
@@ -4377,7 +4441,8 @@ def _run_hsa_blocksparse_backward(
         deterministic,
         keep_ids,
         hash_ids,
-    )
+        runtime=runtime,
+        )
 
 
 class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
@@ -4399,6 +4464,8 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, softmax_scale)
         )
+        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+        ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
         ctx.schedule = schedule
         ctx.keep_ids = keep_ids
         ctx.hash_ids = hash_ids
@@ -4423,29 +4490,71 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_blocksparse
-
         q, k, v, out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             ctx.saved_tensors
         )
-        dq, dk, dv = run_hsa_bwd_sm100_blocksparse(
-            q,
-            k,
-            v,
-            out,
-            dout,
-            lse,
-            sentence_lse if sentence_lse.numel() > 0 else None,
-            sentence_q_stream if sentence_q_stream.numel() > 0 else None,
-            sentence_k_stream if sentence_k_stream.numel() > 0 else None,
-            sentence_v_stream if sentence_v_stream.numel() > 0 else None,
-            sentence_out_stream if sentence_out_stream.numel() > 0 else None,
-            ctx.schedule,
-            ctx.softmax_scale,
-            ctx.deterministic,
-            ctx.keep_ids,
-            ctx.hash_ids,
-        )
+        sentence_lse = sentence_lse if sentence_lse.numel() > 0 else None
+        sentence_q_stream = sentence_q_stream if sentence_q_stream.numel() > 0 else None
+        sentence_k_stream = sentence_k_stream if sentence_k_stream.numel() > 0 else None
+        sentence_v_stream = sentence_v_stream if sentence_v_stream.numel() > 0 else None
+        sentence_out_stream = sentence_out_stream if sentence_out_stream.numel() > 0 else None
+
+        if ctx.hsa_backward_mode == "sparse_mask":
+            dq, dk, dv = _run_hsa_packed_mask_backward(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                ctx.keep_ids,
+                ctx.hash_ids,
+                runtime=ctx.block_sparse_runtime,
+            )
+        elif ctx.hsa_backward_mode == "monolithic_sentence":
+            from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_monolithic
+
+            dq, dk, dv = run_hsa_bwd_sm100_monolithic(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                sentence_lse=sentence_lse,
+                sentence_q_stream=sentence_q_stream,
+                sentence_k_stream=sentence_k_stream,
+                sentence_v_stream=sentence_v_stream,
+                sentence_out_stream=sentence_out_stream,
+            )
+        else:
+            from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_blocksparse
+
+            dq, dk, dv = run_hsa_bwd_sm100_blocksparse(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                sentence_lse,
+                sentence_q_stream,
+                sentence_k_stream,
+                sentence_v_stream,
+                sentence_out_stream,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                ctx.keep_ids,
+                ctx.hash_ids,
+                runtime=ctx.block_sparse_runtime,
+            )
         return dq, dk, dv, None, None, None, None, None, None
 
 

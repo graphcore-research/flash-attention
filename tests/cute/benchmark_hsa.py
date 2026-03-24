@@ -69,6 +69,19 @@ CANONICAL_CASES = (
     BenchmarkCase(name="longer-eq", batch_size=2, seqlen=2048, nheads=8, headdim=64, n_kv_heads=8),
 )
 
+# Keep the stable 64x128 sparse backward geometry for long-context benchmarking.
+# 32x* is blocked by the FA4 backward dQ M-mode restriction, and 64x64 is not
+# currently stable/correct on the kept sparse backward path.
+LONG_CONTEXT_CASES = (
+    BenchmarkCase(name="long-16k", batch_size=1, seqlen=16384, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-32k", batch_size=1, seqlen=32768, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-64k", batch_size=1, seqlen=65536, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-100k", batch_size=1, seqlen=100000, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+)
+
+ALL_CASES = CANONICAL_CASES + LONG_CONTEXT_CASES
+LONG_CONTEXT_CASE_NAMES = frozenset(case.name for case in LONG_CONTEXT_CASES)
+
 
 def _unwrap_output(result):
     return result[0] if isinstance(result, tuple) else result
@@ -181,6 +194,128 @@ def _true_fused_env():
     }
 
 
+def _benchmark_env_for_case(case: BenchmarkCase):
+    del case
+    return _true_fused_env()
+
+
+def _benchmark_mode_label(case: BenchmarkCase) -> str:
+    return "sentence_true_fused" if case.name == "sentence-only" else "mixed_sparse_mask"
+
+
+def _benchmark_sparse_bwd_config_label() -> str:
+    block_q = os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q", "64")
+    block_k = os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_K", "128")
+    subtile_factor = os.environ.get("FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR", "1")
+    return f"bwd_block_q={block_q} bwd_block_k={block_k} bwd_subtile_factor={subtile_factor}"
+
+
+def _is_long_context_case(case: BenchmarkCase) -> bool:
+    return case.name in LONG_CONTEXT_CASE_NAMES
+
+
+def _get_selected_cases(*, env_var: str, default: tuple[BenchmarkCase, ...]) -> list[BenchmarkCase]:
+    selected = [name.strip() for name in os.environ.get(env_var, "").split(",")]
+    selected = [name for name in selected if name]
+    if not selected:
+        return list(default)
+    by_name = {case.name: case for case in ALL_CASES}
+    missing = [name for name in selected if name not in by_name]
+    if missing:
+        raise KeyError(f"Unknown {env_var} entries: {', '.join(missing)}")
+    return [by_name[name] for name in selected]
+
+
+def _use_sparse_profile_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_PROFILE_SPARSE_MASK", "0") == "1"
+
+
+def _use_geometry_sweep_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_GEOMETRY_SWEEP", "0") == "1"
+
+
+def _geometry_sweep_configs() -> tuple[tuple[int, int, int], ...]:
+    return (
+        (64, 128, 1),
+        (64, 64, 1),
+        (32, 64, 1),
+        (32, 32, 1),
+    )
+
+
+def _geometry_sweep_env(block_q: int, block_k: int, subtile_factor: int) -> dict[str, str]:
+    return {
+        "FLASH_ATTN_HSA_BACKWARD_BLOCK_Q": str(block_q),
+        "FLASH_ATTN_HSA_BACKWARD_BLOCK_K": str(block_k),
+        "FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR": str(subtile_factor),
+    }
+
+
+def _summarize_sparse_backward_occupancy(sparse_tensors, packed_masks, *, seqlen: int) -> dict[str, float | int]:
+    mask_block_cnt = sparse_tensors.mask_block_cnt.detach().cpu()
+    mask_block_idx = sparse_tensors.mask_block_idx.detach().cpu()
+    full_block_cnt = None if sparse_tensors.full_block_cnt is None else sparse_tensors.full_block_cnt.detach().cpu()
+    full_block_idx = None if sparse_tensors.full_block_idx is None else sparse_tensors.full_block_idx.detach().cpu()
+    block_id_table = packed_masks.block_id_table.detach().cpu()
+    mask_words = packed_masks.mask_words.detach().cpu()
+
+    batch_size = mask_block_cnt.shape[0]
+    num_k_blocks = mask_block_cnt.shape[2]
+    num_q_blocks = mask_block_idx.shape[3]
+    q_block_size, k_block_size = sparse_tensors.block_size
+    words_per_row = packed_masks.words_per_row
+
+    allowed_pairs = 0
+    valid_active_area = 0
+    nominal_active_area = 0
+    active_blocks = 0
+
+    for batch_idx in range(batch_size):
+        for k_block in range(num_k_blocks):
+            k_start = k_block * k_block_size
+            k_len = min(k_block_size, seqlen - k_start)
+            tail_mask = (1 << (k_len % 32)) - 1 if k_len % 32 != 0 else None
+
+            full_cnt = 0 if full_block_cnt is None else int(full_block_cnt[batch_idx, 0, k_block].item())
+            active_blocks += full_cnt
+            for offset in range(full_cnt):
+                q_block = int(full_block_idx[batch_idx, 0, k_block, offset].item())
+                q_start = q_block * q_block_size
+                q_len = min(q_block_size, seqlen - q_start)
+                allowed_pairs += q_len * k_len
+                valid_active_area += q_len * k_len
+                nominal_active_area += q_block_size * k_block_size
+
+            partial_cnt = int(mask_block_cnt[batch_idx, 0, k_block].item())
+            active_blocks += partial_cnt
+            for offset in range(partial_cnt):
+                q_block = int(mask_block_idx[batch_idx, 0, k_block, offset].item())
+                q_start = q_block * q_block_size
+                q_len = min(q_block_size, seqlen - q_start)
+                block_id = int(block_id_table[batch_idx, k_block, q_block].item())
+                valid_active_area += q_len * k_len
+                nominal_active_area += q_block_size * k_block_size
+                for q_local in range(q_len):
+                    for word_idx in range(words_per_row):
+                        word = int(mask_words[block_id, q_local, word_idx].item()) & 0xFFFFFFFF
+                        if tail_mask is not None and word_idx == words_per_row - 1:
+                            word &= tail_mask
+                        allowed_pairs += word.bit_count()
+
+    total_blocks = batch_size * num_k_blocks * num_q_blocks
+    causal_pairs = batch_size * seqlen * (seqlen + 1) // 2
+
+    return {
+        "allowed_pairs": allowed_pairs,
+        "total_blocks": total_blocks,
+        "active_blocks": active_blocks,
+        "token_density": allowed_pairs / causal_pairs if causal_pairs > 0 else 0.0,
+        "active_block_density": active_blocks / total_blocks if total_blocks > 0 else 0.0,
+        "active_fill_nominal": allowed_pairs / nominal_active_area if nominal_active_area > 0 else 0.0,
+        "active_fill_valid": allowed_pairs / valid_active_area if valid_active_area > 0 else 0.0,
+    }
+
+
 def _run_sparse_attention(
     q,
     k,
@@ -250,6 +385,272 @@ def _measure_forward_backward_ms(
 
     return _measure_ms(_run, warmup_iters, benchmark_iters)
 
+
+def _event_self_device_us(event) -> float:
+    return float(getattr(event, "self_cuda_time_total", getattr(event, "self_device_time_total", 0.0)))
+
+
+def _top_cuda_rows(prof, *, include_patterns: tuple[str, ...] = (), limit: int = 8) -> list[tuple[str, float]]:
+    rows = []
+    events = sorted(prof.key_averages(), key=_event_self_device_us, reverse=True)
+    for event in events:
+        key = getattr(event, "key", getattr(event, "name", ""))
+        value_us = _event_self_device_us(event)
+        if value_us <= 0.0:
+            continue
+        if include_patterns and not any(pattern in key for pattern in include_patterns):
+            continue
+        if key.startswith("aten::") or key.startswith("_") or key.startswith("void at::") or key.startswith("Memcpy"):
+            continue
+        rows.append((key, value_us))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _profile_sparse_mask_case(case: BenchmarkCase):
+    build_hsa_schedule, flash_attn_func, flash_attn_hsa_sparse_func, _ = _lazy_flash_attn_imports()
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
+    q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
+    k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    env_updates = _benchmark_env_for_case(case)
+
+    with _temporary_env(**env_updates):
+        q_hsa = q_data.clone().requires_grad_(True)
+        k_hsa = k_data.clone().requires_grad_(True)
+        v_hsa = v_data.clone().requires_grad_(True)
+        out_hsa = flash_attn_hsa_sparse_func(q_hsa, k_hsa, v_hsa, keep_ids=keep_ids, hash_ids=hash_ids, hsa_schedule=schedule)
+        hsa_loss = _unwrap_output(out_hsa).float().square().mean()
+
+    q_dense = q_data.clone().requires_grad_(True)
+    k_dense = k_data.clone().requires_grad_(True)
+    v_dense = v_data.clone().requires_grad_(True)
+    dense_loss = _unwrap_output(flash_attn_func(q_dense, k_dense, v_dense, causal=True)).float().square().mean()
+
+    def _run_hsa():
+        with _temporary_env(**env_updates):
+            torch.autograd.grad(hsa_loss, (q_hsa, k_hsa, v_hsa), retain_graph=True)
+
+    def _run_dense():
+        torch.autograd.grad(dense_loss, (q_dense, k_dense, v_dense), retain_graph=True)
+
+    warmups = max(3, min(case.warmup_iters, 5))
+    for _ in range(warmups):
+        _run_hsa()
+        _run_dense()
+    torch.cuda.synchronize()
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False,
+    ) as sparse_prof:
+        _run_hsa()
+        torch.cuda.synchronize()
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False,
+    ) as dense_prof:
+        _run_dense()
+        torch.cuda.synchronize()
+
+    sparse_rows = _top_cuda_rows(sparse_prof, limit=6)
+    dense_rows = _top_cuda_rows(
+        dense_prof,
+        include_patterns=(
+            "FlashAttentionBackwardSm100",
+            "flash_attncuteflash_bwd_sm100",
+            "FlashAttentionBackwardPreprocess",
+            "flash_attncuteflash_bwd_preprocess",
+            "FlashAttentionBackwardPostprocess",
+            "flash_attncuteflash_bwd_postprocess",
+        ),
+        limit=6,
+    )
+    dense_kernel_key, dense_kernel_us = dense_rows[0] if dense_rows else ("", 0.0)
+
+    print(
+        f"sparse_mask_profile_case={case.name} mode={_benchmark_mode_label(case)} "
+        f"{_benchmark_sparse_bwd_config_label()}"
+    )
+    if sparse_rows:
+        top_key, top_us = sparse_rows[0]
+        ratio = top_us / dense_kernel_us if dense_kernel_us > 0.0 else float('inf')
+        print(f"sparse_mask_backward_top case={case.name} self_cuda_us={top_us:.1f} vs_fa4_backward={ratio:.2f}x kernel={top_key}")
+        for key, value_us in sparse_rows[1:]:
+            print(f"sparse_mask_backward_neighbor case={case.name} self_cuda_us={value_us:.1f} kernel={key}")
+    if dense_kernel_us > 0.0:
+        print(f"dense_fa4_backward_baseline case={case.name} self_cuda_us={dense_kernel_us:.1f} kernel={dense_kernel_key}")
+        for key, value_us in dense_rows[1:]:
+            print(f"dense_fa4_backward_neighbor case={case.name} self_cuda_us={value_us:.1f} kernel={key}")
+
+
+def _run_geometry_sweep_case(case: BenchmarkCase, *, block_q: int, block_k: int, subtile_factor: int):
+    build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
+    q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
+    k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    env_updates = {
+        **_benchmark_env_for_case(case),
+        **_geometry_sweep_env(block_q, block_k, subtile_factor),
+    }
+
+    hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
+    dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
+    dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+
+    try:
+        out_hsa = hsa_forward(q_data, k_data, v_data)
+        out_ref = dense_ref_forward(q_data, k_data, v_data)
+        hsa_max_diff = (out_hsa.float() - out_ref.float()).abs().max().item()
+        hsa_mean_diff = (out_hsa.float() - out_ref.float()).abs().mean().item()
+
+        hsa_bwd_ms = _measure_backward_ms(
+            hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=env_updates,
+        )
+        dense_causal_bwd_ms = _measure_backward_ms(
+            dense_causal_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+        )
+        hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+
+        print(
+            f"geometry_sweep_case={case.name} mode={_benchmark_mode_label(case)} "
+            f"bwd_block_q={block_q} bwd_block_k={block_k} bwd_subtile_factor={subtile_factor} "
+            f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
+            f"hsa_max_diff={hsa_max_diff:.6f} hsa_mean_diff={hsa_mean_diff:.6f} "
+            f"hsa_bwd_ms={hsa_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
+            f"hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x"
+        )
+    except Exception as exc:
+        print(
+            f"geometry_sweep_failure case={case.name} mode={_benchmark_mode_label(case)} "
+            f"bwd_block_q={block_q} bwd_block_k={block_k} bwd_subtile_factor={subtile_factor} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+
+
+def _run_geometry_sweep_once():
+    default_cases = tuple(case for case in CANONICAL_CASES if case.name != "sentence-only")
+    for case in _get_selected_cases(
+        env_var="FLASH_ATTN_HSA_GEOMETRY_SWEEP_CASES",
+        default=default_cases,
+    ):
+        for block_q, block_k, subtile_factor in _geometry_sweep_configs():
+            _run_geometry_sweep_case(
+                case,
+                block_q=block_q,
+                block_k=block_k,
+                subtile_factor=subtile_factor,
+            )
+
+
+def _run_long_case(case: BenchmarkCase):
+    import flash_attn.cute.hsa as hsa_module
+
+    build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
+    q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
+    k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    env_updates = _benchmark_env_for_case(case)
+
+    with _temporary_env(**env_updates):
+        runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
+    occupancy = _summarize_sparse_backward_occupancy(
+        runtime.backward_sparse,
+        runtime.backward_packed_masks,
+        seqlen=case.seqlen,
+    )
+
+    hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
+    dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
+
+    hsa_bwd_ms = _measure_backward_ms(
+        hsa_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=env_updates,
+    )
+    dense_causal_bwd_ms = _measure_backward_ms(
+        dense_causal_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+    )
+    hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+
+    dense_hdt_bwd_ms = None
+    dense_hdt_status = "skipped_32k_plus"
+    dense_hdt_ratio = None
+    if case.name == "long-16k":
+        dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
+        try:
+            dense_hdt_bwd_ms = _measure_backward_ms(
+                dense_ref_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+            dense_hdt_ratio = hsa_bwd_ms / dense_hdt_bwd_ms if dense_hdt_bwd_ms > 0 else float("inf")
+            dense_hdt_status = "measured"
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            torch.cuda.empty_cache()
+            dense_hdt_status = f"failed_{type(exc).__name__}"
+
+    line = (
+        f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
+        f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
+        f"allowed_pairs={occupancy['allowed_pairs']} token_density={occupancy['token_density']:.6f} "
+        f"active_blocks={occupancy['active_blocks']} total_blocks={occupancy['total_blocks']} "
+        f"active_block_density={occupancy['active_block_density']:.6f} "
+        f"active_fill_nominal={occupancy['active_fill_nominal']:.6f} "
+        f"active_fill_valid={occupancy['active_fill_valid']:.6f} "
+        f"hsa_bwd_ms={hsa_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
+        f"hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x"
+    )
+    if dense_hdt_bwd_ms is not None and dense_hdt_ratio is not None:
+        line += f" dense_hdt_bwd_ms={dense_hdt_bwd_ms:.3f} hsa_bwd_vs_hdt={dense_hdt_ratio:.2f}x"
+    else:
+        line += f" dense_hdt_bwd_status={dense_hdt_status}"
+    print(line)
+
+
 def run_case(case: BenchmarkCase):
     build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
     device = "cuda"
@@ -260,41 +661,25 @@ def run_case(case: BenchmarkCase):
     q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    env_updates = _benchmark_env_for_case(case)
 
-    split_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, env_updates=_split_monolithic_env()
-    )
-    true_fused_forward = lambda q, k, v: _run_sparse_attention(
-        q, k, v, keep_ids, hash_ids, schedule, env_updates=_true_fused_env()
-    )
+    hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
     dense_ref_forward = lambda q, k, v: hsa_reference_attention(q, k, v, keep_ids, hash_ids)
 
-    out_split = split_forward(q_data, k_data, v_data)
-    out_true_fused = true_fused_forward(q_data, k_data, v_data)
+    out_hsa = hsa_forward(q_data, k_data, v_data)
     out_ref = dense_ref_forward(q_data, k_data, v_data)
-    split_max_diff = (out_split.float() - out_ref.float()).abs().max().item()
-    split_mean_diff = (out_split.float() - out_ref.float()).abs().mean().item()
-    true_fused_max_diff = (out_true_fused.float() - out_ref.float()).abs().max().item()
-    true_fused_mean_diff = (out_true_fused.float() - out_ref.float()).abs().mean().item()
+    hsa_max_diff = (out_hsa.float() - out_ref.float()).abs().max().item()
+    hsa_mean_diff = (out_hsa.float() - out_ref.float()).abs().mean().item()
 
-    split_fwd_ms = _measure_forward_ms(
-        split_forward,
+    hsa_fwd_ms = _measure_forward_ms(
+        hsa_forward,
         q_data,
         k_data,
         v_data,
         case.warmup_iters,
         case.benchmark_iters,
-        env_updates=_split_monolithic_env(),
-    )
-    true_fused_fwd_ms = _measure_forward_ms(
-        true_fused_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates=_true_fused_env(),
+        env_updates=env_updates,
     )
     dense_causal_fwd_ms = _measure_forward_ms(
         dense_causal_forward,
@@ -304,23 +689,14 @@ def run_case(case: BenchmarkCase):
         case.warmup_iters,
         case.benchmark_iters,
     )
-    split_bwd_ms = _measure_backward_ms(
-        split_forward,
+    hsa_bwd_ms = _measure_backward_ms(
+        hsa_forward,
         q_data,
         k_data,
         v_data,
         case.warmup_iters,
         case.benchmark_iters,
-        env_updates=_split_monolithic_env(),
-    )
-    true_fused_bwd_ms = _measure_backward_ms(
-        true_fused_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates=_true_fused_env(),
+        env_updates=env_updates,
     )
     dense_causal_bwd_ms = _measure_backward_ms(
         dense_causal_forward,
@@ -330,23 +706,14 @@ def run_case(case: BenchmarkCase):
         case.warmup_iters,
         case.benchmark_iters,
     )
-    split_fwd_bwd_ms = _measure_forward_backward_ms(
-        split_forward,
+    hsa_fwd_bwd_ms = _measure_forward_backward_ms(
+        hsa_forward,
         q_data,
         k_data,
         v_data,
         case.warmup_iters,
         case.benchmark_iters,
-        env_updates=_split_monolithic_env(),
-    )
-    true_fused_fwd_bwd_ms = _measure_forward_backward_ms(
-        true_fused_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates=_true_fused_env(),
+        env_updates=env_updates,
     )
     dense_causal_fwd_bwd_ms = _measure_forward_backward_ms(
         dense_causal_forward,
@@ -357,40 +724,41 @@ def run_case(case: BenchmarkCase):
         case.benchmark_iters,
     )
 
-    split_vs_dense = split_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
-    true_fused_vs_dense = true_fused_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
-    true_fused_vs_split = true_fused_bwd_ms / split_bwd_ms if split_bwd_ms > 0 else float("inf")
-    split_fwd_vs_dense = split_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
-    true_fused_fwd_vs_dense = true_fused_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
-    true_fused_fwd_vs_split = true_fused_fwd_ms / split_fwd_ms if split_fwd_ms > 0 else float("inf")
-    split_fwd_bwd_vs_dense = split_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
-    true_fused_fwd_bwd_vs_dense = (
-        true_fused_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
-    )
-    true_fused_fwd_bwd_vs_split = true_fused_fwd_bwd_ms / split_fwd_bwd_ms if split_fwd_bwd_ms > 0 else float("inf")
+    hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+    hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
+    hsa_fwd_bwd_vs_dense = hsa_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
 
     print(
-        f"{case.name}: shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
-        f"split_max_diff={split_max_diff:.6f} split_mean_diff={split_mean_diff:.6f} "
-        f"true_fused_max_diff={true_fused_max_diff:.6f} true_fused_mean_diff={true_fused_mean_diff:.6f} "
-        f"split_fwd_ms={split_fwd_ms:.3f} true_fused_fwd_ms={true_fused_fwd_ms:.3f} dense_causal_fwd_ms={dense_causal_fwd_ms:.3f} "
-        f"split_fwd_vs_dense={split_fwd_vs_dense:.2f}x true_fused_fwd_vs_dense={true_fused_fwd_vs_dense:.2f}x "
-        f"true_fused_fwd_vs_split={true_fused_fwd_vs_split:.2f}x "
-        f"split_bwd_ms={split_bwd_ms:.3f} true_fused_bwd_ms={true_fused_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
-        f"split_vs_dense={split_vs_dense:.2f}x true_fused_vs_dense={true_fused_vs_dense:.2f}x "
-        f"true_fused_vs_split={true_fused_vs_split:.2f}x "
-        f"split_fwd_bwd_ms={split_fwd_bwd_ms:.3f} true_fused_fwd_bwd_ms={true_fused_fwd_bwd_ms:.3f} "
-        f"dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} split_fwd_bwd_vs_dense={split_fwd_bwd_vs_dense:.2f}x "
-        f"true_fused_fwd_bwd_vs_dense={true_fused_fwd_bwd_vs_dense:.2f}x "
-        f"true_fused_fwd_bwd_vs_split={true_fused_fwd_bwd_vs_split:.2f}x"
+        f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
+        f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim}) "
+        f"hsa_max_diff={hsa_max_diff:.6f} hsa_mean_diff={hsa_mean_diff:.6f} "
+        f"hsa_fwd_ms={hsa_fwd_ms:.3f} dense_causal_fwd_ms={dense_causal_fwd_ms:.3f} "
+        f"hsa_fwd_vs_dense={hsa_fwd_vs_dense:.2f}x "
+        f"hsa_bwd_ms={hsa_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
+        f"hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x "
+        f"hsa_fwd_bwd_ms={hsa_fwd_bwd_ms:.3f} dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} "
+        f"hsa_fwd_bwd_vs_dense={hsa_fwd_bwd_vs_dense:.2f}x"
     )
 
 
 def _run_cases_once():
     _ensure_cuda_ready()
     print(f"device={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
-    for case in CANONICAL_CASES:
-        run_case(case)
+    if _use_geometry_sweep_mode():
+        _run_geometry_sweep_once()
+        return
+    if _use_sparse_profile_mode():
+        for case in _get_selected_cases(
+            env_var="FLASH_ATTN_HSA_PROFILE_CASES",
+            default=(CANONICAL_CASES[1], CANONICAL_CASES[2], CANONICAL_CASES[3]),
+        ):
+            _profile_sparse_mask_case(case)
+        return
+    for case in _get_selected_cases(env_var="FLASH_ATTN_HSA_CASES", default=CANONICAL_CASES):
+        if _is_long_context_case(case):
+            _run_long_case(case)
+        else:
+            run_case(case)
 
 
 def main():

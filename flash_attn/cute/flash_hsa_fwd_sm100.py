@@ -751,7 +751,7 @@ def _run_hsa_fwd_sm100_direct(
 ):
     hsa_mod = _load_hsa_module()
     runtime = hsa_mod._get_hsa_block_sparse_runtime(schedule, q, k)
-    sparse_tensors_torch = hsa_mod._to_block_sparse_tensors_torch(runtime.forward_sparse)
+    sparse_tensors_torch = runtime.forward_sparse_torch
 
     q = q.contiguous() if q.stride(-1) != 1 else q
     k = k.contiguous() if k.stride(-1) != 1 else k
@@ -878,7 +878,8 @@ def run_hsa_fwd_sm100_blocksparse(
     use_monolithic_bwd = os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
     use_true_fused_bwd = _use_hsa_true_fused_bwd()
     runtime_state = _materialize_runtime_state(schedule) if use_monolithic_bwd else None
-    use_true_fused_forward = _should_use_hsa_true_fused_forward(
+    only_sentence_family = runtime_state is not None and _runtime_state_has_only_sentence_family(runtime_state)
+    use_true_fused_forward = only_sentence_family and _should_use_hsa_true_fused_forward(
         q,
         k,
         use_true_fused_bwd=use_true_fused_bwd,
@@ -887,10 +888,9 @@ def run_hsa_fwd_sm100_blocksparse(
         use_monolithic_bwd
         and use_true_fused_bwd
         and use_true_fused_forward
-        and runtime_state is not None
-        and _runtime_state_has_only_sentence_family(runtime_state)
+        and only_sentence_family
     )
-    if use_monolithic_bwd and not can_export_sentence_cache_from_total:
+    if use_monolithic_bwd and only_sentence_family and not can_export_sentence_cache_from_total:
         sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             _run_hsa_sentence_stream_cache_precompute(
                 q,

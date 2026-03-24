@@ -1,3 +1,6 @@
+import importlib.util
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -60,10 +63,23 @@ pytestmark = pytest.mark.skipif(
 )
 
 HAS_HSA_SPARSE_FA4 = HAS_HSA_FA4 and _CUDA_CAPABILITY[0] >= 10
+_BENCHMARK_HSA_MODULE = None
 
 
 def _unwrap_output(result):
     return result[0] if isinstance(result, tuple) else result
+
+
+def _load_benchmark_hsa_module():
+    global _BENCHMARK_HSA_MODULE
+    if _BENCHMARK_HSA_MODULE is None:
+        module_path = Path(__file__).with_name("benchmark_hsa.py")
+        spec = importlib.util.spec_from_file_location("benchmark_hsa_test_helper", module_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _BENCHMARK_HSA_MODULE = module
+    return _BENCHMARK_HSA_MODULE
 
 
 def _empty_stream_like(stream):
@@ -331,6 +347,33 @@ def test_hsa_backward_packed_masks_reconstruct_dense_mask():
     ref_mask = torch.isfinite(compute_hsa_mask(keep_ids, hash_ids))
 
     assert torch.equal(dense_mask, ref_mask)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_backward_packed_mask_occupancy_matches_dense_mask_allowed_pairs(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    benchmark_hsa = _load_benchmark_hsa_module()
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 193, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size=batch_size, seqlen=seqlen, device=device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q", "64")
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_BLOCK_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR", "1")
+
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    summary = benchmark_hsa._summarize_sparse_backward_occupancy(
+        runtime.backward_sparse,
+        runtime.backward_packed_masks,
+        seqlen=seqlen,
+    )
+    ref_allowed_pairs = int(torch.isfinite(compute_hsa_mask(keep_ids, hash_ids)).sum().item())
+
+    assert summary["allowed_pairs"] == ref_allowed_pairs
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -1252,63 +1295,18 @@ def test_hsa_monolithic_sentence_tail_family_uses_mma_and_matches_reference(monk
     _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_monolithic_sentence_tail_v_grad", atol=6e-2, rtol=6e-2)
 
 
-@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
-@pytest.mark.parametrize("n_kv_heads", [4, 2])
-def test_hsa_monolithic_anchor_full_family_uses_mma_and_matches_reference(monkeypatch, n_kv_heads):
-    import flash_attn.cute.hsa as hsa_module
-    import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
-
+def _run_mixed_sparse_mask_case(
+    *,
+    batch_size: int,
+    seqlen: int,
+    nheads: int,
+    headdim: int,
+    n_kv_heads: int,
+    keep_ids: torch.Tensor,
+    hash_ids: torch.Tensor,
+):
     device = "cuda"
     dtype = torch.bfloat16
-    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
-    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
-    schedule = build_hsa_schedule(keep_ids, hash_ids)
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", "1")
-    monkeypatch.delenv("FLASH_ATTN_HSA_USE_PACKED_BWD", raising=False)
-    monkeypatch.delenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", raising=False)
-
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_packed_mask_backward",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_backward_panel_batched",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_descriptor_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "run_hsa_bwd_sm100_packed",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed backward prototype used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_panel_batch_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("panel CuTe helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_rowgroup_main_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("row-group backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_monolithic_main_torch",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Torch monolithic fallback used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_anchor_full_scalar",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_full scalar helper used")),
-    )
-
     q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
     k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
     v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
@@ -1323,7 +1321,7 @@ def test_hsa_monolithic_anchor_full_family_uses_mma_and_matches_reference(monkey
             v_sparse,
             keep_ids=keep_ids,
             hash_ids=hash_ids,
-            hsa_schedule=schedule,
+            hsa_schedule=build_hsa_schedule(keep_ids, hash_ids),
         )
     )
     loss_sparse = out_sparse.float().square().mean()
@@ -1341,16 +1339,19 @@ def test_hsa_monolithic_anchor_full_family_uses_mma_and_matches_reference(monkey
     ).float()
     loss_ref = out_ref.square().mean()
     loss_ref.backward()
+    return out_sparse, q_sparse.grad, k_sparse.grad, v_sparse.grad, out_ref, q_ref.grad, k_ref.grad, v_ref.grad
 
-    _assert_close(out_sparse.float(), out_ref, "hsa_monolithic_anchor_full_output")
-    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_monolithic_anchor_full_q_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_monolithic_anchor_full_k_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_monolithic_anchor_full_v_grad", atol=6e-2, rtol=6e-2)
+
+def _assert_finite_gradients(name, *grads):
+    for grad in grads:
+        assert grad is not None, f"{name}: missing gradient"
+        assert torch.isfinite(grad).all(), f"{name}: non-finite gradient"
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("use_true_fused", [False, True])
 @pytest.mark.parametrize("n_kv_heads", [4, 2])
-def test_hsa_monolithic_anchor_tail_family_uses_mma_and_matches_reference(monkeypatch, n_kv_heads):
+def test_hsa_mixed_monolithic_env_routes_to_packed_mask_backward(monkeypatch, use_true_fused, n_kv_heads):
     import flash_attn.cute.hsa as hsa_module
     import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
 
@@ -1358,343 +1359,149 @@ def test_hsa_monolithic_anchor_tail_family_uses_mma_and_matches_reference(monkey
     dtype = torch.bfloat16
     batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
     keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
-    schedule = build_hsa_schedule(keep_ids, hash_ids)
     monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", "1")
+    if use_true_fused:
+        monkeypatch.setenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "1")
+        monkeypatch.delenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", raising=False)
+    else:
+        monkeypatch.delenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", raising=False)
+        monkeypatch.setenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", "1")
     monkeypatch.delenv("FLASH_ATTN_HSA_USE_PACKED_BWD", raising=False)
     monkeypatch.delenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", raising=False)
 
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_packed_mask_backward",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
-    )
+    packed_mask_calls = 0
+    original_packed_mask_backward = hsa_module._run_hsa_packed_mask_backward
+
+    def _tracked_packed_mask_backward(*args, **kwargs):
+        nonlocal packed_mask_calls
+        packed_mask_calls += 1
+        return original_packed_mask_backward(*args, **kwargs)
+
+    monkeypatch.setattr(hsa_module, "_run_hsa_packed_mask_backward", _tracked_packed_mask_backward)
     monkeypatch.setattr(
         hsa_module,
         "_run_hsa_backward_panel_batched",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy graph-traversal backward helper used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_descriptor_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
+        "run_hsa_bwd_sm100_monolithic",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("mixed monolithic backward used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
         "run_hsa_bwd_sm100_packed",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed backward prototype used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_panel_batch_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("panel CuTe helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_rowgroup_main_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("row-group backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_monolithic_main_torch",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Torch monolithic fallback used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_anchor_tail_scalar",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_tail scalar helper used")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed graph-traversal prototype used")),
     )
 
-    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-
-    q_sparse = q_data.clone().requires_grad_(True)
-    k_sparse = k_data.clone().requires_grad_(True)
-    v_sparse = v_data.clone().requires_grad_(True)
-    out_sparse = _unwrap_output(
-        flash_attn_hsa_sparse_func(
-            q_sparse,
-            k_sparse,
-            v_sparse,
-            keep_ids=keep_ids,
-            hash_ids=hash_ids,
-            hsa_schedule=schedule,
-        )
+    out_sparse, q_grad, k_grad, v_grad, out_ref, q_ref_grad, k_ref_grad, v_ref_grad = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
     )
-    loss_sparse = out_sparse.float().square().mean()
-    loss_sparse.backward()
 
-    q_ref = q_data.clone().float().requires_grad_(True)
-    k_ref = k_data.clone().float().requires_grad_(True)
-    v_ref = v_data.clone().float().requires_grad_(True)
-    out_ref = hsa_reference_attention(
-        q_ref.to(dtype=dtype),
-        k_ref.to(dtype=dtype),
-        v_ref.to(dtype=dtype),
-        keep_ids,
-        hash_ids,
-    ).float()
-    loss_ref = out_ref.square().mean()
-    loss_ref.backward()
-
-    _assert_close(out_sparse.float(), out_ref, "hsa_monolithic_anchor_tail_output")
-    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_monolithic_anchor_tail_q_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_monolithic_anchor_tail_k_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_monolithic_anchor_tail_v_grad", atol=6e-2, rtol=6e-2)
+    assert packed_mask_calls == 1
+    _assert_close(out_sparse.float(), out_ref, "hsa_mixed_sparse_mask_route_output")
+    _assert_finite_gradients("hsa_mixed_sparse_mask_route_grads", q_grad, k_grad, v_grad)
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
-@pytest.mark.parametrize("n_kv_heads", [4, 2])
-def test_hsa_monolithic_backward_matches_reference(monkeypatch, n_kv_heads):
+@pytest.mark.parametrize(
+    "block_q,block_k,subtile_factor",
+    [
+        (64, 128, 1),
+        (64, 64, 1),
+        (32, 64, 1),
+        (32, 32, 1),
+    ],
+)
+def test_hsa_sparse_mask_runtime_honors_requested_backward_geometry(monkeypatch, block_q, block_k, subtile_factor):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q", str(block_q))
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_BLOCK_K", str(block_k))
+    monkeypatch.setenv("FLASH_ATTN_HSA_BACKWARD_SUBTILE_FACTOR", str(subtile_factor))
+
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    sparse_block_q = block_q * subtile_factor
+    assert runtime.backward_block_q == block_q
+    assert runtime.backward_block_k == block_k
+    assert runtime.backward_subtile_factor == subtile_factor
+    assert runtime.backward_sparse.block_size == (sparse_block_q, block_k)
+    assert runtime.backward_sparse_torch is not None
+    assert runtime.backward_sparse_torch.block_size == (sparse_block_q, block_k)
+    assert runtime.backward_packed_masks.q_block_size == sparse_block_q
+    assert runtime.backward_packed_masks.k_block_size == block_k
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize(
+    "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
+    [
+        ("mixed_small_eq", 1, 65, 4, 64, 4),
+        ("mixed_small_gqa", 1, 65, 4, 64, 2),
+        ("train_eq", 2, 1024, 8, 64, 8),
+        ("train_gqa", 2, 1024, 8, 64, 2),
+    ],
+)
+def test_hsa_mixed_sparse_mask_backward_smoke(monkeypatch, label, batch_size, seqlen, nheads, headdim, n_kv_heads):
     import flash_attn.cute.hsa as hsa_module
     import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
 
     device = "cuda"
-    dtype = torch.bfloat16
-    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
     keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
-    schedule = build_hsa_schedule(keep_ids, hash_ids)
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
-    monkeypatch.setenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", "1")
-    monkeypatch.delenv("FLASH_ATTN_HSA_USE_PACKED_BWD", raising=False)
-    monkeypatch.delenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", raising=False)
-    hsa_bwd_module.run_hsa_bwd_sm100_monolithic.launch_plan_cache.clear()
-
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_packed_mask_backward",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_backward_panel_batched",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_descriptor_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "run_hsa_bwd_sm100_packed",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed backward prototype used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_panel_batch_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("panel CuTe helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_rowgroup_main_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("row-group backward helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_monolithic_main_torch",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Torch monolithic fallback used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_monolithic_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("host-side monolithic MMA prepass used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_build_hsa_bwd_monolithic_launch_plan",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic launch plan used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_allocate_hsa_bwd_monolithic_workspaces",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic workspaces allocated")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_prepare_hsa_bwd_monolithic_workspaces",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic workspaces prepared")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_anchor_full_scalar",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_full scalar helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_anchor_tail_scalar",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_tail scalar helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_anchor_full_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_full family prepass used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_anchor_tail_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("anchor_tail family prepass used")),
-    )
-
-    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-
-    q_sparse = q_data.clone().requires_grad_(True)
-    k_sparse = k_data.clone().requires_grad_(True)
-    v_sparse = v_data.clone().requires_grad_(True)
-    out_sparse = _unwrap_output(
-        flash_attn_hsa_sparse_func(
-            q_sparse,
-            k_sparse,
-            v_sparse,
-            keep_ids=keep_ids,
-            hash_ids=hash_ids,
-            hsa_schedule=schedule,
-        )
-    )
-    loss_sparse = out_sparse.float().square().mean()
-    loss_sparse.backward()
-
-    q_ref = q_data.clone().float().requires_grad_(True)
-    k_ref = k_data.clone().float().requires_grad_(True)
-    v_ref = v_data.clone().float().requires_grad_(True)
-    out_ref = hsa_reference_attention(
-        q_ref.to(dtype=dtype),
-        k_ref.to(dtype=dtype),
-        v_ref.to(dtype=dtype),
-        keep_ids,
-        hash_ids,
-    ).float()
-    loss_ref = out_ref.square().mean()
-    loss_ref.backward()
-
-    _assert_close(out_sparse.float(), out_ref, "hsa_monolithic_backward_output")
-    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_monolithic_q_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_monolithic_k_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_monolithic_v_grad", atol=6e-2, rtol=6e-2)
-
-
-@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
-@pytest.mark.parametrize("n_kv_heads", [4, 2])
-def test_hsa_true_fused_backward_matches_reference(monkeypatch, n_kv_heads):
-    import flash_attn.cute.hsa as hsa_module
-    import flash_attn.cute.flash_hsa_bwd_sm100 as hsa_bwd_module
-
-    device = "cuda"
-    dtype = torch.bfloat16
-    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
-    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
-    schedule = build_hsa_schedule(keep_ids, hash_ids)
     monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "1")
     monkeypatch.setenv("FLASH_ATTN_HSA_USE_TRUE_FUSED_BWD", "1")
     monkeypatch.delenv("FLASH_ATTN_HSA_USE_KERNEL_SENTENCE_FULL", raising=False)
     monkeypatch.delenv("FLASH_ATTN_HSA_USE_PACKED_BWD", raising=False)
     monkeypatch.delenv("FLASH_ATTN_HSA_USE_HYBRID_BWD", raising=False)
-    hsa_bwd_module.run_hsa_bwd_sm100_monolithic.compile_cache.clear()
-    hsa_bwd_module.run_hsa_bwd_sm100_monolithic.launch_plan_cache.clear()
 
-    monkeypatch.setattr(
-        hsa_module,
-        "_run_hsa_packed_mask_backward",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward helper used")),
-    )
+    packed_mask_calls = 0
+    original_packed_mask_backward = hsa_module._run_hsa_packed_mask_backward
+
+    def _tracked_packed_mask_backward(*args, **kwargs):
+        nonlocal packed_mask_calls
+        packed_mask_calls += 1
+        return original_packed_mask_backward(*args, **kwargs)
+
+    monkeypatch.setattr(hsa_module, "_run_hsa_packed_mask_backward", _tracked_packed_mask_backward)
     monkeypatch.setattr(
         hsa_module,
         "_run_hsa_backward_panel_batched",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy batched backward helper used")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy graph-traversal backward helper used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_bwd_sentence_families_direct",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("split sentence direct path used")),
+        "run_hsa_bwd_sm100_monolithic",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("mixed monolithic backward used")),
     )
     monkeypatch.setattr(
         hsa_bwd_module,
-        "_run_hsa_bwd_sentence_families_direct_rows",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("split sentence row precompute used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_sentence_scatter_rows_kernel",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy per-tensor sentence scatter used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_descriptor_mma_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence-family panel batch helper used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_sentence_full_kernel_fa4_slice",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full split kernel fastpath used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_sentence_full_fa4_fastpath",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sentence_full host fastpath used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_run_hsa_bwd_monolithic_main_cute",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy mixed monolithic kernel used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_build_hsa_bwd_monolithic_launch_plan",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic launch plan used")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_allocate_hsa_bwd_monolithic_workspaces",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic workspaces allocated")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_prepare_hsa_bwd_monolithic_workspaces",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("monolithic workspaces prepared")),
-    )
-    monkeypatch.setattr(
-        hsa_bwd_module,
-        "_build_hsa_monolithic_panel_batches",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy monolithic panel batches built")),
+        "run_hsa_bwd_sm100_packed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed graph-traversal prototype used")),
     )
 
-    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
-
-    q_sparse = q_data.clone().requires_grad_(True)
-    k_sparse = k_data.clone().requires_grad_(True)
-    v_sparse = v_data.clone().requires_grad_(True)
-    out_sparse = _unwrap_output(
-        flash_attn_hsa_sparse_func(
-            q_sparse,
-            k_sparse,
-            v_sparse,
-            keep_ids=keep_ids,
-            hash_ids=hash_ids,
-            hsa_schedule=schedule,
-        )
+    out_sparse, q_grad, k_grad, v_grad, out_ref, q_ref_grad, k_ref_grad, v_ref_grad = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
     )
-    loss_sparse = out_sparse.float().square().mean()
-    loss_sparse.backward()
 
-    q_ref = q_data.clone().float().requires_grad_(True)
-    k_ref = k_data.clone().float().requires_grad_(True)
-    v_ref = v_data.clone().float().requires_grad_(True)
-    out_ref = hsa_reference_attention(
-        q_ref.to(dtype=dtype),
-        k_ref.to(dtype=dtype),
-        v_ref.to(dtype=dtype),
-        keep_ids,
-        hash_ids,
-    ).float()
-    loss_ref = out_ref.square().mean()
-    loss_ref.backward()
-
-    _assert_close(out_sparse.float(), out_ref, "hsa_true_fused_backward_output")
-    _assert_close(q_sparse.grad.float(), q_ref.grad, "hsa_true_fused_q_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(k_sparse.grad.float(), k_ref.grad, "hsa_true_fused_k_grad", atol=6e-2, rtol=6e-2)
-    _assert_close(v_sparse.grad.float(), v_ref.grad, "hsa_true_fused_v_grad", atol=6e-2, rtol=6e-2)
+    assert packed_mask_calls == 1
+    _assert_close(out_sparse.float(), out_ref, f"{label}_output")
+    _assert_finite_gradients(f"{label}_grads", q_grad, k_grad, v_grad)

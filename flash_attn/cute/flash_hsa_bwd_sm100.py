@@ -6284,6 +6284,7 @@ def run_hsa_bwd_sm100_blocksparse(
     deterministic: bool,
     keep_ids: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    runtime=None,
 ):
     hsa_mod = _load_hsa_module()
     return hsa_mod._run_hsa_blocksparse_backward(
@@ -6303,4 +6304,5 @@ def run_hsa_bwd_sm100_blocksparse(
         deterministic,
         keep_ids,
         hash_ids,
+        runtime,
     )

@@ -397,6 +397,86 @@ FP4_QK_FORMAT_CONFIG = {
     "mxfp4": ("e8m0", 32, torch.float8_e8m0fnu),
 }
 
+FP4_DECODE_TABLE = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def _unpack_fp4x2_tensor(packed: torch.Tensor) -> torch.Tensor:
+    packed_i32 = packed.to(torch.int32)
+    return torch.stack((packed_i32 & 0xF, (packed_i32 >> 4) & 0xF), dim=-1).flatten(start_dim=-2)
+
+
+def _dequantize_nvfp4_rowwise(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    sf_vec_size: int,
+    sg: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if is_fake_mode():
+        # FakeTensorMode compile tests only need the dequantized logical shape.
+        # Avoid device-dependent table materialization or value-dependent ops here.
+        return torch.empty(
+            (*packed.shape[:-1], packed.shape[-1] * 2),
+            device=packed.device,
+            dtype=torch.float32,
+        )
+    values = FP4_DECODE_TABLE.to(device=packed.device)[_unpack_fp4x2_tensor(packed).long()]
+    dequant = (
+        values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+        * scale.to(torch.float32).unsqueeze(-1)
+    ).flatten(start_dim=-2)
+    if sg is not None:
+        dequant = dequant * sg.to(torch.float32)[:, None, :, None]
+    return dequant
+
+
+def _quantize_nvfp4_transpose_from_bf16(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build kernel-friendly transpose FP4 metadata directly from BF16/FP16 Q or K."""
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"Expected BF16/FP16 input, got {x.dtype}")
+    batch_size, seqlen, num_heads, head_dim = x.shape
+    seqlen_groups = math.ceil(seqlen / 16)
+    seqlen_padded = seqlen_groups * 16
+    x_t = x.permute(0, 2, 3, 1).contiguous().to(torch.float32)  # (B, H, D, S)
+    if seqlen_padded != seqlen:
+        x_t = torch.nn.functional.pad(x_t, (0, seqlen_padded - seqlen))
+    groups = x_t.view(batch_size, num_heads, head_dim, seqlen_groups, 16)
+    scale = groups.abs().amax(dim=-1) / 6.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    norm = groups / scale.unsqueeze(-1)
+    fp4_grid = FP4_DECODE_TABLE.to(device=x.device, dtype=torch.float32).view(1, 1, 1, 1, 1, 16)
+    indices = (norm.unsqueeze(-1) - fp4_grid).abs().argmin(dim=-1).to(torch.uint8)
+    pairs = indices.view(batch_size, num_heads, head_dim, seqlen_padded // 2, 2)
+    packed = (pairs[..., 0] | (pairs[..., 1] << 4)).permute(0, 2, 1, 3).contiguous()
+    packed = packed[..., : math.ceil(seqlen / 2)]
+    scale = scale.to(torch.float8_e4m3fn).permute(0, 2, 1, 3).contiguous()
+    return packed, scale
+
+
+def _get_static_tensor_layout_key(tensor: Optional[torch.Tensor]) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    if tensor is None:
+        return None
+    return (tuple(tensor.shape), tuple(tensor.stride()))
+
 
 def _fp4_qk_max_kv_stages(
     *,
@@ -474,6 +554,325 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     else:
         local = False
     return causal, local, window_size_left, window_size_right
+
+
+def _validate_fp4_bwd_qk_inputs(
+    q_packed: torch.Tensor,
+    k_packed: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    q_scale: Optional[torch.Tensor],
+    k_scale: Optional[torch.Tensor],
+    q_sg: Optional[torch.Tensor],
+    k_sg: Optional[torch.Tensor],
+    fp4_qk_format: str,
+    *,
+    q_col_packed: Optional[torch.Tensor],
+    k_col_packed: Optional[torch.Tensor],
+    q_col_scale: Optional[torch.Tensor],
+    k_col_scale: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch],
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    softcap: float,
+    score_mod: Optional[Callable],
+    score_mod_bwd: Optional[Callable],
+    mask_mod: Optional[Callable],
+    aux_tensors: Optional[list[torch.Tensor]],
+    arch: int,
+) -> Tuple[int, int]:
+    _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
+    if fp4_qk_format != "nvfp4":
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K currently only supports fp4_qk_format='nvfp4'."
+        )
+    if arch // 10 not in [10, 11]:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K is only supported on SM100/SM110 in this milestone."
+        )
+    if cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K only supports dense fixed-length inputs in this milestone."
+        )
+    if block_sparse_tensors is not None:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K does not support block sparsity in this milestone."
+        )
+    if window_size_left is not None or window_size_right is not None:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K does not support local/sliding-window attention in this milestone."
+        )
+    if softcap != 0.0:
+        raise NotImplementedError("Experimental FP4 backward Q/K does not support softcap.")
+    if score_mod is not None or score_mod_bwd is not None or mask_mod is not None:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K does not support score_mod, score_mod_bwd, or mask_mod."
+        )
+    if aux_tensors is not None:
+        raise NotImplementedError("Experimental FP4 backward Q/K does not support aux_tensors.")
+    if q_packed.dtype != torch.uint8 or k_packed.dtype != torch.uint8:
+        raise TypeError("Experimental FP4 backward Q/K expects packed uint8 Q/K tensors.")
+    if q_scale is None or k_scale is None:
+        raise ValueError("Experimental FP4 backward Q/K requires q_scale and k_scale.")
+    if q_scale.dtype != sf_dtype or k_scale.dtype != sf_dtype:
+        raise TypeError(f"{fp4_qk_format} expects q_scale/k_scale dtype {sf_dtype}.")
+    if q_sg is None or k_sg is None:
+        raise ValueError("Experimental FP4 backward Q/K requires q_sg and k_sg.")
+    if q_sg.dtype != torch.float32 or k_sg.dtype != torch.float32:
+        raise TypeError("Experimental FP4 backward Q/K expects q_sg/k_sg dtype torch.float32.")
+    for tensor_name, packed_tensor in (("q_col_packed", q_col_packed), ("k_col_packed", k_col_packed)):
+        if packed_tensor is None:
+            raise ValueError(f"Experimental FP4 backward Q/K requires {tensor_name}.")
+        if packed_tensor.dtype != torch.uint8:
+            raise TypeError(f"{tensor_name} must be torch.uint8.")
+    for tensor_name, scale_tensor in (("q_col_scale", q_col_scale), ("k_col_scale", k_col_scale)):
+        if scale_tensor is None:
+            raise ValueError(f"Experimental FP4 backward Q/K requires {tensor_name}.")
+        if scale_tensor.dtype != sf_dtype:
+            raise TypeError(f"{tensor_name} must have dtype {sf_dtype}.")
+
+    if q_packed.ndim != 4 or k_packed.ndim != 4:
+        raise ValueError("Experimental FP4 backward Q/K expects dense 4D Q/K tensors.")
+    batch_size, seqlen_q, num_head, q_packed_dim = q_packed.shape
+    batch_size_k, seqlen_k, num_head_kv, k_packed_dim = k_packed.shape
+    if batch_size_k != batch_size:
+        raise ValueError("q_packed and k_packed must agree on batch size.")
+    if q_packed_dim != k_packed_dim:
+        raise ValueError("Packed FP4 Q/K tensors must have the same last dimension.")
+    if num_head != num_head_kv:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K currently only supports dense MHA (num_head == num_head_kv)."
+        )
+
+    head_dim = q_packed_dim * 2
+    if head_dim not in (64, 128):
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K currently only supports head_dim in {64, 128}."
+        )
+    if head_dim % sf_vec_size != 0:
+        raise ValueError(f"FP4 head_dim={head_dim} must be divisible by scale vec size {sf_vec_size}.")
+
+    expected_q_scale_shape = (batch_size, seqlen_q, num_head, head_dim // sf_vec_size)
+    expected_k_scale_shape = (batch_size, seqlen_k, num_head_kv, head_dim // sf_vec_size)
+    expected_q_col_packed_shape = (batch_size, head_dim, num_head, math.ceil(seqlen_q / 2))
+    expected_k_col_packed_shape = (batch_size, head_dim, num_head_kv, math.ceil(seqlen_k / 2))
+    expected_q_col_scale_shape = (batch_size, head_dim, num_head, math.ceil(seqlen_q / sf_vec_size))
+    expected_k_col_scale_shape = (batch_size, head_dim, num_head_kv, math.ceil(seqlen_k / sf_vec_size))
+    if q_scale.shape != expected_q_scale_shape:
+        raise ValueError(
+            f"q_scale shape {tuple(q_scale.shape)} != expected {expected_q_scale_shape} for FP4 backward."
+        )
+    if k_scale.shape != expected_k_scale_shape:
+        raise ValueError(
+            f"k_scale shape {tuple(k_scale.shape)} != expected {expected_k_scale_shape} for FP4 backward."
+        )
+    if q_col_packed.shape != expected_q_col_packed_shape:
+        raise ValueError(
+            f"q_col_packed shape {tuple(q_col_packed.shape)} != expected {expected_q_col_packed_shape} for FP4 backward."
+        )
+    if k_col_packed.shape != expected_k_col_packed_shape:
+        raise ValueError(
+            f"k_col_packed shape {tuple(k_col_packed.shape)} != expected {expected_k_col_packed_shape} for FP4 backward."
+        )
+    if q_col_scale.shape != expected_q_col_scale_shape:
+        raise ValueError(
+            f"q_col_scale shape {tuple(q_col_scale.shape)} != expected {expected_q_col_scale_shape} for FP4 backward."
+        )
+    if k_col_scale.shape != expected_k_col_scale_shape:
+        raise ValueError(
+            f"k_col_scale shape {tuple(k_col_scale.shape)} != expected {expected_k_col_scale_shape} for FP4 backward."
+        )
+    if q_sg.shape != (batch_size, num_head):
+        raise ValueError(
+            f"q_sg shape {tuple(q_sg.shape)} != expected {(batch_size, num_head)} for FP4 backward."
+        )
+    if k_sg.shape != (batch_size, num_head_kv):
+        raise ValueError(
+            f"k_sg shape {tuple(k_sg.shape)} != expected {(batch_size, num_head_kv)} for FP4 backward."
+        )
+
+    if v.dtype != torch.bfloat16:
+        raise NotImplementedError("Experimental FP4 backward Q/K currently only supports BF16 V.")
+    if v.shape != (batch_size, seqlen_k, num_head_kv, head_dim):
+        raise ValueError(
+            f"v shape {tuple(v.shape)} != expected {(batch_size, seqlen_k, num_head_kv, head_dim)}."
+        )
+    if out.shape != (batch_size, seqlen_q, num_head, head_dim):
+        raise ValueError(
+            f"out shape {tuple(out.shape)} != expected {(batch_size, seqlen_q, num_head, head_dim)}."
+        )
+    if dout.shape != out.shape:
+        raise ValueError(f"dout shape {tuple(dout.shape)} != expected {tuple(out.shape)}.")
+    if lse.shape != (batch_size, num_head, seqlen_q):
+        raise ValueError(
+            f"lse shape {tuple(lse.shape)} != expected {(batch_size, num_head, seqlen_q)}."
+        )
+    return head_dim, sf_vec_size
+
+
+def _flash_attn_bwd_fp4_qk(
+    q_packed: torch.Tensor,
+    k_packed: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_sg: torch.Tensor,
+    k_sg: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    deterministic: bool = False,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    dlse: Optional[torch.Tensor] = None,
+    fp4_qk_format: Literal["nvfp4", "mxfp4"] = "nvfp4",
+    q_col_packed: Optional[torch.Tensor] = None,
+    k_col_packed: Optional[torch.Tensor] = None,
+    q_col_scale: Optional[torch.Tensor] = None,
+    k_col_scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Experimental internal FP4 backward helper for dense fixed-length MHA.
+
+    The default path keeps backward stable and simple: dequantize rowwise Q/K to
+    BF16 and reuse the existing backward kernel plumbing. The native FP4 dQ/dK
+    kernel is still available for bring-up behind the internal
+    FLASH_ATTN_FP4_BWD_ENABLE_NATIVE override.
+    """
+    arch = _get_device_arch()
+    causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
+        causal, window_size_left, window_size_right
+    )
+    if local:
+        raise NotImplementedError(
+            "Experimental FP4 backward Q/K currently only supports dense non-local or causal attention."
+        )
+    head_dim, sf_vec_size = _validate_fp4_bwd_qk_inputs(
+        q_packed,
+        k_packed,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        fp4_qk_format,
+        q_col_packed=q_col_packed,
+        k_col_packed=k_col_packed,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        block_sparse_tensors=block_sparse_tensors,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        softcap=softcap,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        arch=arch,
+    )
+    q_packed, k_packed, q_scale, k_scale, q_sg, k_sg, q_col_packed, k_col_packed, q_col_scale, k_col_scale = [
+        maybe_contiguous(t)
+        for t in (q_packed, k_packed, q_scale, k_scale, q_sg, k_sg, q_col_packed, k_col_packed, q_col_scale, k_col_scale)
+    ]
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = _dequantize_nvfp4_rowwise(q_packed, q_scale, sf_vec_size, q_sg).to(torch.bfloat16)
+    k = _dequantize_nvfp4_rowwise(k_packed, k_scale, sf_vec_size, k_sg).to(torch.bfloat16)
+    ref_dq_scale_tensor = torch.ones_like(k_sg)
+    ref_dk_scale_tensor = torch.ones_like(q_sg)
+    enable_native_fp4_bwd = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE")
+    if _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_REFERENCE") or not enable_native_fp4_bwd:
+        return _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            deterministic=deterministic,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
+            dlse=dlse,
+            dq_scale_tensor=ref_dq_scale_tensor,
+            dk_scale_tensor=ref_dk_scale_tensor,
+        )
+    use_external_col_metadata = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_USE_EXTERNAL_COL_METADATA")
+    native_q_col_packed = q_col_packed
+    native_k_col_packed = k_col_packed
+    native_q_col_scale = q_col_scale
+    native_k_col_scale = k_col_scale
+    native_dq_scale_tensor = k_sg
+    native_dk_scale_tensor = q_sg
+    if not is_fake_mode() and not use_external_col_metadata:
+        native_q_col_packed, native_q_col_scale = _quantize_nvfp4_transpose_from_bf16(q)
+        native_k_col_packed, native_k_col_scale = _quantize_nvfp4_transpose_from_bf16(k)
+        native_dq_scale_tensor = torch.ones_like(k_sg)
+        native_dk_scale_tensor = torch.ones_like(q_sg)
+    return _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        deterministic=deterministic,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        block_sparse_tensors=block_sparse_tensors,
+        dlse=dlse,
+        dq_scale_tensor=native_dq_scale_tensor,
+        dk_scale_tensor=native_dk_scale_tensor,
+        q_col_packed_fp4=native_q_col_packed,
+        k_col_packed_fp4=native_k_col_packed,
+        q_col_scale_fp4=native_q_col_scale,
+        k_col_scale_fp4=native_k_col_scale,
+        fp4_bwd_qk_format=fp4_qk_format,
+    )
 
 
 def _flash_attn_fwd(
@@ -1442,6 +1841,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
+    has_scale_tensor,
     use_2cta_instrs, cluster_size, arch,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
@@ -1449,16 +1849,18 @@ def _compile_bwd_postprocess(
         dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
     )
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
+    num_head = mQ.shape[2] if not has_cuseqlens_q else mQ.shape[1]
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    mScale = fake_tensor(Float32, (batch, num_head), divisibility=1) if has_scale_tensor else None
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
     )
     return cute.compile(
-        fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
+        fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mScale, mCuSeqlensQ, mSeqUsedQ,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1466,6 +1868,7 @@ def _compile_bwd_postprocess(
 
 def _bwd_postprocess_convert(
     accum, output, scale,
+    scale_tensor,
     cu_seqlens, seqused,
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
@@ -1475,13 +1878,14 @@ def _bwd_postprocess_convert(
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
+        scale_tensor is not None,
         use_2cta_instrs, cluster_size, arch,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
         _bwd_postprocess_convert.compile_cache[compile_key](
-            accum, output, scale, cu_seqlens, seqused,
+            accum, output, scale, scale_tensor, cu_seqlens, seqused,
         )
 
 
@@ -1529,6 +1933,14 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    dq_scale_tensor: Optional[torch.Tensor] = None,
+    dk_scale_tensor: Optional[torch.Tensor] = None,
+    dv_scale_tensor: Optional[torch.Tensor] = None,
+    q_col_packed_fp4: Optional[torch.Tensor] = None,
+    k_col_packed_fp4: Optional[torch.Tensor] = None,
+    q_col_scale_fp4: Optional[torch.Tensor] = None,
+    k_col_scale_fp4: Optional[torch.Tensor] = None,
+    fp4_bwd_qk_format: Optional[Literal["nvfp4", "mxfp4"]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1600,9 +2012,27 @@ def _flash_attn_bwd(
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
 
-    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
+    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, dq_scale_tensor, dk_scale_tensor, dv_scale_tensor, q_col_packed_fp4, k_col_packed_fp4, q_col_scale_fp4, k_col_scale_fp4 = [
         maybe_contiguous(t)
-        for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        for t in (
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            dq_scale_tensor,
+            dk_scale_tensor,
+            dv_scale_tensor,
+            q_col_packed_fp4,
+            k_col_packed_fp4,
+            q_col_scale_fp4,
+            k_col_scale_fp4,
+        )
     ]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -1622,6 +2052,18 @@ def _flash_attn_bwd(
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+    use_fp4_bwd_qk = q_col_packed_fp4 is not None
+
+    if use_fp4_bwd_qk:
+        if not all(
+            tensor is not None
+            for tensor in (k_col_packed_fp4, q_col_scale_fp4, k_col_scale_fp4)
+        ):
+            raise ValueError("FP4 backward Q/K requires q/k column tensors and scale tensors together.")
+        if fp4_bwd_qk_format != "nvfp4":
+            raise NotImplementedError("Native FP4 backward Q/K currently only supports fp4_bwd_qk_format='nvfp4'.")
+        if arch // 10 not in [10, 11]:
+            raise NotImplementedError("Native FP4 backward Q/K currently only supports SM100/SM110.")
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -1685,6 +2127,8 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    if use_fp4_bwd_qk and qhead_per_kvhead != 1:
+        raise NotImplementedError("Native FP4 backward Q/K currently only supports dense MHA.")
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
@@ -1698,6 +2142,13 @@ def _flash_attn_bwd(
 
     device = q.device
     out_torch_dtype = q.dtype
+    for tensor_name, tensor, expected_shape in (
+        ("dq_scale_tensor", dq_scale_tensor, (batch_size, num_head)),
+        ("dk_scale_tensor", dk_scale_tensor, (batch_size, num_head_kv)),
+        ("dv_scale_tensor", dv_scale_tensor, (batch_size, num_head_kv)),
+    ):
+        if tensor is not None:
+            _validate_tensor(tensor, tensor_name, expected_shape, torch.float32, device)
 
     if dq is None:
         dq = torch.empty_like(q)
@@ -1811,6 +2262,24 @@ def _flash_attn_bwd(
         num_threads = 512
     else:
         num_threads = 384
+    if use_fp4_bwd_qk:
+        cluster_size = 1
+        use_2cta_instrs = False
+    fp4_bwd_native_skip_dk = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DK")
+    )
+    fp4_bwd_native_skip_dq = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DQ")
+    )
+    fp4_bwd_native_skip_ds_store = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DS_STORE")
+    )
+    fp4_bwd_native_skip_ds_quant = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DS_QUANT")
+    )
+    fp4_bwd_native_skip_qt_kt_loads = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_QT_KT_LOADS")
+    )
 
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
@@ -1876,6 +2345,11 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            False,
+            None,
+            None,
+            None,
+            None,
         )
     else:
         compile_key = (
@@ -1905,15 +2379,33 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_q is None,
             seqused_k is None,
+            use_fp4_bwd_qk,
+            fp4_bwd_qk_format if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_dk if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_dq if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_ds_store if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_ds_quant if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_qt_kt_loads if use_fp4_bwd_qk else None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            _get_static_tensor_layout_key(q_col_packed_fp4) if use_fp4_bwd_qk else None,
+            _get_static_tensor_layout_key(k_col_packed_fp4) if use_fp4_bwd_qk else None,
+            _get_static_tensor_layout_key(q_col_scale_fp4) if use_fp4_bwd_qk else None,
+            _get_static_tensor_layout_key(k_col_scale_fp4) if use_fp4_bwd_qk else None,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
+        if use_fp4_bwd_qk:
+            q_col_tensor = to_cute_fp4_tensor(q_col_packed_fp4)
+            k_col_tensor = to_cute_fp4_tensor(k_col_packed_fp4)
+            q_col_scale_tensor = to_cute_tensor(q_col_scale_fp4)
+            k_col_scale_tensor = to_cute_tensor(k_col_scale_fp4)
+        else:
+            q_col_tensor = k_col_tensor = q_col_scale_tensor = k_col_scale_tensor = None
         dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
             to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
         ]
@@ -1981,6 +2473,10 @@ def _flash_attn_bwd(
                 subtile_factor=subtile_factor,
             )
         else:
+            fp4_sf_dtype = None
+            fp4_sf_vec_size = 0
+            if use_fp4_bwd_qk:
+                fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_bwd_qk_format)
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
                 head_dim_v,
@@ -1997,6 +2493,14 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                use_fp4_bwd_qk=use_fp4_bwd_qk,
+                fp4_bwd_native_skip_dk=fp4_bwd_native_skip_dk,
+                fp4_bwd_native_skip_dq=fp4_bwd_native_skip_dq,
+                fp4_bwd_native_skip_ds_store=fp4_bwd_native_skip_ds_store,
+                fp4_bwd_native_skip_ds_quant=fp4_bwd_native_skip_ds_quant,
+                fp4_bwd_native_skip_qt_kt_loads=fp4_bwd_native_skip_qt_kt_loads,
+                fp4_sf_dtype=fp4_sf_dtype,
+                fp4_sf_vec_size=fp4_sf_vec_size,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2016,6 +2520,10 @@ def _flash_attn_bwd(
             dq_accum_tensor,
             dk_tensor if not dKV_postprocess else dk_accum_tensor,
             dv_tensor if not dKV_postprocess else dv_accum_tensor,
+            q_col_tensor,
+            k_col_tensor,
+            q_col_scale_tensor,
+            k_col_scale_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -2033,6 +2541,8 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
+        q_col_runtime = to_tvm_ffi_fp4x2_tensor(q_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
+        k_col_runtime = to_tvm_ffi_fp4x2_tensor(k_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
             k.detach(),
@@ -2043,6 +2553,10 @@ def _flash_attn_bwd(
             dq_accum,
             dk if not dKV_postprocess else dk_accum,
             dv if not dKV_postprocess else dv_accum,
+            q_col_runtime,
+            k_col_runtime,
+            q_col_scale_fp4,
+            k_col_scale_fp4,
             softmax_scale,
             current_stream,
             cu_seqlens_q,
@@ -2068,6 +2582,7 @@ def _flash_attn_bwd(
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     _bwd_postprocess_convert(
         dq_accum, dq, softmax_scale,
+        dq_scale_tensor,
         cu_seqlens_q, seqused_q,
         arch, dtype, head_dim, m_block_size, num_threads_post,
         AtomLayoutMdQ, dQ_swapAB,
@@ -2078,6 +2593,7 @@ def _flash_attn_bwd(
         # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
         _bwd_postprocess_convert(
             dk_accum, dk, softmax_scale,
+            dk_scale_tensor,
             cu_seqlens_k, seqused_k,
             arch, dtype, head_dim, n_block_size, num_threads_post,
             AtomLayoutNdKV, dKV_swapAB,
@@ -2086,6 +2602,7 @@ def _flash_attn_bwd(
         # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
         _bwd_postprocess_convert(
             dv_accum, dv, 1.0,
+            dv_scale_tensor,
             cu_seqlens_k, seqused_k,
             arch, dtype, head_dim_v, n_block_size, num_threads_post,
             AtomLayoutNdKV, dKV_swapAB,

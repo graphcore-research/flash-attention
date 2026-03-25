@@ -8,7 +8,13 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import (
+    _bwd_postprocess_convert,
+    _bwd_preprocess,
+    _flash_attn_bwd,
+    _flash_attn_bwd_fp4_qk,
+    _flash_attn_fwd,
+)
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
 
@@ -71,17 +77,24 @@ def _install_fake_cuda_runtime(monkeypatch):
     )
     monkeypatch.setattr(
         "flash_attn.cute.interface.torch.cuda.get_device_properties",
-        lambda _device: types.SimpleNamespace(multi_processor_count=132, major=10, minor=0),
+        lambda _device: types.SimpleNamespace(
+            multi_processor_count=132, major=10, minor=0, name="Fake SM100"
+        ),
     )
     monkeypatch.setattr(
         "torch.cuda.get_device_properties",
-        lambda _device: types.SimpleNamespace(multi_processor_count=132, major=10, minor=0),
+        lambda _device: types.SimpleNamespace(
+            multi_processor_count=132, major=10, minor=0, name="Fake SM100"
+        ),
     )
     # CuTe runtime fake tensors do not expose layout metadata yet, so keep the
     # fake-compile tests focused on dispatch/cache behavior rather than layout recasting.
     monkeypatch.setattr("flash_attn.cute.interface.to_cute_fp4_tensor", lambda tensor, *args, **kwargs: tensor)
     monkeypatch.setattr("flash_attn.cute.interface.to_cute_fp4_vt_tensor", lambda tensor, *args, **kwargs: tensor)
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", {})
+    monkeypatch.setattr(_flash_attn_bwd, "compile_cache", {})
+    monkeypatch.setattr(_bwd_preprocess, "compile_cache", {})
+    monkeypatch.setattr(_bwd_postprocess_convert, "compile_cache", {})
     return compile_calls
 
 
@@ -159,6 +172,37 @@ def _make_fake_fp4_pv_dense_inputs(
         batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // sf_vec, device="cuda", dtype=sf_dtype
     )
     return q, k, v, q_scale, k_scale, v_scale
+
+
+def _make_fake_fp4_bwd_inputs(
+    *,
+    fp4_qk_format: str,
+    head_dim: int,
+    num_heads: int = 4,
+    num_heads_kv: int | None = None,
+    batch_size: int = 2,
+    seqlen_q: int = 128,
+    seqlen_k: int = 128,
+    device: str = "cuda",
+):
+    num_heads_kv = num_heads if num_heads_kv is None else num_heads_kv
+    sf_vec = FP4_FORMAT_TO_VEC[fp4_qk_format]
+    sf_dtype = FP4_FORMAT_TO_DTYPE[fp4_qk_format]
+    q = torch.empty(batch_size, seqlen_q, num_heads, head_dim // 2, device=device, dtype=torch.uint8)
+    k = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim // 2, device=device, dtype=torch.uint8)
+    v = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim, device=device, dtype=torch.bfloat16)
+    out = torch.empty(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    dout = torch.empty_like(out)
+    lse = torch.empty(batch_size, num_heads, seqlen_q, device=device, dtype=torch.float32)
+    q_scale = torch.empty(batch_size, seqlen_q, num_heads, head_dim // sf_vec, device=device, dtype=sf_dtype)
+    k_scale = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim // sf_vec, device=device, dtype=sf_dtype)
+    q_col = torch.empty(batch_size, head_dim, num_heads, (seqlen_q + 1) // 2, device=device, dtype=torch.uint8)
+    k_col = torch.empty(batch_size, head_dim, num_heads_kv, (seqlen_k + 1) // 2, device=device, dtype=torch.uint8)
+    q_col_scale = torch.empty(batch_size, head_dim, num_heads, (seqlen_q + sf_vec - 1) // sf_vec, device=device, dtype=sf_dtype)
+    k_col_scale = torch.empty(batch_size, head_dim, num_heads_kv, (seqlen_k + sf_vec - 1) // sf_vec, device=device, dtype=sf_dtype)
+    q_sg = torch.empty(batch_size, num_heads, device=device, dtype=torch.float32)
+    k_sg = torch.empty(batch_size, num_heads_kv, device=device, dtype=torch.float32)
+    return q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg
 
 
 def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
@@ -302,6 +346,132 @@ def test_fp4_pv_fake_compile_dense_forward(
     assert lse.dtype == torch.float32
     assert len(compile_calls) == 1
     assert len(_flash_attn_fwd.compile_cache) == 1
+
+
+@pytest.mark.parametrize(
+    "head_dim,causal",
+    [
+        (64, False),
+        (64, True),
+        (128, False),
+        (128, True),
+    ],
+)
+def test_fp4_bwd_qk_fake_compile_dense_native(monkeypatch, head_dim, causal):
+    compile_calls = _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+
+    with FakeTensorMode():
+        (
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_col,
+            k_col,
+            q_col_scale,
+            k_col_scale,
+            q_sg,
+            k_sg,
+        ) = _make_fake_fp4_bwd_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=head_dim,
+            num_heads=4,
+            batch_size=2,
+            seqlen_q=64,
+            seqlen_k=64,
+        )
+        dq, dk, dv = _flash_attn_bwd_fp4_qk(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            causal=causal,
+            q_col_packed=q_col,
+            k_col_packed=k_col,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
+        )
+
+    assert dq.dtype == torch.bfloat16
+    assert dk.dtype == torch.bfloat16
+    assert dv.dtype == torch.bfloat16
+    assert len(compile_calls) == 3
+    assert len(_flash_attn_bwd.compile_cache) == 1
+
+
+def test_fp4_bwd_qk_fake_compile_native_cache_separates_transpose_layouts(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+
+    with FakeTensorMode():
+        inputs_h2 = _make_fake_fp4_bwd_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            num_heads=2,
+            batch_size=1,
+            seqlen_q=64,
+            seqlen_k=64,
+        )
+        q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = inputs_h2
+        _flash_attn_bwd_fp4_qk(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            q_col_packed=q_col,
+            k_col_packed=k_col,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
+        )
+        bwd_cache_after_h2 = len(_flash_attn_bwd.compile_cache)
+
+        inputs_h4 = _make_fake_fp4_bwd_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            num_heads=4,
+            batch_size=1,
+            seqlen_q=64,
+            seqlen_k=64,
+        )
+        q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = inputs_h4
+        _flash_attn_bwd_fp4_qk(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            q_col_packed=q_col,
+            k_col_packed=k_col,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
+        )
+
+    assert bwd_cache_after_h2 == 1
+    assert len(_flash_attn_bwd.compile_cache) == 2
 
 
 def test_fp4_compile_cache_separates_bf16_and_fp4(monkeypatch):
@@ -855,12 +1025,457 @@ def test_fp4_qk_rejects_non_sm100_arch(monkeypatch):
             )
 
 
+@pytest.mark.parametrize(
+    "kwargs,expected_error",
+    [
+        ({"fp4_qk_format": "mxfp4"}, NotImplementedError),
+        ({"num_heads": 4, "num_heads_kv": 2}, NotImplementedError),
+        ({"missing_q_col_packed": True}, ValueError),
+        ({"missing_k_col_packed": True}, ValueError),
+        ({"missing_q_col_scale": True}, ValueError),
+        ({"missing_k_col_scale": True}, ValueError),
+        ({"q_sg_shape_delta": 1}, ValueError),
+        ({"v_dtype": torch.float16}, NotImplementedError),
+        ({"softcap": 0.5}, NotImplementedError),
+        ({"block_sparse": True}, NotImplementedError),
+    ],
+)
+def test_fp4_bwd_qk_validation_errors(monkeypatch, kwargs, expected_error):
+    captured = {}
+
+    def fake_bwd(*args, **bwd_kwargs):
+        captured["called"] = True
+        raise AssertionError("validation should fail before dispatch")
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+
+    q_heads = kwargs.get("num_heads", 4)
+    k_heads = kwargs.get("num_heads_kv", q_heads)
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format=kwargs.get("fp4_qk_format", "nvfp4") if kwargs.get("fp4_qk_format") else "nvfp4",
+        head_dim=64,
+        num_heads=q_heads,
+        num_heads_kv=k_heads,
+        batch_size=2,
+        seqlen_q=32,
+        seqlen_k=32,
+        device="cpu",
+    )
+    if k_heads != q_heads:
+        k = torch.empty(k.shape[0], k.shape[1], k_heads, k.shape[-1], device="cpu", dtype=k.dtype)
+        v = torch.empty(v.shape[0], v.shape[1], k_heads, v.shape[-1], device="cpu", dtype=v.dtype)
+        k_scale = torch.empty(
+            k_scale.shape[0], k_scale.shape[1], k_heads, k_scale.shape[-1], device="cpu", dtype=k_scale.dtype
+        )
+        k_col = torch.empty(k_col.shape[0], k_col.shape[1], k_heads, k_col.shape[-1], device="cpu", dtype=k_col.dtype)
+        k_col_scale = torch.empty(
+            k_col_scale.shape[0], k_col_scale.shape[1], k_heads, k_col_scale.shape[-1], device="cpu", dtype=k_col_scale.dtype
+        )
+        k_sg = torch.empty(k_sg.shape[0], k_heads, device="cpu", dtype=k_sg.dtype)
+    if "v_dtype" in kwargs:
+        v = v.to(kwargs["v_dtype"])
+    if "q_sg_shape_delta" in kwargs:
+        q_sg = torch.empty(
+            q_sg.shape[0],
+            q_sg.shape[1] + kwargs["q_sg_shape_delta"],
+            device="cpu",
+            dtype=q_sg.dtype,
+        )
+    block_sparse_tensors = None
+    if kwargs.get("block_sparse"):
+        block_sparse_tensors = BlockSparseTensorsTorch(
+            full_block_cnt=torch.empty(1, 1, 1, device="cpu", dtype=torch.int32),
+            full_block_idx=torch.empty(1, 1, 1, 1, device="cpu", dtype=torch.int32),
+            mask_block_cnt=torch.empty(1, 1, 1, device="cpu", dtype=torch.int32),
+            mask_block_idx=torch.empty(1, 1, 1, 1, device="cpu", dtype=torch.int32),
+            block_size=(128, 128),
+        )
+
+    with pytest.raises(expected_error):
+        _flash_attn_bwd_fp4_qk(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            softcap=kwargs.get("softcap", 0.0),
+            fp4_qk_format=kwargs.get("fp4_qk_format", "nvfp4"),
+            block_sparse_tensors=block_sparse_tensors,
+            q_col_packed=None if kwargs.get("missing_q_col_packed") else q_col,
+            k_col_packed=None if kwargs.get("missing_k_col_packed") else k_col,
+            q_col_scale=None if kwargs.get("missing_q_col_scale") else q_col_scale,
+            k_col_scale=None if kwargs.get("missing_k_col_scale") else k_col_scale,
+        )
+    assert "called" not in captured
+
+
+def test_fp4_bwd_qk_dequantizes_rowwise_inputs_before_dispatch(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["q"] = q
+        captured["k"] = k
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=64,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device="cpu",
+    )
+    q.fill_(0x22)
+    k.fill_(0x44)
+    q_scale.fill_(1.0)
+    k_scale.fill_(1.0)
+    q_col.fill_(0x22)
+    k_col.fill_(0x44)
+    q_col_scale.fill_(1.0)
+    k_col_scale.fill_(1.0)
+    q_sg.fill_(2.0)
+    k_sg.fill_(0.5)
+    v.zero_()
+    out.zero_()
+    dout.zero_()
+    lse.zero_()
+
+    dq, dk, dv = _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+        causal=True,
+        deterministic=True,
+    )
+
+    assert dq.shape == (1, 4, 2, 64)
+    assert dk.shape == (1, 4, 2, 64)
+    assert dv.shape == (1, 4, 2, 64)
+    torch.testing.assert_close(
+        captured["q"].float(),
+        torch.full((1, 4, 2, 64), 2.0),
+    )
+    torch.testing.assert_close(
+        captured["k"].float(),
+        torch.full((1, 4, 2, 64), 1.0),
+    )
+    assert captured["kwargs"]["causal"] is True
+    assert captured["kwargs"]["deterministic"] is True
+    torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
+    torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
+    assert "q_col_packed_fp4" not in captured["kwargs"]
+    assert "k_col_packed_fp4" not in captured["kwargs"]
+
+
+def test_fp4_bwd_qk_native_repacks_transpose_metadata(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["q"] = q
+        captured["k"] = k
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=64,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device="cpu",
+    )
+    q.fill_(0x22)
+    k.fill_(0x44)
+    q_scale.fill_(1.0)
+    k_scale.fill_(1.0)
+    q_col.fill_(0x22)
+    k_col.fill_(0x44)
+    q_col_scale.fill_(1.0)
+    k_col_scale.fill_(1.0)
+    q_sg.fill_(2.0)
+    k_sg.fill_(0.5)
+    v.zero_()
+    out.zero_()
+    dout.zero_()
+    lse.zero_()
+
+    dq, dk, dv = _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+    )
+
+    assert dq.shape == (1, 4, 2, 64)
+    assert dk.shape == (1, 4, 2, 64)
+    assert dv.shape == (1, 4, 2, 64)
+    assert captured["kwargs"]["q_col_packed_fp4"].shape == (1, 64, 2, 2)
+    assert captured["kwargs"]["k_col_packed_fp4"].shape == (1, 64, 2, 2)
+    assert captured["kwargs"]["q_col_scale_fp4"].shape == (1, 64, 2, 1)
+    assert captured["kwargs"]["k_col_scale_fp4"].shape == (1, 64, 2, 1)
+    torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
+    torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
+
+
+def test_fp4_bwd_qk_native_can_use_external_transpose_metadata(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_USE_EXTERNAL_COL_METADATA", "1")
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=64,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device="cpu",
+    )
+    q_col.fill_(0x12)
+    k_col.fill_(0x34)
+    q_col_scale.fill_(3.0)
+    k_col_scale.fill_(4.0)
+    q_sg.fill_(2.0)
+    k_sg.fill_(0.5)
+
+    _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+    )
+
+    assert torch.equal(captured["kwargs"]["q_col_packed_fp4"], q_col)
+    assert torch.equal(captured["kwargs"]["k_col_packed_fp4"], k_col)
+    torch.testing.assert_close(captured["kwargs"]["q_col_scale_fp4"], q_col_scale)
+    torch.testing.assert_close(captured["kwargs"]["k_col_scale_fp4"], k_col_scale)
+    torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], k_sg)
+    torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], q_sg)
+
+
 def _require_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for runtime FP4 tests.")
     major, minor = torch.cuda.get_device_capability()
     if major not in (10, 11):
         pytest.skip(f"FP4 runtime tests require SM100/SM110, got {major}.{minor}.")
+
+
+def _require_tk_quant_v5():
+    tk_dir = "/workspace/codebases/fp4_matmul/TK_quantisation/nvfp4_v5"
+    if not os.path.isdir(tk_dir):
+        pytest.skip("TK NVFP4 quantization directory is unavailable.")
+    if not any(name.startswith("_tk_quant_v5") and name.endswith(".so") for name in os.listdir(tk_dir)):
+        pytest.skip("TK NVFP4 quantization extension is unavailable.")
+
+
+def _run_fp4_bwd_native_runtime_case(*, timeout_s: int = 180) -> None:
+    script = textwrap.dedent(
+        """
+        import math
+        import os
+        import sys
+        import torch
+
+        sys.path.insert(0, "/workspace/codebases/fp4_matmul/flash-attention")
+        sys.path.insert(0, "/workspace/codebases/fp4_matmul/TK_quantisation/nvfp4_v5")
+
+        import _tk_quant_v5 as tk
+        from flash_attn.cute.interface import _flash_attn_bwd_fp4_qk
+
+        torch.manual_seed(0)
+        device = "cuda"
+        batch_size, seqlen, num_heads, head_dim = 1, 128, 4, 64
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+        q_bf16 = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        k_bf16 = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        v = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        out = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        dout = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        lse = torch.randn(batch_size, num_heads, seqlen, device=device, dtype=torch.float32).contiguous()
+
+        q_packed = torch.empty(batch_size, seqlen, num_heads, head_dim // 2, device=device, dtype=torch.uint8)
+        k_packed = torch.empty_like(q_packed)
+        q_scale = torch.empty(batch_size, seqlen, num_heads, head_dim // 16, device=device, dtype=torch.float8_e4m3fn)
+        k_scale = torch.empty_like(q_scale)
+        q_col_packed = torch.empty(batch_size, head_dim, num_heads, seqlen // 2, device=device, dtype=torch.uint8)
+        k_col_packed = torch.empty_like(q_col_packed)
+        q_col_scale = torch.empty(batch_size, head_dim, num_heads, seqlen // 16, device=device, dtype=torch.float8_e4m3fn)
+        k_col_scale = torch.empty_like(q_col_scale)
+        q_sg = torch.empty(batch_size, num_heads, device=device, dtype=torch.float32)
+        k_sg = torch.empty_like(q_sg)
+
+        for b in range(batch_size):
+            for h in range(num_heads):
+                qh = q_bf16[b, :, h, :].contiguous()
+                kh = k_bf16[b, :, h, :].contiguous()
+                qamax = qh.abs().max().reshape(1).float()
+                kamax = kh.abs().max().reshape(1).float()
+                qr, qsu8, qc, qcsu8 = tk.tk_quantize_transpose(qh, qamax, qamax, True)
+                kr, ksu8, kc, kcsu8 = tk.tk_quantize_transpose(kh, kamax, kamax, True)
+                q_packed[b, :, h, :] = qr
+                k_packed[b, :, h, :] = kr
+                q_scale[b, :, h, :] = qsu8.view(torch.float8_e4m3fn)
+                k_scale[b, :, h, :] = ksu8.view(torch.float8_e4m3fn)
+                q_col_packed[b, :, h, :] = qc
+                k_col_packed[b, :, h, :] = kc
+                q_col_scale[b, :, h, :] = qcsu8.view(torch.float8_e4m3fn)
+                k_col_scale[b, :, h, :] = kcsu8.view(torch.float8_e4m3fn)
+                q_sg[b, h] = qamax.item() / 2688.0
+                k_sg[b, h] = kamax.item() / 2688.0
+
+        for key in list(os.environ):
+            if key.startswith("FLASH_ATTN_FP4_BWD_"):
+                os.environ.pop(key, None)
+        os.environ["FLASH_ATTN_FP4_BWD_FORCE_REFERENCE"] = "1"
+        dq_ref, dk_ref, dv_ref = _flash_attn_bwd_fp4_qk(
+            q_packed,
+            k_packed,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            softmax_scale=softmax_scale,
+            q_col_packed=q_col_packed,
+            k_col_packed=k_col_packed,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
+        )
+        ref_cpu = {
+            "dq": dq_ref.float().cpu().clone(),
+            "dk": dk_ref.float().cpu().clone(),
+            "dv": dv_ref.float().cpu().clone(),
+        }
+        del os.environ["FLASH_ATTN_FP4_BWD_FORCE_REFERENCE"]
+        os.environ["FLASH_ATTN_FP4_BWD_ENABLE_NATIVE"] = "1"
+        dq, dk, dv = _flash_attn_bwd_fp4_qk(
+            q_packed,
+            k_packed,
+            v,
+            out,
+            dout,
+            lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
+            softmax_scale=softmax_scale,
+            q_col_packed=q_col_packed,
+            k_col_packed=k_col_packed,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
+        )
+        got_cpu = {
+            "dq": dq.float().cpu(),
+            "dk": dk.float().cpu(),
+            "dv": dv.float().cpu(),
+        }
+        for name in ("dq", "dk", "dv"):
+            if not torch.isfinite(ref_cpu[name]).all().item():
+                raise AssertionError(f"Reference {name} contains NaN or Inf.")
+            if not torch.isfinite(got_cpu[name]).all().item():
+                raise AssertionError(f"Native {name} contains NaN or Inf.")
+
+        dq_mean_abs = (got_cpu["dq"] - ref_cpu["dq"]).abs().mean().item()
+        dk_mean_abs = (got_cpu["dk"] - ref_cpu["dk"]).abs().mean().item()
+        dv_max_abs = (got_cpu["dv"] - ref_cpu["dv"]).abs().max().item()
+        if dq_mean_abs > 0.1:
+            raise AssertionError(f"dQ mean_abs {dq_mean_abs} exceeded 0.1")
+        if dk_mean_abs > 0.1:
+            raise AssertionError(f"dK mean_abs {dk_mean_abs} exceeded 0.1")
+        if dv_max_abs != 0.0:
+            raise AssertionError(f"dV max_abs {dv_max_abs} should be exactly 0.0")
+        print("runtime-ok")
+        """
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/workspace/codebases/fp4_matmul/flash-attention",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=os.environ.copy(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"FP4 native backward runtime smoke test timed out after {timeout_s}s.")
+    if result.returncode != 0:
+        pytest.fail(
+            "FP4 native backward runtime smoke test failed.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
 
 
 def _run_fp4_runtime_case(
@@ -1069,6 +1684,12 @@ def _run_fp4_pv_probe(script: str, *, direct_loader: bool, timeout_s: int = 180)
             f"FP4 PV probe failed for {loader_mode} loader.\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+
+
+def test_fp4_bwd_qk_native_runtime_smoke():
+    _require_sm100()
+    _require_tk_quant_v5()
+    _run_fp4_bwd_native_runtime_case()
 
 
 @pytest.mark.parametrize(

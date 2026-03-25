@@ -209,6 +209,7 @@ class FlashAttentionBackwardPostprocess:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
+        mScale: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         stream: cuda.CUstream,
@@ -219,8 +220,12 @@ class FlashAttentionBackwardPostprocess:
         if const_expr(mdQaccum is not None):
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
+        if const_expr(mScale is not None and mScale.element_type is not cutlass.Float32):
+            raise TypeError("mScale tensor must be Float32")
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
+        if const_expr(mScale is not None):
+            mScale = assume_tensor_aligned(mScale)
 
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
@@ -262,6 +267,7 @@ class FlashAttentionBackwardPostprocess:
         self.kernel(
             mdQaccum,
             mdQ,
+            mScale,
             mCuSeqlensQ,
             mSeqUsedQ,
             scale,
@@ -286,6 +292,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
+        mScale: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         scale: cutlass.Float32,
@@ -324,6 +331,9 @@ class FlashAttentionBackwardPostprocess:
         m_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
+            scale_total = scale
+            if const_expr(mScale is not None):
+                scale_total = scale_total * mScale[batch_idx, head_idx]
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
@@ -470,7 +480,7 @@ class FlashAttentionBackwardPostprocess:
                             cute.recast_ptr(tdQrdQ_r2s_cpy.iterator),
                             tdQrdQ_r2s[((None, 0), (stage_lo, stage_hi), 0, 0)].shape,
                         )
-                        dQ_vec = tdQrdQ_r2s_cpy.load() * scale
+                        dQ_vec = tdQrdQ_r2s_cpy.load() * scale_total
                         tdQrdQ_r2s[((None, 0), (stage_lo, stage_hi), 0, 0)].store(
                             dQ_vec.to(self.dtype)
                         )
@@ -524,7 +534,7 @@ class FlashAttentionBackwardPostprocess:
                 cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
                 # Convert tdQrdQaccum from fp32 to fp16/bf16
                 rdQ = cute.make_fragment_like(acc, self.dtype)
-                rdQ.store((acc.load() * scale).to(self.dtype))
+                rdQ.store((acc.load() * scale_total).to(self.dtype))
 
                 # Step 3: Copy dQ from register to smem
                 cute.arch.barrier()  # make sure all threads have finished loading dQaccum

@@ -3740,6 +3740,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
     qgroup_num_splits: list[int] = []
 
     split_entries: list[dict[str, object]] = []
+    split_indices_by_qgroup: dict[int, list[int]] = {}
     max_blocks_per_split = max(1, max_packed_k // logical_block_k)
     pack_k_bin = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PACKED_K_BIN", "0") == "1"
 
@@ -3930,19 +3931,20 @@ def _build_hsa_forward_synthetic_grid_metadata(
             tile_q_length.append(q_count)
             tile_k_length.append(len(active_k_rows_sorted))
 
-            split_entries.append(
-                {
-                    "qgroup_idx": qgroup_idx,
-                    "slot": split_slot,
-                    "packed_k": packed_k,
-                    "dense": dense,
-                    "padded_k_rows": padded_k_rows,
-                    "q_length": q_count,
-                    "k_length": packed_k_native,
-                    "mask_words": mask_words,
-                    "split_fill": split_fill,
-                }
-            )
+            split_entry = {
+                "qgroup_idx": qgroup_idx,
+                "slot": split_slot,
+                "packed_k": packed_k,
+                "dense": dense,
+                "padded_k_rows": padded_k_rows,
+                "q_length": q_count,
+                "k_length": packed_k_native,
+                "mask_words": mask_words,
+                "split_fill": split_fill,
+            }
+            split_idx = len(split_entries)
+            split_entries.append(split_entry)
+            split_indices_by_qgroup.setdefault(qgroup_idx, []).append(split_idx)
 
     for batch_idx in range(num_batches):
         for q_block_idx in range(num_q_blocks):
@@ -4001,6 +4003,50 @@ def _build_hsa_forward_synthetic_grid_metadata(
                                     word ^= bit
                 _append_forward_qgroup(batch_idx, q_block_idx, q_subgroup_idx, row_cols_global)
 
+    def _build_qgroup_union_entry(qgroup_idx: int) -> dict[str, object]:
+        split_ids = sorted(split_indices_by_qgroup.get(qgroup_idx, []), key=lambda idx: int(split_entries[idx]["slot"]))
+        packed_q = qgroup_packed_q[qgroup_idx]
+        union_k_length = sum(int(split_entries[split_idx]["k_length"]) for split_idx in split_ids)
+        union_words_per_row = (union_k_length + 31) // 32
+        union_mask_words = [0] * (packed_q * union_words_per_row)
+        union_padded_k_rows: list[int] = []
+        union_allowed_pairs = 0
+        col_offset = 0
+
+        for split_idx in split_ids:
+            split_entry = split_entries[split_idx]
+            split_k_length = int(split_entry["k_length"])
+            split_mask_words = split_entry["mask_words"]
+            split_words_per_row = 0 if packed_q <= 0 else len(split_mask_words) // packed_q
+            union_padded_k_rows.extend(int(row_idx) for row_idx in split_entry["padded_k_rows"][:split_k_length])
+            for q_slot in range(packed_q):
+                row_base = q_slot * split_words_per_row
+                for word_idx in range(split_words_per_row):
+                    word = int(split_mask_words[row_base + word_idx]) & 0xFFFFFFFF
+                    while word:
+                        bit = word & -word
+                        bit_idx = bit.bit_length() - 1
+                        local_k = word_idx * 32 + bit_idx
+                        if local_k < split_k_length:
+                            global_k = col_offset + local_k
+                            union_word_idx = global_k // 32
+                            union_bit_idx = global_k % 32
+                            union_mask_words[q_slot * union_words_per_row + union_word_idx] |= 1 << union_bit_idx
+                            union_allowed_pairs += 1
+                        word ^= bit
+            col_offset += split_k_length
+
+        q_count = int(qgroup_length[qgroup_idx])
+        dense = union_allowed_pairs == q_count * union_k_length
+        return {
+            "k_length": union_k_length,
+            "words_per_row": union_words_per_row,
+            "mask_words": union_mask_words,
+            "padded_k_rows": union_padded_k_rows,
+            "allowed_pairs": union_allowed_pairs,
+            "dense": dense,
+        }
+
     qgroup_bucket_map: dict[int, list[int]] = {}
     for qgroup_idx, packed_q in enumerate(qgroup_packed_q):
         qgroup_bucket_map.setdefault(packed_q, []).append(qgroup_idx)
@@ -4035,6 +4081,21 @@ def _build_hsa_forward_synthetic_grid_metadata(
         )
         execution_bucket_map.setdefault(key, []).append((split_idx, qgroup_local_idx))
 
+    one_launch_bucket_data: dict[int, dict[str, object]] = {}
+    if logical_block_q == 2 and logical_block_k == 2:
+        for qgroup_bucket_id in range(len(qgroup_bucket_packed_q)):
+            qgroup_start = qgroup_bucket_row_ptr[qgroup_bucket_id]
+            qgroup_end = qgroup_bucket_row_ptr[qgroup_bucket_id + 1]
+            qgroup_ids = qgroup_bucket_idx[qgroup_start:qgroup_end]
+            union_entries = {qgroup_idx: _build_qgroup_union_entry(qgroup_idx) for qgroup_idx in qgroup_ids}
+            bucket_packed_k_value = max((int(entry["k_length"]) for entry in union_entries.values()), default=0)
+            if bucket_packed_k_value <= max_packed_k:
+                one_launch_bucket_data[qgroup_bucket_id] = {
+                    "qgroup_ids": qgroup_ids,
+                    "union_entries": union_entries,
+                    "packed_k": bucket_packed_k_value,
+                }
+
     bucket_row_ptr = [0]
     bucket_tile_idx: list[int] = []
     bucket_packed_q: list[int] = []
@@ -4054,9 +4115,75 @@ def _build_hsa_forward_synthetic_grid_metadata(
     bucket_words_per_row: list[int] = []
     bucket_allowed_pairs: list[int] = []
     bucket_fill: list[float] = []
+    bucket_use_qgroup_q: list[bool] = []
+    bucket_scatter_only: list[bool] = []
     qgroup_bucket_to_split_buckets: dict[int, list[int]] = {bucket_id: [] for bucket_id in range(len(qgroup_bucket_packed_q))}
 
+    for qgroup_bucket_id in range(len(qgroup_bucket_packed_q)):
+        one_launch_bucket = one_launch_bucket_data.get(qgroup_bucket_id)
+        if one_launch_bucket is None:
+            continue
+        packed_q = qgroup_bucket_packed_q[qgroup_bucket_id]
+        packed_k = int(one_launch_bucket["packed_k"])
+        words_per_row_bucket = (packed_k + 31) // 32
+        qgroup_ids = one_launch_bucket["qgroup_ids"]
+        union_entries = one_launch_bucket["union_entries"]
+        bucket_idx = len(bucket_packed_q)
+        qgroup_bucket_to_split_buckets[qgroup_bucket_id].append(bucket_idx)
+        bucket_packed_q.append(packed_q)
+        bucket_packed_k.append(packed_k)
+        bucket_qgroup_bucket_idx.append(qgroup_bucket_id)
+        bucket_split_slot.append(0)
+        bucket_use_qgroup_q.append(True)
+        bucket_scatter_only.append(True)
+        bucket_tile_idx.extend(int(qgroup_idx) for qgroup_idx in qgroup_ids)
+        bucket_row_ptr.append(len(bucket_tile_idx))
+
+        all_dense = all(
+            bool(union_entries[int(qgroup_idx)]["dense"]) and int(union_entries[int(qgroup_idx)]["k_length"]) == packed_k
+            for qgroup_idx in qgroup_ids
+        )
+        bucket_dense.append(1 if all_dense else 0)
+        bucket_allowed_pairs_value = 0
+
+        for qgroup_local_idx, qgroup_idx in enumerate(qgroup_ids):
+            qgroup_idx = int(qgroup_idx)
+            q_start_idx = qgroup_row_ptr[qgroup_idx]
+            q_end_idx = qgroup_row_ptr[qgroup_idx + 1]
+            q_rows = qgroup_rows[q_start_idx:q_end_idx]
+            q_count = int(qgroup_length[qgroup_idx])
+            union_entry = union_entries[qgroup_idx]
+            union_k_length = int(union_entry["k_length"])
+            union_words_per_row = int(union_entry["words_per_row"])
+            base_row = qgroup_local_idx * packed_q
+            bucket_q_row_idx.extend(base_row + row for row in range(packed_q))
+            bucket_q_src_row_idx.extend(q_rows)
+            bucket_q_src_row_idx.extend([-1] * (packed_q - len(q_rows)))
+            bucket_k_row_idx.extend(int(row_idx) for row_idx in union_entry["padded_k_rows"])
+            bucket_k_row_idx.extend([-1] * (packed_k - union_k_length))
+            bucket_q_length.append(q_count)
+            bucket_k_length.append(union_k_length)
+            bucket_allowed_pairs_value += int(union_entry["allowed_pairs"])
+            if not all_dense:
+                union_mask_words = union_entry["mask_words"]
+                for q_slot in range(packed_q):
+                    row_base = q_slot * union_words_per_row
+                    bucket_mask_words.extend(
+                        _wrap_u32_to_i32(int(word))
+                        for word in union_mask_words[row_base:row_base + union_words_per_row]
+                    )
+                    bucket_mask_words.extend([0] * (words_per_row_bucket - union_words_per_row))
+
+        bucket_q_row_idx_row_ptr.append(len(bucket_q_row_idx))
+        bucket_k_row_idx_row_ptr.append(len(bucket_k_row_idx))
+        bucket_mask_word_row_ptr.append(len(bucket_mask_words))
+        bucket_words_per_row.append(words_per_row_bucket)
+        bucket_allowed_pairs.append(bucket_allowed_pairs_value)
+        bucket_fill.append(bucket_allowed_pairs_value / max(len(qgroup_ids) * packed_q * packed_k, 1))
+
     for (qgroup_bucket_id, packed_k), split_members in sorted(execution_bucket_map.items()):
+        if qgroup_bucket_id in one_launch_bucket_data:
+            continue
         packed_q = qgroup_bucket_packed_q[qgroup_bucket_id]
         words_per_row_bucket = (packed_k + 31) // 32
         split_members.sort(key=lambda item: (item[1], item[0]))
@@ -4068,6 +4195,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
         bucket_dense.append(1 if all_dense else 0)
         bucket_split_slot.append(min(int(split_entries[split_idx]["slot"]) for split_idx, _ in split_members))
         bucket_qgroup_bucket_idx.append(qgroup_bucket_id)
+        bucket_use_qgroup_q.append(False)
+        bucket_scatter_only.append(False)
         bucket_tile_idx.extend(split_idx for split_idx, _ in split_members)
         bucket_row_ptr.append(len(bucket_tile_idx))
         bucket_allowed_pairs_value = 0
@@ -4156,6 +4285,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
         "bucket_q_length_range": bucket_data_range,
         "bucket_k_length_range": bucket_data_range,
         "bucket_mask_word_range": bucket_mask_word_range,
+        "bucket_use_qgroup_q": bucket_use_qgroup_q,
+        "bucket_scatter_only": bucket_scatter_only,
     }
 
     return HSASyntheticGridMetadata(

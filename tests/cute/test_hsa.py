@@ -1573,6 +1573,40 @@ def test_hsa_synthetic_grid_runtime_honors_env_geometry(monkeypatch):
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 @pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,headdim",
+    [
+        (1, 65, 4, 64),
+        (2, 1024, 8, 64),
+    ],
+)
+def test_hsa_synthetic_grid_2x2_collapses_to_one_bucket(monkeypatch, batch_size, seqlen, nheads, headdim):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.delenv("FLASH_ATTN_HSA_SYNTHETIC_PACKED_K_BIN", raising=False)
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+
+    metadata = runtime.forward_synthetic_grid
+    assert metadata is not None
+    plan = metadata.forward_execution_plan
+    assert plan is not None
+    assert len(plan["bucket_packed_k"]) == 1
+    assert plan["bucket_use_qgroup_q"] == [True]
+    assert plan["bucket_scatter_only"] == [True]
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize(
     "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
     [
         ("mixed_small_eq", 1, 65, 4, 64, 4),

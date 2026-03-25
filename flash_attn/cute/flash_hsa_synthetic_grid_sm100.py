@@ -854,6 +854,8 @@ def _run_bucketed_forward(
     bucket_q_length_range = execution_plan["bucket_q_length_range"]
     bucket_k_length_range = execution_plan["bucket_k_length_range"]
     bucket_mask_word_range = execution_plan["bucket_mask_word_range"]
+    bucket_use_qgroup_q = execution_plan.get("bucket_use_qgroup_q")
+    bucket_scatter_only = execution_plan.get("bucket_scatter_only")
 
     for qgroup_bucket_idx, packed_q in enumerate(qgroup_bucket_packed_q):
         qgroup_bucket_size_value = qgroup_bucket_size[qgroup_bucket_idx]
@@ -876,15 +878,20 @@ def _run_bucketed_forward(
             k_bucket_start, k_bucket_end = bucket_k_row_range[split_bucket_idx]
             q_length_start, q_length_end = bucket_q_length_range[split_bucket_idx]
             k_length_start, k_length_end = bucket_k_length_range[split_bucket_idx]
-            q_bucket_row_idx = metadata.bucket_q_row_idx[q_bucket_start:q_bucket_end].contiguous()
             q_bucket_src_row_idx = metadata.bucket_q_src_row_idx[q_bucket_src_start:q_bucket_src_end].contiguous()
             k_bucket_row_idx = metadata.bucket_k_row_idx[k_bucket_start:k_bucket_end].contiguous()
             q_length = metadata.bucket_q_length[q_length_start:q_length_end].contiguous()
             k_length = metadata.bucket_k_length[k_length_start:k_length_end].contiguous()
 
-            q_buf_flat = get_q_workspace(q_workspace, bucket_size, packed_q_bucket)
+            use_qgroup_q = False if bucket_use_qgroup_q is None else bool(bucket_use_qgroup_q[split_bucket_idx])
+            scatter_only = False if bucket_scatter_only is None else bool(bucket_scatter_only[split_bucket_idx])
+            if use_qgroup_q:
+                q_buf_flat = qgroup_q_buf_flat
+            else:
+                q_bucket_row_idx = metadata.bucket_q_row_idx[q_bucket_start:q_bucket_end].contiguous()
+                q_buf_flat = get_q_workspace(q_workspace, bucket_size, packed_q_bucket)
+                _run_synthetic_pack_rows_kernel(qgroup_q_buf_flat, q_bucket_row_idx, q_buf_flat)
             k_buf_flat, v_buf_flat = get_kv_workspace(bucket_size, packed_k)
-            _run_synthetic_pack_rows_kernel(qgroup_q_buf_flat, q_bucket_row_idx, q_buf_flat)
             _run_synthetic_pack_kv_rows_kernel(k_flat, v_flat, k_bucket_row_idx, k_buf_flat, v_buf_flat)
 
             q_buf = q_buf_flat.view(bucket_size, packed_q_bucket, q.shape[2], q.shape[3])
@@ -920,13 +927,19 @@ def _run_bucketed_forward(
                 aux_tensors=aux_tensors,
                 return_lse=True,
             )
-            _run_synthetic_combine_scatter_rows_kernel(
-                out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous(),
-                lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous(),
-                q_bucket_src_row_idx,
-                total_out,
-                total_lse,
-            )
+            out_bucket_flat = out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous()
+            lse_bucket_flat = lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous()
+            if scatter_only:
+                _run_synthetic_scatter_rows_kernel(out_bucket_flat, q_bucket_src_row_idx, total_out)
+                _run_synthetic_scatter_lse_kernel(lse_bucket_flat, q_bucket_src_row_idx, total_lse)
+            else:
+                _run_synthetic_combine_scatter_rows_kernel(
+                    out_bucket_flat,
+                    lse_bucket_flat,
+                    q_bucket_src_row_idx,
+                    total_out,
+                    total_lse,
+                )
 
     out = total_out.to(dtype=q.dtype).view(q.shape[0], q.shape[1], q.shape[2], head_dim_v)
     lse = total_lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()

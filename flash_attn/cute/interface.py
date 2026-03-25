@@ -472,6 +472,22 @@ def _quantize_nvfp4_transpose_from_bf16(x: torch.Tensor) -> Tuple[torch.Tensor, 
     return packed, scale
 
 
+def _quantize_nvfp4_transpose_scale_from_bf16(x: torch.Tensor) -> torch.Tensor:
+    """Build only the kernel-friendly transpose FP4 scales from BF16/FP16 Q or K."""
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"Expected BF16/FP16 input, got {x.dtype}")
+    batch_size, seqlen, num_heads, head_dim = x.shape
+    seqlen_groups = math.ceil(seqlen / 16)
+    seqlen_padded = seqlen_groups * 16
+    x_t = x.permute(0, 2, 3, 1).contiguous().to(torch.float32)  # (B, H, D, S)
+    if seqlen_padded != seqlen:
+        x_t = torch.nn.functional.pad(x_t, (0, seqlen_padded - seqlen))
+    groups = x_t.view(batch_size, num_heads, head_dim, seqlen_groups, 16)
+    scale = groups.abs().amax(dim=-1) / 6.0
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return scale.to(torch.float8_e4m3fn).permute(0, 2, 1, 3).contiguous()
+
+
 def _get_static_tensor_layout_key(tensor: Optional[torch.Tensor]) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
     if tensor is None:
         return None
@@ -839,8 +855,8 @@ def _flash_attn_bwd_fp4_qk(
     native_dq_scale_tensor = k_sg
     native_dk_scale_tensor = q_sg
     if not is_fake_mode() and not use_external_col_metadata:
-        native_q_col_packed, native_q_col_scale = _quantize_nvfp4_transpose_from_bf16(q)
-        native_k_col_packed, native_k_col_scale = _quantize_nvfp4_transpose_from_bf16(k)
+        native_q_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(q)
+        native_k_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(k)
         native_dq_scale_tensor = torch.ones_like(k_sg)
         native_dk_scale_tensor = torch.ones_like(q_sg)
     return _flash_attn_bwd(

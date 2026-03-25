@@ -1193,7 +1193,7 @@ def test_fp4_bwd_qk_dequantizes_rowwise_inputs_before_dispatch(monkeypatch):
     assert "k_col_packed_fp4" not in captured["kwargs"]
 
 
-def test_fp4_bwd_qk_native_repacks_transpose_metadata(monkeypatch):
+def test_fp4_bwd_qk_native_uses_external_packed_with_synthesized_scales(monkeypatch):
     captured = {}
 
     def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
@@ -1254,8 +1254,8 @@ def test_fp4_bwd_qk_native_repacks_transpose_metadata(monkeypatch):
     assert dq.shape == (1, 4, 2, 64)
     assert dk.shape == (1, 4, 2, 64)
     assert dv.shape == (1, 4, 2, 64)
-    assert captured["kwargs"]["q_col_packed_fp4"].shape == (1, 64, 2, 2)
-    assert captured["kwargs"]["k_col_packed_fp4"].shape == (1, 64, 2, 2)
+    assert captured["kwargs"]["q_col_packed_fp4"] is q_col
+    assert captured["kwargs"]["k_col_packed_fp4"] is k_col
     assert captured["kwargs"]["q_col_scale_fp4"].shape == (1, 64, 2, 1)
     assert captured["kwargs"]["k_col_scale_fp4"].shape == (1, 64, 2, 1)
     torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
@@ -1471,9 +1471,156 @@ def _run_fp4_bwd_native_runtime_case(*, timeout_s: int = 180) -> None:
         )
     except subprocess.TimeoutExpired:
         pytest.fail(f"FP4 native backward runtime smoke test timed out after {timeout_s}s.")
+        if result.returncode != 0:
+            pytest.fail(
+                "FP4 native backward runtime smoke test failed.\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+
+
+def _run_fp4_bwd_native_mixed_metadata_runtime_case(*, timeout_s: int = 180) -> None:
+    script = textwrap.dedent(
+        """
+        import math
+        import os
+        import sys
+        import torch
+
+        sys.path.insert(0, "/workspace/codebases/fp4_matmul/flash-attention")
+        sys.path.insert(0, "/workspace/codebases/fp4_matmul/TK_quantisation/nvfp4_v5")
+
+        import _tk_quant_v5 as tk
+        from flash_attn.cute.interface import _flash_attn_bwd, _dequantize_nvfp4_rowwise, _quantize_nvfp4_transpose_from_bf16
+
+        torch.manual_seed(0)
+        device = "cuda"
+        batch_size, seqlen, num_heads, head_dim = 1, 128, 4, 64
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+        q_bf16 = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        k_bf16 = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        v = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        out = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        dout = (torch.randn(batch_size, seqlen, num_heads, head_dim, device=device, dtype=torch.bfloat16) * 0.1).contiguous()
+        lse = torch.randn(batch_size, num_heads, seqlen, device=device, dtype=torch.float32).contiguous()
+
+        q_packed = torch.empty(batch_size, seqlen, num_heads, head_dim // 2, device=device, dtype=torch.uint8)
+        k_packed = torch.empty_like(q_packed)
+        q_scale = torch.empty(batch_size, seqlen, num_heads, head_dim // 16, device=device, dtype=torch.float8_e4m3fn)
+        k_scale = torch.empty_like(q_scale)
+        q_col_packed = torch.empty(batch_size, head_dim, num_heads, seqlen // 2, device=device, dtype=torch.uint8)
+        k_col_packed = torch.empty_like(q_col_packed)
+        q_col_scale = torch.empty(batch_size, head_dim, num_heads, seqlen // 16, device=device, dtype=torch.float8_e4m3fn)
+        k_col_scale = torch.empty_like(q_col_scale)
+        q_sg = torch.empty(batch_size, num_heads, device=device, dtype=torch.float32)
+        k_sg = torch.empty_like(q_sg)
+
+        for b in range(batch_size):
+            for h in range(num_heads):
+                qh = q_bf16[b, :, h, :].contiguous()
+                kh = k_bf16[b, :, h, :].contiguous()
+                qamax = qh.abs().max().reshape(1).float()
+                kamax = kh.abs().max().reshape(1).float()
+                qr, qsu8, qc, qcsu8 = tk.tk_quantize_transpose(qh, qamax, qamax, True)
+                kr, ksu8, kc, kcsu8 = tk.tk_quantize_transpose(kh, kamax, kamax, True)
+                q_packed[b, :, h, :] = qr
+                k_packed[b, :, h, :] = kr
+                q_scale[b, :, h, :] = qsu8.view(torch.float8_e4m3fn)
+                k_scale[b, :, h, :] = ksu8.view(torch.float8_e4m3fn)
+                q_col_packed[b, :, h, :] = qc
+                k_col_packed[b, :, h, :] = kc
+                q_col_scale[b, :, h, :] = qcsu8.view(torch.float8_e4m3fn)
+                k_col_scale[b, :, h, :] = kcsu8.view(torch.float8_e4m3fn)
+                q_sg[b, h] = qamax.item() / 2688.0
+                k_sg[b, h] = kamax.item() / 2688.0
+
+        q = _dequantize_nvfp4_rowwise(q_packed, q_scale, 16, q_sg).to(torch.bfloat16)
+        k = _dequantize_nvfp4_rowwise(k_packed, k_scale, 16, k_sg).to(torch.bfloat16)
+        synth_q_col_packed, synth_q_col_scale = _quantize_nvfp4_transpose_from_bf16(q)
+        synth_k_col_packed, synth_k_col_scale = _quantize_nvfp4_transpose_from_bf16(k)
+
+        for key in list(os.environ):
+            if key.startswith("FLASH_ATTN_FP4_BWD_"):
+                os.environ.pop(key, None)
+        os.environ["FLASH_ATTN_FP4_BWD_ENABLE_NATIVE"] = "1"
+
+        dq_ref, dk_ref, dv_ref = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=softmax_scale,
+            dq_scale_tensor=torch.ones_like(k_sg),
+            dk_scale_tensor=torch.ones_like(q_sg),
+            q_col_packed_fp4=synth_q_col_packed,
+            k_col_packed_fp4=synth_k_col_packed,
+            q_col_scale_fp4=synth_q_col_scale,
+            k_col_scale_fp4=synth_k_col_scale,
+            fp4_bwd_qk_format="nvfp4",
+        )
+        dq_mix, dk_mix, dv_mix = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=softmax_scale,
+            dq_scale_tensor=torch.ones_like(k_sg),
+            dk_scale_tensor=torch.ones_like(q_sg),
+            q_col_packed_fp4=q_col_packed,
+            k_col_packed_fp4=k_col_packed,
+            q_col_scale_fp4=synth_q_col_scale,
+            k_col_scale_fp4=synth_k_col_scale,
+            fp4_bwd_qk_format="nvfp4",
+        )
+
+        ref_cpu = {
+            "dq": dq_ref.float().cpu(),
+            "dk": dk_ref.float().cpu(),
+            "dv": dv_ref.float().cpu(),
+        }
+        mix_cpu = {
+            "dq": dq_mix.float().cpu(),
+            "dk": dk_mix.float().cpu(),
+            "dv": dv_mix.float().cpu(),
+        }
+
+        for name in ("dq", "dk", "dv"):
+            if not torch.isfinite(ref_cpu[name]).all().item():
+                raise AssertionError(f"Reference {name} contains NaN or Inf.")
+            if not torch.isfinite(mix_cpu[name]).all().item():
+                raise AssertionError(f"Mixed-metadata {name} contains NaN or Inf.")
+
+        dq_mean_abs = (mix_cpu["dq"] - ref_cpu["dq"]).abs().mean().item()
+        dk_mean_abs = (mix_cpu["dk"] - ref_cpu["dk"]).abs().mean().item()
+        dv_max_abs = (mix_cpu["dv"] - ref_cpu["dv"]).abs().max().item()
+        if dq_mean_abs > 0.02:
+            raise AssertionError(f"dQ mean_abs {dq_mean_abs} exceeded 0.02")
+        if dk_mean_abs > 0.06:
+            raise AssertionError(f"dK mean_abs {dk_mean_abs} exceeded 0.06")
+        if dv_max_abs != 0.0:
+            raise AssertionError(f"dV max_abs {dv_max_abs} should be exactly 0.0")
+        print("runtime-ok")
+        """
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/workspace/codebases/fp4_matmul/flash-attention",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=os.environ.copy(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"FP4 native mixed-metadata backward smoke test timed out after {timeout_s}s.")
     if result.returncode != 0:
         pytest.fail(
-            "FP4 native backward runtime smoke test failed.\n"
+            "FP4 native mixed-metadata backward smoke test failed.\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
@@ -1690,6 +1837,12 @@ def test_fp4_bwd_qk_native_runtime_smoke():
     _require_sm100()
     _require_tk_quant_v5()
     _run_fp4_bwd_native_runtime_case()
+
+
+def test_fp4_bwd_qk_native_mixed_metadata_runtime_smoke():
+    _require_sm100()
+    _require_tk_quant_v5()
+    _run_fp4_bwd_native_mixed_metadata_runtime_case()
 
 
 @pytest.mark.parametrize(

@@ -173,6 +173,8 @@ class HSASyntheticGridMetadata:
     bucket_packed_q: torch.Tensor
     bucket_packed_k: torch.Tensor
     bucket_dense: torch.Tensor
+    bucket_allowed_pairs: Optional[torch.Tensor] = None
+    bucket_fill: Optional[torch.Tensor] = None
     max_packed_k: Optional[int] = None
     tile_fill: Optional[torch.Tensor] = None
     tile_q_length: Optional[torch.Tensor] = None
@@ -232,6 +234,10 @@ class HSASyntheticGridMetadata:
             bucket_packed_q=self.bucket_packed_q.to(device=device),
             bucket_packed_k=self.bucket_packed_k.to(device=device),
             bucket_dense=self.bucket_dense.to(device=device),
+            bucket_allowed_pairs=(
+                None if self.bucket_allowed_pairs is None else self.bucket_allowed_pairs.to(device=device)
+            ),
+            bucket_fill=None if self.bucket_fill is None else self.bucket_fill.to(device=device),
             max_packed_k=self.max_packed_k,
             tile_q_length=None if self.tile_q_length is None else self.tile_q_length.to(device=device),
             tile_k_length=None if self.tile_k_length is None else self.tile_k_length.to(device=device),
@@ -3735,6 +3741,20 @@ def _build_hsa_forward_synthetic_grid_metadata(
 
     split_entries: list[dict[str, object]] = []
     max_blocks_per_split = max(1, max_packed_k // logical_block_k)
+    pack_k_bin = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PACKED_K_BIN", "0") == "1"
+
+    def _bin_packed_k(packed_k_native: int) -> int:
+        if not pack_k_bin or logical_block_q != 2 or logical_block_k != 2:
+            return packed_k_native
+        if packed_k_native <= 2:
+            return 2
+        if packed_k_native <= 4:
+            return 4
+        if packed_k_native <= 8:
+            return 8
+        if packed_k_native <= 16:
+            return 16
+        return min(max_packed_k, _align_up(packed_k_native, 16))
 
     def _fill_score(blocks: list[dict[str, object]], packed_q: int) -> float:
         if not blocks or packed_q <= 0:
@@ -3839,7 +3859,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
         qgroup_num_splits.append(len(splits))
 
         for split_slot, split_blocks in enumerate(splits):
-            packed_k = logical_block_k * len(split_blocks)
+            packed_k_native = logical_block_k * len(split_blocks)
+            packed_k = _bin_packed_k(packed_k_native)
             split_packed_cols = [set() for _ in range(q_count)]
             split_global_rows = [set() for _ in range(q_count)]
             active_k_rows: set[int] = set()
@@ -3879,6 +3900,9 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     bit_idx = k_slot % 32
                     mask_words[q_slot * words_per_row_split + word_idx] |= 1 << bit_idx
 
+            if packed_k > packed_k_native:
+                padded_k_rows.extend([-1] * (packed_k - packed_k_native))
+
             active_k_rows_sorted = sorted(active_k_rows)
             k_compact = {k_row: idx for idx, k_row in enumerate(active_k_rows_sorted)}
             compact_cols_per_row: list[list[int]] = []
@@ -3914,7 +3938,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     "dense": dense,
                     "padded_k_rows": padded_k_rows,
                     "q_length": q_count,
-                    "k_length": packed_k,
+                    "k_length": packed_k_native,
                     "mask_words": mask_words,
                     "split_fill": split_fill,
                 }
@@ -4001,14 +4025,13 @@ def _build_hsa_forward_synthetic_grid_metadata(
             qgroup_bucket_q_row_idx.extend([-1] * (packed_q - len(q_rows)))
         qgroup_bucket_q_row_idx_row_ptr.append(len(qgroup_bucket_q_row_idx))
 
-    execution_bucket_map: dict[tuple[int, int, bool], list[tuple[int, int]]] = {}
+    execution_bucket_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for split_idx, split_entry in enumerate(split_entries):
         qgroup_idx = int(split_entry["qgroup_idx"])
         qgroup_bucket_id, qgroup_local_idx = qgroup_bucket_local_pos[qgroup_idx]
         key = (
             qgroup_bucket_id,
             int(split_entry["packed_k"]),
-            bool(split_entry["dense"]),
         )
         execution_bucket_map.setdefault(key, []).append((split_idx, qgroup_local_idx))
 
@@ -4029,21 +4052,25 @@ def _build_hsa_forward_synthetic_grid_metadata(
     bucket_mask_word_row_ptr = [0]
     bucket_mask_words: list[int] = []
     bucket_words_per_row: list[int] = []
+    bucket_allowed_pairs: list[int] = []
+    bucket_fill: list[float] = []
     qgroup_bucket_to_split_buckets: dict[int, list[int]] = {bucket_id: [] for bucket_id in range(len(qgroup_bucket_packed_q))}
 
-    for (qgroup_bucket_id, packed_k, is_dense), split_members in sorted(execution_bucket_map.items()):
+    for (qgroup_bucket_id, packed_k), split_members in sorted(execution_bucket_map.items()):
         packed_q = qgroup_bucket_packed_q[qgroup_bucket_id]
         words_per_row_bucket = (packed_k + 31) // 32
         split_members.sort(key=lambda item: (item[1], item[0]))
+        all_dense = all(bool(split_entries[split_idx]["dense"]) for split_idx, _ in split_members)
         bucket_idx = len(bucket_packed_q)
         qgroup_bucket_to_split_buckets[qgroup_bucket_id].append(bucket_idx)
         bucket_packed_q.append(packed_q)
         bucket_packed_k.append(packed_k)
-        bucket_dense.append(1 if is_dense else 0)
+        bucket_dense.append(1 if all_dense else 0)
         bucket_split_slot.append(min(int(split_entries[split_idx]["slot"]) for split_idx, _ in split_members))
         bucket_qgroup_bucket_idx.append(qgroup_bucket_id)
         bucket_tile_idx.extend(split_idx for split_idx, _ in split_members)
         bucket_row_ptr.append(len(bucket_tile_idx))
+        bucket_allowed_pairs_value = 0
 
         for split_idx, qgroup_local_idx in split_members:
             split_entry = split_entries[split_idx]
@@ -4058,7 +4085,11 @@ def _build_hsa_forward_synthetic_grid_metadata(
             bucket_k_row_idx.extend(int(row_idx) for row_idx in split_entry["padded_k_rows"])
             bucket_q_length.append(int(split_entry["q_length"]))
             bucket_k_length.append(int(split_entry["k_length"]))
-            if not is_dense:
+            if bool(split_entry["dense"]):
+                bucket_allowed_pairs_value += int(split_entry["q_length"]) * int(split_entry["k_length"])
+            else:
+                bucket_allowed_pairs_value += sum((int(word) & 0xFFFFFFFF).bit_count() for word in split_entry["mask_words"])
+            if not all_dense:
                 bucket_mask_words.extend(
                     _wrap_u32_to_i32(int(word)) for word in split_entry["mask_words"]
                 )
@@ -4067,6 +4098,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
         bucket_k_row_idx_row_ptr.append(len(bucket_k_row_idx))
         bucket_mask_word_row_ptr.append(len(bucket_mask_words))
         bucket_words_per_row.append(words_per_row_bucket)
+        bucket_allowed_pairs.append(bucket_allowed_pairs_value)
+        bucket_fill.append(bucket_allowed_pairs_value / max(len(split_members) * packed_q * packed_k, 1))
 
     qgroup_bucket_split_bucket_row_ptr = [0]
     qgroup_bucket_split_bucket_idx: list[int] = []
@@ -4152,6 +4185,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
         bucket_packed_q=torch.tensor(bucket_packed_q, dtype=torch.int32, device=device),
         bucket_packed_k=torch.tensor(bucket_packed_k, dtype=torch.int32, device=device),
         bucket_dense=torch.tensor(bucket_dense, dtype=torch.bool, device=device),
+        bucket_allowed_pairs=torch.tensor(bucket_allowed_pairs, dtype=torch.int32, device=device),
+        bucket_fill=torch.tensor(bucket_fill, dtype=torch.float32, device=device),
         max_packed_k=max_packed_k,
         tile_q_length=torch.tensor(tile_q_length, dtype=torch.int32, device=device),
         tile_k_length=torch.tensor(tile_k_length, dtype=torch.int32, device=device),

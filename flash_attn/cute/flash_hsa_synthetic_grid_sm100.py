@@ -79,20 +79,41 @@ def _summarize_one_grid(metadata) -> dict[str, float | int]:
     q_rows_per_tile = metadata.tile_q_row_ptr[1:] - metadata.tile_q_row_ptr[:-1]
     k_rows_per_tile = metadata.tile_k_row_ptr[1:] - metadata.tile_k_row_ptr[:-1]
     logical_pairs_per_tile = metadata.tile_logical_pair_row_ptr[1:] - metadata.tile_logical_pair_row_ptr[:-1]
-    if metadata.tile_fill is not None:
-        fill = metadata.tile_fill.float()
+    if (
+        metadata.bucket_packed_q is not None
+        and metadata.bucket_packed_q.numel() > 0
+        and (metadata.bucket_fill is not None or metadata.bucket_allowed_pairs is not None)
+    ):
+        bucket_sizes = metadata.bucket_row_ptr[1:] - metadata.bucket_row_ptr[:-1]
+        if metadata.bucket_fill is not None:
+            fill = metadata.bucket_fill.float()
+        elif metadata.bucket_allowed_pairs is not None:
+            packed_area = bucket_sizes.float() * metadata.bucket_packed_q.float() * metadata.bucket_packed_k.float()
+            fill = metadata.bucket_allowed_pairs.float() / torch.clamp(packed_area, min=1.0)
+        else:
+            packed_area = metadata.bucket_packed_q.float() * metadata.bucket_packed_k.float()
+            fill = metadata.tile_allowed_pairs.float() / torch.clamp(packed_area, min=1.0)
+        avg_packed_q = _mean_or_zero(metadata.bucket_packed_q)
+        avg_packed_k = _mean_or_zero(metadata.bucket_packed_k)
+        num_buckets = int(metadata.bucket_packed_q.numel())
     else:
-        packed_area = metadata.tile_packed_q.float() * metadata.tile_packed_k.float()
-        fill = metadata.tile_allowed_pairs.float() / torch.clamp(packed_area, min=1.0)
+        if metadata.tile_fill is not None:
+            fill = metadata.tile_fill.float()
+        else:
+            packed_area = metadata.tile_packed_q.float() * metadata.tile_packed_k.float()
+            fill = metadata.tile_allowed_pairs.float() / torch.clamp(packed_area, min=1.0)
+        avg_packed_q = _mean_or_zero(metadata.tile_packed_q)
+        avg_packed_k = _mean_or_zero(metadata.tile_packed_k)
+        num_buckets = 0
     return {
         "num_tiles": metadata.num_tiles,
         "num_qgroups": int(metadata.qgroup_length.numel()) if metadata.qgroup_length is not None else 0,
-        "num_buckets": int(metadata.bucket_packed_q.numel()),
+        "num_buckets": num_buckets,
         "avg_q_rows": _mean_or_zero(q_rows_per_tile),
         "avg_k_rows": _mean_or_zero(k_rows_per_tile),
         "avg_logical_pairs": _mean_or_zero(logical_pairs_per_tile),
-        "avg_packed_q": _mean_or_zero(metadata.tile_packed_q),
-        "avg_packed_k": _mean_or_zero(metadata.tile_packed_k),
+        "avg_packed_q": avg_packed_q,
+        "avg_packed_k": avg_packed_k,
         "avg_fill": _mean_or_zero(fill),
         "fill_p50": _quantile_or_zero(fill, 0.5),
         "fill_p90": _quantile_or_zero(fill, 0.9),

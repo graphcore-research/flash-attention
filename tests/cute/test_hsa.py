@@ -1539,6 +1539,8 @@ def test_hsa_synthetic_grid_runtime_builds_metadata(monkeypatch):
     assert runtime.synthetic_grid.logical_block_q == 32
     assert runtime.synthetic_grid.logical_block_k == 32
     assert runtime.synthetic_grid.num_tiles > 0
+    assert runtime.forward_synthetic_grid.forward_execution_plan is not None
+    assert runtime.forward_synthetic_grid.forward_execution_plan["bucket_size"]
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -1565,6 +1567,8 @@ def test_hsa_synthetic_grid_runtime_honors_env_geometry(monkeypatch):
     assert runtime.forward_synthetic_grid.logical_block_k == 128
     assert runtime.forward_synthetic_grid.max_packed_k == 128
     assert runtime.forward_synthetic_grid.num_tiles > 0
+    assert runtime.forward_synthetic_grid.forward_execution_plan is not None
+    assert runtime.forward_synthetic_grid.forward_execution_plan["qgroup_bucket_packed_q"]
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")

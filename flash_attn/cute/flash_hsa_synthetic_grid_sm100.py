@@ -764,6 +764,8 @@ def _run_bucketed_forward(
     schedule,
     softmax_scale: float,
     metadata,
+    *,
+    runtime,
 ):
     hsa_module = _load_hsa_module()
     _flash_attn_fwd = hsa_module._lazy_cute_imports()[5]
@@ -777,113 +779,109 @@ def _run_bucketed_forward(
     total_out = torch.zeros(total_rows, num_q_heads, head_dim_v, dtype=torch.float32, device=q.device)
     total_lse = torch.full((total_rows, num_q_heads), float("-inf"), dtype=torch.float32, device=q.device)
 
-    if metadata.qgroup_bucket_packed_q is None:
-        raise RuntimeError("Synthetic packed metadata is missing q-group bucket structures")
+    execution_plan = metadata.forward_execution_plan
+    if execution_plan is None:
+        raise RuntimeError("Synthetic packed metadata is missing the cached forward execution plan")
 
-    host_index_view = metadata.host_index_view
-    if host_index_view is None:
-        host_index_view = {
-            "qgroup_bucket_packed_q": metadata.qgroup_bucket_packed_q.cpu().tolist(),
-            "qgroup_bucket_row_ptr": metadata.qgroup_bucket_row_ptr.cpu().tolist(),
-            "qgroup_bucket_q_row_idx_row_ptr": metadata.qgroup_bucket_q_row_idx_row_ptr.cpu().tolist(),
-            "qgroup_bucket_split_bucket_row_ptr": metadata.qgroup_bucket_split_bucket_row_ptr.cpu().tolist(),
-            "qgroup_bucket_split_bucket_idx": metadata.qgroup_bucket_split_bucket_idx.cpu().tolist(),
-            "bucket_row_ptr": metadata.bucket_row_ptr.cpu().tolist(),
-            "bucket_packed_k": metadata.bucket_packed_k.cpu().tolist(),
-            "bucket_dense": metadata.bucket_dense.cpu().tolist(),
-            "bucket_words_per_row": metadata.bucket_words_per_row.cpu().tolist(),
-            "bucket_q_row_idx_row_ptr": metadata.bucket_q_row_idx_row_ptr.cpu().tolist(),
-            "bucket_k_row_idx_row_ptr": metadata.bucket_k_row_idx_row_ptr.cpu().tolist(),
-            "bucket_mask_word_row_ptr": metadata.bucket_mask_word_row_ptr.cpu().tolist(),
+    workspace = runtime.synthetic_forward_workspace
+    if workspace is None:
+        workspace = {
+            "qgroup_q": {},
+            "bucket_q": {},
+            "bucket_kv": {},
         }
-        metadata.host_index_view = host_index_view
+        runtime.synthetic_forward_workspace = workspace
 
-    qgroup_bucket_packed_q_host = host_index_view["qgroup_bucket_packed_q"]
-    qgroup_bucket_row_ptr_host = host_index_view["qgroup_bucket_row_ptr"]
-    qgroup_bucket_q_row_idx_row_ptr_host = host_index_view["qgroup_bucket_q_row_idx_row_ptr"]
-    qgroup_bucket_split_bucket_row_ptr_host = host_index_view["qgroup_bucket_split_bucket_row_ptr"]
-    qgroup_bucket_split_bucket_idx_host = host_index_view["qgroup_bucket_split_bucket_idx"]
-    bucket_row_ptr_host = host_index_view["bucket_row_ptr"]
-    bucket_packed_k_host = host_index_view["bucket_packed_k"]
-    bucket_dense_host = host_index_view["bucket_dense"]
-    bucket_words_per_row_host = host_index_view["bucket_words_per_row"]
-    bucket_q_row_idx_row_ptr_host = host_index_view["bucket_q_row_idx_row_ptr"]
-    bucket_k_row_idx_row_ptr_host = host_index_view["bucket_k_row_idx_row_ptr"]
-    bucket_mask_word_row_ptr_host = host_index_view["bucket_mask_word_row_ptr"]
-    qgroup_q_workspace: dict[tuple[int, int], torch.Tensor] = {}
-    q_workspace: dict[tuple[int, int], torch.Tensor] = {}
-    kv_workspace: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+    qgroup_q_workspace = workspace["qgroup_q"]
+    q_workspace = workspace["bucket_q"]
+    kv_workspace = workspace["bucket_kv"]
 
-    def get_q_workspace(cache: dict[tuple[int, int], torch.Tensor], rows: int, packed_q: int) -> torch.Tensor:
-        key = (rows, packed_q)
+    def get_q_workspace(cache: dict, rows: int, packed_q: int) -> torch.Tensor:
+        key = (str(q.device), q.dtype, rows, packed_q, q.shape[2], q.shape[3])
         buf = cache.get(key)
-        if buf is None:
-            buf = torch.empty((rows * packed_q, q.shape[2], q.shape[3]), dtype=q.dtype, device=q.device)
+        needed = rows * packed_q
+        if buf is None or buf.shape[0] < needed:
+            buf = torch.empty((needed, q.shape[2], q.shape[3]), dtype=q.dtype, device=q.device)
             cache[key] = buf
-        return buf
+        return buf[:needed]
 
     def get_kv_workspace(rows: int, packed_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (rows, packed_k)
+        key = (str(k.device), k.dtype, v.dtype, rows, packed_k, k.shape[2], k.shape[3], v.shape[2], v.shape[3])
         bufs = kv_workspace.get(key)
-        if bufs is None:
+        needed = rows * packed_k
+        if bufs is None or bufs[0].shape[0] < needed:
             bufs = (
-                torch.empty((rows * packed_k, k.shape[2], k.shape[3]), dtype=k.dtype, device=k.device),
-                torch.empty((rows * packed_k, v.shape[2], v.shape[3]), dtype=v.dtype, device=v.device),
+                torch.empty((needed, k.shape[2], k.shape[3]), dtype=k.dtype, device=k.device),
+                torch.empty((needed, v.shape[2], v.shape[3]), dtype=v.dtype, device=v.device),
             )
             kv_workspace[key] = bufs
-        return bufs
+        return bufs[0][:needed], bufs[1][:needed]
 
-    for qgroup_bucket_idx, packed_q in enumerate(qgroup_bucket_packed_q_host):
-        qgroup_bucket_size = qgroup_bucket_row_ptr_host[qgroup_bucket_idx + 1] - qgroup_bucket_row_ptr_host[qgroup_bucket_idx]
-        if qgroup_bucket_size <= 0:
+    qgroup_bucket_packed_q = execution_plan["qgroup_bucket_packed_q"]
+    qgroup_bucket_size = execution_plan["qgroup_bucket_size"]
+    qgroup_bucket_q_row_range = execution_plan["qgroup_bucket_q_row_range"]
+    qgroup_bucket_execution_bucket_range = execution_plan["qgroup_bucket_execution_bucket_range"]
+    qgroup_bucket_execution_bucket_idx = execution_plan["qgroup_bucket_execution_bucket_idx"]
+    bucket_size_plan = execution_plan["bucket_size"]
+    bucket_packed_q = execution_plan["bucket_packed_q"]
+    bucket_packed_k = execution_plan["bucket_packed_k"]
+    bucket_dense = execution_plan["bucket_dense"]
+    bucket_words_per_row = execution_plan["bucket_words_per_row"]
+    bucket_q_row_range = execution_plan["bucket_q_row_range"]
+    bucket_q_src_row_range = execution_plan["bucket_q_src_row_range"]
+    bucket_k_row_range = execution_plan["bucket_k_row_range"]
+    bucket_q_length_range = execution_plan["bucket_q_length_range"]
+    bucket_k_length_range = execution_plan["bucket_k_length_range"]
+    bucket_mask_word_range = execution_plan["bucket_mask_word_range"]
+
+    for qgroup_bucket_idx, packed_q in enumerate(qgroup_bucket_packed_q):
+        qgroup_bucket_size_value = qgroup_bucket_size[qgroup_bucket_idx]
+        if qgroup_bucket_size_value <= 0:
             continue
-        qgroup_q_start = qgroup_bucket_q_row_idx_row_ptr_host[qgroup_bucket_idx]
-        qgroup_q_end = qgroup_bucket_q_row_idx_row_ptr_host[qgroup_bucket_idx + 1]
+        qgroup_q_start, qgroup_q_end = qgroup_bucket_q_row_range[qgroup_bucket_idx]
         qgroup_bucket_rows = metadata.qgroup_bucket_q_row_idx[qgroup_q_start:qgroup_q_end].contiguous()
-        qgroup_q_buf_flat = get_q_workspace(qgroup_q_workspace, qgroup_bucket_size, packed_q)
+        qgroup_q_buf_flat = get_q_workspace(qgroup_q_workspace, qgroup_bucket_size_value, packed_q)
         _run_synthetic_pack_rows_kernel(q_flat, qgroup_bucket_rows, qgroup_q_buf_flat)
-        split_bucket_start = qgroup_bucket_split_bucket_row_ptr_host[qgroup_bucket_idx]
-        split_bucket_end = qgroup_bucket_split_bucket_row_ptr_host[qgroup_bucket_idx + 1]
-        split_bucket_ids = qgroup_bucket_split_bucket_idx_host[split_bucket_start:split_bucket_end]
+        exec_bucket_start, exec_bucket_end = qgroup_bucket_execution_bucket_range[qgroup_bucket_idx]
+        split_bucket_ids = qgroup_bucket_execution_bucket_idx[exec_bucket_start:exec_bucket_end]
         for split_bucket_idx in split_bucket_ids:
-            bucket_size = bucket_row_ptr_host[split_bucket_idx + 1] - bucket_row_ptr_host[split_bucket_idx]
+            bucket_size = bucket_size_plan[split_bucket_idx]
             if bucket_size <= 0:
                 continue
-            packed_k = bucket_packed_k_host[split_bucket_idx]
-            q_bucket_start = bucket_q_row_idx_row_ptr_host[split_bucket_idx]
-            q_bucket_end = bucket_q_row_idx_row_ptr_host[split_bucket_idx + 1]
-            k_bucket_start = bucket_k_row_idx_row_ptr_host[split_bucket_idx]
-            k_bucket_end = bucket_k_row_idx_row_ptr_host[split_bucket_idx + 1]
-            bucket_data_start = bucket_row_ptr_host[split_bucket_idx]
-            bucket_data_end = bucket_row_ptr_host[split_bucket_idx + 1]
+            packed_q_bucket = bucket_packed_q[split_bucket_idx]
+            packed_k = bucket_packed_k[split_bucket_idx]
+            q_bucket_start, q_bucket_end = bucket_q_row_range[split_bucket_idx]
+            q_bucket_src_start, q_bucket_src_end = bucket_q_src_row_range[split_bucket_idx]
+            k_bucket_start, k_bucket_end = bucket_k_row_range[split_bucket_idx]
+            q_length_start, q_length_end = bucket_q_length_range[split_bucket_idx]
+            k_length_start, k_length_end = bucket_k_length_range[split_bucket_idx]
             q_bucket_row_idx = metadata.bucket_q_row_idx[q_bucket_start:q_bucket_end].contiguous()
-            q_bucket_src_row_idx = metadata.bucket_q_src_row_idx[q_bucket_start:q_bucket_end].contiguous()
+            q_bucket_src_row_idx = metadata.bucket_q_src_row_idx[q_bucket_src_start:q_bucket_src_end].contiguous()
             k_bucket_row_idx = metadata.bucket_k_row_idx[k_bucket_start:k_bucket_end].contiguous()
-            q_length = metadata.bucket_q_length[bucket_data_start:bucket_data_end].contiguous()
-            k_length = metadata.bucket_k_length[bucket_data_start:bucket_data_end].contiguous()
+            q_length = metadata.bucket_q_length[q_length_start:q_length_end].contiguous()
+            k_length = metadata.bucket_k_length[k_length_start:k_length_end].contiguous()
 
-            q_buf_flat = get_q_workspace(q_workspace, bucket_size, packed_q)
+            q_buf_flat = get_q_workspace(q_workspace, bucket_size, packed_q_bucket)
             k_buf_flat, v_buf_flat = get_kv_workspace(bucket_size, packed_k)
             _run_synthetic_pack_rows_kernel(qgroup_q_buf_flat, q_bucket_row_idx, q_buf_flat)
             _run_synthetic_pack_kv_rows_kernel(k_flat, v_flat, k_bucket_row_idx, k_buf_flat, v_buf_flat)
 
-            q_buf = q_buf_flat.view(bucket_size, packed_q, q.shape[2], q.shape[3])
+            q_buf = q_buf_flat.view(bucket_size, packed_q_bucket, q.shape[2], q.shape[3])
             k_buf = k_buf_flat.view(bucket_size, packed_k, k.shape[2], k.shape[3])
             v_buf = v_buf_flat.view(bucket_size, packed_k, v.shape[2], v.shape[3])
             q_length = hsa_module._tag_aux_tensor(q_length, leading_dim=0)
             k_length = hsa_module._tag_aux_tensor(k_length, leading_dim=0)
 
-            if bool(bucket_dense_host[split_bucket_idx]):
+            if bool(bucket_dense[split_bucket_idx]):
                 mask_mod = hsa_module.get_hsa_synthetic_packed_dense_mask_mod()
                 aux_tensors = [q_length, k_length]
             else:
-                words_per_row = bucket_words_per_row_host[split_bucket_idx]
-                mask_word_start = bucket_mask_word_row_ptr_host[split_bucket_idx]
-                mask_word_end = bucket_mask_word_row_ptr_host[split_bucket_idx + 1]
+                words_per_row = bucket_words_per_row[split_bucket_idx]
+                mask_word_start, mask_word_end = bucket_mask_word_range[split_bucket_idx]
                 if mask_word_end <= mask_word_start:
                     raise RuntimeError("Synthetic packed bitmap bucket is missing mask words")
                 mask_words_flat = metadata.bucket_mask_words[mask_word_start:mask_word_end].contiguous()
-                mask_words = mask_words_flat.view(bucket_size, packed_q, words_per_row).contiguous()
+                mask_words = mask_words_flat.view(bucket_size, packed_q_bucket, words_per_row).contiguous()
                 mask_words = hsa_module._tag_aux_tensor(mask_words, leading_dim=2)
                 mask_mod = hsa_module.get_hsa_synthetic_packed_bitmap_mask_mod(words_per_row)
                 aux_tensors = [q_length, k_length, mask_words]
@@ -902,8 +900,8 @@ def _run_bucketed_forward(
                 return_lse=True,
             )
             _run_synthetic_combine_scatter_rows_kernel(
-                out_bucket.reshape(bucket_size * packed_q, num_q_heads, head_dim_v).contiguous(),
-                lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q, num_q_heads).contiguous(),
+                out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous(),
+                lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous(),
                 q_bucket_src_row_idx,
                 total_out,
                 total_lse,
@@ -932,7 +930,7 @@ def run_hsa_fwd_sm100_synthetic_grid(
     metadata = runtime.forward_synthetic_grid
     if metadata is None:
         raise RuntimeError("Synthetic packed forward metadata is unavailable")
-    out, lse = _run_bucketed_forward(q, k, v, schedule, softmax_scale, metadata)
+    out, lse = _run_bucketed_forward(q, k, v, schedule, softmax_scale, metadata, runtime=runtime)
     sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = _empty_sentence_cache(
         q, k, v
     )

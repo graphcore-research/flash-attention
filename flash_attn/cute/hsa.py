@@ -201,6 +201,7 @@ class HSASyntheticGridMetadata:
     qgroup_bucket_q_row_idx: Optional[torch.Tensor] = None
     qgroup_bucket_split_bucket_row_ptr: Optional[torch.Tensor] = None
     qgroup_bucket_split_bucket_idx: Optional[torch.Tensor] = None
+    forward_execution_plan: Optional[dict] = None
     host_index_view: Optional[dict] = None
 
     def to(self, device: torch.device | str):
@@ -288,6 +289,7 @@ class HSASyntheticGridMetadata:
                 if self.qgroup_bucket_split_bucket_idx is None
                 else self.qgroup_bucket_split_bucket_idx.to(device=device)
             ),
+            forward_execution_plan=self.forward_execution_plan,
             host_index_view=self.host_index_view,
         )
 
@@ -316,6 +318,7 @@ class HSABlockSparseRuntime:
     forward_synthetic_grid: Optional[HSASyntheticGridMetadata] = None
     backward_synthetic_grid: Optional[HSASyntheticGridMetadata] = None
     synthetic_grid: Optional[HSASyntheticGridMetadata] = None
+    synthetic_forward_workspace: Optional[dict] = None
 
     def to(self, device: torch.device | str):
         def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
@@ -349,6 +352,7 @@ class HSABlockSparseRuntime:
                 None if self.backward_synthetic_grid is None else self.backward_synthetic_grid.to(device=device)
             ),
             synthetic_grid=None if self.synthetic_grid is None else self.synthetic_grid.to(device=device),
+            synthetic_forward_workspace=None,
         )
 
 
@@ -3997,17 +4001,16 @@ def _build_hsa_forward_synthetic_grid_metadata(
             qgroup_bucket_q_row_idx.extend([-1] * (packed_q - len(q_rows)))
         qgroup_bucket_q_row_idx_row_ptr.append(len(qgroup_bucket_q_row_idx))
 
-    split_bucket_map: dict[tuple[int, int, int, bool], list[tuple[int, int]]] = {}
+    execution_bucket_map: dict[tuple[int, int, bool], list[tuple[int, int]]] = {}
     for split_idx, split_entry in enumerate(split_entries):
         qgroup_idx = int(split_entry["qgroup_idx"])
         qgroup_bucket_id, qgroup_local_idx = qgroup_bucket_local_pos[qgroup_idx]
         key = (
             qgroup_bucket_id,
-            int(split_entry["slot"]),
             int(split_entry["packed_k"]),
             bool(split_entry["dense"]),
         )
-        split_bucket_map.setdefault(key, []).append((split_idx, qgroup_local_idx))
+        execution_bucket_map.setdefault(key, []).append((split_idx, qgroup_local_idx))
 
     bucket_row_ptr = [0]
     bucket_tile_idx: list[int] = []
@@ -4028,16 +4031,16 @@ def _build_hsa_forward_synthetic_grid_metadata(
     bucket_words_per_row: list[int] = []
     qgroup_bucket_to_split_buckets: dict[int, list[int]] = {bucket_id: [] for bucket_id in range(len(qgroup_bucket_packed_q))}
 
-    for (qgroup_bucket_id, split_slot, packed_k, is_dense), split_members in sorted(split_bucket_map.items()):
+    for (qgroup_bucket_id, packed_k, is_dense), split_members in sorted(execution_bucket_map.items()):
         packed_q = qgroup_bucket_packed_q[qgroup_bucket_id]
         words_per_row_bucket = (packed_k + 31) // 32
-        split_members.sort(key=lambda item: item[1])
+        split_members.sort(key=lambda item: (item[1], item[0]))
         bucket_idx = len(bucket_packed_q)
         qgroup_bucket_to_split_buckets[qgroup_bucket_id].append(bucket_idx)
         bucket_packed_q.append(packed_q)
         bucket_packed_k.append(packed_k)
         bucket_dense.append(1 if is_dense else 0)
-        bucket_split_slot.append(split_slot)
+        bucket_split_slot.append(min(int(split_entries[split_idx]["slot"]) for split_idx, _ in split_members))
         bucket_qgroup_bucket_idx.append(qgroup_bucket_id)
         bucket_tile_idx.extend(split_idx for split_idx, _ in split_members)
         bucket_row_ptr.append(len(bucket_tile_idx))
@@ -4071,13 +4074,56 @@ def _build_hsa_forward_synthetic_grid_metadata(
         split_bucket_ids = qgroup_bucket_to_split_buckets.get(qgroup_bucket_id, [])
         split_bucket_ids.sort(
             key=lambda bucket_idx: (
-                bucket_split_slot[bucket_idx],
                 bucket_packed_k[bucket_idx],
                 bucket_dense[bucket_idx],
+                bucket_idx,
             )
         )
         qgroup_bucket_split_bucket_idx.extend(split_bucket_ids)
         qgroup_bucket_split_bucket_row_ptr.append(len(qgroup_bucket_split_bucket_idx))
+
+    bucket_size = [bucket_row_ptr[idx + 1] - bucket_row_ptr[idx] for idx in range(len(bucket_packed_q))]
+    bucket_q_row_range = [
+        (bucket_q_row_idx_row_ptr[idx], bucket_q_row_idx_row_ptr[idx + 1]) for idx in range(len(bucket_packed_q))
+    ]
+    bucket_k_row_range = [
+        (bucket_k_row_idx_row_ptr[idx], bucket_k_row_idx_row_ptr[idx + 1]) for idx in range(len(bucket_packed_q))
+    ]
+    bucket_data_range = [(bucket_row_ptr[idx], bucket_row_ptr[idx + 1]) for idx in range(len(bucket_packed_q))]
+    bucket_mask_word_range = [
+        (bucket_mask_word_row_ptr[idx], bucket_mask_word_row_ptr[idx + 1]) for idx in range(len(bucket_packed_q))
+    ]
+    qgroup_bucket_range = [
+        (qgroup_bucket_row_ptr[idx], qgroup_bucket_row_ptr[idx + 1]) for idx in range(len(qgroup_bucket_packed_q))
+    ]
+    qgroup_bucket_q_row_range = [
+        (qgroup_bucket_q_row_idx_row_ptr[idx], qgroup_bucket_q_row_idx_row_ptr[idx + 1])
+        for idx in range(len(qgroup_bucket_packed_q))
+    ]
+    qgroup_bucket_execution_bucket_range = [
+        (qgroup_bucket_split_bucket_row_ptr[idx], qgroup_bucket_split_bucket_row_ptr[idx + 1])
+        for idx in range(len(qgroup_bucket_packed_q))
+    ]
+    forward_execution_plan = {
+        "qgroup_bucket_packed_q": qgroup_bucket_packed_q,
+        "qgroup_bucket_size": [end - start for start, end in qgroup_bucket_range],
+        "qgroup_bucket_range": qgroup_bucket_range,
+        "qgroup_bucket_q_row_range": qgroup_bucket_q_row_range,
+        "qgroup_bucket_execution_bucket_range": qgroup_bucket_execution_bucket_range,
+        "qgroup_bucket_execution_bucket_idx": qgroup_bucket_split_bucket_idx,
+        "bucket_qgroup_bucket_idx": bucket_qgroup_bucket_idx,
+        "bucket_size": bucket_size,
+        "bucket_packed_q": bucket_packed_q,
+        "bucket_packed_k": bucket_packed_k,
+        "bucket_dense": [bool(value) for value in bucket_dense],
+        "bucket_words_per_row": bucket_words_per_row,
+        "bucket_q_row_range": bucket_q_row_range,
+        "bucket_q_src_row_range": bucket_q_row_range,
+        "bucket_k_row_range": bucket_k_row_range,
+        "bucket_q_length_range": bucket_data_range,
+        "bucket_k_length_range": bucket_data_range,
+        "bucket_mask_word_range": bucket_mask_word_range,
+    }
 
     return HSASyntheticGridMetadata(
         logical_block_q=logical_block_q,
@@ -4139,6 +4185,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
         qgroup_bucket_split_bucket_idx=torch.tensor(
             qgroup_bucket_split_bucket_idx, dtype=torch.int32, device=device
         ),
+        forward_execution_plan=forward_execution_plan,
     )
 
 

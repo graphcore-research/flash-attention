@@ -952,7 +952,9 @@ def run_case(case: BenchmarkCase):
     if synthetic_summary is not None:
         line += (
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
+            f" synth_max_packed_k={synthetic_summary['max_packed_k']}"
             f" synth_tiles={synthetic_summary['num_tiles']}"
+            f" synth_qgroups={synthetic_summary['forward_qgroups']}"
             f" synth_avg_q_rows={synthetic_summary['avg_q_rows']:.1f}"
             f" synth_avg_k_rows={synthetic_summary['avg_k_rows']:.1f}"
             f" synth_avg_logical_pairs={synthetic_summary['avg_logical_pairs']:.1f}"
@@ -962,7 +964,10 @@ def run_case(case: BenchmarkCase):
             f" synth_bwd_buckets={synthetic_summary['backward_buckets']}"
             f" synth_fwd_avg_packed={synthetic_summary['forward_avg_packed_q']:.1f}x{synthetic_summary['forward_avg_packed_k']:.1f}"
             f" synth_bwd_avg_packed={synthetic_summary['backward_avg_packed_q']:.1f}x{synthetic_summary['backward_avg_packed_k']:.1f}"
+            f" synth_fwd_avg_num_splits={synthetic_summary['forward_avg_num_splits']:.2f}"
             f" synth_fwd_avg_fill={synthetic_summary['forward_avg_fill']:.4f}"
+            f" synth_fwd_fill_p50={synthetic_summary['forward_fill_p50']:.4f}"
+            f" synth_fwd_fill_p90={synthetic_summary['forward_fill_p90']:.4f}"
             f" synth_bwd_avg_fill={synthetic_summary['backward_avg_fill']:.4f}"
         )
     print(line)

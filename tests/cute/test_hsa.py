@@ -1542,6 +1542,32 @@ def test_hsa_synthetic_grid_runtime_builds_metadata(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_grid_runtime_honors_env_geometry(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+
+    assert runtime.forward_synthetic_grid is not None
+    assert runtime.synthetic_grid is runtime.forward_synthetic_grid
+    assert runtime.forward_synthetic_grid.logical_block_q == 2
+    assert runtime.forward_synthetic_grid.logical_block_k == 128
+    assert runtime.forward_synthetic_grid.max_packed_k == 128
+    assert runtime.forward_synthetic_grid.num_tiles > 0
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 @pytest.mark.parametrize(
     "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
     [

@@ -4310,10 +4310,12 @@ def _build_hsa_forward_synthetic_grid_metadata(
             if row_compact_available:
                 row_bucket_row_k_range: list[tuple[int, int]] = []
                 row_bucket_row_k_to_union_range: list[tuple[int, int]] = []
+                row_bucket_union_to_row_range: list[tuple[int, int]] = []
                 row_bucket_row_k_length_range: list[tuple[int, int]] = []
                 row_bucket_row_k_cap: list[int] = []
                 row_bucket_row_k_row_idx: list[int] = []
                 row_bucket_row_k_to_union_idx: list[int] = []
+                row_bucket_union_to_row_slot: list[int] = []
                 row_bucket_row_k_length: list[int] = []
                 row_bucket_avg_row_k: list[float] = []
                 row_bucket_max_row_k: list[int] = []
@@ -4373,6 +4375,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
 
                     row_k_start = len(row_bucket_row_k_row_idx)
                     row_k_to_union_start = len(row_bucket_row_k_to_union_idx)
+                    union_to_row_start = len(row_bucket_union_to_row_slot)
                     row_k_length_start = len(row_bucket_row_k_length)
                     row_bucket_row_k_cap.append(bucket_max_row_k)
                     row_bucket_avg_row_k.append(
@@ -4380,14 +4383,22 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     )
                     row_bucket_max_row_k.append(bucket_max_row_k)
                     for row_k_rows, row_k_to_union in zip(per_bucket_rows, per_bucket_to_union):
+                        union_to_row = [-1] * packed_k
+                        for row_slot_idx, union_idx in enumerate(row_k_to_union):
+                            if 0 <= union_idx < packed_k:
+                                union_to_row[union_idx] = row_slot_idx
                         row_bucket_row_k_length.append(len(row_k_rows))
                         row_bucket_row_k_row_idx.extend(row_k_rows)
                         row_bucket_row_k_row_idx.extend([-1] * (bucket_max_row_k - len(row_k_rows)))
                         row_bucket_row_k_to_union_idx.extend(row_k_to_union)
                         row_bucket_row_k_to_union_idx.extend([-1] * (bucket_max_row_k - len(row_k_to_union)))
+                        row_bucket_union_to_row_slot.extend(union_to_row)
                     row_bucket_row_k_range.append((row_k_start, len(row_bucket_row_k_row_idx)))
                     row_bucket_row_k_to_union_range.append(
                         (row_k_to_union_start, len(row_bucket_row_k_to_union_idx))
+                    )
+                    row_bucket_union_to_row_range.append(
+                        (union_to_row_start, len(row_bucket_union_to_row_slot))
                     )
                     row_bucket_row_k_length_range.append((row_k_length_start, len(row_bucket_row_k_length)))
 
@@ -4397,12 +4408,16 @@ def _build_hsa_forward_synthetic_grid_metadata(
                         "bucket_row_k_cap": row_bucket_row_k_cap,
                         "bucket_row_k_range": row_bucket_row_k_range,
                         "bucket_row_k_to_union_range": row_bucket_row_k_to_union_range,
+                        "bucket_union_to_row_range": row_bucket_union_to_row_range,
                         "bucket_row_k_length_range": row_bucket_row_k_length_range,
                         "bucket_avg_row_k": row_bucket_avg_row_k,
                         "bucket_max_row_k": row_bucket_max_row_k,
                         "bucket_row_k_row_idx": torch.tensor(row_bucket_row_k_row_idx, dtype=torch.int32, device=device),
                         "bucket_row_k_to_union_idx": torch.tensor(
                             row_bucket_row_k_to_union_idx, dtype=torch.int32, device=device
+                        ),
+                        "bucket_union_to_row_slot": torch.tensor(
+                            row_bucket_union_to_row_slot, dtype=torch.int32, device=device
                         ),
                         "bucket_row_k_length": torch.tensor(row_bucket_row_k_length, dtype=torch.int32, device=device),
                     }

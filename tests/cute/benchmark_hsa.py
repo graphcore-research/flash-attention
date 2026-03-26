@@ -964,6 +964,7 @@ def run_case(case: BenchmarkCase):
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
             f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"
+            f" synth_qgroups_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA', '2')}"
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
             f" synth_max_packed_k={synthetic_summary['max_packed_k']}"
             f" synth_max_direct_segments={synthetic_summary['max_direct_segments']}"

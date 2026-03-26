@@ -570,8 +570,9 @@ class FlashHSASyntheticMicroFwdDenseSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -690,8 +691,9 @@ class FlashHSASyntheticMicroFwdMaskedSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -1168,6 +1170,19 @@ def _synthetic_micro_bwd_enabled() -> bool:
     }
 
 
+def _get_synthetic_qgroups_per_cta() -> int:
+    import os
+
+    value = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA", "2").strip().lower()
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = 2
+    if parsed not in (1, 2, 4):
+        parsed = 2
+    return parsed
+
+
 def _can_use_synthetic_micro_bwd(
     q_rows: torch.Tensor,
     k_rows: torch.Tensor,
@@ -1263,8 +1278,9 @@ class FlashHSASyntheticDirectMicroFwdDenseSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -1467,8 +1483,9 @@ class FlashHSASyntheticDirectMicroFwdMaskedSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -2417,8 +2434,9 @@ class FlashHSASyntheticDirectRowMicroFwdSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -2438,7 +2456,7 @@ class FlashHSASyntheticDirectRowMicroFwdSm100:
         mLSERows: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        grid_x = (mQRowIdx.shape[0] + 1) // 2
+        grid_x = (mQRowIdx.shape[0] + self.qgroups_per_cta - 1) // self.qgroups_per_cta
         grid_y = mQRows.shape[1]
         self.kernel(
             mQRows,
@@ -2483,18 +2501,28 @@ class FlashHSASyntheticDirectRowMicroFwdSm100:
         qgroup_in_cta = subwarp_idx // Int32(2)
         row_idx = subwarp_idx % Int32(2)
         lane = tidx % Int32(16)
-        qgroup_base = qgroup_pair_idx * Int32(2)
+        qgroup_base = qgroup_pair_idx * Int32(self.qgroups_per_cta)
         qgroup_count = Int32(mQRowIdx.shape[0])
         dim0 = lane * Int32(4)
         dim1 = dim0 + Int32(1)
         dim2 = dim0 + Int32(2)
         dim3 = dim0 + Int32(3)
         smem = cutlass.utils.SmemAllocator()
-        sScores = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 16)), byte_alignment=16)
-        sProbs = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 16)), byte_alignment=16)
-        sK = smem.allocate_tensor(mKRows.element_type, cute.make_layout((2, 16, 64)), byte_alignment=16)
-        sV = smem.allocate_tensor(mVRows.element_type, cute.make_layout((2, 16, 64)), byte_alignment=16)
-        for elem_idx in cutlass.range(tidx, Int32(2) * Int32(16) * Int32(64), self.num_threads, unroll=1):
+        sScores = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.qgroups_per_cta * 2, 16)), byte_alignment=16
+        )
+        sProbs = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.qgroups_per_cta * 2, 16)), byte_alignment=16
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type, cute.make_layout((self.qgroups_per_cta, 16, 64)), byte_alignment=16
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type, cute.make_layout((self.qgroups_per_cta, 16, 64)), byte_alignment=16
+        )
+        for elem_idx in cutlass.range(
+            tidx, Int32(self.qgroups_per_cta) * Int32(16) * Int32(64), self.num_threads, unroll=1
+        ):
             qgroup_load = elem_idx // (Int32(16) * Int32(64))
             rem = elem_idx - qgroup_load * Int32(16) * Int32(64)
             union_slot = rem // Int32(64)
@@ -2517,7 +2545,7 @@ class FlashHSASyntheticDirectRowMicroFwdSm100:
                 sK[qgroup_load, union_slot, dim_idx] = Float32(0.0).to(sK.element_type)
                 sV[qgroup_load, union_slot, dim_idx] = Float32(0.0).to(sV.element_type)
         cute.arch.barrier()
-        if subwarp_idx < Int32(4):
+        if subwarp_idx < Int32(self.qgroups_per_cta * 2):
             qgroup_idx = qgroup_base + qgroup_in_cta
             qgroup_valid = qgroup_idx < qgroup_count
             q_length = Int32(0)
@@ -2634,8 +2662,9 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64):
-        self.num_threads = num_threads
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
 
     @cute.jit
     def __call__(
@@ -2660,7 +2689,7 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
         mdVRows: cute.Tensor,
         stream: cuda.CUstream,
     ):
-        grid_x = (mQRowIdx.shape[0] + 1) // 2
+        grid_x = (mQRowIdx.shape[0] + self.qgroups_per_cta - 1) // self.qgroups_per_cta
         grid_y = mQRows.shape[1]
         self.kernel(
             mQRows,
@@ -2715,17 +2744,25 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
         qgroup_in_cta = subwarp_idx // Int32(2)
         row_idx = subwarp_idx % Int32(2)
         lane = tidx % Int32(16)
-        qgroup_base = qgroup_pair_idx * Int32(2)
+        qgroup_base = qgroup_pair_idx * Int32(self.qgroups_per_cta)
         qgroup_count = Int32(mQRowIdx.shape[0])
         dim0 = lane * Int32(4)
         dim1 = dim0 + Int32(1)
         dim2 = dim0 + Int32(2)
         dim3 = dim0 + Int32(3)
         smem = cutlass.utils.SmemAllocator()
-        sRowDK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 16, 64)), byte_alignment=16)
-        sRowDV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 16, 64)), byte_alignment=16)
-        sK = smem.allocate_tensor(mKRows.element_type, cute.make_layout((2, 16, 64)), byte_alignment=16)
-        sV = smem.allocate_tensor(mVRows.element_type, cute.make_layout((2, 16, 64)), byte_alignment=16)
+        sRowDK = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.qgroups_per_cta * 2, 16, 64)), byte_alignment=16
+        )
+        sRowDV = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((self.qgroups_per_cta * 2, 16, 64)), byte_alignment=16
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type, cute.make_layout((self.qgroups_per_cta, 16, 64)), byte_alignment=16
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type, cute.make_layout((self.qgroups_per_cta, 16, 64)), byte_alignment=16
+        )
         qgroup_idx = qgroup_base + qgroup_in_cta
         qgroup_valid = qgroup_idx < qgroup_count
         row_k_length = Int32(0)
@@ -2736,7 +2773,9 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
             dim_idx = elem_idx - key_slot * Int32(64)
             sRowDK[subwarp_idx, key_slot, dim_idx] = Float32(0.0)
             sRowDV[subwarp_idx, key_slot, dim_idx] = Float32(0.0)
-        for elem_idx in cutlass.range(tidx, Int32(2) * Int32(16) * Int32(64), self.num_threads, unroll=1):
+        for elem_idx in cutlass.range(
+            tidx, Int32(self.qgroups_per_cta) * Int32(16) * Int32(64), self.num_threads, unroll=1
+        ):
             qgroup_load = elem_idx // (Int32(16) * Int32(64))
             rem = elem_idx - qgroup_load * Int32(16) * Int32(64)
             union_slot = rem // Int32(64)
@@ -2759,7 +2798,7 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
                 sK[qgroup_load, union_slot, dim_idx] = Float32(0.0).to(sK.element_type)
                 sV[qgroup_load, union_slot, dim_idx] = Float32(0.0).to(sV.element_type)
         cute.arch.barrier()
-        if subwarp_idx < Int32(4):
+        if subwarp_idx < Int32(self.qgroups_per_cta * 2):
             q_length = Int32(0)
             if qgroup_valid:
                 q_length = Int32(mQLength[qgroup_idx])
@@ -2876,7 +2915,7 @@ class FlashHSASyntheticDirectRowMicroBwdSm100:
                 if dim3 < mdQRows.shape[2]:
                     mdQRows[global_q_row, head_idx, dim3] = dq3
         cute.arch.barrier()
-        if subwarp_idx < Int32(4) and qgroup_valid:
+        if subwarp_idx < Int32(self.qgroups_per_cta * 2) and qgroup_valid:
             union_k_length = Int32(mUnionKLength[qgroup_idx])
             row0_subwarp = qgroup_in_cta * Int32(2)
             row1_subwarp = row0_subwarp + Int32(1)
@@ -2952,8 +2991,9 @@ def _run_synthetic_direct_row_micro_fwd_kernel(
     softmax_scale: float,
 ):
     _require_cute_runtime()
+    qgroups_per_cta = _get_synthetic_qgroups_per_cta()
     compile_key = (
-        "synthetic_direct_row_micro_fwd_v4",
+        "synthetic_direct_row_micro_fwd_v5",
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -2963,10 +3003,11 @@ def _run_synthetic_direct_row_micro_fwd_kernel(
         q_rows.shape[1],
         q_rows.shape[2],
         v_rows.shape[2],
+        qgroups_per_cta,
         torch.cuda.get_device_capability(q_rows.device),
     )
     if compile_key not in _run_synthetic_direct_row_micro_fwd_kernel.compile_cache:
-        kernel = FlashHSASyntheticDirectRowMicroFwdSm100()
+        kernel = FlashHSASyntheticDirectRowMicroFwdSm100(qgroups_per_cta=qgroups_per_cta)
         _run_synthetic_direct_row_micro_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -3028,8 +3069,9 @@ def _run_synthetic_direct_row_micro_bwd_kernel(
     softmax_scale: float,
 ):
     _require_cute_runtime()
+    qgroups_per_cta = _get_synthetic_qgroups_per_cta()
     compile_key = (
-        "synthetic_direct_row_micro_bwd_v5",
+        "synthetic_direct_row_micro_bwd_v6",
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -3041,10 +3083,11 @@ def _run_synthetic_direct_row_micro_bwd_kernel(
         q_rows.shape[1],
         q_rows.shape[2],
         v_rows.shape[2],
+        qgroups_per_cta,
         torch.cuda.get_device_capability(q_rows.device),
     )
     if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel.compile_cache:
-        kernel = FlashHSASyntheticDirectRowMicroBwdSm100()
+        kernel = FlashHSASyntheticDirectRowMicroBwdSm100(qgroups_per_cta=qgroups_per_cta)
         _run_synthetic_direct_row_micro_bwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),

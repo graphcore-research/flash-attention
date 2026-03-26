@@ -238,7 +238,9 @@ def _synthetic_mode_label() -> str:
     if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") != "1":
         return "disabled"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") == "1":
-        return "one_launch_micro"
+        if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1":
+            return "direct_micro_fwd_bwd"
+        return "direct_micro_fwd"
     return "one_launch_generic_fa"
 
 
@@ -960,6 +962,7 @@ def run_case(case: BenchmarkCase):
     if synthetic_summary is not None:
         line += (
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
+            f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
             f" synth_max_packed_k={synthetic_summary['max_packed_k']}"

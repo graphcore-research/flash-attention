@@ -5746,20 +5746,43 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         sentence_out_stream = sentence_out_stream if sentence_out_stream.numel() > 0 else None
 
         if ctx.hsa_backward_mode == "sparse_mask":
-            dq, dk, dv = _run_hsa_packed_mask_backward(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                ctx.schedule,
-                ctx.softmax_scale,
-                ctx.deterministic,
-                ctx.keep_ids,
-                ctx.hash_ids,
-                runtime=ctx.block_sparse_runtime,
-            )
+            if ctx.use_synthetic_grid and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1":
+                from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
+
+                dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    sentence_lse,
+                    sentence_q_stream,
+                    sentence_k_stream,
+                    sentence_v_stream,
+                    sentence_out_stream,
+                    ctx.schedule,
+                    ctx.softmax_scale,
+                    ctx.deterministic,
+                    ctx.keep_ids,
+                    ctx.hash_ids,
+                    runtime=ctx.block_sparse_runtime,
+                )
+            else:
+                dq, dk, dv = _run_hsa_packed_mask_backward(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    ctx.schedule,
+                    ctx.softmax_scale,
+                    ctx.deterministic,
+                    ctx.keep_ids,
+                    ctx.hash_ids,
+                    runtime=ctx.block_sparse_runtime,
+                )
         elif ctx.hsa_backward_mode == "monolithic_sentence":
             from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_monolithic
 

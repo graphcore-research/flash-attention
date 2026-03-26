@@ -1873,6 +1873,108 @@ def test_hsa_synthetic_micro_saved_tensor_mix_has_finite_grads(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_micro_backward_routes_off_sparse_mask(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+    import flash_attn.cute.hsa as hsa_module
+
+    batch_size, seqlen, nheads, headdim, n_kv_heads = 1, 65, 4, 64, 4
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    calls = {"bwd": 0}
+    original_bwd = synthetic_module.run_hsa_bwd_sm100_synthetic_grid
+
+    def _tracked_bwd(*args, **kwargs):
+        calls["bwd"] += 1
+        return original_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(synthetic_module, "run_hsa_bwd_sm100_synthetic_grid", _tracked_bwd)
+    monkeypatch.setattr(
+        hsa_module,
+        "_run_hsa_packed_mask_backward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("packed-mask backward used")),
+    )
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "1")
+
+    out_micro, q_micro, k_micro, v_micro, out_ref, _, _, _ = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    assert calls["bwd"] == 1
+    _assert_close(out_micro.float(), out_ref.float(), "mixed_small_eq_synthetic_micro_bwd_output_vs_ref")
+    _assert_finite_gradients("mixed_small_eq_synthetic_micro_bwd_grads", q_micro, k_micro, v_micro)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize(
+    "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
+    [
+        ("mixed_small_eq", 1, 65, 4, 64, 4),
+        ("train_eq", 2, 1024, 8, 64, 8),
+        ("longer_eq", 2, 2048, 8, 64, 8),
+    ],
+)
+def test_hsa_synthetic_micro_forward_backward_matches_reference_and_has_finite_grads(
+    monkeypatch,
+    label,
+    batch_size,
+    seqlen,
+    nheads,
+    headdim,
+    n_kv_heads,
+):
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    dtype = torch.bfloat16
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "1")
+    out_micro, q_micro, k_micro, v_micro, out_ref, q_ref_grad, k_ref_grad, v_ref_grad = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    _assert_close(out_micro.float(), out_ref.float(), f"{label}_synthetic_micro_fwd_bwd_output_vs_ref")
+    _assert_finite_gradients(f"{label}_synthetic_micro_fwd_bwd_grads", q_micro, k_micro, v_micro)
+    _assert_close(q_micro.float(), q_ref_grad, f"{label}_synthetic_micro_fwd_bwd_q_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(k_micro.float(), k_ref_grad, f"{label}_synthetic_micro_fwd_bwd_k_grad", atol=6e-2, rtol=6e-2)
+    _assert_close(v_micro.float(), v_ref_grad, f"{label}_synthetic_micro_fwd_bwd_v_grad", atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
 

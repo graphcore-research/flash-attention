@@ -5,12 +5,14 @@ import math
 import torch
 
 try:
+    import cutlass
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
     from cutlass import Float32, Int32
 
     from flash_attn.cute.cache_utils import get_jit_cache
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
+    from flash_attn.cute import utils
     from flash_attn.cute.utils import scalar_to_ssa, ssa_to_scalar
 
     _HAS_CUTE_RUNTIME = True
@@ -201,6 +203,9 @@ def _empty_sentence_cache(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         torch.empty(0, v.shape[2], v.shape[3], dtype=v.dtype, device=device),
         torch.empty(0, q.shape[2], v.shape[3], dtype=q.dtype, device=device),
     )
+
+
+_LOG2_E = math.log2(math.e)
 
 
 class FlashHSASyntheticPackRowsSm100:
@@ -518,6 +523,274 @@ class FlashHSASyntheticCombineScatterRowsSm100:
                 mDstLSE[global_row, head_idx] = next_lse.to(mDstLSE.element_type)
 
 
+class FlashHSASyntheticMicroFwdDenseSm100:
+    """Specialized forward kernel for one-launch synthetic 2xK buckets."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQPacked.shape[0]
+        grid_y = mQPacked.shape[2]
+        self.kernel(
+            mQPacked,
+            mKPacked,
+            mVPacked,
+            mQLength,
+            mKLength,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qgroup_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        if warp_idx < Int32(2):
+            q_length = Int32(mQLength[qgroup_idx])
+            if warp_idx >= q_length:
+                if lane == Int32(0):
+                    mLSEPacked[qgroup_idx, warp_idx, head_idx] = -Float32.inf
+                for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                    mOutPacked[qgroup_idx, warp_idx, head_idx, dim_idx] = Float32(0.0).to(
+                        mOutPacked.element_type
+                    )
+            else:
+                k_length = Int32(mKLength[qgroup_idx])
+                row_idx = warp_idx
+                row_max = -Float32.inf
+                for k_idx in range(mKPacked.shape[1]):
+                    if Int32(k_idx) < k_length:
+                        score = Float32(0.0)
+                        for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                            q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
+                            k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                            score += q_val * k_val
+                        score = utils.warp_reduce(score, lambda a, b: a + b)
+                        score *= softmax_scale
+                        row_max = score if score > row_max else row_max
+
+                if row_max == -Float32.inf:
+                    if lane == Int32(0):
+                        mLSEPacked[qgroup_idx, row_idx, head_idx] = -Float32.inf
+                    for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                        mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = Float32(0.0).to(
+                            mOutPacked.element_type
+                        )
+                else:
+                    row_sum = Float32(0.0)
+                    for k_idx in range(mKPacked.shape[1]):
+                        if Int32(k_idx) < k_length:
+                            score = Float32(0.0)
+                            for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                                q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
+                                k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                                score += q_val * k_val
+                            score = utils.warp_reduce(score, lambda a, b: a + b)
+                            score *= softmax_scale
+                            row_sum += cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+
+                    inv_row_sum = Float32(0.0) if row_sum == Float32(0.0) else Float32(1.0) / row_sum
+                    for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                        acc_val = Float32(0.0)
+                        for k_idx in range(mKPacked.shape[1]):
+                            if Int32(k_idx) < k_length:
+                                score = Float32(0.0)
+                                for score_dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                                    q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, score_dim_idx])
+                                    k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, score_dim_idx])
+                                    score += q_val * k_val
+                                score = utils.warp_reduce(score, lambda a, b: a + b)
+                                score *= softmax_scale
+                                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+                                acc_val += prob * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                        mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = (acc_val * inv_row_sum).to(
+                            mOutPacked.element_type
+                        )
+                    if lane == Int32(0):
+                        lse = row_max + ssa_to_scalar(
+                            cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True)
+                        )
+                        mLSEPacked[qgroup_idx, row_idx, head_idx] = lse.to(mLSEPacked.element_type)
+
+
+class FlashHSASyntheticMicroFwdMaskedSm100:
+    """Masked synthetic micro forward for one-launch 2xK buckets."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQPacked.shape[0]
+        grid_y = mQPacked.shape[2]
+        self.kernel(
+            mQPacked,
+            mKPacked,
+            mVPacked,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qgroup_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        if warp_idx < Int32(2):
+            q_length = Int32(mQLength[qgroup_idx])
+            if warp_idx >= q_length:
+                if lane == Int32(0):
+                    mLSEPacked[qgroup_idx, warp_idx, head_idx] = -Float32.inf
+                for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                    mOutPacked[qgroup_idx, warp_idx, head_idx, dim_idx] = Float32(0.0).to(
+                        mOutPacked.element_type
+                    )
+            else:
+                k_length = Int32(mKLength[qgroup_idx])
+                row_idx = warp_idx
+                row_max = -Float32.inf
+                for k_idx in range(mKPacked.shape[1]):
+                    allowed = False
+                    if Int32(k_idx) < k_length:
+                        word_idx = k_idx // 32
+                        bit_idx = k_idx % 32
+                        mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
+                        bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                        allowed = bit != cutlass.Uint32(0)
+                    if allowed:
+                        score = Float32(0.0)
+                        for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                            q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
+                            k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                            score += q_val * k_val
+                        score = utils.warp_reduce(score, lambda a, b: a + b)
+                        score *= softmax_scale
+                        row_max = score if score > row_max else row_max
+
+                if row_max == -Float32.inf:
+                    if lane == Int32(0):
+                        mLSEPacked[qgroup_idx, row_idx, head_idx] = -Float32.inf
+                    for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                        mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = Float32(0.0).to(
+                            mOutPacked.element_type
+                        )
+                else:
+                    row_sum = Float32(0.0)
+                    for k_idx in range(mKPacked.shape[1]):
+                        allowed = False
+                        if Int32(k_idx) < k_length:
+                            word_idx = k_idx // 32
+                            bit_idx = k_idx % 32
+                            mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
+                            bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                            allowed = bit != cutlass.Uint32(0)
+                        if allowed:
+                            score = Float32(0.0)
+                            for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                                q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
+                                k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                                score += q_val * k_val
+                            score = utils.warp_reduce(score, lambda a, b: a + b)
+                            score *= softmax_scale
+                            row_sum += cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+
+                    inv_row_sum = Float32(0.0) if row_sum == Float32(0.0) else Float32(1.0) / row_sum
+                    for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
+                        acc_val = Float32(0.0)
+                        for k_idx in range(mKPacked.shape[1]):
+                            allowed = False
+                            if Int32(k_idx) < k_length:
+                                word_idx = k_idx // 32
+                                bit_idx = k_idx % 32
+                                mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
+                                bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                                allowed = bit != cutlass.Uint32(0)
+                            if allowed:
+                                score = Float32(0.0)
+                                for score_dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
+                                    q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, score_dim_idx])
+                                    k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, score_dim_idx])
+                                    score += q_val * k_val
+                                score = utils.warp_reduce(score, lambda a, b: a + b)
+                                score *= softmax_scale
+                                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+                                acc_val += prob * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                        mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = (acc_val * inv_row_sum).to(
+                            mOutPacked.element_type
+                        )
+                    if lane == Int32(0):
+                        lse = row_max + ssa_to_scalar(
+                            cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True)
+                        )
+                        mLSEPacked[qgroup_idx, row_idx, head_idx] = lse.to(mLSEPacked.element_type)
+
+
 def _run_synthetic_pack_rows_kernel(
     src_rows: torch.Tensor,
     row_idx: torch.Tensor,
@@ -710,6 +983,160 @@ def _run_synthetic_combine_scatter_rows_kernel(
 _run_synthetic_combine_scatter_rows_kernel.compile_cache = get_jit_cache("hsa_synth_combine_scatter_rows")
 
 
+def _can_use_synthetic_micro_fwd(
+    q_buf: torch.Tensor,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    *,
+    packed_q: int,
+    packed_k: int,
+) -> bool:
+    return (
+        packed_q <= 2
+        and packed_k <= 32
+        and q_buf.dtype in (torch.float16, torch.bfloat16)
+        and k_buf.dtype == q_buf.dtype
+        and v_buf.dtype == q_buf.dtype
+        and q_buf.shape[3] <= 128
+        and v_buf.shape[3] <= 128
+    )
+
+
+def _synthetic_micro_fwd_enabled() -> bool:
+    import os
+
+    return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _run_synthetic_micro_fwd_dense_kernel(
+    q_buf: torch.Tensor,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    q_length: torch.Tensor,
+    k_length: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute_runtime()
+    out = torch.empty(
+        (q_buf.shape[0], q_buf.shape[1], q_buf.shape[2], v_buf.shape[3]),
+        dtype=torch.float32,
+        device=q_buf.device,
+    )
+    lse = torch.empty((q_buf.shape[0], q_buf.shape[1], q_buf.shape[2]), dtype=torch.float32, device=q_buf.device)
+    compile_key = (
+        "synthetic_micro_fwd_dense_v1",
+        q_buf.dtype,
+        k_buf.dtype,
+        v_buf.dtype,
+        q_buf.shape[1],
+        k_buf.shape[1],
+        q_buf.shape[2],
+        q_buf.shape[3],
+        v_buf.shape[3],
+        torch.cuda.get_device_capability(q_buf.device),
+    )
+    if compile_key not in _run_synthetic_micro_fwd_dense_kernel.compile_cache:
+        kernel = FlashHSASyntheticMicroFwdDenseSm100()
+        _run_synthetic_micro_fwd_dense_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_buf),
+            to_cute_tensor(k_buf),
+            to_cute_tensor(v_buf),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(k_length, assumed_align=4, leading_dim=0),
+            Float32(softmax_scale),
+            to_cute_tensor(out, assumed_align=4),
+            to_cute_tensor(lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_micro_fwd_dense_kernel.compile_cache[compile_key](
+        q_buf,
+        k_buf,
+        v_buf,
+        q_length,
+        k_length,
+        Float32(softmax_scale),
+        out,
+        lse,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return out, lse
+
+
+_run_synthetic_micro_fwd_dense_kernel.compile_cache = get_jit_cache("hsa_synth_micro_fwd_dense")
+
+
+def _run_synthetic_micro_fwd_masked_kernel(
+    q_buf: torch.Tensor,
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    q_length: torch.Tensor,
+    k_length: torch.Tensor,
+    mask_words: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute_runtime()
+    out = torch.empty(
+        (q_buf.shape[0], q_buf.shape[1], q_buf.shape[2], v_buf.shape[3]),
+        dtype=torch.float32,
+        device=q_buf.device,
+    )
+    lse = torch.empty((q_buf.shape[0], q_buf.shape[1], q_buf.shape[2]), dtype=torch.float32, device=q_buf.device)
+    compile_key = (
+        "synthetic_micro_fwd_masked_v1",
+        q_buf.dtype,
+        k_buf.dtype,
+        v_buf.dtype,
+        q_buf.shape[1],
+        k_buf.shape[1],
+        q_buf.shape[2],
+        q_buf.shape[3],
+        v_buf.shape[3],
+        mask_words.shape[2],
+        torch.cuda.get_device_capability(q_buf.device),
+    )
+    if compile_key not in _run_synthetic_micro_fwd_masked_kernel.compile_cache:
+        kernel = FlashHSASyntheticMicroFwdMaskedSm100()
+        _run_synthetic_micro_fwd_masked_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_buf),
+            to_cute_tensor(k_buf),
+            to_cute_tensor(v_buf),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(k_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(mask_words, assumed_align=4, leading_dim=2),
+            Float32(softmax_scale),
+            to_cute_tensor(out, assumed_align=4),
+            to_cute_tensor(lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_micro_fwd_masked_kernel.compile_cache[compile_key](
+        q_buf,
+        k_buf,
+        v_buf,
+        q_length,
+        k_length,
+        mask_words,
+        Float32(softmax_scale),
+        out,
+        lse,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return out, lse
+
+
+_run_synthetic_micro_fwd_masked_kernel.compile_cache = get_jit_cache("hsa_synth_micro_fwd_masked")
+
+
 def _slice_bucket_flat_rows(
     metadata,
     bucket_idx: int,
@@ -897,38 +1324,73 @@ def _run_bucketed_forward(
             q_buf = q_buf_flat.view(bucket_size, packed_q_bucket, q.shape[2], q.shape[3])
             k_buf = k_buf_flat.view(bucket_size, packed_k, k.shape[2], k.shape[3])
             v_buf = v_buf_flat.view(bucket_size, packed_k, v.shape[2], v.shape[3])
-            q_length = hsa_module._tag_aux_tensor(q_length, leading_dim=0)
-            k_length = hsa_module._tag_aux_tensor(k_length, leading_dim=0)
-
-            if bool(bucket_dense[split_bucket_idx]):
-                mask_mod = hsa_module.get_hsa_synthetic_packed_dense_mask_mod()
-                aux_tensors = [q_length, k_length]
-            else:
+            dense_bucket = bool(bucket_dense[split_bucket_idx])
+            mask_words = None
+            if not dense_bucket:
                 words_per_row = bucket_words_per_row[split_bucket_idx]
                 mask_word_start, mask_word_end = bucket_mask_word_range[split_bucket_idx]
                 if mask_word_end <= mask_word_start:
                     raise RuntimeError("Synthetic packed bitmap bucket is missing mask words")
                 mask_words_flat = metadata.bucket_mask_words[mask_word_start:mask_word_end].contiguous()
                 mask_words = mask_words_flat.view(bucket_size, packed_q_bucket, words_per_row).contiguous()
-                mask_words = hsa_module._tag_aux_tensor(mask_words, leading_dim=2)
-                mask_mod = hsa_module.get_hsa_synthetic_packed_bitmap_mask_mod(words_per_row)
-                aux_tensors = [q_length, k_length, mask_words]
 
-            out_bucket, lse_bucket = _flash_attn_fwd(
+            if scatter_only and _synthetic_micro_fwd_enabled() and _can_use_synthetic_micro_fwd(
                 q_buf,
                 k_buf,
                 v_buf,
-                softmax_scale=softmax_scale,
-                causal=False,
-                m_block_size=128,
-                n_block_size=128,
-                pack_gqa=False,
-                mask_mod=mask_mod,
-                aux_tensors=aux_tensors,
-                return_lse=True,
-            )
-            out_bucket_flat = out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous()
-            lse_bucket_flat = lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous()
+                packed_q=packed_q_bucket,
+                packed_k=packed_k,
+            ):
+                if dense_bucket:
+                    out_bucket, lse_bucket = _run_synthetic_micro_fwd_dense_kernel(
+                        q_buf,
+                        k_buf,
+                        v_buf,
+                        q_length,
+                        k_length,
+                        softmax_scale=softmax_scale,
+                    )
+                else:
+                    out_bucket, lse_bucket = _run_synthetic_micro_fwd_masked_kernel(
+                        q_buf,
+                        k_buf,
+                        v_buf,
+                        q_length,
+                        k_length,
+                        mask_words,
+                        softmax_scale=softmax_scale,
+                    )
+                out_bucket_flat = out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous()
+                lse_bucket_flat = lse_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous()
+            else:
+                q_length = hsa_module._tag_aux_tensor(q_length, leading_dim=0)
+                k_length = hsa_module._tag_aux_tensor(k_length, leading_dim=0)
+
+                if dense_bucket:
+                    mask_mod = hsa_module.get_hsa_synthetic_packed_dense_mask_mod()
+                    aux_tensors = [q_length, k_length]
+                else:
+                    assert mask_words is not None
+                    words_per_row = bucket_words_per_row[split_bucket_idx]
+                    mask_words = hsa_module._tag_aux_tensor(mask_words, leading_dim=2)
+                    mask_mod = hsa_module.get_hsa_synthetic_packed_bitmap_mask_mod(words_per_row)
+                    aux_tensors = [q_length, k_length, mask_words]
+
+                out_bucket, lse_bucket = _flash_attn_fwd(
+                    q_buf,
+                    k_buf,
+                    v_buf,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    m_block_size=128,
+                    n_block_size=128,
+                    pack_gqa=False,
+                    mask_mod=mask_mod,
+                    aux_tensors=aux_tensors,
+                    return_lse=True,
+                )
+                out_bucket_flat = out_bucket.reshape(bucket_size * packed_q_bucket, num_q_heads, head_dim_v).contiguous()
+                lse_bucket_flat = lse_bucket.permute(0, 2, 1).reshape(bucket_size * packed_q_bucket, num_q_heads).contiguous()
             if scatter_only:
                 _run_synthetic_scatter_rows_kernel(out_bucket_flat, q_bucket_src_row_idx, total_out)
                 _run_synthetic_scatter_lse_kernel(lse_bucket_flat, q_bucket_src_row_idx, total_lse)

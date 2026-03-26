@@ -2078,6 +2078,33 @@ def test_hsa_synthetic_micro_backward_row_compact_falls_back_when_headdim_unsupp
     _assert_finite_gradients("mixed_small_headdim128_synthetic_micro_grads", q_micro, k_micro, v_micro)
 
 
+def test_hsa_synthetic_micro_backward_selector_honors_accum_mode(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _row_local(*args, **kwargs):
+        calls.append("row_local")
+
+    def _union_local(*args, **kwargs):
+        calls.append("union_local")
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_row_local", _row_local)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_union_local", _union_local)
+
+    t = torch.empty(1)
+    args = (t,) * 17
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "row_local")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["row_local"]
+
+    calls.clear()
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "union_local")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["union_local"]
+
+
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module

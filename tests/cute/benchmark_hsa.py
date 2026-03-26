@@ -234,6 +234,14 @@ def _benchmark_mode_label(case: BenchmarkCase) -> str:
     return "sentence_true_fused" if case.name == "sentence-only" else "mixed_sparse_mask"
 
 
+def _synthetic_mode_label() -> str:
+    if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") != "1":
+        return "disabled"
+    if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") == "1":
+        return "one_launch_micro"
+    return "one_launch_generic_fa"
+
+
 def _benchmark_sparse_bwd_config_label() -> str:
     block_q = os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_Q", "64")
     block_k = os.environ.get("FLASH_ATTN_HSA_BACKWARD_BLOCK_K", "128")
@@ -951,6 +959,8 @@ def run_case(case: BenchmarkCase):
         )
     if synthetic_summary is not None:
         line += (
+            f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
+            f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
             f" synth_max_packed_k={synthetic_summary['max_packed_k']}"
             f" synth_tiles={synthetic_summary['num_tiles']}"

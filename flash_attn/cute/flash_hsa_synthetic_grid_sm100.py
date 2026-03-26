@@ -589,17 +589,31 @@ class FlashHSASyntheticMicroFwdDenseSm100:
             else:
                 k_length = Int32(mKLength[qgroup_idx])
                 row_idx = warp_idx
-                row_max = -Float32.inf
-                for k_idx in range(mKPacked.shape[1]):
-                    if Int32(k_idx) < k_length:
+                score = -Float32.inf
+                if lane < k_length:
+                    if mQPacked.shape[3] in (64, 128):
                         score = Float32(0.0)
-                        for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                            q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
-                            k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
-                            score += q_val * k_val
-                        score = utils.warp_reduce(score, lambda a, b: a + b)
-                        score *= softmax_scale
-                        row_max = score if score > row_max else row_max
+                        for dim_idx in range(0, mQPacked.shape[3], 4):
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 0]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 0]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 1]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 1]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 2]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 2]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 3]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 3]
+                            )
+                    else:
+                        score = Float32(0.0)
+                        for dim_idx in range(mQPacked.shape[3]):
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx]
+                            )
+                    score *= softmax_scale
+                row_max = utils.warp_reduce(score, utils.fmax)
 
                 if row_max == -Float32.inf:
                     if lane == Int32(0):
@@ -609,32 +623,16 @@ class FlashHSASyntheticMicroFwdDenseSm100:
                             mOutPacked.element_type
                         )
                 else:
-                    row_sum = Float32(0.0)
-                    for k_idx in range(mKPacked.shape[1]):
-                        if Int32(k_idx) < k_length:
-                            score = Float32(0.0)
-                            for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                                q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
-                                k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
-                                score += q_val * k_val
-                            score = utils.warp_reduce(score, lambda a, b: a + b)
-                            score *= softmax_scale
-                            row_sum += cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
-
+                    prob = Float32(0.0)
+                    if lane < k_length:
+                        prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+                    row_sum = utils.warp_reduce(prob, lambda a, b: a + b)
                     inv_row_sum = Float32(0.0) if row_sum == Float32(0.0) else Float32(1.0) / row_sum
                     for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
                         acc_val = Float32(0.0)
                         for k_idx in range(mKPacked.shape[1]):
-                            if Int32(k_idx) < k_length:
-                                score = Float32(0.0)
-                                for score_dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                                    q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, score_dim_idx])
-                                    k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, score_dim_idx])
-                                    score += q_val * k_val
-                                score = utils.warp_reduce(score, lambda a, b: a + b)
-                                score *= softmax_scale
-                                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
-                                acc_val += prob * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                            prob_k = utils.shuffle_sync(prob, k_idx)
+                            acc_val += prob_k * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
                         mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = (acc_val * inv_row_sum).to(
                             mOutPacked.element_type
                         )
@@ -714,24 +712,38 @@ class FlashHSASyntheticMicroFwdMaskedSm100:
             else:
                 k_length = Int32(mKLength[qgroup_idx])
                 row_idx = warp_idx
-                row_max = -Float32.inf
-                for k_idx in range(mKPacked.shape[1]):
-                    allowed = False
-                    if Int32(k_idx) < k_length:
-                        word_idx = k_idx // 32
-                        bit_idx = k_idx % 32
-                        mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
-                        bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
-                        allowed = bit != cutlass.Uint32(0)
-                    if allowed:
+                allowed = False
+                if lane < k_length:
+                    word_idx = lane // 32
+                    bit_idx = lane % 32
+                    mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    allowed = bit != cutlass.Uint32(0)
+                score = -Float32.inf
+                if allowed:
+                    if mQPacked.shape[3] in (64, 128):
                         score = Float32(0.0)
-                        for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                            q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
-                            k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
-                            score += q_val * k_val
-                        score = utils.warp_reduce(score, lambda a, b: a + b)
-                        score *= softmax_scale
-                        row_max = score if score > row_max else row_max
+                        for dim_idx in range(0, mQPacked.shape[3], 4):
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 0]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 0]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 1]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 1]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 2]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 2]
+                            )
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx + 3]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx + 3]
+                            )
+                    else:
+                        score = Float32(0.0)
+                        for dim_idx in range(mQPacked.shape[3]):
+                            score += Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx]) * Float32(
+                                mKPacked[qgroup_idx, lane, head_idx, dim_idx]
+                            )
+                    score *= softmax_scale
+                row_max = utils.warp_reduce(score, utils.fmax)
 
                 if row_max == -Float32.inf:
                     if lane == Int32(0):
@@ -741,46 +753,16 @@ class FlashHSASyntheticMicroFwdMaskedSm100:
                             mOutPacked.element_type
                         )
                 else:
-                    row_sum = Float32(0.0)
-                    for k_idx in range(mKPacked.shape[1]):
-                        allowed = False
-                        if Int32(k_idx) < k_length:
-                            word_idx = k_idx // 32
-                            bit_idx = k_idx % 32
-                            mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
-                            bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
-                            allowed = bit != cutlass.Uint32(0)
-                        if allowed:
-                            score = Float32(0.0)
-                            for dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                                q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, dim_idx])
-                                k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, dim_idx])
-                                score += q_val * k_val
-                            score = utils.warp_reduce(score, lambda a, b: a + b)
-                            score *= softmax_scale
-                            row_sum += cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
-
+                    prob = Float32(0.0)
+                    if allowed:
+                        prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+                    row_sum = utils.warp_reduce(prob, lambda a, b: a + b)
                     inv_row_sum = Float32(0.0) if row_sum == Float32(0.0) else Float32(1.0) / row_sum
                     for dim_idx in range(lane, mOutPacked.shape[3], cute.arch.WARP_SIZE):
                         acc_val = Float32(0.0)
                         for k_idx in range(mKPacked.shape[1]):
-                            allowed = False
-                            if Int32(k_idx) < k_length:
-                                word_idx = k_idx // 32
-                                bit_idx = k_idx % 32
-                                mask_word = cutlass.Uint32(mMaskWords[qgroup_idx, row_idx, word_idx])
-                                bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
-                                allowed = bit != cutlass.Uint32(0)
-                            if allowed:
-                                score = Float32(0.0)
-                                for score_dim_idx in range(lane, mQPacked.shape[3], cute.arch.WARP_SIZE):
-                                    q_val = Float32(mQPacked[qgroup_idx, row_idx, head_idx, score_dim_idx])
-                                    k_val = Float32(mKPacked[qgroup_idx, k_idx, head_idx, score_dim_idx])
-                                    score += q_val * k_val
-                                score = utils.warp_reduce(score, lambda a, b: a + b)
-                                score *= softmax_scale
-                                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
-                                acc_val += prob * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
+                            prob_k = utils.shuffle_sync(prob, k_idx)
+                            acc_val += prob_k * Float32(mVPacked[qgroup_idx, k_idx, head_idx, dim_idx])
                         mOutPacked[qgroup_idx, row_idx, head_idx, dim_idx] = (acc_val * inv_row_sum).to(
                             mOutPacked.element_type
                         )
@@ -1030,7 +1012,7 @@ def _run_synthetic_micro_fwd_dense_kernel(
     )
     lse = torch.empty((q_buf.shape[0], q_buf.shape[1], q_buf.shape[2]), dtype=torch.float32, device=q_buf.device)
     compile_key = (
-        "synthetic_micro_fwd_dense_v1",
+        "synthetic_micro_fwd_dense_v2",
         q_buf.dtype,
         k_buf.dtype,
         v_buf.dtype,
@@ -1091,7 +1073,7 @@ def _run_synthetic_micro_fwd_masked_kernel(
     )
     lse = torch.empty((q_buf.shape[0], q_buf.shape[1], q_buf.shape[2]), dtype=torch.float32, device=q_buf.device)
     compile_key = (
-        "synthetic_micro_fwd_masked_v1",
+        "synthetic_micro_fwd_masked_v2",
         q_buf.dtype,
         k_buf.dtype,
         v_buf.dtype,

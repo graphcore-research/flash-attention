@@ -1348,6 +1348,86 @@ def _run_mixed_sparse_mask_case(
     return out_sparse, q_sparse.grad, k_sparse.grad, v_sparse.grad, out_ref, q_ref.grad, k_ref.grad, v_ref.grad
 
 
+def _capture_synthetic_forward_saved_tensors(
+    *,
+    q_data: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    keep_ids: torch.Tensor,
+    hash_ids: torch.Tensor,
+):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+    import flash_attn.cute.hsa as hsa_module
+
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    softmax_scale = 1.0 / (q_data.shape[-1] ** 0.5)
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+    out, lse, *_ = synthetic_module.run_hsa_fwd_sm100_synthetic_grid(
+        q_data,
+        k_data,
+        v_data,
+        schedule,
+        softmax_scale,
+        runtime=runtime,
+    )
+    return out.detach(), lse.detach()
+
+
+def _run_synthetic_case_with_saved_tensor_override(
+    monkeypatch,
+    *,
+    batch_size: int,
+    seqlen: int,
+    nheads: int,
+    headdim: int,
+    n_kv_heads: int,
+    keep_ids: torch.Tensor,
+    hash_ids: torch.Tensor,
+    q_data: torch.Tensor,
+    k_data: torch.Tensor,
+    v_data: torch.Tensor,
+    saved_out: torch.Tensor,
+    saved_lse: torch.Tensor,
+):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    def _override_fwd(q, k, v, schedule, softmax_scale, *, runtime=None):
+        del schedule, softmax_scale, runtime
+        sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+            synthetic_module._empty_sentence_cache(q, k, v)
+        )
+        return (
+            saved_out.clone(),
+            saved_lse.clone(),
+            sentence_lse,
+            sentence_q_stream,
+            sentence_k_stream,
+            sentence_v_stream,
+            sentence_out_stream,
+        )
+
+    with monkeypatch.context() as local_patch:
+        local_patch.setattr(synthetic_module, "run_hsa_fwd_sm100_synthetic_grid", _override_fwd)
+        local_patch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+        local_patch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+        local_patch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+        local_patch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+        local_patch.delenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", raising=False)
+        return _run_mixed_sparse_mask_case(
+            batch_size=batch_size,
+            seqlen=seqlen,
+            nheads=nheads,
+            headdim=headdim,
+            n_kv_heads=n_kv_heads,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+            q_data=q_data,
+            k_data=k_data,
+            v_data=v_data,
+        )
+
+
 def _assert_finite_gradients(name, *grads):
     for grad in grads:
         assert grad is not None, f"{name}: missing gradient"
@@ -1677,6 +1757,119 @@ def test_hsa_synthetic_grid_matches_sparse_path(
     _assert_close(out_synth.float(), out_base.float(), f"{label}_synthetic_grid_output_vs_sparse")
     _assert_close(out_synth.float(), out_ref.float(), f"{label}_synthetic_grid_output_vs_ref")
     _assert_finite_gradients(f"{label}_synthetic_grid_grads", q_synth, k_synth, v_synth)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize(
+    "label,batch_size,seqlen,nheads,headdim,n_kv_heads",
+    [
+        ("mixed_small_eq", 1, 65, 4, 64, 4),
+        ("train_eq", 2, 1024, 8, 64, 8),
+    ],
+)
+def test_hsa_synthetic_micro_forward_matches_reference_and_has_finite_grads(
+    monkeypatch,
+    label,
+    batch_size,
+    seqlen,
+    nheads,
+    headdim,
+    n_kv_heads,
+):
+    device = "cuda"
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    dtype = torch.bfloat16
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+    out_micro, q_micro, k_micro, v_micro, out_ref, _, _, _ = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    _assert_close(out_micro.float(), out_ref.float(), f"{label}_synthetic_micro_output_vs_ref")
+    _assert_finite_gradients(f"{label}_synthetic_micro_grads", q_micro, k_micro, v_micro)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_micro_saved_tensor_mix_has_finite_grads(monkeypatch):
+    batch_size, seqlen, nheads, headdim, n_kv_heads = 2, 1024, 8, 64, 8
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    base_env = {
+        "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID": "1",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q": "2",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K": "2",
+        "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K": "128",
+    }
+
+    with monkeypatch.context() as local_patch:
+        for key, value in base_env.items():
+            local_patch.setenv(key, value)
+        local_patch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0")
+        stable_out, stable_lse = _capture_synthetic_forward_saved_tensors(
+            q_data=q_data,
+            k_data=k_data,
+            v_data=v_data,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+        )
+
+    with monkeypatch.context() as local_patch:
+        for key, value in base_env.items():
+            local_patch.setenv(key, value)
+        local_patch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+        micro_out, micro_lse = _capture_synthetic_forward_saved_tensors(
+            q_data=q_data,
+            k_data=k_data,
+            v_data=v_data,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+        )
+
+    combos = {
+        "stable_out_stable_lse": (stable_out, stable_lse),
+        "micro_out_micro_lse": (micro_out, micro_lse),
+        "micro_out_stable_lse": (micro_out, stable_lse),
+        "stable_out_micro_lse": (stable_out, micro_lse),
+    }
+    for name, (saved_out, saved_lse) in combos.items():
+        out_mix, q_mix, k_mix, v_mix, _, _, _, _ = _run_synthetic_case_with_saved_tensor_override(
+            monkeypatch,
+            batch_size=batch_size,
+            seqlen=seqlen,
+            nheads=nheads,
+            headdim=headdim,
+            n_kv_heads=n_kv_heads,
+            keep_ids=keep_ids,
+            hash_ids=hash_ids,
+            q_data=q_data,
+            k_data=k_data,
+            v_data=v_data,
+            saved_out=saved_out,
+            saved_lse=saved_lse,
+        )
+        _assert_close(out_mix.float(), saved_out.float(), f"{name}_saved_output")
+        _assert_finite_gradients(f"{name}_saved_grads", q_mix, k_mix, v_mix)
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")

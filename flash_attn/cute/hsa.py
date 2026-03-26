@@ -327,6 +327,7 @@ class HSABlockSparseRuntime:
     backward_synthetic_grid: Optional[HSASyntheticGridMetadata] = None
     synthetic_grid: Optional[HSASyntheticGridMetadata] = None
     synthetic_forward_workspace: Optional[dict] = None
+    synthetic_backward_workspace: Optional[dict] = None
 
     def to(self, device: torch.device | str):
         def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
@@ -361,6 +362,7 @@ class HSABlockSparseRuntime:
             ),
             synthetic_grid=None if self.synthetic_grid is None else self.synthetic_grid.to(device=device),
             synthetic_forward_workspace=None,
+            synthetic_backward_workspace=None,
         )
 
 

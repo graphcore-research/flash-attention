@@ -250,6 +250,10 @@ class FP4FlashAttentionForwardSm100:
         self.use_fp4_qk = use_fp4_qk
         self.use_fp4_pv = use_fp4_pv
         self.fp4_pv_direct_loader = os.getenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "0") == "1"
+        self.fp4_pv_force_cta_direct = os.getenv("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT", "0") == "1"
+        # Keep the legacy env var name for the opt-in PV quantizer experiment even though the
+        # current landing uses decode-centric block scales after the CTA-local amax reduction.
+        self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
         raw_debug_offset = os.getenv("FLASH_ATTN_FP4_PV_RAW_BYTE_OFFSET")
         self.fp4_pv_raw_byte_offset = int(raw_debug_offset) if raw_debug_offset is not None else -1
         self.fp4_sf_dtype = Float8E4M3FN if fp4_sf_dtype == "e4m3" else Float8E8M0FNU
@@ -1893,7 +1897,7 @@ class FP4FlashAttentionForwardSm100:
             if const_expr(self.use_fp4_pv and self.fp4_pv_direct_loader):
                 assert mV_storage is not None
                 load_V = partial(
-                    self.load_vt_fp4_pv_stage,
+                    self.load_v_fp4_pv_stage_public,
                     mV,
                     mV_storage,
                     mV_scale,
@@ -1970,15 +1974,16 @@ class FP4FlashAttentionForwardSm100:
                             )
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
-                    if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader) and warp_idx == self.load_warp_ids[0]:
-                        self.load_v_scale_stage_public(
-                            mV_scale,
-                            batch_idx,
-                            kv_head_idx,
-                            sSFV[None, None, None, kv_producer_state.index],
-                            n_block_max - 1,
-                            seqlen.seqlen_k,
-                        )
+                    if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader):
+                        if warp_idx == self.load_warp_ids[0]:
+                            self.load_v_scale_stage_public(
+                                mV_scale,
+                                batch_idx,
+                                kv_head_idx,
+                                sSFV[None, None, None, kv_producer_state.index],
+                                n_block_max - 1,
+                                seqlen.seqlen_k,
+                            )
                     kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
@@ -1998,15 +2003,16 @@ class FP4FlashAttentionForwardSm100:
                             )
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
-                        if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader) and warp_idx == self.load_warp_ids[0]:
-                            self.load_v_scale_stage_public(
-                                mV_scale,
-                                batch_idx,
-                                kv_head_idx,
-                                sSFV[None, None, None, kv_producer_state.index],
-                                n_block,
-                                seqlen.seqlen_k,
-                            )
+                        if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader):
+                            if warp_idx == self.load_warp_ids[0]:
+                                self.load_v_scale_stage_public(
+                                    mV_scale,
+                                    batch_idx,
+                                    kv_head_idx,
+                                    sSFV[None, None, None, kv_producer_state.index],
+                                    n_block,
+                                    seqlen.seqlen_k,
+                                )
                         kv_producer_state.advance()
 
             else:
@@ -2184,7 +2190,7 @@ class FP4FlashAttentionForwardSm100:
                 partial(
                     sm100_utils.gemm_ptx_fp4_block_scaled_partial,
                     pv_mma_op,
-                    tOtO[None, None, None, stage],
+                    self.tmem_o_offset[stage],
                     tOrP[None, None, None, stage],
                     tmem_sa_addr=Int32(self.tmem_sfp_offset),
                     tmem_sb_addr=Int32(self.tmem_sfv_offset),
@@ -2597,6 +2603,23 @@ class FP4FlashAttentionForwardSm100:
         return tP_conv_groups, tPc_conv_groups
 
     @cute.jit
+    def reduce_fp4_pv_group_amax_masked(
+        self,
+        slot_ptr: cutlass.Int64,
+        group_max_log2: Float32,
+    ):
+        """Reduce a masked FP4 PV block amax over all warp lanes sharing one logical scale slot."""
+        reduced = group_max_log2
+        has_masked_peer = group_max_log2 == -cutlass.Float32.inf
+        for peer_lane in cutlass.range_constexpr(cute.arch.WARP_SIZE):
+            peer_slot_ptr = cutlass.Int64(utils.shuffle_sync(slot_ptr, offset=peer_lane))
+            peer_max_log2 = utils.shuffle_sync(group_max_log2, offset=peer_lane)
+            if peer_slot_ptr == slot_ptr:
+                reduced = cute.arch.fmax(reduced, peer_max_log2)
+                has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        return reduced, has_masked_peer
+
+    @cute.jit
     def quantize_p_fragment_to_fp4(
         self,
         softmax: SoftmaxSm100,
@@ -2647,7 +2670,6 @@ class FP4FlashAttentionForwardSm100:
             sSFP_logical.layout,
         )
 
-        lane_idx = cute.arch.lane_idx()
         log2_fp4_max = Float32(math.log2(6.0))
         neg_log2_fp4_max = Float32(-math.log2(6.0))
         for gi in cutlass.range_constexpr(cute.size(tSrP_conv_preexp_groups.shape[0])):
@@ -2655,16 +2677,104 @@ class FP4FlashAttentionForwardSm100:
             for ei in cutlass.range_constexpr(cute.size(tSrP_conv_preexp_groups.shape[1])):
                 group_max_log2 = cute.arch.fmax(group_max_log2, tSrP_conv_preexp_groups[gi, ei])
             coord = tScP_conv_groups[gi, 0]
-            row = coord[0]
-            col = coord[1]
-            partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
-            partner_col = cute.arch.shuffle_sync_bfly(col, offset=1)
-            share_scale_with_partner = (row == partner_row) and (col == partner_col)
-            if share_scale_with_partner:
-                group_max_log2 = cute.arch.fmax(
-                    group_max_log2,
-                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
-                )
+            row = Int32(coord[0])
+            col = Int32(coord[1])
+            if const_expr(self.fp4_pv_cta_quant):
+                # Unmasked CTA-local FP4 PV keeps the fast butterfly reduction used on
+                # the stable noncausal path. Masked iterations only switch to the exact
+                # segmented reduction for slots that actually contain masked peers.
+                if const_expr(use_masked_exp_emu):
+                    slot_ptr = utils.elem_pointer(
+                        sSFP_logical_u8,
+                        (row, col, Int32(0)),
+                    ).toint()
+                    exact_group_max_log2, slot_has_masked_peer = self.reduce_fp4_pv_group_amax_masked(
+                        slot_ptr,
+                        group_max_log2,
+                    )
+                    if slot_has_masked_peer:
+                        group_max_log2 = exact_group_max_log2
+                    else:
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+                        partner_col = cute.arch.shuffle_sync_bfly(col, offset=1)
+                        if (row == partner_row) and (col == partner_col):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=2)
+                        partner_col = cute.arch.shuffle_sync_bfly(col, offset=2)
+                        if (row == partner_row) and (col == partner_col):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=4)
+                        partner_col = cute.arch.shuffle_sync_bfly(col, offset=4)
+                        if (row == partner_row) and (col == partner_col):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=8)
+                        partner_col = cute.arch.shuffle_sync_bfly(col, offset=8)
+                        if (row == partner_row) and (col == partner_col):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=16)
+                        partner_col = cute.arch.shuffle_sync_bfly(col, offset=16)
+                        if (row == partner_row) and (col == partner_col):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                            )
+                else:
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+                    partner_col = cute.arch.shuffle_sync_bfly(col, offset=1)
+                    if (row == partner_row) and (col == partner_col):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=2)
+                    partner_col = cute.arch.shuffle_sync_bfly(col, offset=2)
+                    if (row == partner_row) and (col == partner_col):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=4)
+                    partner_col = cute.arch.shuffle_sync_bfly(col, offset=4)
+                    if (row == partner_row) and (col == partner_col):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=8)
+                    partner_col = cute.arch.shuffle_sync_bfly(col, offset=8)
+                    if (row == partner_row) and (col == partner_col):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=16)
+                    partner_col = cute.arch.shuffle_sync_bfly(col, offset=16)
+                    if (row == partner_row) and (col == partner_col):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                        )
+            else:
+                partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+                partner_col = cute.arch.shuffle_sync_bfly(col, offset=1)
+                share_scale_with_partner = (row == partner_row) and (col == partner_col)
+                if share_scale_with_partner:
+                    group_max_log2 = cute.arch.fmax(
+                        group_max_log2,
+                        cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                    )
             group_is_masked = group_max_log2 == -cutlass.Float32.inf
             group_max_safe = Float32(0.0) if group_is_masked else group_max_log2
             scale_f32 = (
@@ -4018,16 +4128,12 @@ class FP4FlashAttentionForwardSm100:
                     raw_offset = row_pair * 64 + row_parity * 32 + self.fp4_pv_raw_byte_offset
                     if raw_offset < cute.size(sV_stage_bytes_flat.shape):
                         sV_stage_bytes_flat[raw_offset] = mV_storage[
-                            batch_idx, seqlen_idx, kv_head_idx, Int32(0)
+                            batch_idx, kv_head_idx, Int32(0), block * (self.n_block_size // 2) + row_pair
                         ]
         else:
-            valid_packed_cols = mV_storage.shape[3]
-            mV_storage_vt = make_public_fp4_v_storage_vt_tensor(mV_storage)
-            gV_block_bytes = cute.local_tile(
-                mV_storage_vt[None, None, kv_head_idx, batch_idx],
-                (valid_packed_cols, self.n_block_size),
-                (0, block),
-            )
+            valid_packed_cols = self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width
+            low_nibble_mask = Int32(0x0F)
+            shift_bits = Int32(4)
             for idx in cutlass.range(
                 tidx, self.n_block_size * valid_packed_cols, num_load_threads, unroll=1
             ):
@@ -4037,9 +4143,30 @@ class FP4FlashAttentionForwardSm100:
                 if seqlen_idx < seqlen_k:
                     row_pair = row // 2
                     row_parity = row - row_pair * 2
-                    sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = gV_block_bytes[
-                        packed_col, row
-                    ]
+                    src_d0 = packed_col * 2
+                    src_d1 = src_d0 + 1
+                    nibble_shift = row_parity * shift_bits
+                    src0_i32 = Int32(
+                        mV_storage[
+                            src_d0,
+                            block * (self.n_block_size // 2) + row_pair,
+                            kv_head_idx,
+                            batch_idx,
+                        ]
+                    )
+                    src1_i32 = Int32(
+                        mV_storage[
+                            src_d1,
+                            block * (self.n_block_size // 2) + row_pair,
+                            kv_head_idx,
+                            batch_idx,
+                        ]
+                    )
+                    nibble0 = (src0_i32 >> nibble_shift) & low_nibble_mask
+                    nibble1 = (src1_i32 >> nibble_shift) & low_nibble_mask
+                    sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = cutlass.Uint8(
+                        nibble0 | (nibble1 << shift_bits)
+                    )
 
         if (
             cute.arch.lane_idx() == 0
@@ -4049,13 +4176,13 @@ class FP4FlashAttentionForwardSm100:
         ):
             fa_logging.fa_printf(
                 2,
-                "FP4 PV producer public V bytes[col,row] c0 row0/1, c1 row0/1, c8 row0, c16 row0: %d %d %d %d %d %d\n",
-                mV_storage[batch_idx, Int32(0), kv_head_idx, Int32(0)],
-                mV_storage[batch_idx, Int32(1), kv_head_idx, Int32(0)],
-                mV_storage[batch_idx, Int32(0), kv_head_idx, Int32(1)],
-                mV_storage[batch_idx, Int32(1), kv_head_idx, Int32(1)],
-                mV_storage[batch_idx, Int32(0), kv_head_idx, Int32(8)],
-                mV_storage[batch_idx, Int32(0), kv_head_idx, Int32(16)],
+                "FP4 PV producer Vt bytes[d,rowpair] d0/1 pair0, d8 pair0, d16 pair0: %d %d %d %d %d %d\n",
+                mV_storage[Int32(0), Int32(0), kv_head_idx, batch_idx],
+                mV_storage[Int32(1), Int32(0), kv_head_idx, batch_idx],
+                mV_storage[Int32(0), Int32(0), kv_head_idx, batch_idx],
+                mV_storage[Int32(1), Int32(0), kv_head_idx, batch_idx],
+                mV_storage[Int32(8), Int32(0), kv_head_idx, batch_idx],
+                mV_storage[Int32(16), Int32(0), kv_head_idx, batch_idx],
             )
             fa_logging.fa_printf(
                 2,
@@ -4519,9 +4646,9 @@ class FP4FlashAttentionForwardSm100:
     @cute.jit
     def load_vt_fp4_pv_stage(
         self,
-        mV: cute.Tensor,          # public packed logical V: (b, s_k, h_k, d)
-        mV_storage: cute.Tensor,  # public packed-byte V: (b, s_k, h_k, d_packed)
-        mV_scale: cute.Tensor,    # public compact V scales: (b, s_k, h_k, d // sf_vec)
+        mV: cute.Tensor,          # unused: logical internal Vt view
+        mV_storage: cute.Tensor,  # public packed-byte Vt storage: (b, h_k, d, s_k // 2)
+        mV_scale: cute.Tensor,    # public swizzled SFVt storage: (b, h_k, d, s_k // sf_vec)
         thr_mma_pv: cute.core.ThrMma,
         batch_idx: Int32,
         kv_head_idx: Int32,
@@ -4533,10 +4660,13 @@ class FP4FlashAttentionForwardSm100:
         producer_state: pipeline.PipelineState,
         page_idx: Optional[Int32] = None,
     ):
+        del mV
         del page_idx
         stage, phase = producer_state.index, producer_state.phase
         pipeline_kv.producer_acquire(producer_state)
 
+        num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
+        tidx = cute.arch.thread_idx()[0] % num_load_threads
         sV_stage = sV[None, None, None, stage]
         if const_expr(self.uneven_kv_smem):
             sV_stage = self.offset_kv_smem(sV_stage, stage, phase ^ 1)
@@ -4555,51 +4685,74 @@ class FP4FlashAttentionForwardSm100:
         sSFV_logical_u8_flat = cute.group_modes(
             cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
         )
-        mV_storage_vt = make_public_fp4_v_storage_vt_tensor(mV_storage)
         valid_packed_cols = self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width
-        gV_block_bytes = cute.local_tile(
-            mV_storage_vt[None, None, kv_head_idx, batch_idx],
-            (valid_packed_cols, self.n_block_size),
-            (0, block),
-        )
         sV_stage_packed = self.as_packed_byte_tensor(
             sV_stage,
             storage_dtype=self.v_storage_dtype,
         )
+        zero_v = self.v_storage_dtype(0)
+        low_nibble_mask = Int32(0x0F)
+        shift_bits = Int32(4)
 
-        lane_idx = cute.arch.lane_idx()
         one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
         del thr_mma_pv
-        for idx in cutlass.range(lane_idx, self.n_block_size * valid_packed_cols, cute.arch.WARP_SIZE, unroll=1):
+        for idx in cutlass.range(
+            tidx,
+            self.n_block_size * valid_packed_cols,
+            num_load_threads,
+            unroll=1,
+        ):
             packed_col = idx // self.n_block_size
             row = idx - packed_col * self.n_block_size
             seqlen_idx = block * self.n_block_size + row
             row_pair = row // 2
             row_parity = row - row_pair * 2
             if seqlen_idx < seqlen_k:
-                sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = gV_block_bytes[
-                    packed_col, row
-                ]
+                src_d0 = packed_col * 2
+                src_d1 = src_d0 + 1
+                src0_i32 = Int32(mV_storage[batch_idx, kv_head_idx, src_d0, block * (self.n_block_size // 2) + row_pair])
+                src1_i32 = Int32(mV_storage[batch_idx, kv_head_idx, src_d1, block * (self.n_block_size // 2) + row_pair])
+                nibble_shift = row_parity * shift_bits
+                nibble0 = (src0_i32 >> nibble_shift) & low_nibble_mask
+                nibble1 = (src1_i32 >> nibble_shift) & low_nibble_mask
+                packed_byte = cutlass.Uint8(nibble0 | (nibble1 << shift_bits))
+                sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = packed_byte
+            else:
+                sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = zero_v
 
-        for idx in cutlass.range(cute.arch.lane_idx(), cute.size(sSFV_logical_u8_flat.shape), cute.arch.WARP_SIZE, unroll=1):
+        for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
             sSFV_logical_u8_flat[idx] = one_scale_u8
 
         num_d_groups = self.head_dim_v_padded // self.fp4_sf_vec_size
-        mV_scale_u8 = cute.make_tensor(
+        num_seq_groups = mV_scale.shape[3]
+        num_heads_kv = mV_scale.shape[1]
+        raw_scale_u8 = cute.make_tensor(
             cute.recast_ptr(
                 utils.elem_pointer(mV_scale, (0,) * cute.rank(mV_scale)),
                 dtype=cutlass.Uint8,
             ),
-            mV_scale.layout,
+            (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
         )
-        for idx in cutlass.range(cute.arch.lane_idx(), self.n_block_size * num_d_groups, cute.arch.WARP_SIZE, unroll=1):
+        slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
+        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
             row = idx // num_d_groups
             d_group = idx - row * num_d_groups
             seqlen_idx = block * self.n_block_size + row
             if seqlen_idx < seqlen_k:
-                sSFV_logical_u8[d_group * self.fp4_sf_vec_size, row, 0, 0] = mV_scale_u8[
-                    batch_idx, seqlen_idx, kv_head_idx, d_group
-                ]
+                d_idx = d_group * self.fp4_sf_vec_size
+                seq_group = seqlen_idx // self.fp4_sf_vec_size
+                tile_m = d_idx // 64
+                row_in_tile = d_idx - tile_m * 64
+                quad = row_in_tile // 16
+                row_mod16 = row_in_tile - quad * 16
+                raw_offset = (
+                    tile_m * 64 * num_seq_groups
+                    + (seq_group // 4) * 256
+                    + (seq_group % 4)
+                    + quad * 4
+                    + row_mod16 * 16
+                )
+                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
 
         cute.arch.sync_warp()
         cute.arch.fence_proxy(

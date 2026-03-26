@@ -9,13 +9,16 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flash_attn.cute.interface import (
+    _adapt_tk_nvfp4_transpose_scale,
     _bwd_postprocess_convert,
     _bwd_preprocess,
     _flash_attn_bwd,
     _flash_attn_bwd_fp4_qk,
     _flash_attn_fwd,
+    _unswizzle_tk_nvfp4_transpose_scale_bytes,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from tests.cute.benchmark_fp4_qk import _benchmark_case
 
 
 FP4_GRID = torch.tensor(
@@ -218,6 +221,60 @@ def _dequantize_fp4(packed: torch.Tensor, scale: torch.Tensor, sf_vec_size: int)
     ).flatten(start_dim=-2)
 
 
+def _fp4_pv_partner_reduce(values: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    out = values.clone()
+    for lane in range(values.numel()):
+        partner = lane ^ 1
+        if partner < values.numel() and rows[lane] == rows[partner] and cols[lane] == cols[partner]:
+            out[lane] = torch.maximum(out[lane], values[partner])
+    return out
+
+
+def _fp4_pv_full_warp_reduce(values: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    out = values.clone()
+    for offset in (1, 2, 4, 8, 16):
+        prev = out.clone()
+        for lane in range(values.numel()):
+            partner = lane ^ offset
+            if partner < values.numel() and rows[lane] == rows[partner] and cols[lane] == cols[partner]:
+                out[lane] = torch.maximum(prev[lane], prev[partner])
+    return out
+
+
+def _fp4_pv_exact_slot_reduce(values: torch.Tensor, slot_ids: torch.Tensor) -> torch.Tensor:
+    out = values.clone()
+    for lane in range(values.numel()):
+        out[lane] = values[slot_ids == slot_ids[lane]].max()
+    return out
+
+
+def _stage_fp4_vt_public_bytes_for_pv(packed_vt: torch.Tensor) -> torch.Tensor:
+    """Repack public seq-packed Vt bytes into the D-packed PV shared-memory byte layout."""
+    batch_size, num_heads, head_dim, seqlen_packed = packed_vt.shape
+    assert head_dim % 2 == 0
+    out = torch.empty(
+        batch_size,
+        num_heads,
+        seqlen_packed * 2,
+        head_dim // 2,
+        dtype=torch.uint8,
+        device=packed_vt.device,
+    )
+    packed_i32 = packed_vt.to(torch.int32)
+    for row in range(seqlen_packed * 2):
+        row_pair, row_parity = divmod(row, 2)
+        src0 = packed_i32[:, :, 0::2, row_pair]
+        src1 = packed_i32[:, :, 1::2, row_pair]
+        if row_parity == 0:
+            nibble0 = src0 & 0xF
+            nibble1 = src1 & 0xF
+        else:
+            nibble0 = (src0 >> 4) & 0xF
+            nibble1 = (src1 >> 4) & 0xF
+        out[:, :, row] = (nibble0 | (nibble1 << 4)).to(torch.uint8)
+    return out
+
+
 def _swizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
     batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
     out = torch.empty_like(scale_vt)
@@ -256,6 +313,26 @@ def _unswizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
             )
             logical[:, :, d, seq_group] = flat_in[:, :, offset]
     return out
+
+
+def _swizzle_tk_nvfp4_transpose_scale(scale: torch.Tensor) -> torch.Tensor:
+    batch_size, head_dim, num_heads, seqlen_groups = scale.shape
+    if head_dim % 64 != 0:
+        raise ValueError("TK transpose-scale swizzle helper expects head_dim divisible by 64.")
+    if seqlen_groups % 4 != 0:
+        raise ValueError("TK transpose-scale swizzle helper expects seqlen_groups divisible by 4.")
+    logical_u8 = scale.view(torch.uint8).permute(0, 2, 1, 3).contiguous()
+    flat_out = torch.empty(batch_size, num_heads, head_dim * seqlen_groups, device=scale.device, dtype=torch.uint8)
+    for d in range(head_dim):
+        tile_m, row_in_tile = divmod(d, 64)
+        j = row_in_tile % 32
+        grp = row_in_tile // 32
+        tile_base = tile_m * 64 * seqlen_groups
+        for seq_group in range(seqlen_groups):
+            offset = tile_base + (seq_group // 4) * 256 + j * 8 + grp * 4 + (seq_group % 4)
+            flat_out[:, :, offset] = logical_u8[:, :, d, seq_group]
+    swizzled_u8 = flat_out.view(batch_size, num_heads, head_dim, seqlen_groups).permute(0, 2, 1, 3).contiguous()
+    return swizzled_u8.flatten().view(torch.float8_e4m3fn).view_as(scale)
 
 
 def _dequantize_fp4_vt(packed_vt: torch.Tensor, scale_vt: torch.Tensor, sf_vec_size: int) -> torch.Tensor:
@@ -603,6 +680,202 @@ def test_fp4_compile_cache_separates_pv_loader_modes(monkeypatch):
 
     assert len(compile_calls) == 2
     assert len(_flash_attn_fwd.compile_cache) == 2
+
+
+def test_fp4_pv_cta_quant_reference_warp_reduce_matches_full_block_amax():
+    values = torch.tensor(
+        [
+            1.0, 5.0, 3.0, 7.0, 2.0, 4.0, 6.0, 8.0,
+            9.0, 12.0, 10.0, 11.0, 13.0, 15.0, 14.0, 16.0,
+            17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0,
+        ],
+        dtype=torch.float32,
+    )
+    rows = torch.tensor(
+        [0] * 8 + [1] * 8 + list(range(16, 32)),
+        dtype=torch.int64,
+    )
+    cols = torch.zeros(32, dtype=torch.int64)
+
+    legacy = _fp4_pv_partner_reduce(values, rows, cols)
+    cta = _fp4_pv_full_warp_reduce(values, rows, cols)
+
+    assert torch.equal(cta[:8], torch.full((8,), 8.0))
+    assert torch.equal(cta[8:16], torch.full((8,), 16.0))
+    assert torch.equal(cta[16:], values[16:])
+    assert not torch.equal(legacy[:8], cta[:8])
+    assert not torch.equal(legacy[8:16], cta[8:16])
+
+
+def test_fp4_pv_cta_quant_reference_masked_slot_reduce_matches_exact_amax():
+    values = torch.tensor(
+        [
+            1.0,
+            -torch.inf,
+            3.0,
+            7.0,
+            2.0,
+            9.0,
+            4.0,
+            5.0,
+            8.0,
+            10.0,
+            11.0,
+            12.0,
+            13.0,
+            14.0,
+            15.0,
+            16.0,
+            17.0,
+            18.0,
+            19.0,
+            20.0,
+            21.0,
+            22.0,
+            23.0,
+            24.0,
+            25.0,
+            26.0,
+            27.0,
+            28.0,
+            29.0,
+            30.0,
+            31.0,
+            32.0,
+        ],
+        dtype=torch.float32,
+    )
+    slot_ids = torch.arange(32, dtype=torch.int64)
+    slot_ids[[0, 3, 5]] = 0
+    slot_ids[[1, 6]] = 1
+    rows = slot_ids.clone()
+    cols = torch.zeros_like(slot_ids)
+
+    widened = _fp4_pv_full_warp_reduce(values, rows, cols)
+    exact = _fp4_pv_exact_slot_reduce(values, slot_ids)
+
+    assert torch.equal(exact[[0, 3, 5]], torch.full((3,), 9.0))
+    assert torch.equal(exact[[1, 6]], torch.full((2,), 4.0))
+    assert not torch.equal(widened[[0, 3, 5]], exact[[0, 3, 5]])
+    assert not torch.equal(widened[[1, 6]], exact[[1, 6]])
+
+
+def test_fp4_pv_cta_quant_reference_storage_slot_key_avoids_coarse_alias():
+    values = torch.tensor([1.0, 9.0, 4.0, 7.0], dtype=torch.float32)
+    coarse_slot_ids = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+    storage_slot_ids = torch.tensor([100, 100, 200, 200], dtype=torch.int64)
+
+    coarse = _fp4_pv_exact_slot_reduce(values, coarse_slot_ids)
+    exact = _fp4_pv_exact_slot_reduce(values, storage_slot_ids)
+
+    assert torch.equal(coarse, torch.full((4,), 9.0))
+    assert torch.equal(exact[:2], torch.full((2,), 9.0))
+    assert torch.equal(exact[2:], torch.full((2,), 7.0))
+
+
+def test_fp4_pv_direct_loader_byte_repack_matches_logical_vt_values():
+    batch_size, num_heads, head_dim, seqlen = 1, 2, 64, 128
+    logical_codes = torch.arange(batch_size * num_heads * head_dim * seqlen, dtype=torch.uint8)
+    logical_codes = (logical_codes % 16).view(batch_size, num_heads, head_dim, seqlen)
+    packed_vt = ((logical_codes[..., 1::2] << 4) | logical_codes[..., 0::2]).contiguous()
+
+    staged = _stage_fp4_vt_public_bytes_for_pv(packed_vt)
+    expected = _unpack_fp4(packed_vt).permute(0, 1, 3, 2).contiguous()
+    staged_values = _unpack_fp4(staged)
+
+    assert torch.equal(staged_values, expected)
+
+
+def test_fp4_pv_public_vt_scale_unswizzle_roundtrips():
+    logical = torch.linspace(
+        0.25,
+        8.0,
+        steps=1 * 2 * 64 * 8,
+        dtype=torch.float32,
+    ).reshape(1, 2, 64, 8).to(torch.float8_e4m3fn)
+    swizzled = _swizzle_fp4_vt_scale(logical)
+    roundtrip = _unswizzle_fp4_vt_scale(swizzled)
+
+    assert torch.equal(roundtrip.view(torch.uint8), logical.view(torch.uint8))
+
+
+def test_fp4_compile_cache_separates_pv_legacy_and_cta_quant(monkeypatch):
+    compile_calls = _install_fake_cuda_runtime(monkeypatch)
+
+    with FakeTensorMode():
+        q, k, v_packed, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            head_dim_v=64,
+        )
+        monkeypatch.delenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", raising=False)
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+        monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "1")
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert len(compile_calls) == 2
+    assert len(_flash_attn_fwd.compile_cache) == 2
+
+
+def test_fp4_pv_cta_quant_direct_loader_dispatches_cta_quantizer(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "1")
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "1")
+    kernel_state = {}
+    real_kernel_cls = _flash_attn_fwd.__globals__["FP4FlashAttentionForwardSm100"]
+
+    def wrapped_kernel(*args, **kwargs):
+        kernel = real_kernel_cls(*args, **kwargs)
+        kernel_state["fp4_pv_direct_loader"] = kernel.fp4_pv_direct_loader
+        kernel_state["fp4_pv_cta_quant"] = kernel.fp4_pv_cta_quant
+        return kernel
+
+    monkeypatch.setitem(_flash_attn_fwd.__globals__, "FP4FlashAttentionForwardSm100", wrapped_kernel)
+
+    with FakeTensorMode():
+        q, k, v_packed, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            head_dim_v=64,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert kernel_state["fp4_pv_direct_loader"] is True
+    assert kernel_state["fp4_pv_cta_quant"] is True
 
 
 def test_fp4_d128_noncausal_uses_2cta_schedule(monkeypatch):
@@ -1115,6 +1388,27 @@ def test_fp4_bwd_qk_validation_errors(monkeypatch, kwargs, expected_error):
     assert "called" not in captured
 
 
+def test_tk_nvfp4_transpose_scale_adapter_unswizzles_exactly():
+    batch_size, head_dim, num_heads, seqlen_groups = 2, 64, 3, 8
+    logical = torch.linspace(
+        0.25,
+        8.0,
+        steps=batch_size * head_dim * num_heads * seqlen_groups,
+        device="cpu",
+        dtype=torch.float32,
+    ).reshape(batch_size, head_dim, num_heads, seqlen_groups).to(torch.float8_e4m3fn)
+    swizzled = _swizzle_tk_nvfp4_transpose_scale(logical)
+    unswizzled = _unswizzle_tk_nvfp4_transpose_scale_bytes(swizzled)
+    assert torch.equal(unswizzled.view(torch.uint8), logical.view(torch.uint8))
+
+    adapted = _adapt_tk_nvfp4_transpose_scale(
+        swizzled,
+        torch.ones(batch_size, num_heads, dtype=torch.float32),
+        logical,
+    )
+    assert torch.equal(adapted.view(torch.uint8), logical.view(torch.uint8))
+
+
 def test_fp4_bwd_qk_dequantizes_rowwise_inputs_before_dispatch(monkeypatch):
     captured = {}
 
@@ -1193,7 +1487,7 @@ def test_fp4_bwd_qk_dequantizes_rowwise_inputs_before_dispatch(monkeypatch):
     assert "k_col_packed_fp4" not in captured["kwargs"]
 
 
-def test_fp4_bwd_qk_native_uses_external_packed_with_synthesized_scales(monkeypatch):
+def test_fp4_bwd_qk_native_uses_adapted_tk_scales_by_default(monkeypatch):
     captured = {}
 
     def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
@@ -1215,8 +1509,8 @@ def test_fp4_bwd_qk_native_uses_external_packed_with_synthesized_scales(monkeypa
         head_dim=64,
         num_heads=2,
         batch_size=1,
-        seqlen_q=4,
-        seqlen_k=4,
+        seqlen_q=64,
+        seqlen_k=64,
         device="cpu",
     )
     q.fill_(0x22)
@@ -1225,14 +1519,16 @@ def test_fp4_bwd_qk_native_uses_external_packed_with_synthesized_scales(monkeypa
     k_scale.fill_(1.0)
     q_col.fill_(0x22)
     k_col.fill_(0x44)
-    q_col_scale.fill_(1.0)
-    k_col_scale.fill_(1.0)
     q_sg.fill_(2.0)
     k_sg.fill_(0.5)
     v.zero_()
     out.zero_()
     dout.zero_()
     lse.zero_()
+    logical_q_col_scale = torch.full_like(q_col_scale, 0.34375)
+    logical_k_col_scale = torch.full_like(k_col_scale, 0.171875)
+    q_col_scale.copy_(_swizzle_tk_nvfp4_transpose_scale(torch.full_like(q_col_scale, 0.171875)))
+    k_col_scale.copy_(_swizzle_tk_nvfp4_transpose_scale(torch.full_like(k_col_scale, 0.34375)))
 
     dq, dk, dv = _flash_attn_bwd_fp4_qk(
         q,
@@ -1251,13 +1547,76 @@ def test_fp4_bwd_qk_native_uses_external_packed_with_synthesized_scales(monkeypa
         k_col_scale=k_col_scale,
     )
 
-    assert dq.shape == (1, 4, 2, 64)
-    assert dk.shape == (1, 4, 2, 64)
-    assert dv.shape == (1, 4, 2, 64)
+    assert dq.shape == (1, 64, 2, 64)
+    assert dk.shape == (1, 64, 2, 64)
+    assert dv.shape == (1, 64, 2, 64)
     assert captured["kwargs"]["q_col_packed_fp4"] is q_col
     assert captured["kwargs"]["k_col_packed_fp4"] is k_col
-    assert captured["kwargs"]["q_col_scale_fp4"].shape == (1, 64, 2, 1)
-    assert captured["kwargs"]["k_col_scale_fp4"].shape == (1, 64, 2, 1)
+    torch.testing.assert_close(captured["kwargs"]["q_col_scale_fp4"].float(), logical_q_col_scale.float())
+    torch.testing.assert_close(captured["kwargs"]["k_col_scale_fp4"].float(), logical_k_col_scale.float())
+    torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
+    torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
+
+
+def test_fp4_bwd_qk_native_can_force_synthesized_tk_scales(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_FORCE_SYNTH_COL_SCALE", "1")
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=64,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=64,
+        seqlen_k=64,
+        device="cpu",
+    )
+    q.fill_(0x22)
+    k.fill_(0x44)
+    q_scale.fill_(1.0)
+    k_scale.fill_(1.0)
+    q_col.fill_(0x22)
+    k_col.fill_(0x44)
+    q_col_scale.fill_(7.0)
+    k_col_scale.fill_(7.0)
+    q_sg.fill_(2.0)
+    k_sg.fill_(0.5)
+    v.zero_()
+    out.zero_()
+    dout.zero_()
+    lse.zero_()
+
+    _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+    )
+
+    torch.testing.assert_close(captured["kwargs"]["q_col_scale_fp4"].float(), torch.full_like(q_col_scale, 0.34375).float())
+    torch.testing.assert_close(captured["kwargs"]["k_col_scale_fp4"].float(), torch.full_like(k_col_scale, 0.171875).float())
     torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
     torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
 
@@ -1478,7 +1837,7 @@ def _run_fp4_bwd_native_runtime_case(*, timeout_s: int = 180) -> None:
             )
 
 
-def _run_fp4_bwd_native_mixed_metadata_runtime_case(*, timeout_s: int = 180) -> None:
+def _run_fp4_bwd_native_tk_scale_adapter_runtime_case(*, timeout_s: int = 180) -> None:
     script = textwrap.dedent(
         """
         import math
@@ -1490,7 +1849,7 @@ def _run_fp4_bwd_native_mixed_metadata_runtime_case(*, timeout_s: int = 180) -> 
         sys.path.insert(0, "/workspace/codebases/fp4_matmul/TK_quantisation/nvfp4_v5")
 
         import _tk_quant_v5 as tk
-        from flash_attn.cute.interface import _flash_attn_bwd, _dequantize_nvfp4_rowwise, _quantize_nvfp4_transpose_from_bf16
+        from flash_attn.cute.interface import _flash_attn_bwd_fp4_qk
 
         torch.manual_seed(0)
         device = "cuda"
@@ -1534,69 +1893,66 @@ def _run_fp4_bwd_native_mixed_metadata_runtime_case(*, timeout_s: int = 180) -> 
                 q_sg[b, h] = qamax.item() / 2688.0
                 k_sg[b, h] = kamax.item() / 2688.0
 
-        q = _dequantize_nvfp4_rowwise(q_packed, q_scale, 16, q_sg).to(torch.bfloat16)
-        k = _dequantize_nvfp4_rowwise(k_packed, k_scale, 16, k_sg).to(torch.bfloat16)
-        synth_q_col_packed, synth_q_col_scale = _quantize_nvfp4_transpose_from_bf16(q)
-        synth_k_col_packed, synth_k_col_scale = _quantize_nvfp4_transpose_from_bf16(k)
-
         for key in list(os.environ):
             if key.startswith("FLASH_ATTN_FP4_BWD_"):
                 os.environ.pop(key, None)
         os.environ["FLASH_ATTN_FP4_BWD_ENABLE_NATIVE"] = "1"
-
-        dq_ref, dk_ref, dv_ref = _flash_attn_bwd(
-            q,
-            k,
+        dq_adapt, dk_adapt, dv_adapt = _flash_attn_bwd_fp4_qk(
+            q_packed,
+            k_packed,
             v,
             out,
             dout,
             lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
             softmax_scale=softmax_scale,
-            dq_scale_tensor=torch.ones_like(k_sg),
-            dk_scale_tensor=torch.ones_like(q_sg),
-            q_col_packed_fp4=synth_q_col_packed,
-            k_col_packed_fp4=synth_k_col_packed,
-            q_col_scale_fp4=synth_q_col_scale,
-            k_col_scale_fp4=synth_k_col_scale,
-            fp4_bwd_qk_format="nvfp4",
+            q_col_packed=q_col_packed,
+            k_col_packed=k_col_packed,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
         )
-        dq_mix, dk_mix, dv_mix = _flash_attn_bwd(
-            q,
-            k,
+        os.environ["FLASH_ATTN_FP4_BWD_FORCE_SYNTH_COL_SCALE"] = "1"
+        dq_synth, dk_synth, dv_synth = _flash_attn_bwd_fp4_qk(
+            q_packed,
+            k_packed,
             v,
             out,
             dout,
             lse,
+            q_scale,
+            k_scale,
+            q_sg,
+            k_sg,
             softmax_scale=softmax_scale,
-            dq_scale_tensor=torch.ones_like(k_sg),
-            dk_scale_tensor=torch.ones_like(q_sg),
-            q_col_packed_fp4=q_col_packed,
-            k_col_packed_fp4=k_col_packed,
-            q_col_scale_fp4=synth_q_col_scale,
-            k_col_scale_fp4=synth_k_col_scale,
-            fp4_bwd_qk_format="nvfp4",
+            q_col_packed=q_col_packed,
+            k_col_packed=k_col_packed,
+            q_col_scale=q_col_scale,
+            k_col_scale=k_col_scale,
         )
 
-        ref_cpu = {
-            "dq": dq_ref.float().cpu(),
-            "dk": dk_ref.float().cpu(),
-            "dv": dv_ref.float().cpu(),
+        adapt_cpu = {
+            "dq": dq_adapt.float().cpu(),
+            "dk": dk_adapt.float().cpu(),
+            "dv": dv_adapt.float().cpu(),
         }
-        mix_cpu = {
-            "dq": dq_mix.float().cpu(),
-            "dk": dk_mix.float().cpu(),
-            "dv": dv_mix.float().cpu(),
+        synth_cpu = {
+            "dq": dq_synth.float().cpu(),
+            "dk": dk_synth.float().cpu(),
+            "dv": dv_synth.float().cpu(),
         }
 
         for name in ("dq", "dk", "dv"):
-            if not torch.isfinite(ref_cpu[name]).all().item():
-                raise AssertionError(f"Reference {name} contains NaN or Inf.")
-            if not torch.isfinite(mix_cpu[name]).all().item():
-                raise AssertionError(f"Mixed-metadata {name} contains NaN or Inf.")
+            if not torch.isfinite(adapt_cpu[name]).all().item():
+                raise AssertionError(f"Adapted {name} contains NaN or Inf.")
+            if not torch.isfinite(synth_cpu[name]).all().item():
+                raise AssertionError(f"Synthesized fallback {name} contains NaN or Inf.")
 
-        dq_mean_abs = (mix_cpu["dq"] - ref_cpu["dq"]).abs().mean().item()
-        dk_mean_abs = (mix_cpu["dk"] - ref_cpu["dk"]).abs().mean().item()
-        dv_max_abs = (mix_cpu["dv"] - ref_cpu["dv"]).abs().max().item()
+        dq_mean_abs = (adapt_cpu["dq"] - synth_cpu["dq"]).abs().mean().item()
+        dk_mean_abs = (adapt_cpu["dk"] - synth_cpu["dk"]).abs().mean().item()
+        dv_max_abs = (adapt_cpu["dv"] - synth_cpu["dv"]).abs().max().item()
         if dq_mean_abs > 0.02:
             raise AssertionError(f"dQ mean_abs {dq_mean_abs} exceeded 0.02")
         if dk_mean_abs > 0.06:
@@ -1617,10 +1973,10 @@ def _run_fp4_bwd_native_mixed_metadata_runtime_case(*, timeout_s: int = 180) -> 
             check=False,
         )
     except subprocess.TimeoutExpired:
-        pytest.fail(f"FP4 native mixed-metadata backward smoke test timed out after {timeout_s}s.")
+        pytest.fail(f"FP4 native TK-scale adapter backward smoke test timed out after {timeout_s}s.")
     if result.returncode != 0:
         pytest.fail(
-            "FP4 native mixed-metadata backward smoke test failed.\n"
+            "FP4 native TK-scale adapter backward smoke test failed.\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
@@ -1687,7 +2043,7 @@ def _run_fp4_runtime_case(
             logical_scale_vt = _unswizzle_fp4_vt_scale(scale_vt)
             values = values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
             values = values * logical_scale_vt.to(torch.float32).unsqueeze(-1)
-            return values.flatten(start_dim=2, end_dim=3).permute(0, 3, 1, 2).contiguous()
+            return values.flatten(start_dim=3, end_dim=4).permute(0, 3, 1, 2).contiguous()
 
         torch.manual_seed(0)
         batch_size = 2
@@ -1833,16 +2189,298 @@ def _run_fp4_pv_probe(script: str, *, direct_loader: bool, timeout_s: int = 180)
         )
 
 
+def _run_fp4_pv_cta_quant_compare_case(
+    *,
+    head_dim: int = 64,
+    causal: bool = False,
+    direct_loader: bool = False,
+    seeds: tuple[int, ...] = (0,),
+    atol: float = 2e-1,
+    rtol: float = 5e-2,
+    timeout_s: int = 180,
+) -> None:
+    extra_env = {"FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1"} if direct_loader else {}
+    seeds_literal = ", ".join(str(seed) for seed in seeds)
+    script = textwrap.dedent(
+        f"""
+        import os
+        import torch
+        from flash_attn.cute.interface import _flash_attn_fwd
+
+        FP4_GRID = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
+
+        for seed in ({seeds_literal},):
+            torch.manual_seed(seed)
+            batch_size, seqlen_q, seqlen_k, num_heads = 1, 128, 128, 4
+            seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
+            head_dim = {head_dim}
+            scale_value = 0.125
+
+            q_packed = torch.randint(0, 256, (batch_size, seqlen_q, num_heads, head_dim // 2), device="cuda", dtype=torch.uint8)
+            k_packed = torch.randint(0, 256, (batch_size, seqlen_k, num_heads, head_dim // 2), device="cuda", dtype=torch.uint8)
+            v_packed = torch.randint(0, 256, (batch_size, num_heads, head_dim, seqlen_k_padded // 2), device="cuda", dtype=torch.uint8)
+            q_scale = torch.full((batch_size, seqlen_q, num_heads, head_dim // 16), scale_value, device="cuda", dtype=torch.float8_e4m3fn)
+            k_scale = torch.full((batch_size, seqlen_k, num_heads, head_dim // 16), scale_value, device="cuda", dtype=torch.float8_e4m3fn)
+            v_scale = torch.full((batch_size, num_heads, head_dim, seqlen_k_padded // 16), scale_value, device="cuda", dtype=torch.float8_e4m3fn)
+            v_scale = _swizzle_fp4_vt_scale(v_scale)
+
+            os.environ.pop("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", None)
+            out_legacy, lse_legacy = _flash_attn_fwd(
+                q_packed,
+                k_packed,
+                v_packed,
+                causal={causal},
+                return_lse=True,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+            os.environ["FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE"] = "1"
+            out_cta, lse_cta = _flash_attn_fwd(
+                q_packed,
+                k_packed,
+                v_packed,
+                causal={causal},
+                return_lse=True,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+            torch.cuda.synchronize()
+
+            if not torch.isfinite(out_cta.float()).all().item():
+                raise AssertionError(f"seed={{seed}}: CTA FP4 PV output contains NaN or Inf.")
+            if not torch.isfinite(lse_cta.float()).all().item():
+                raise AssertionError(f"seed={{seed}}: CTA FP4 PV LSE contains NaN or Inf.")
+
+            try:
+                torch.testing.assert_close(out_cta.float(), out_legacy.float(), atol={atol}, rtol={rtol})
+                torch.testing.assert_close(lse_cta.float(), lse_legacy.float(), atol={atol}, rtol={rtol})
+            except AssertionError as exc:
+                raise AssertionError(f"seed={{seed}}: {{exc}}") from exc
+        print("cta-legacy-ok")
+        """
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/workspace/codebases/fp4_matmul/flash-attention",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env={**os.environ, **extra_env},
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        loader_mode = "direct" if direct_loader else "legacy"
+        pytest.fail(f"FP4 PV CTA quant compare timed out after {timeout_s}s for {loader_mode} loader.")
+    if result.returncode != 0:
+        loader_mode = "direct" if direct_loader else "legacy"
+        pytest.fail(
+            f"FP4 PV CTA quant compare failed for {loader_mode} loader.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
+def _run_fp4_pv_causal_oracle_case(
+    *,
+    head_dim: int,
+    direct_loader: bool = False,
+    timeout_s: int = 180,
+    expect_close: bool = True,
+    atol: float = 2e-1,
+    rtol: float = 5e-2,
+) -> None:
+    extra_env = {
+        "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1",
+        **({"FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1"} if direct_loader else {}),
+    }
+    script = textwrap.dedent(
+        f"""
+        import torch
+        from flash_attn.cute.interface import _flash_attn_fwd
+
+        FP4_GRID = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+        def _unpack_fp4(packed):
+            packed_i32 = packed.to(torch.int32)
+            return torch.stack((packed_i32 & 0xF, (packed_i32 >> 4) & 0xF), dim=-1).flatten(start_dim=-2)
+
+        def _dequantize_fp4(packed, scale, sf_vec_size):
+            values = FP4_GRID[_unpack_fp4(packed).long()]
+            return (
+                values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+                * scale.to(torch.float32).unsqueeze(-1)
+            ).flatten(start_dim=-2)
+
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
+
+        def _unswizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.view(batch_size, num_heads, -1)
+            logical = out.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    logical[:, :, d, seq_group] = flat_in[:, :, offset]
+            return out
+
+        def _dequantize_fp4_vt(packed_vt, scale_vt, sf_vec_size):
+            values = FP4_GRID[_unpack_fp4(packed_vt).long()]
+            logical_scale_vt = _unswizzle_fp4_vt_scale(scale_vt)
+            values = values.unflatten(dim=-1, sizes=(-1, sf_vec_size))
+            values = values * logical_scale_vt.to(torch.float32).unsqueeze(-1)
+            return values.flatten(start_dim=3, end_dim=4).permute(0, 3, 1, 2).contiguous()
+
+        torch.manual_seed(0)
+        batch_size, seqlen_q, seqlen_k, num_heads = 1, 128, 128, 4
+        head_dim = {head_dim}
+        seqlen_k_padded = 128
+        scale_value = 0.125
+
+        q_packed = torch.zeros((batch_size, seqlen_q, num_heads, head_dim // 2), device="cuda", dtype=torch.uint8)
+        k_packed = torch.zeros((batch_size, seqlen_k, num_heads, head_dim // 2), device="cuda", dtype=torch.uint8)
+        v_packed = torch.randint(
+            0, 256, (batch_size, num_heads, head_dim, seqlen_k_padded // 2), device="cuda", dtype=torch.uint8
+        )
+        q_scale = torch.ones((batch_size, seqlen_q, num_heads, head_dim // 16), device="cuda", dtype=torch.float8_e4m3fn)
+        k_scale = torch.ones((batch_size, seqlen_k, num_heads, head_dim // 16), device="cuda", dtype=torch.float8_e4m3fn)
+        v_scale = torch.full(
+            (batch_size, num_heads, head_dim, seqlen_k_padded // 16),
+            scale_value,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        v_scale = _swizzle_fp4_vt_scale(v_scale)
+
+        q_ref = _dequantize_fp4(q_packed, q_scale, 16).to(torch.bfloat16)
+        k_ref = _dequantize_fp4(k_packed, k_scale, 16).to(torch.bfloat16)
+        v_ref = _dequantize_fp4_vt(v_packed, v_scale, 16)[:, :seqlen_k].to(torch.bfloat16)
+
+        out_fp4, lse_fp4 = _flash_attn_fwd(
+            q_packed,
+            k_packed,
+            v_packed,
+            causal=True,
+            return_lse=True,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+        out_ref, lse_ref = _flash_attn_fwd(
+            q_ref,
+            k_ref,
+            v_ref,
+            causal=True,
+            return_lse=True,
+        )
+        torch.cuda.synchronize()
+
+        if not torch.isfinite(out_fp4.float()).all().item():
+            raise AssertionError("FP4 PV causal oracle output contains NaN or Inf.")
+        if not torch.isfinite(lse_fp4.float()).all().item():
+            raise AssertionError("FP4 PV causal oracle LSE contains NaN or Inf.")
+
+        if {expect_close}:
+            torch.testing.assert_close(out_fp4.float(), out_ref.float(), atol={atol}, rtol={rtol})
+            torch.testing.assert_close(lse_fp4.float(), lse_ref.float(), atol={atol}, rtol={rtol})
+        else:
+            diff_out = (out_fp4.float() - out_ref.float()).abs().max().item()
+            diff_lse = (lse_fp4.float() - lse_ref.float()).abs().max().item()
+            print(f"informational_diff_out={{diff_out}} informational_diff_lse={{diff_lse}}")
+        print("pv-causal-oracle-ok")
+        """
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd="/workspace/codebases/fp4_matmul/flash-attention",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env={**os.environ, **extra_env},
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        loader_mode = "direct" if direct_loader else "legacy"
+        pytest.fail(f"FP4 PV causal oracle timed out after {timeout_s}s for {loader_mode} loader.")
+    if result.returncode != 0:
+        loader_mode = "direct" if direct_loader else "legacy"
+        pytest.fail(
+            f"FP4 PV causal oracle failed for {loader_mode} loader.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+
 def test_fp4_bwd_qk_native_runtime_smoke():
     _require_sm100()
     _require_tk_quant_v5()
     _run_fp4_bwd_native_runtime_case()
 
 
-def test_fp4_bwd_qk_native_mixed_metadata_runtime_smoke():
+def test_fp4_bwd_qk_native_tk_scale_adapter_runtime_smoke():
     _require_sm100()
     _require_tk_quant_v5()
-    _run_fp4_bwd_native_mixed_metadata_runtime_case()
+    _run_fp4_bwd_native_tk_scale_adapter_runtime_case()
 
 
 @pytest.mark.parametrize(
@@ -1914,6 +2552,92 @@ def test_fp4_pv_runtime_matches_bf16_reference_masked_edge_causal():
         seqlen_k=128,
         use_fp4_pv=True,
     )
+
+
+def test_fp4_pv_cta_quant_runtime_matches_bf16_reference_masked_edge_causal():
+    _require_sm100()
+    _run_fp4_runtime_case(
+        4,
+        4,
+        head_dim=64,
+        causal=True,
+        seqlen_q=64,
+        seqlen_k=128,
+        use_fp4_pv=True,
+        extra_env={"FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1"},
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fp4_pv_cta_quant_pv_only_causal_oracle_matches_bf16_regular_loader(head_dim):
+    _require_sm100()
+    _run_fp4_pv_causal_oracle_case(
+        head_dim=head_dim,
+        direct_loader=False,
+        expect_close=True,
+        atol=2.5e-1,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fp4_pv_cta_quant_pv_only_causal_oracle_direct_loader_informational(head_dim):
+    _require_sm100()
+    _run_fp4_pv_causal_oracle_case(head_dim=head_dim, direct_loader=True, expect_close=False)
+
+
+def test_fp4_pv_cta_quant_runtime_matches_legacy_path():
+    _require_sm100()
+    _run_fp4_pv_cta_quant_compare_case(
+        head_dim=64,
+        causal=False,
+        direct_loader=False,
+    )
+
+
+def test_fp4_pv_cta_quant_direct_loader_runtime_matches_legacy_path():
+    _require_sm100()
+    _run_fp4_pv_cta_quant_compare_case(
+        head_dim=64,
+        causal=False,
+        direct_loader=True,
+    )
+
+
+def test_fp4_pv_cta_quant_benchmark_reports_causal_pv_modes():
+    _require_sm100()
+    result = _benchmark_case(
+        kind="mha",
+        seqlen=128,
+        head_dim=64,
+        causal=True,
+        batch_size=1,
+        scale_value=0.125,
+        warmup=1,
+        iters=1,
+        pv_modes=["legacy", "cta", "cta_direct"],
+        skip_qk_baseline_check=True,
+    )
+    assert result["pv_cta_status"] == "ok"
+    assert not result["pv_legacy_status"].startswith("error_")
+    assert not result["pv_cta_direct_status"].startswith("error_")
+    assert result["pv_cta_out_max"] <= result["pv_legacy_out_max"]
+
+
+def test_fp4_pv_cta_quant_benchmark_regular_d128_causal_is_ok():
+    _require_sm100()
+    result = _benchmark_case(
+        kind="mha",
+        seqlen=512,
+        head_dim=128,
+        causal=True,
+        batch_size=1,
+        scale_value=0.125,
+        warmup=1,
+        iters=1,
+        pv_modes=["legacy", "cta", "cta_direct"],
+        skip_qk_baseline_check=True,
+    )
+    assert result["pv_cta_status"] == "ok"
 
 
 @pytest.mark.parametrize("direct_loader", [False])

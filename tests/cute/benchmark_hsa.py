@@ -966,6 +966,7 @@ def run_case(case: BenchmarkCase):
             f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
             f" synth_max_packed_k={synthetic_summary['max_packed_k']}"
+            f" synth_max_direct_segments={synthetic_summary['max_direct_segments']}"
             f" synth_tiles={synthetic_summary['num_tiles']}"
             f" synth_qgroups={synthetic_summary['forward_qgroups']}"
             f" synth_avg_q_rows={synthetic_summary['avg_q_rows']:.1f}"
@@ -981,6 +982,15 @@ def run_case(case: BenchmarkCase):
             f" synth_fwd_avg_fill={synthetic_summary['forward_avg_fill']:.4f}"
             f" synth_fwd_fill_p50={synthetic_summary['forward_fill_p50']:.4f}"
             f" synth_fwd_fill_p90={synthetic_summary['forward_fill_p90']:.4f}"
+            f" synth_fwd_avg_direct_segments={synthetic_summary['forward_avg_direct_segments']:.2f}"
+            f" synth_fwd_avg_segment_k={synthetic_summary['forward_avg_segment_k_length']:.2f}"
+            f" synth_fwd_avg_segment_fill={synthetic_summary['forward_avg_segment_fill']:.4f}"
+            f" synth_fwd_segment_fill_p50={synthetic_summary['forward_segment_fill_p50']:.4f}"
+            f" synth_fwd_segment_fill_p90={synthetic_summary['forward_segment_fill_p90']:.4f}"
+            f" synth_fwd_avg_row_k={synthetic_summary['forward_avg_row_k']:.2f}"
+            f" synth_fwd_row_k_p50={synthetic_summary['forward_row_k_p50']:.2f}"
+            f" synth_fwd_row_k_p90={synthetic_summary['forward_row_k_p90']:.2f}"
+            f" synth_fwd_avg_union_k={synthetic_summary['forward_avg_union_k']:.2f}"
             f" synth_bwd_avg_fill={synthetic_summary['backward_avg_fill']:.4f}"
         )
     print(line)

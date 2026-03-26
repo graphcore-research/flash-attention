@@ -176,6 +176,7 @@ class HSASyntheticGridMetadata:
     bucket_allowed_pairs: Optional[torch.Tensor] = None
     bucket_fill: Optional[torch.Tensor] = None
     max_packed_k: Optional[int] = None
+    max_direct_segments: Optional[int] = None
     tile_fill: Optional[torch.Tensor] = None
     tile_q_length: Optional[torch.Tensor] = None
     tile_k_length: Optional[torch.Tensor] = None
@@ -239,6 +240,7 @@ class HSASyntheticGridMetadata:
             ),
             bucket_fill=None if self.bucket_fill is None else self.bucket_fill.to(device=device),
             max_packed_k=self.max_packed_k,
+            max_direct_segments=self.max_direct_segments,
             tile_q_length=None if self.tile_q_length is None else self.tile_q_length.to(device=device),
             tile_k_length=None if self.tile_k_length is None else self.tile_k_length.to(device=device),
             bucket_q_row_idx_row_ptr=(
@@ -3570,6 +3572,13 @@ def _get_hsa_synthetic_max_packed_k(logical_block_k: int) -> int:
     return max_packed_k
 
 
+def _get_hsa_synthetic_max_direct_segments() -> int:
+    max_direct_segments = int(os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "1"))
+    if max_direct_segments not in (1, 2, 3, 4):
+        raise ValueError("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS must be 1, 2, 3, or 4")
+    return max_direct_segments
+
+
 def _can_use_hsa_synthetic_grid_for_inputs(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> bool:
     return (
         _use_hsa_synthetic_grid()
@@ -3742,6 +3751,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
     split_entries: list[dict[str, object]] = []
     split_indices_by_qgroup: dict[int, list[int]] = {}
     max_blocks_per_split = max(1, max_packed_k // logical_block_k)
+    max_direct_segments = _get_hsa_synthetic_max_direct_segments()
     pack_k_bin = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PACKED_K_BIN", "0") == "1"
 
     def _bin_packed_k(packed_k_native: int) -> int:
@@ -4047,6 +4057,97 @@ def _build_hsa_forward_synthetic_grid_metadata(
             "dense": dense,
         }
 
+    def _build_qgroup_merged_entry(
+        qgroup_idx: int,
+        packed_q: int,
+        q_count: int,
+        split_ids: list[int],
+    ) -> dict[str, object]:
+        split_ids = sorted(split_ids, key=lambda idx: int(split_entries[idx]["slot"]))
+        merged_k_length = sum(int(split_entries[split_idx]["k_length"]) for split_idx in split_ids)
+        merged_words_per_row = (merged_k_length + 31) // 32
+        merged_mask_words = [0] * (packed_q * merged_words_per_row)
+        merged_padded_k_rows: list[int] = []
+        merged_allowed_pairs = 0
+        merged_dense = True
+        col_offset = 0
+
+        for split_idx in split_ids:
+            split_entry = split_entries[split_idx]
+            split_k_length = int(split_entry["k_length"])
+            split_mask_words = split_entry["mask_words"]
+            split_words_per_row = 0 if packed_q <= 0 else len(split_mask_words) // packed_q
+            merged_padded_k_rows.extend(int(row_idx) for row_idx in split_entry["padded_k_rows"][:split_k_length])
+            merged_dense = merged_dense and bool(split_entry["dense"])
+            for q_slot in range(packed_q):
+                row_base = q_slot * split_words_per_row
+                for word_idx in range(split_words_per_row):
+                    word = int(split_mask_words[row_base + word_idx]) & 0xFFFFFFFF
+                    while word:
+                        bit = word & -word
+                        bit_idx = bit.bit_length() - 1
+                        local_k = word_idx * 32 + bit_idx
+                        if local_k < split_k_length:
+                            global_k = col_offset + local_k
+                            merged_word_idx = global_k // 32
+                            merged_bit_idx = global_k % 32
+                            merged_mask_words[q_slot * merged_words_per_row + merged_word_idx] |= 1 << merged_bit_idx
+                            merged_allowed_pairs += 1
+                        word ^= bit
+            col_offset += split_k_length
+
+        merged_dense = merged_dense and merged_allowed_pairs == q_count * merged_k_length
+        return {
+            "qgroup_idx": qgroup_idx,
+            "split_ids": list(split_ids),
+            "k_length": merged_k_length,
+            "words_per_row": merged_words_per_row,
+            "mask_words": merged_mask_words,
+            "padded_k_rows": merged_padded_k_rows,
+            "allowed_pairs": merged_allowed_pairs,
+            "dense": merged_dense,
+            "split_fill": merged_allowed_pairs / max(packed_q * merged_k_length, 1),
+            "slot": min((int(split_entries[split_idx]["slot"]) for split_idx in split_ids), default=0),
+        }
+
+    def _merge_qgroup_split_groups(
+        qgroup_idx: int,
+        packed_q: int,
+        q_count: int,
+        split_groups: list[list[int]],
+    ) -> list[list[int]] | None:
+        if len(split_groups) <= max_direct_segments:
+            return [sorted(group, key=lambda idx: int(split_entries[idx]["slot"])) for group in split_groups]
+        working_groups = [list(group) for group in split_groups]
+        while len(working_groups) > max_direct_segments:
+            best_pair: tuple[int, int] | None = None
+            best_key: tuple[float, int, int, int] | None = None
+            for left_idx in range(len(working_groups)):
+                for right_idx in range(left_idx + 1, len(working_groups)):
+                    merged_ids = working_groups[left_idx] + working_groups[right_idx]
+                    merged_entry = _build_qgroup_merged_entry(qgroup_idx, packed_q, q_count, merged_ids)
+                    merged_k_length = int(merged_entry["k_length"])
+                    if merged_k_length > max_packed_k:
+                        continue
+                    min_slot = min(int(split_entries[split_idx]["slot"]) for split_idx in merged_ids)
+                    candidate_key = (
+                        float(merged_entry["split_fill"]),
+                        int(merged_entry["allowed_pairs"]),
+                        -merged_k_length,
+                        -min_slot,
+                    )
+                    if best_key is None or candidate_key > best_key:
+                        best_key = candidate_key
+                        best_pair = (left_idx, right_idx)
+            if best_pair is None:
+                return None
+            left_idx, right_idx = best_pair
+            merged_group = working_groups[left_idx] + working_groups[right_idx]
+            working_groups[left_idx] = sorted(merged_group, key=lambda idx: int(split_entries[idx]["slot"]))
+            del working_groups[right_idx]
+            working_groups.sort(key=lambda group: min(int(split_entries[split_idx]["slot"]) for split_idx in group))
+        return working_groups
+
     qgroup_bucket_map: dict[int, list[int]] = {}
     for qgroup_idx, packed_q in enumerate(qgroup_packed_q):
         qgroup_bucket_map.setdefault(packed_q, []).append(qgroup_idx)
@@ -4070,6 +4171,271 @@ def _build_hsa_forward_synthetic_grid_metadata(
             qgroup_bucket_q_row_idx.extend(q_rows)
             qgroup_bucket_q_row_idx.extend([-1] * (packed_q - len(q_rows)))
         qgroup_bucket_q_row_idx_row_ptr.append(len(qgroup_bucket_q_row_idx))
+
+    direct_execution_plan = None
+    if logical_block_q == 2 and logical_block_k == 2:
+        direct_bucket_row_ptr = [0]
+        direct_bucket_qgroup_bucket_idx: list[int] = []
+        direct_bucket_segment_slot: list[int] = []
+        direct_bucket_packed_q: list[int] = []
+        direct_bucket_packed_k: list[int] = []
+        direct_bucket_dense: list[bool] = []
+        direct_bucket_q_row_idx_row_ptr = [0]
+        direct_bucket_q_row_idx: list[int] = []
+        direct_bucket_k_row_idx_row_ptr = [0]
+        direct_bucket_k_row_idx: list[int] = []
+        direct_bucket_q_length: list[int] = []
+        direct_bucket_k_length: list[int] = []
+        direct_bucket_mask_word_row_ptr = [0]
+        direct_bucket_mask_words: list[int] = []
+        direct_bucket_words_per_row: list[int] = []
+        direct_bucket_allowed_pairs: list[int] = []
+        direct_bucket_fill: list[float] = []
+        direct_qgroup_num_segments = [0] * len(qgroup_length)
+        direct_qgroup_bucket_segment_row_ptr = [0]
+        direct_qgroup_bucket_segment_idx: list[int] = []
+        direct_qgroup_bucket_num_segments: list[int] = []
+        direct_available = True
+
+        for qgroup_bucket_id in range(len(qgroup_bucket_packed_q)):
+            qgroup_start = qgroup_bucket_row_ptr[qgroup_bucket_id]
+            qgroup_end = qgroup_bucket_row_ptr[qgroup_bucket_id + 1]
+            qgroup_ids = [int(qgroup_idx) for qgroup_idx in qgroup_bucket_idx[qgroup_start:qgroup_end]]
+            packed_q = int(qgroup_bucket_packed_q[qgroup_bucket_id])
+            qgroup_segments: dict[int, list[dict[str, object]]] = {}
+            bucket_num_segments = 0
+
+            for qgroup_idx in qgroup_ids:
+                q_count = int(qgroup_length[qgroup_idx])
+                split_ids = sorted(split_indices_by_qgroup.get(qgroup_idx, []), key=lambda idx: int(split_entries[idx]["slot"]))
+                split_groups = [[split_idx] for split_idx in split_ids]
+                merged_groups = _merge_qgroup_split_groups(qgroup_idx, packed_q, q_count, split_groups)
+                if merged_groups is None:
+                    direct_available = False
+                    break
+                merged_entries = [
+                    _build_qgroup_merged_entry(qgroup_idx, packed_q, q_count, merged_group)
+                    for merged_group in merged_groups
+                ]
+                qgroup_segments[qgroup_idx] = merged_entries
+                direct_qgroup_num_segments[qgroup_idx] = len(merged_entries)
+                bucket_num_segments = max(bucket_num_segments, len(merged_entries))
+            if not direct_available:
+                break
+
+            direct_qgroup_bucket_num_segments.append(bucket_num_segments)
+            for segment_slot in range(bucket_num_segments):
+                active_members = [
+                    (qgroup_idx, qgroup_segments[qgroup_idx][segment_slot])
+                    for qgroup_idx in qgroup_ids
+                    if segment_slot < len(qgroup_segments[qgroup_idx])
+                ]
+                bucket_size_value = len(active_members)
+                packed_k = max((int(entry["k_length"]) for _, entry in active_members), default=0)
+                if packed_k > max_packed_k:
+                    direct_available = False
+                    break
+                words_per_row = (packed_k + 31) // 32
+                bucket_dense = all(bool(entry["dense"]) for _, entry in active_members)
+                bucket_allowed_pairs_value = 0
+                bucket_idx = len(direct_bucket_packed_q)
+                direct_qgroup_bucket_segment_idx.append(bucket_idx)
+                direct_bucket_qgroup_bucket_idx.append(qgroup_bucket_id)
+                direct_bucket_segment_slot.append(segment_slot)
+                direct_bucket_packed_q.append(packed_q)
+                direct_bucket_packed_k.append(packed_k)
+                direct_bucket_dense.append(bucket_dense)
+                direct_bucket_row_ptr.append(direct_bucket_row_ptr[-1] + bucket_size_value)
+
+                for qgroup_idx, entry in active_members:
+                    qgroup_idx = int(qgroup_idx)
+                    q_count = int(qgroup_length[qgroup_idx])
+                    q_start_idx = qgroup_row_ptr[qgroup_idx]
+                    q_end_idx = qgroup_row_ptr[qgroup_idx + 1]
+                    q_rows = qgroup_rows[q_start_idx:q_end_idx]
+                    direct_bucket_q_row_idx.extend(q_rows)
+                    direct_bucket_q_row_idx.extend([-1] * (packed_q - len(q_rows)))
+                    k_length = int(entry["k_length"])
+                    direct_bucket_q_length.append(q_count)
+                    direct_bucket_k_length.append(k_length)
+                    bucket_allowed_pairs_value += int(entry["allowed_pairs"])
+                    direct_bucket_k_row_idx.extend(int(row_idx) for row_idx in entry["padded_k_rows"][:k_length])
+                    direct_bucket_k_row_idx.extend([-1] * (packed_k - k_length))
+                    if not bucket_dense:
+                        entry_words_per_row = int(entry["words_per_row"])
+                        entry_mask_words = entry["mask_words"]
+                        for q_slot in range(packed_q):
+                            row_base = q_slot * entry_words_per_row
+                            direct_bucket_mask_words.extend(
+                                _wrap_u32_to_i32(int(word))
+                                for word in entry_mask_words[row_base:row_base + entry_words_per_row]
+                            )
+                            direct_bucket_mask_words.extend([0] * (words_per_row - entry_words_per_row))
+
+                direct_bucket_q_row_idx_row_ptr.append(len(direct_bucket_q_row_idx))
+                direct_bucket_k_row_idx_row_ptr.append(len(direct_bucket_k_row_idx))
+                direct_bucket_mask_word_row_ptr.append(len(direct_bucket_mask_words))
+                direct_bucket_words_per_row.append(words_per_row)
+                direct_bucket_allowed_pairs.append(bucket_allowed_pairs_value)
+                direct_bucket_fill.append(
+                    bucket_allowed_pairs_value / max(bucket_size_value * packed_q * max(packed_k, 1), 1)
+                    if packed_k > 0
+                    else 0.0
+                )
+            if not direct_available:
+                break
+            direct_qgroup_bucket_segment_row_ptr.append(len(direct_qgroup_bucket_segment_idx))
+
+        if direct_available:
+            direct_bucket_count = len(direct_bucket_packed_q)
+            direct_bucket_q_row_range = [
+                (direct_bucket_q_row_idx_row_ptr[idx], direct_bucket_q_row_idx_row_ptr[idx + 1])
+                for idx in range(direct_bucket_count)
+            ]
+            direct_bucket_k_row_range = [
+                (direct_bucket_k_row_idx_row_ptr[idx], direct_bucket_k_row_idx_row_ptr[idx + 1])
+                for idx in range(direct_bucket_count)
+            ]
+            direct_bucket_data_range = [
+                (direct_bucket_row_ptr[idx], direct_bucket_row_ptr[idx + 1])
+                for idx in range(direct_bucket_count)
+            ]
+            direct_bucket_mask_word_range = [
+                (direct_bucket_mask_word_row_ptr[idx], direct_bucket_mask_word_row_ptr[idx + 1])
+                for idx in range(direct_bucket_count)
+            ]
+            row_compact_plan = None
+            row_compact_cap = 16
+            row_compact_available = max_direct_segments == 1
+            if row_compact_available:
+                row_bucket_row_k_range: list[tuple[int, int]] = []
+                row_bucket_row_k_to_union_range: list[tuple[int, int]] = []
+                row_bucket_row_k_length_range: list[tuple[int, int]] = []
+                row_bucket_row_k_cap: list[int] = []
+                row_bucket_row_k_row_idx: list[int] = []
+                row_bucket_row_k_to_union_idx: list[int] = []
+                row_bucket_row_k_length: list[int] = []
+                row_bucket_avg_row_k: list[float] = []
+                row_bucket_max_row_k: list[int] = []
+
+                for direct_bucket_idx in range(direct_bucket_count):
+                    bucket_size_value = direct_bucket_data_range[direct_bucket_idx][1] - direct_bucket_data_range[direct_bucket_idx][0]
+                    packed_q = int(direct_bucket_packed_q[direct_bucket_idx])
+                    packed_k = int(direct_bucket_packed_k[direct_bucket_idx])
+                    words_per_row = int(direct_bucket_words_per_row[direct_bucket_idx])
+                    q_length_start, q_length_end = direct_bucket_data_range[direct_bucket_idx]
+                    k_length_start, k_length_end = direct_bucket_data_range[direct_bucket_idx]
+                    q_lengths_bucket = direct_bucket_q_length[q_length_start:q_length_end]
+                    k_lengths_bucket = direct_bucket_k_length[k_length_start:k_length_end]
+                    k_row_start, _ = direct_bucket_k_row_range[direct_bucket_idx]
+                    mask_word_start, _ = direct_bucket_mask_word_range[direct_bucket_idx]
+                    dense_bucket = bool(direct_bucket_dense[direct_bucket_idx])
+
+                    per_bucket_rows: list[list[int]] = []
+                    per_bucket_to_union: list[list[int]] = []
+                    per_bucket_lengths: list[int] = []
+                    bucket_max_row_k = 0
+
+                    for member_idx in range(bucket_size_value):
+                        q_count = int(q_lengths_bucket[member_idx])
+                        k_length = int(k_lengths_bucket[member_idx])
+                        k_member_start = k_row_start + member_idx * packed_k
+                        k_rows_member = [int(row_idx) for row_idx in direct_bucket_k_row_idx[k_member_start:k_member_start + k_length]]
+                        mask_member_start = mask_word_start + member_idx * packed_q * words_per_row
+
+                        for q_slot in range(packed_q):
+                            row_k_rows: list[int] = []
+                            row_k_to_union: list[int] = []
+                            if q_slot < q_count:
+                                if dense_bucket:
+                                    row_k_rows = list(k_rows_member)
+                                    row_k_to_union = list(range(k_length))
+                                else:
+                                    row_word_start = mask_member_start + q_slot * words_per_row
+                                    for word_idx in range(words_per_row):
+                                        word = int(direct_bucket_mask_words[row_word_start + word_idx]) & 0xFFFFFFFF
+                                        while word:
+                                            bit = word & -word
+                                            bit_idx = bit.bit_length() - 1
+                                            local_k = word_idx * 32 + bit_idx
+                                            if local_k < k_length:
+                                                row_k_rows.append(k_rows_member[local_k])
+                                                row_k_to_union.append(local_k)
+                                            word ^= bit
+                            per_bucket_rows.append(row_k_rows)
+                            per_bucket_to_union.append(row_k_to_union)
+                            per_bucket_lengths.append(len(row_k_rows))
+                            bucket_max_row_k = max(bucket_max_row_k, len(row_k_rows))
+
+                    if bucket_max_row_k > row_compact_cap:
+                        row_compact_available = False
+                        break
+
+                    row_k_start = len(row_bucket_row_k_row_idx)
+                    row_k_to_union_start = len(row_bucket_row_k_to_union_idx)
+                    row_k_length_start = len(row_bucket_row_k_length)
+                    row_bucket_row_k_cap.append(bucket_max_row_k)
+                    row_bucket_avg_row_k.append(
+                        (sum(per_bucket_lengths) / len(per_bucket_lengths)) if per_bucket_lengths else 0.0
+                    )
+                    row_bucket_max_row_k.append(bucket_max_row_k)
+                    for row_k_rows, row_k_to_union in zip(per_bucket_rows, per_bucket_to_union):
+                        row_bucket_row_k_length.append(len(row_k_rows))
+                        row_bucket_row_k_row_idx.extend(row_k_rows)
+                        row_bucket_row_k_row_idx.extend([-1] * (bucket_max_row_k - len(row_k_rows)))
+                        row_bucket_row_k_to_union_idx.extend(row_k_to_union)
+                        row_bucket_row_k_to_union_idx.extend([-1] * (bucket_max_row_k - len(row_k_to_union)))
+                    row_bucket_row_k_range.append((row_k_start, len(row_bucket_row_k_row_idx)))
+                    row_bucket_row_k_to_union_range.append(
+                        (row_k_to_union_start, len(row_bucket_row_k_to_union_idx))
+                    )
+                    row_bucket_row_k_length_range.append((row_k_length_start, len(row_bucket_row_k_length)))
+
+                if row_compact_available:
+                    row_compact_plan = {
+                        "row_k_cap_limit": row_compact_cap,
+                        "bucket_row_k_cap": row_bucket_row_k_cap,
+                        "bucket_row_k_range": row_bucket_row_k_range,
+                        "bucket_row_k_to_union_range": row_bucket_row_k_to_union_range,
+                        "bucket_row_k_length_range": row_bucket_row_k_length_range,
+                        "bucket_avg_row_k": row_bucket_avg_row_k,
+                        "bucket_max_row_k": row_bucket_max_row_k,
+                        "bucket_row_k_row_idx": torch.tensor(row_bucket_row_k_row_idx, dtype=torch.int32, device=device),
+                        "bucket_row_k_to_union_idx": torch.tensor(
+                            row_bucket_row_k_to_union_idx, dtype=torch.int32, device=device
+                        ),
+                        "bucket_row_k_length": torch.tensor(row_bucket_row_k_length, dtype=torch.int32, device=device),
+                    }
+            direct_execution_plan = {
+                "max_direct_segments": max_direct_segments,
+                "qgroup_num_segments": direct_qgroup_num_segments,
+                "qgroup_bucket_num_segments": direct_qgroup_bucket_num_segments,
+                "qgroup_bucket_segment_range": [
+                    (direct_qgroup_bucket_segment_row_ptr[idx], direct_qgroup_bucket_segment_row_ptr[idx + 1])
+                    for idx in range(len(direct_qgroup_bucket_num_segments))
+                ],
+                "qgroup_bucket_segment_idx": direct_qgroup_bucket_segment_idx,
+                "bucket_qgroup_bucket_idx": direct_bucket_qgroup_bucket_idx,
+                "bucket_segment_slot": direct_bucket_segment_slot,
+                "bucket_size": [end - start for start, end in direct_bucket_data_range],
+                "bucket_packed_q": direct_bucket_packed_q,
+                "bucket_packed_k": direct_bucket_packed_k,
+                "bucket_dense": direct_bucket_dense,
+                "bucket_words_per_row": direct_bucket_words_per_row,
+                "bucket_q_row_range": direct_bucket_q_row_range,
+                "bucket_k_row_range": direct_bucket_k_row_range,
+                "bucket_q_length_range": direct_bucket_data_range,
+                "bucket_k_length_range": direct_bucket_data_range,
+                "bucket_mask_word_range": direct_bucket_mask_word_range,
+                "bucket_allowed_pairs": direct_bucket_allowed_pairs,
+                "bucket_fill": direct_bucket_fill,
+                "bucket_q_row_idx": torch.tensor(direct_bucket_q_row_idx, dtype=torch.int32, device=device),
+                "bucket_k_row_idx": torch.tensor(direct_bucket_k_row_idx, dtype=torch.int32, device=device),
+                "bucket_q_length": torch.tensor(direct_bucket_q_length, dtype=torch.int32, device=device),
+                "bucket_k_length": torch.tensor(direct_bucket_k_length, dtype=torch.int32, device=device),
+                "bucket_mask_words": torch.tensor(direct_bucket_mask_words, dtype=torch.int32, device=device),
+                "row_compact_plan": row_compact_plan,
+            }
 
     execution_bucket_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for split_idx, split_entry in enumerate(split_entries):
@@ -4287,6 +4653,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
         "bucket_mask_word_range": bucket_mask_word_range,
         "bucket_use_qgroup_q": bucket_use_qgroup_q,
         "bucket_scatter_only": bucket_scatter_only,
+        "direct_execution_plan": direct_execution_plan,
     }
 
     return HSASyntheticGridMetadata(
@@ -4319,6 +4686,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
         bucket_allowed_pairs=torch.tensor(bucket_allowed_pairs, dtype=torch.int32, device=device),
         bucket_fill=torch.tensor(bucket_fill, dtype=torch.float32, device=device),
         max_packed_k=max_packed_k,
+        max_direct_segments=max_direct_segments,
         tile_q_length=torch.tensor(tile_q_length, dtype=torch.int32, device=device),
         tile_k_length=torch.tensor(tile_k_length, dtype=torch.int32, device=device),
         bucket_q_row_idx_row_ptr=torch.tensor(bucket_q_row_idx_row_ptr, dtype=torch.int32, device=device),
@@ -4520,6 +4888,7 @@ def _ensure_hsa_synthetic_grid_metadata(
     forward_logical_block_q = _get_hsa_synthetic_logical_block_size("q")
     forward_logical_block_k = _get_hsa_synthetic_logical_block_size("k")
     forward_max_packed_k = _get_hsa_synthetic_max_packed_k(forward_logical_block_k)
+    forward_max_direct_segments = _get_hsa_synthetic_max_direct_segments()
     if runtime.backward_synthetic_grid is None:
         runtime.backward_synthetic_grid = _build_hsa_backward_synthetic_grid_metadata(schedule, runtime)
     needs_forward_rebuild = (
@@ -4527,6 +4896,7 @@ def _ensure_hsa_synthetic_grid_metadata(
         or runtime.forward_synthetic_grid.logical_block_q != forward_logical_block_q
         or runtime.forward_synthetic_grid.logical_block_k != forward_logical_block_k
         or runtime.forward_synthetic_grid.max_packed_k != forward_max_packed_k
+        or runtime.forward_synthetic_grid.max_direct_segments != forward_max_direct_segments
     )
     if needs_forward_rebuild:
         runtime.forward_synthetic_grid = _build_hsa_forward_synthetic_grid_metadata(

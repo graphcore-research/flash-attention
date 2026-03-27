@@ -82,6 +82,7 @@ LONG_CONTEXT_CASES = (
     BenchmarkCase(name="long-32k", batch_size=1, seqlen=32768, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
     BenchmarkCase(name="long-64k", batch_size=1, seqlen=65536, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
     BenchmarkCase(name="long-100k", batch_size=1, seqlen=100000, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-128k", batch_size=1, seqlen=131072, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
 )
 
 ALL_CASES = CANONICAL_CASES + LONG_CONTEXT_CASES
@@ -273,6 +274,38 @@ def _previous_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | Non
             "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS": "1",
             "FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD": "1",
             "FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE": "row_local",
+            "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
+        }
+    )
+    return env
+
+
+def _should_measure_sparse_mask_mixed_backward_baseline(case: BenchmarkCase) -> bool:
+    return (
+        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
+        and case.name != "sentence-only"
+        and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
+    )
+
+
+def _sparse_mask_mixed_backward_baseline_label() -> str:
+    return "direct_micro_fwd_sparse_mask_bwd"
+
+
+def _sparse_mask_mixed_backward_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_benchmark_env_for_case(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K": "128",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD": "0",
             "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA": "2",
             "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD": "2",
             "FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE": "row_local",
@@ -801,6 +834,8 @@ def _run_long_case(case: BenchmarkCase):
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     prev_synth_bwd_ms = None
     hsa_bwd_vs_prev = None
+    sparse_mask_mixed_bwd_ms = None
+    hsa_bwd_vs_sparse_mask_mixed = None
 
     hdt_in_repo_dense_bwd_ms = None
     hdt_in_repo_dense_status = "skipped_32k_plus"
@@ -846,6 +881,23 @@ def _run_long_case(case: BenchmarkCase):
             env_updates=prev_env_updates,
         )
         hsa_bwd_vs_prev = hsa_bwd_ms / prev_synth_bwd_ms if prev_synth_bwd_ms > 0 else float("inf")
+    if _should_measure_sparse_mask_mixed_backward_baseline(case):
+        sparse_mask_env_updates = _sparse_mask_mixed_backward_baseline_env(case)
+        sparse_mask_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=sparse_mask_env_updates
+        )
+        sparse_mask_mixed_bwd_ms = _measure_backward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        hsa_bwd_vs_sparse_mask_mixed = (
+            hsa_bwd_ms / sparse_mask_mixed_bwd_ms if sparse_mask_mixed_bwd_ms > 0 else float("inf")
+        )
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -874,6 +926,12 @@ def _run_long_case(case: BenchmarkCase):
             f" prev_synth_label={_previous_synthetic_baseline_label()}"
             f" prev_synth_bwd_ms={prev_synth_bwd_ms:.3f}"
             f" hsa_bwd_vs_prev={hsa_bwd_vs_prev:.2f}x"
+        )
+    if sparse_mask_mixed_bwd_ms is not None:
+        line += (
+            f" sparse_mask_mixed_bwd_label={_sparse_mask_mixed_backward_baseline_label()}"
+            f" sparse_mask_mixed_bwd_ms={sparse_mask_mixed_bwd_ms:.3f}"
+            f" hsa_bwd_vs_sparse_mask_mixed={hsa_bwd_vs_sparse_mask_mixed:.2f}x"
         )
     print(line)
 
@@ -960,6 +1018,10 @@ def run_case(case: BenchmarkCase):
     prev_synth_bwd_ms = None
     prev_synth_fwd_bwd_ms = None
     hsa_fwd_bwd_vs_prev = None
+    sparse_mask_mixed_fwd_ms = None
+    sparse_mask_mixed_bwd_ms = None
+    sparse_mask_mixed_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_sparse_mask_mixed = None
     if _should_measure_previous_synthetic_baseline(case):
         prev_env_updates = _previous_synthetic_baseline_env(case)
         prev_hsa_forward = lambda q, k, v: _run_sparse_attention(
@@ -993,6 +1055,41 @@ def run_case(case: BenchmarkCase):
             env_updates=prev_env_updates,
         )
         hsa_fwd_bwd_vs_prev = hsa_fwd_bwd_ms / prev_synth_fwd_bwd_ms if prev_synth_fwd_bwd_ms > 0 else float("inf")
+    if _should_measure_sparse_mask_mixed_backward_baseline(case):
+        sparse_mask_env_updates = _sparse_mask_mixed_backward_baseline_env(case)
+        sparse_mask_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=sparse_mask_env_updates
+        )
+        sparse_mask_mixed_fwd_ms = _measure_forward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        sparse_mask_mixed_bwd_ms = _measure_backward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        sparse_mask_mixed_fwd_bwd_ms = _measure_forward_backward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        hsa_fwd_bwd_vs_sparse_mask_mixed = (
+            hsa_fwd_bwd_ms / sparse_mask_mixed_fwd_bwd_ms if sparse_mask_mixed_fwd_bwd_ms > 0 else float("inf")
+        )
     hdt_in_repo_dense_fwd_ms = _measure_forward_ms(
         dense_ref_forward,
         q_data,
@@ -1057,6 +1154,18 @@ def run_case(case: BenchmarkCase):
             f" prev_synth_bwd_ms={prev_synth_bwd_ms:.3f}"
             f" prev_synth_fwd_bwd_ms={prev_synth_fwd_bwd_ms:.3f}"
             f" hsa_fwd_bwd_vs_prev={hsa_fwd_bwd_vs_prev:.2f}x"
+        )
+    if (
+        sparse_mask_mixed_fwd_bwd_ms is not None
+        and sparse_mask_mixed_bwd_ms is not None
+        and sparse_mask_mixed_fwd_ms is not None
+    ):
+        line += (
+            f" sparse_mask_mixed_bwd_label={_sparse_mask_mixed_backward_baseline_label()}"
+            f" sparse_mask_mixed_fwd_ms={sparse_mask_mixed_fwd_ms:.3f}"
+            f" sparse_mask_mixed_bwd_ms={sparse_mask_mixed_bwd_ms:.3f}"
+            f" sparse_mask_mixed_fwd_bwd_ms={sparse_mask_mixed_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_sparse_mask_mixed={hsa_fwd_bwd_vs_sparse_mask_mixed:.2f}x"
         )
     if synthetic_summary is not None:
         line += (

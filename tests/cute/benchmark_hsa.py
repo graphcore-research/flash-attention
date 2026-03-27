@@ -251,6 +251,37 @@ def _benchmark_sparse_bwd_config_label() -> str:
     return f"bwd_block_q={block_q} bwd_block_k={block_k} bwd_subtile_factor={subtile_factor}"
 
 
+def _should_measure_previous_synthetic_baseline(case: BenchmarkCase) -> bool:
+    return (
+        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
+        and case.name != "sentence-only"
+    )
+
+
+def _previous_synthetic_baseline_label() -> str:
+    return "direct_micro_row_local_baseline"
+
+
+def _previous_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_benchmark_env_for_case(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K": "128",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE": "row_local",
+            "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
+        }
+    )
+    return env
+
+
 def _is_long_context_case(case: BenchmarkCase) -> bool:
     return case.name in LONG_CONTEXT_CASE_NAMES
 
@@ -768,6 +799,8 @@ def _run_long_case(case: BenchmarkCase):
         case.benchmark_iters,
     )
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+    prev_synth_bwd_ms = None
+    hsa_bwd_vs_prev = None
 
     hdt_in_repo_dense_bwd_ms = None
     hdt_in_repo_dense_status = "skipped_32k_plus"
@@ -798,6 +831,21 @@ def _run_long_case(case: BenchmarkCase):
         hdt_vendor_bwd_ms = external_result.get("bwd_ms")
         if hdt_vendor_status == "measured" and isinstance(hdt_vendor_bwd_ms, (int, float)):
             hdt_vendor_ratio = hsa_bwd_ms / hdt_vendor_bwd_ms if hdt_vendor_bwd_ms > 0 else float("inf")
+    if _should_measure_previous_synthetic_baseline(case):
+        prev_env_updates = _previous_synthetic_baseline_env(case)
+        prev_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=prev_env_updates
+        )
+        prev_synth_bwd_ms = _measure_backward_ms(
+            prev_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=prev_env_updates,
+        )
+        hsa_bwd_vs_prev = hsa_bwd_ms / prev_synth_bwd_ms if prev_synth_bwd_ms > 0 else float("inf")
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -821,6 +869,12 @@ def _run_long_case(case: BenchmarkCase):
         line += f" hdt_vendor_bwd_ms={hdt_vendor_bwd_ms:.3f} hsa_bwd_vs_hdt_vendor={hdt_vendor_ratio:.2f}x"
     else:
         line += f" hdt_vendor_bwd_status={hdt_vendor_status}"
+    if prev_synth_bwd_ms is not None:
+        line += (
+            f" prev_synth_label={_previous_synthetic_baseline_label()}"
+            f" prev_synth_bwd_ms={prev_synth_bwd_ms:.3f}"
+            f" hsa_bwd_vs_prev={hsa_bwd_vs_prev:.2f}x"
+        )
     print(line)
 
 
@@ -902,6 +956,43 @@ def run_case(case: BenchmarkCase):
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
     hsa_fwd_bwd_vs_dense = hsa_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
+    prev_synth_fwd_ms = None
+    prev_synth_bwd_ms = None
+    prev_synth_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_prev = None
+    if _should_measure_previous_synthetic_baseline(case):
+        prev_env_updates = _previous_synthetic_baseline_env(case)
+        prev_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=prev_env_updates
+        )
+        prev_synth_fwd_ms = _measure_forward_ms(
+            prev_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=prev_env_updates,
+        )
+        prev_synth_bwd_ms = _measure_backward_ms(
+            prev_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=prev_env_updates,
+        )
+        prev_synth_fwd_bwd_ms = _measure_forward_backward_ms(
+            prev_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=prev_env_updates,
+        )
+        hsa_fwd_bwd_vs_prev = hsa_fwd_bwd_ms / prev_synth_fwd_bwd_ms if prev_synth_fwd_bwd_ms > 0 else float("inf")
     hdt_in_repo_dense_fwd_ms = _measure_forward_ms(
         dense_ref_forward,
         q_data,
@@ -959,6 +1050,14 @@ def run_case(case: BenchmarkCase):
             f" hdt_in_repo_dense_fwd_bwd_ms={hdt_in_repo_dense_fwd_bwd_ms:.3f}"
             f" hdt_vendor_status={hdt_vendor_status}"
         )
+    if prev_synth_fwd_bwd_ms is not None and prev_synth_bwd_ms is not None and prev_synth_fwd_ms is not None:
+        line += (
+            f" prev_synth_label={_previous_synthetic_baseline_label()}"
+            f" prev_synth_fwd_ms={prev_synth_fwd_ms:.3f}"
+            f" prev_synth_bwd_ms={prev_synth_bwd_ms:.3f}"
+            f" prev_synth_fwd_bwd_ms={prev_synth_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_prev={hsa_fwd_bwd_vs_prev:.2f}x"
+        )
     if synthetic_summary is not None:
         line += (
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
@@ -967,6 +1066,7 @@ def run_case(case: BenchmarkCase):
             f" synth_qgroups_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA', '2')}"
             f" synth_qgroups_per_cta_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD', '2')}"
             f" synth_row_bwd_accum_mode={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE', 'row_local')}"
+            f" synthetic_short_bwd_mode={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD', 'off')}"
             f" synth_logical_block={synthetic_summary['logical_block_q']}x{synthetic_summary['logical_block_k']}"
             f" synth_max_packed_k={synthetic_summary['max_packed_k']}"
             f" synth_max_direct_segments={synthetic_summary['max_direct_segments']}"

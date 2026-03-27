@@ -2105,6 +2105,34 @@ def test_hsa_synthetic_micro_backward_selector_honors_accum_mode(monkeypatch):
     assert calls == ["union_local"]
 
 
+def test_hsa_synthetic_micro_backward_selector_honors_short_mode(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _short(*args, **kwargs):
+        calls.append("short")
+
+    def _row_local(*args, **kwargs):
+        calls.append("row_local")
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_short", _short)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_row_local", _row_local)
+
+    t = torch.empty(1)
+    args = (t,) * 17
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "row_local")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD", "on")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["short"]
+
+    calls.clear()
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD", "off")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["row_local"]
+
+
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module

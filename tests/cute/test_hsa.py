@@ -2095,6 +2095,7 @@ def test_hsa_synthetic_micro_backward_selector_honors_accum_mode(monkeypatch):
     t = torch.empty(1)
     args = (t,) * 17
 
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off")
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "row_local")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
     assert calls == ["row_local"]
@@ -2122,6 +2123,7 @@ def test_hsa_synthetic_micro_backward_selector_honors_short_mode(monkeypatch):
     t = torch.empty(1)
     args = (t,) * 17
 
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off")
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "row_local")
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD", "on")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
@@ -2129,6 +2131,68 @@ def test_hsa_synthetic_micro_backward_selector_honors_short_mode(monkeypatch):
 
     calls.clear()
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD", "off")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["row_local"]
+
+
+def test_hsa_synthetic_micro_backward_selector_honors_fused_mode(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _fused(*args, **kwargs):
+        calls.append("fused")
+
+    def _row_local(*args, **kwargs):
+        calls.append("row_local")
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_fused", _fused)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_row_local", _row_local)
+
+    q_rows = torch.empty((1, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((1, 1, 64))
+    dout_rows = torch.empty((1, 1, 64))
+    lse_rows = torch.empty((1, 1))
+    q_row_idx = torch.empty((1, 2), dtype=torch.int32)
+    row_k_row_idx = torch.empty((1, 2, 1), dtype=torch.int32)
+    union_k_row_idx = torch.empty((1, 8), dtype=torch.int32)
+    row_k_to_union_idx = torch.empty((1, 2, 1), dtype=torch.int32)
+    union_to_row_slot = torch.empty((1, 2, 8), dtype=torch.int32)
+    q_length = torch.empty((1,), dtype=torch.int32)
+    row_k_length = torch.empty((1, 2), dtype=torch.int32)
+    union_k_length = torch.empty((1,), dtype=torch.int32)
+    dq_rows = torch.empty((1, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+    args = (
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "on")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
+    assert calls == ["fused"]
+
+    calls.clear()
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ROW_BWD_ACCUM_MODE", "row_local")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel(*args, softmax_scale=1.0)
     assert calls == ["row_local"]
 

@@ -2197,6 +2197,55 @@ def test_hsa_synthetic_micro_backward_selector_honors_fused_mode(monkeypatch):
     assert calls == ["row_local"]
 
 
+def test_hsa_synthetic_row_compact_backward_selector_honors_one_kernel_mode(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    q_rows = torch.empty((1, 1, 64))
+    union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "on")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "on")
+    mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
+        q_rows,
+        union_k_row_idx,
+        q_row_idx,
+        unique_key_row_idx,
+        4,
+    )
+    assert mode == "one_kernel"
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "off")
+    mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
+        q_rows,
+        union_k_row_idx,
+        q_row_idx,
+        unique_key_row_idx,
+        4,
+    )
+    assert mode == "split"
+
+
+def test_hsa_synthetic_row_compact_backward_selector_falls_back_when_one_kernel_unsupported(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    q_rows = torch.empty((1, 1, 64))
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "auto")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "off")
+    unsupported_union = torch.empty((8, 17), dtype=torch.int32)
+    mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
+        q_rows,
+        unsupported_union,
+        q_row_idx,
+        unique_key_row_idx,
+        4,
+    )
+    assert mode == "legacy"
+
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module

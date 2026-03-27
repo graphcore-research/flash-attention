@@ -250,8 +250,13 @@ def _synthetic_bwd_kernel_mode_label() -> str:
         return "sparse_mask_plain"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") != "1":
         return "sparse_mask_bwd"
+    one_kernel_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "off").strip().lower()
+    if one_kernel_mode != "off":
+        return f"one_kernel_{one_kernel_mode}"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
-        return "fused"
+        return "legacy_fused"
+    if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
+        return "split"
     short_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD", "off").strip().lower()
     if short_mode != "off":
         return f"short_{short_mode}"
@@ -1375,6 +1380,7 @@ def run_case(case: BenchmarkCase):
         line += (
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
             f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
+            f" synthetic_one_kernel_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD', 'off')}"
             f" synthetic_fused_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD', 'off').strip().lower() in {'1', 'true', 'yes', 'on'} else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synthetic_bwd_kernel_mode={_synthetic_bwd_kernel_mode_label()}"

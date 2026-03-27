@@ -4314,11 +4314,19 @@ def _build_hsa_forward_synthetic_grid_metadata(
                 row_bucket_row_k_to_union_range: list[tuple[int, int]] = []
                 row_bucket_union_to_row_range: list[tuple[int, int]] = []
                 row_bucket_row_k_length_range: list[tuple[int, int]] = []
+                row_bucket_unique_key_range: list[tuple[int, int]] = []
+                row_bucket_unique_key_occurrence_range: list[tuple[int, int]] = []
+                row_bucket_unique_key_occurrence_ptr_range: list[tuple[int, int]] = []
                 row_bucket_row_k_cap: list[int] = []
+                row_bucket_max_unique_key_occurrences: list[int] = []
                 row_bucket_row_k_row_idx: list[int] = []
                 row_bucket_row_k_to_union_idx: list[int] = []
                 row_bucket_union_to_row_slot: list[int] = []
                 row_bucket_row_k_length: list[int] = []
+                row_bucket_unique_key_row_idx: list[int] = []
+                row_bucket_unique_key_member_idx: list[int] = []
+                row_bucket_unique_key_union_idx: list[int] = []
+                row_bucket_unique_key_occurrence_row_ptr: list[int] = []
                 row_bucket_avg_row_k: list[float] = []
                 row_bucket_max_row_k: list[int] = []
 
@@ -4337,6 +4345,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
 
                     per_bucket_rows: list[list[int]] = []
                     per_bucket_to_union: list[list[int]] = []
+                    per_bucket_union_rows: list[list[int]] = []
                     per_bucket_lengths: list[int] = []
                     bucket_max_row_k = 0
 
@@ -4345,6 +4354,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
                         k_length = int(k_lengths_bucket[member_idx])
                         k_member_start = k_row_start + member_idx * packed_k
                         k_rows_member = [int(row_idx) for row_idx in direct_bucket_k_row_idx[k_member_start:k_member_start + k_length]]
+                        per_bucket_union_rows.append(k_rows_member)
                         mask_member_start = mask_word_start + member_idx * packed_q * words_per_row
 
                         for q_slot in range(packed_q):
@@ -4379,6 +4389,9 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     row_k_to_union_start = len(row_bucket_row_k_to_union_idx)
                     union_to_row_start = len(row_bucket_union_to_row_slot)
                     row_k_length_start = len(row_bucket_row_k_length)
+                    unique_key_start = len(row_bucket_unique_key_row_idx)
+                    unique_ptr_start = len(row_bucket_unique_key_occurrence_row_ptr)
+                    row_bucket_unique_key_occurrence_row_ptr.append(len(row_bucket_unique_key_member_idx))
                     row_bucket_row_k_cap.append(bucket_max_row_k)
                     row_bucket_avg_row_k.append(
                         (sum(per_bucket_lengths) / len(per_bucket_lengths)) if per_bucket_lengths else 0.0
@@ -4395,6 +4408,25 @@ def _build_hsa_forward_synthetic_grid_metadata(
                         row_bucket_row_k_to_union_idx.extend(row_k_to_union)
                         row_bucket_row_k_to_union_idx.extend([-1] * (bucket_max_row_k - len(row_k_to_union)))
                         row_bucket_union_to_row_slot.extend(union_to_row)
+
+                    key_occurrence_map: dict[int, list[tuple[int, int]]] = {}
+                    for member_idx, union_rows in enumerate(per_bucket_union_rows):
+                        for union_idx, key_row in enumerate(union_rows):
+                            if key_row >= 0:
+                                key_occurrence_map.setdefault(int(key_row), []).append((member_idx, union_idx))
+                    bucket_max_unique_key_occurrences = 0
+                    for key_row in sorted(key_occurrence_map):
+                        bucket_max_unique_key_occurrences = max(
+                            bucket_max_unique_key_occurrences, len(key_occurrence_map[key_row])
+                        )
+                        occ_start = len(row_bucket_unique_key_member_idx)
+                        for member_idx, union_idx in key_occurrence_map[key_row]:
+                            row_bucket_unique_key_member_idx.append(int(member_idx))
+                            row_bucket_unique_key_union_idx.append(int(union_idx))
+                        row_bucket_unique_key_row_idx.append(int(key_row))
+                        row_bucket_unique_key_occurrence_range.append((occ_start, len(row_bucket_unique_key_member_idx)))
+                        row_bucket_unique_key_occurrence_row_ptr.append(len(row_bucket_unique_key_member_idx))
+
                     row_bucket_row_k_range.append((row_k_start, len(row_bucket_row_k_row_idx)))
                     row_bucket_row_k_to_union_range.append(
                         (row_k_to_union_start, len(row_bucket_row_k_to_union_idx))
@@ -4403,15 +4435,24 @@ def _build_hsa_forward_synthetic_grid_metadata(
                         (union_to_row_start, len(row_bucket_union_to_row_slot))
                     )
                     row_bucket_row_k_length_range.append((row_k_length_start, len(row_bucket_row_k_length)))
+                    row_bucket_unique_key_range.append((unique_key_start, len(row_bucket_unique_key_row_idx)))
+                    row_bucket_unique_key_occurrence_ptr_range.append(
+                        (unique_ptr_start, len(row_bucket_unique_key_occurrence_row_ptr))
+                    )
+                    row_bucket_max_unique_key_occurrences.append(bucket_max_unique_key_occurrences)
 
                 if row_compact_available:
                     row_compact_plan = {
                         "row_k_cap_limit": row_compact_cap,
                         "bucket_row_k_cap": row_bucket_row_k_cap,
+                        "bucket_max_unique_key_occurrences": row_bucket_max_unique_key_occurrences,
                         "bucket_row_k_range": row_bucket_row_k_range,
                         "bucket_row_k_to_union_range": row_bucket_row_k_to_union_range,
                         "bucket_union_to_row_range": row_bucket_union_to_row_range,
                         "bucket_row_k_length_range": row_bucket_row_k_length_range,
+                        "bucket_unique_key_range": row_bucket_unique_key_range,
+                        "bucket_unique_key_occurrence_range": row_bucket_unique_key_occurrence_range,
+                        "bucket_unique_key_occurrence_ptr_range": row_bucket_unique_key_occurrence_ptr_range,
                         "bucket_avg_row_k": row_bucket_avg_row_k,
                         "bucket_max_row_k": row_bucket_max_row_k,
                         "bucket_row_k_row_idx": torch.tensor(row_bucket_row_k_row_idx, dtype=torch.int32, device=device),
@@ -4422,6 +4463,18 @@ def _build_hsa_forward_synthetic_grid_metadata(
                             row_bucket_union_to_row_slot, dtype=torch.int32, device=device
                         ),
                         "bucket_row_k_length": torch.tensor(row_bucket_row_k_length, dtype=torch.int32, device=device),
+                        "bucket_unique_key_row_idx": torch.tensor(
+                            row_bucket_unique_key_row_idx, dtype=torch.int32, device=device
+                        ),
+                        "bucket_unique_key_member_idx": torch.tensor(
+                            row_bucket_unique_key_member_idx, dtype=torch.int32, device=device
+                        ),
+                        "bucket_unique_key_union_idx": torch.tensor(
+                            row_bucket_unique_key_union_idx, dtype=torch.int32, device=device
+                        ),
+                        "bucket_unique_key_occurrence_row_ptr": torch.tensor(
+                            row_bucket_unique_key_occurrence_row_ptr, dtype=torch.int32, device=device
+                        ),
                     }
             direct_execution_plan = {
                 "max_direct_segments": max_direct_segments,

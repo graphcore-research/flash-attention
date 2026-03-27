@@ -244,6 +244,7 @@ class FP4FlashAttentionForwardSm100:
         fp4_sf_vec_size: int = 16,     # 16 for NVFP4, 32 for MXFP4
         pack_gqa_local: bool = False,
         group_qheads_by_kv: bool = False,
+        fp4_pv_fp32_online_rescale: bool = True,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # FP4 QK configuration
@@ -255,6 +256,7 @@ class FP4FlashAttentionForwardSm100:
         # Keep the legacy env var name for the opt-in PV quantizer experiment even though the
         # current landing uses decode-centric block scales after the CTA-local amax reduction.
         self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
+        self.fp4_pv_fp32_online_rescale = use_fp4_pv and fp4_pv_fp32_online_rescale
         raw_debug_offset = os.getenv("FLASH_ATTN_FP4_PV_RAW_BYTE_OFFSET")
         self.fp4_pv_raw_byte_offset = int(raw_debug_offset) if raw_debug_offset is not None else -1
         self.fp4_sf_dtype = Float8E4M3FN if fp4_sf_dtype == "e4m3" else Float8E8M0FNU
@@ -1067,6 +1069,8 @@ class FP4FlashAttentionForwardSm100:
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            # FP32 online-softmax recurrence state for FP4 PV.
+            sOnlineScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 4]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size], self.buffer_align_bytes
             ]
@@ -1425,6 +1429,7 @@ class FP4FlashAttentionForwardSm100:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
+        sOnlineScale = storage.sOnlineScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 4))
 
         # FP4: Create SMEM tensors for scale factors
         if const_expr(self.use_fp4_qk):
@@ -1647,6 +1652,7 @@ class FP4FlashAttentionForwardSm100:
                 softmax_scale=softmax_scale,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
+                sOnlineScale=sOnlineScale,
                 sSFP=sSFP,
                 mLSE=mLSE,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -1692,6 +1698,7 @@ class FP4FlashAttentionForwardSm100:
                 tStS,
                 tOtO,
                 sScale,
+                sOnlineScale,
                 mO,
                 mLSE,
                 sO,
@@ -2586,6 +2593,24 @@ class FP4FlashAttentionForwardSm100:
         )
 
     @cute.jit
+    def store_fp4_pv_online_state(
+        self,
+        sOnlineScale: cute.Tensor,
+        stage: Int32,
+        thread_idx: Int32,
+        alpha: Float32,
+        row_sum_old: Float32,
+        row_sum_new: Float32,
+        inv_row_sum_new: Float32,
+    ):
+        stage_offset = stage * self.m_block_size
+        state_stride = self.q_stage * self.m_block_size
+        sOnlineScale[thread_idx + stage_offset + 0 * state_stride] = alpha
+        sOnlineScale[thread_idx + stage_offset + 1 * state_stride] = row_sum_old
+        sOnlineScale[thread_idx + stage_offset + 2 * state_stride] = row_sum_new
+        sOnlineScale[thread_idx + stage_offset + 3 * state_stride] = inv_row_sum_new
+
+    @cute.jit
     def make_fp4_pv_grouped_views(
         self,
         tP_conv: cute.Tensor,
@@ -2845,6 +2870,7 @@ class FP4FlashAttentionForwardSm100:
         thr_mma_qk: cute.core.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
+        sOnlineScale: cute.Tensor,
         sSFP: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
@@ -3017,12 +3043,14 @@ class FP4FlashAttentionForwardSm100:
                 tStScale_r2t=tStScale_r2t,
                 tStP_r2t=tStP_r2t,
                 sScale=sScale,
+                sOnlineScale=sOnlineScale,
                 sSFP=sSFP,
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=q_head_idx,
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 seqlen=seqlen,
+                learnable_sink=learnable_sink,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
@@ -3198,12 +3226,14 @@ class FP4FlashAttentionForwardSm100:
         tStScale_r2t: cute.Tensor,
         tStP_r2t: cute.Tensor,
         sScale: cute.Tensor,
+        sOnlineScale: cute.Tensor,
         sSFP: Optional[cute.Tensor],
         stage: int | Int32,
         batch_idx: Int32,
         head_idx: Int32,
         m_block: Int32,
         seqlen,
+        learnable_sink: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
@@ -3257,19 +3287,22 @@ class FP4FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
+        row_sum_old = Float32(0.0) if const_expr(is_first) else softmax.row_sum[0]
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
-            # tSrScale_r2t[0] = acc_scale
-            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-            # cute.arch.fence_view_async_tmem_store()
-            thread_idx = thr_tmem_load.thr_idx
-            sScale[thread_idx + stage * self.m_block_size] = acc_scale
+            # Keep the online-softmax recurrence state in its own FP32 buffer so
+            # correction/epilogue no longer overload sScale with both alpha and row stats.
+            self.store_fp4_pv_online_state(
+                sOnlineScale,
+                stage,
+                thr_tmem_load.thr_idx,
+                acc_scale,
+                row_sum_old,
+                row_sum_old,
+                Float32(1.0),
+            )
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
-        # Notify correction wg that row_max is ready
-        # pipeline_sm_stats.producer_commit_w_index(stage)
-        sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
@@ -3318,10 +3351,25 @@ class FP4FlashAttentionForwardSm100:
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 pipeline_p_lastsplit.producer_commit_w_index(stage)
-        else:
+        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(self.use_fp4_pv and self.fp4_pv_fp32_online_rescale and learnable_sink is None):
+            row_sum_new = softmax.row_sum[0]
+            acc_O_mn_row_is_zero_or_nan = row_sum_new == 0.0 or row_sum_new != row_sum_new
+            inv_row_sum_new = Float32(1.0) if acc_O_mn_row_is_zero_or_nan else cute.arch.rcp_approx(row_sum_new)
+            self.store_fp4_pv_online_state(
+                sOnlineScale,
+                stage,
+                thr_tmem_load.thr_idx,
+                acc_scale,
+                row_sum_old,
+                row_sum_new,
+                inv_row_sum_new,
+            )
+        # Notify correction wg that the FP32 online-softmax state is ready.
+        sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+        if const_expr(self.split_P_arrive == 0):
             pipeline_s_p_o.consumer_release_w_index(stage)
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
@@ -3333,6 +3381,7 @@ class FP4FlashAttentionForwardSm100:
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
+        sOnlineScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         sO: cute.Tensor,
@@ -3369,6 +3418,7 @@ class FP4FlashAttentionForwardSm100:
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
+        online_state_stride = self.q_stage * self.m_block_size
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
@@ -3446,7 +3496,10 @@ class FP4FlashAttentionForwardSm100:
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
+                        if const_expr(self.use_fp4_pv and self.fp4_pv_fp32_online_rescale):
+                            scale = sOnlineScale[tidx + stage * self.m_block_size + 0 * online_state_stride]
+                        else:
+                            scale = sScale[tidx + stage * self.m_block_size]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -3504,7 +3557,11 @@ class FP4FlashAttentionForwardSm100:
                                 )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    scale = Float32(1.0)
+                    if const_expr(self.use_fp4_pv and self.fp4_pv_fp32_online_rescale and learnable_sink is None):
+                        scale = sOnlineScale[tidx + stage * self.m_block_size + 3 * online_state_stride]
+                    else:
+                        scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):

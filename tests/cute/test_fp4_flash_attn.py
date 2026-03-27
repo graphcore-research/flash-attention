@@ -248,6 +248,61 @@ def _fp4_pv_exact_slot_reduce(values: torch.Tensor, slot_ids: torch.Tensor) -> t
     return out
 
 
+def _fp4_pv_online_softmax_reference(
+    score_blocks: list[torch.Tensor],
+    value_blocks: list[torch.Tensor],
+) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+    row_max = torch.tensor(float("-inf"), dtype=torch.float32)
+    row_sum = torch.tensor(0.0, dtype=torch.float32)
+    out = torch.zeros(value_blocks[0].shape[-1], dtype=torch.float32)
+    states = []
+    for scores, values in zip(score_blocks, value_blocks):
+        scores_f32 = scores.to(torch.float32)
+        values_f32 = values.to(torch.float32)
+        block_max = scores_f32.max()
+        m_new = torch.maximum(row_max, block_max)
+        alpha = (
+            torch.tensor(0.0, dtype=torch.float32)
+            if torch.isneginf(row_max)
+            else torch.exp(row_max - m_new)
+        )
+        p_block = torch.exp(scores_f32 - m_new)
+        l_new = alpha * row_sum + p_block.sum()
+        inv_l_new = (
+            torch.tensor(1.0, dtype=torch.float32)
+            if (not torch.isfinite(l_new)) or l_new == 0
+            else torch.tensor(1.0, dtype=torch.float32) / l_new
+        )
+        out = (alpha * row_sum * out + p_block @ values_f32) * inv_l_new
+        states.append(
+            {
+                "m_new": m_new,
+                "alpha": alpha,
+                "l_old": row_sum,
+                "l_new": l_new,
+                "inv_l_new": inv_l_new,
+                "o_new": out.clone(),
+            }
+        )
+        row_max = m_new
+        row_sum = l_new
+    return states, out
+
+
+def _fp4_pv_online_softmax_decode_reference(
+    score_blocks: list[torch.Tensor],
+    value_blocks: list[torch.Tensor],
+) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+    return _fp4_pv_online_softmax_reference(score_blocks, value_blocks)
+
+
+def _fp4_pv_online_softmax_encode_reference(
+    score_blocks: list[torch.Tensor],
+    value_blocks: list[torch.Tensor],
+) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+    return _fp4_pv_online_softmax_reference(score_blocks, value_blocks)
+
+
 def _stage_fp4_vt_public_bytes_for_pv(packed_vt: torch.Tensor) -> torch.Tensor:
     """Repack public seq-packed Vt bytes into the D-packed PV shared-memory byte layout."""
     batch_size, num_heads, head_dim, seqlen_packed = packed_vt.shape
@@ -680,6 +735,58 @@ def test_fp4_compile_cache_separates_pv_loader_modes(monkeypatch):
 
     assert len(compile_calls) == 2
     assert len(_flash_attn_fwd.compile_cache) == 2
+
+
+def test_fp4_pv_online_softmax_reference_matches_closed_form():
+    score_blocks = [
+        torch.tensor([0.0, -0.5, 1.0], dtype=torch.float32),
+        torch.tensor([2.0, -1.0], dtype=torch.float32),
+    ]
+    value_blocks = [
+        torch.tensor([[1.0, 0.0], [0.0, 2.0], [2.0, 1.0]], dtype=torch.float32),
+        torch.tensor([[3.0, 4.0], [5.0, 6.0]], dtype=torch.float32),
+    ]
+
+    states, out = _fp4_pv_online_softmax_reference(score_blocks, value_blocks)
+
+    scores_full = torch.cat(score_blocks)
+    values_full = torch.cat(value_blocks, dim=0)
+    probs_full = torch.softmax(scores_full, dim=0)
+    out_expected = probs_full @ values_full
+    lse_expected = torch.logsumexp(scores_full, dim=0)
+
+    torch.testing.assert_close(out, out_expected)
+    torch.testing.assert_close(states[-1]["m_new"] + torch.log(states[-1]["l_new"]), lse_expected)
+
+
+def test_fp4_pv_online_softmax_reference_keeps_running_state_in_float32():
+    score_blocks = [torch.tensor([0.0, 1.0], dtype=torch.float32)]
+    value_blocks = [torch.tensor([[1.0], [2.0]], dtype=torch.float32)]
+
+    states, _ = _fp4_pv_online_softmax_reference(score_blocks, value_blocks)
+
+    for key in ("m_new", "alpha", "l_old", "l_new", "inv_l_new", "o_new"):
+        assert states[0][key].dtype == torch.float32
+
+
+def test_fp4_pv_online_softmax_decode_and_encode_reference_share_recurrence():
+    score_blocks = [
+        torch.tensor([0.25, -1.0, 1.5], dtype=torch.float32),
+        torch.tensor([-0.75, 0.5], dtype=torch.float32),
+    ]
+    value_blocks = [
+        torch.tensor([[1.0, 2.0], [2.0, 3.0], [4.0, 5.0]], dtype=torch.float32),
+        torch.tensor([[6.0, 7.0], [8.0, 9.0]], dtype=torch.float32),
+    ]
+
+    decode_states, decode_out = _fp4_pv_online_softmax_decode_reference(score_blocks, value_blocks)
+    encode_states, encode_out = _fp4_pv_online_softmax_encode_reference(score_blocks, value_blocks)
+
+    torch.testing.assert_close(decode_out, encode_out)
+    assert len(decode_states) == len(encode_states)
+    for decode_state, encode_state in zip(decode_states, encode_states):
+        for key in ("m_new", "alpha", "l_old", "l_new", "inv_l_new", "o_new"):
+            torch.testing.assert_close(decode_state[key], encode_state[key])
 
 
 def test_fp4_pv_cta_quant_reference_warp_reduce_matches_full_block_amax():

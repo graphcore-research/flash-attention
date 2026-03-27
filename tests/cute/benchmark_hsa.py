@@ -252,7 +252,8 @@ def _synthetic_bwd_kernel_mode_label() -> str:
         return "sparse_mask_bwd"
     one_kernel_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "off").strip().lower()
     if one_kernel_mode != "off":
-        return f"one_kernel_{one_kernel_mode}"
+        pingpong_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off").strip().lower()
+        return f"one_kernel_{one_kernel_mode}_pingpong_{pingpong_mode}"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
         return "legacy_fused"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
@@ -318,6 +319,46 @@ def _short_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
     env.update(
         {
             "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "on",
+        }
+    )
+    return env
+
+
+def _should_measure_one_kernel_synthetic_baseline(case: BenchmarkCase) -> bool:
+    return (
+        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
+        and case.name != "sentence-only"
+        and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
+    )
+
+
+def _one_kernel_synthetic_baseline_label() -> str:
+    return "direct_micro_one_kernel_bwd_baseline"
+
+
+def _one_kernel_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_previous_synthetic_baseline_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD": "on",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD": "off",
+        }
+    )
+    return env
+
+
+def _one_kernel_synthetic_pingpong_label() -> str:
+    return "direct_micro_one_kernel_bwd_pingpong"
+
+
+def _one_kernel_synthetic_pingpong_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_baseline_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG": "on",
         }
     )
     return env
@@ -904,6 +945,10 @@ def _run_long_case(case: BenchmarkCase):
     hsa_bwd_vs_prev = None
     short_synth_bwd_ms = None
     hsa_bwd_vs_short = None
+    one_kernel_synth_bwd_ms = None
+    hsa_bwd_vs_one_kernel = None
+    one_kernel_pingpong_bwd_ms = None
+    hsa_bwd_vs_one_kernel_pingpong = None
     sparse_mask_mixed_bwd_ms = None
     hsa_bwd_vs_sparse_mask_mixed = None
 
@@ -982,6 +1027,37 @@ def _run_long_case(case: BenchmarkCase):
             env_updates=short_env_updates,
         )
         hsa_bwd_vs_short = hsa_bwd_ms / short_synth_bwd_ms if short_synth_bwd_ms > 0 else float("inf")
+    if _should_measure_one_kernel_synthetic_baseline(case):
+        one_kernel_env_updates = _one_kernel_synthetic_baseline_env(case)
+        one_kernel_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_env_updates
+        )
+        one_kernel_synth_bwd_ms = _measure_backward_ms(
+            one_kernel_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_env_updates,
+        )
+        hsa_bwd_vs_one_kernel = hsa_bwd_ms / one_kernel_synth_bwd_ms if one_kernel_synth_bwd_ms > 0 else float("inf")
+        one_kernel_pingpong_env_updates = _one_kernel_synthetic_pingpong_env(case)
+        one_kernel_pingpong_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_pingpong_env_updates
+        )
+        one_kernel_pingpong_bwd_ms = _measure_backward_ms(
+            one_kernel_pingpong_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_pingpong_env_updates,
+        )
+        hsa_bwd_vs_one_kernel_pingpong = (
+            hsa_bwd_ms / one_kernel_pingpong_bwd_ms if one_kernel_pingpong_bwd_ms > 0 else float("inf")
+        )
     if _should_measure_sparse_mask_mixed_backward_baseline(case):
         sparse_mask_env_updates = _sparse_mask_mixed_backward_baseline_env(case)
         sparse_mask_hsa_forward = lambda q, k, v: _run_sparse_attention(
@@ -1039,6 +1115,18 @@ def _run_long_case(case: BenchmarkCase):
             f" short_synth_label={_short_synthetic_baseline_label()}"
             f" short_synth_bwd_ms={short_synth_bwd_ms:.3f}"
             f" hsa_bwd_vs_short={hsa_bwd_vs_short:.2f}x"
+        )
+    if one_kernel_synth_bwd_ms is not None:
+        line += (
+            f" one_kernel_bwd_label={_one_kernel_synthetic_baseline_label()}"
+            f" one_kernel_bwd_ms={one_kernel_synth_bwd_ms:.3f}"
+            f" hsa_bwd_vs_one_kernel={hsa_bwd_vs_one_kernel:.2f}x"
+        )
+    if one_kernel_pingpong_bwd_ms is not None:
+        line += (
+            f" one_kernel_pingpong_label={_one_kernel_synthetic_pingpong_label()}"
+            f" one_kernel_pingpong_bwd_ms={one_kernel_pingpong_bwd_ms:.3f}"
+            f" hsa_bwd_vs_one_kernel_pingpong={hsa_bwd_vs_one_kernel_pingpong:.2f}x"
         )
     if sparse_mask_mixed_bwd_ms is not None:
         line += (
@@ -1139,6 +1227,14 @@ def run_case(case: BenchmarkCase):
     short_synth_bwd_ms = None
     short_synth_fwd_bwd_ms = None
     hsa_fwd_bwd_vs_short = None
+    one_kernel_synth_fwd_ms = None
+    one_kernel_synth_bwd_ms = None
+    one_kernel_synth_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_one_kernel = None
+    one_kernel_pingpong_fwd_ms = None
+    one_kernel_pingpong_bwd_ms = None
+    one_kernel_pingpong_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_one_kernel_pingpong = None
     sparse_mask_mixed_fwd_ms = None
     sparse_mask_mixed_bwd_ms = None
     sparse_mask_mixed_fwd_bwd_ms = None
@@ -1244,6 +1340,77 @@ def run_case(case: BenchmarkCase):
             env_updates=short_env_updates,
         )
         hsa_fwd_bwd_vs_short = hsa_fwd_bwd_ms / short_synth_fwd_bwd_ms if short_synth_fwd_bwd_ms > 0 else float("inf")
+    if _should_measure_one_kernel_synthetic_baseline(case):
+        one_kernel_env_updates = _one_kernel_synthetic_baseline_env(case)
+        one_kernel_hsa_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_env_updates
+        )
+        one_kernel_synth_fwd_ms = _measure_forward_ms(
+            one_kernel_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_env_updates,
+        )
+        one_kernel_synth_bwd_ms = _measure_backward_ms(
+            one_kernel_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_env_updates,
+        )
+        one_kernel_synth_fwd_bwd_ms = _measure_forward_backward_ms(
+            one_kernel_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_env_updates,
+        )
+        hsa_fwd_bwd_vs_one_kernel = (
+            hsa_fwd_bwd_ms / one_kernel_synth_fwd_bwd_ms if one_kernel_synth_fwd_bwd_ms > 0 else float("inf")
+        )
+        one_kernel_pingpong_env_updates = _one_kernel_synthetic_pingpong_env(case)
+        one_kernel_pingpong_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_pingpong_env_updates
+        )
+        one_kernel_pingpong_fwd_ms = _measure_forward_ms(
+            one_kernel_pingpong_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_pingpong_env_updates,
+        )
+        one_kernel_pingpong_bwd_ms = _measure_backward_ms(
+            one_kernel_pingpong_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_pingpong_env_updates,
+        )
+        one_kernel_pingpong_fwd_bwd_ms = _measure_forward_backward_ms(
+            one_kernel_pingpong_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_pingpong_env_updates,
+        )
+        hsa_fwd_bwd_vs_one_kernel_pingpong = (
+            hsa_fwd_bwd_ms / one_kernel_pingpong_fwd_bwd_ms
+            if one_kernel_pingpong_fwd_bwd_ms > 0
+            else float("inf")
+        )
     if _should_measure_sparse_mask_mixed_backward_baseline(case):
         sparse_mask_env_updates = _sparse_mask_mixed_backward_baseline_env(case)
         sparse_mask_hsa_forward = lambda q, k, v: _run_sparse_attention(
@@ -1365,6 +1532,30 @@ def run_case(case: BenchmarkCase):
             f" hsa_fwd_bwd_vs_short={hsa_fwd_bwd_vs_short:.2f}x"
         )
     if (
+        one_kernel_synth_fwd_bwd_ms is not None
+        and one_kernel_synth_bwd_ms is not None
+        and one_kernel_synth_fwd_ms is not None
+    ):
+        line += (
+            f" one_kernel_bwd_label={_one_kernel_synthetic_baseline_label()}"
+            f" one_kernel_bwd_fwd_ms={one_kernel_synth_fwd_ms:.3f}"
+            f" one_kernel_bwd_bwd_ms={one_kernel_synth_bwd_ms:.3f}"
+            f" one_kernel_bwd_fwd_bwd_ms={one_kernel_synth_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_one_kernel={hsa_fwd_bwd_vs_one_kernel:.2f}x"
+        )
+    if (
+        one_kernel_pingpong_fwd_bwd_ms is not None
+        and one_kernel_pingpong_bwd_ms is not None
+        and one_kernel_pingpong_fwd_ms is not None
+    ):
+        line += (
+            f" one_kernel_pingpong_label={_one_kernel_synthetic_pingpong_label()}"
+            f" one_kernel_pingpong_fwd_ms={one_kernel_pingpong_fwd_ms:.3f}"
+            f" one_kernel_pingpong_bwd_ms={one_kernel_pingpong_bwd_ms:.3f}"
+            f" one_kernel_pingpong_fwd_bwd_ms={one_kernel_pingpong_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_one_kernel_pingpong={hsa_fwd_bwd_vs_one_kernel_pingpong:.2f}x"
+        )
+    if (
         sparse_mask_mixed_fwd_bwd_ms is not None
         and sparse_mask_mixed_bwd_ms is not None
         and sparse_mask_mixed_fwd_ms is not None
@@ -1381,6 +1572,7 @@ def run_case(case: BenchmarkCase):
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
             f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
             f" synthetic_one_kernel_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD', 'off')}"
+            f" synthetic_one_kernel_bwd_pingpong={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG', 'off')}"
             f" synthetic_fused_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD', 'off').strip().lower() in {'1', 'true', 'yes', 'on'} else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synthetic_bwd_kernel_mode={_synthetic_bwd_kernel_mode_label()}"

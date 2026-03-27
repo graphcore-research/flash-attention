@@ -1216,6 +1216,15 @@ def _get_synthetic_one_kernel_bwd_mode() -> str:
     return value
 
 
+def _get_synthetic_one_kernel_bwd_pingpong_mode() -> str:
+    import os
+
+    value = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off").strip().lower()
+    if value not in {"off", "on", "auto"}:
+        value = "off"
+    return value
+
+
 def _synthetic_split_bwd_enabled() -> bool:
     import os
 
@@ -3665,6 +3674,154 @@ class FlashHSASyntheticDirectRowMicroBwdKeyOwnedSm100:
                 utils.atomic_add_fp32(dv3, utils.elem_pointer(mdVRows, (key_row, head_idx, dim3)))
 
 
+@cute.jit
+def _load_one_kernel_occurrence_row_state(
+    mQRows: cute.Tensor,
+    mOutRows: cute.Tensor,
+    mdORows: cute.Tensor,
+    mLSERows: cute.Tensor,
+    mQRowIdx: cute.Tensor,
+    mUnionToRowSlot: cute.Tensor,
+    occurrence_valid: Boolean,
+    member_idx: Int32,
+    union_idx: Int32,
+    row_i: Int32,
+    head_idx: Int32,
+    dim0: Int32,
+    dim1: Int32,
+    dim2: Int32,
+    dim3: Int32,
+):
+    global_q_row = Int32(-1)
+    participates = Boolean(False)
+    q0 = Float32(0.0)
+    q1 = Float32(0.0)
+    q2 = Float32(0.0)
+    q3 = Float32(0.0)
+    do0 = Float32(0.0)
+    do1 = Float32(0.0)
+    do2 = Float32(0.0)
+    do3 = Float32(0.0)
+    dpsum_partial = Float32(0.0)
+    lse_log2 = Float32(0.0)
+    if occurrence_valid:
+        global_q_row = Int32(mQRowIdx[member_idx, row_i])
+        if global_q_row >= Int32(0):
+            row_slot = Int32(mUnionToRowSlot[member_idx, row_i, union_idx])
+            participates = row_slot >= Int32(0)
+    if participates:
+        if dim0 < mQRows.shape[2]:
+            q0 = Float32(mQRows[global_q_row, head_idx, dim0])
+            out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
+            do0 = Float32(mdORows[global_q_row, head_idx, dim0])
+            dpsum_partial += out0 * do0
+        if dim1 < mQRows.shape[2]:
+            q1 = Float32(mQRows[global_q_row, head_idx, dim1])
+            out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
+            do1 = Float32(mdORows[global_q_row, head_idx, dim1])
+            dpsum_partial += out1 * do1
+        if dim2 < mQRows.shape[2]:
+            q2 = Float32(mQRows[global_q_row, head_idx, dim2])
+            out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
+            do2 = Float32(mdORows[global_q_row, head_idx, dim2])
+            dpsum_partial += out2 * do2
+        if dim3 < mQRows.shape[2]:
+            q3 = Float32(mQRows[global_q_row, head_idx, dim3])
+            out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
+            do3 = Float32(mdORows[global_q_row, head_idx, dim3])
+            dpsum_partial += out3 * do3
+        lse_log2 = Float32(mLSERows[global_q_row, head_idx]) * Float32(_LOG2_E)
+    return (
+        global_q_row,
+        participates,
+        q0,
+        q1,
+        q2,
+        q3,
+        do0,
+        do1,
+        do2,
+        do3,
+        dpsum_partial,
+        lse_log2,
+    )
+
+
+@cute.jit
+def _accumulate_one_kernel_occurrence_row(
+    lane: Int32,
+    mdQRows: cute.Tensor,
+    head_idx: Int32,
+    global_q_row: Int32,
+    participates: Boolean,
+    q0: Float32,
+    q1: Float32,
+    q2: Float32,
+    q3: Float32,
+    do0: Float32,
+    do1: Float32,
+    do2: Float32,
+    do3: Float32,
+    dpsum_partial: Float32,
+    lse_log2: Float32,
+    kval0: Float32,
+    kval1: Float32,
+    kval2: Float32,
+    kval3: Float32,
+    vval0: Float32,
+    vval1: Float32,
+    vval2: Float32,
+    vval3: Float32,
+    dim0: Int32,
+    dim1: Int32,
+    dim2: Int32,
+    dim3: Int32,
+    scale_log2: Float32,
+    softmax_scale: Float32,
+):
+    dk0 = Float32(0.0)
+    dk1 = Float32(0.0)
+    dk2 = Float32(0.0)
+    dk3 = Float32(0.0)
+    dv0 = Float32(0.0)
+    dv1 = Float32(0.0)
+    dv2 = Float32(0.0)
+    dv3 = Float32(0.0)
+    score_partial = Float32(0.0)
+    dprob_partial = Float32(0.0)
+    if participates:
+        score_partial = q0 * kval0 + q1 * kval1 + q2 * kval2 + q3 * kval3
+        dprob_partial = do0 * vval0 + do1 * vval1 + do2 * vval2 + do3 * vval3
+    dpsum = utils.warp_reduce(dpsum_partial, lambda a, b: a + b, width=16)
+    score = utils.warp_reduce(score_partial, lambda a, b: a + b, width=16)
+    dprob = utils.warp_reduce(dprob_partial, lambda a, b: a + b, width=16)
+    prob = Float32(0.0)
+    ds_scaled = Float32(0.0)
+    if lane == Int32(0) and participates:
+        prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+        ds_scaled = prob * (dprob - dpsum) * softmax_scale
+    prob = utils.shuffle_sync(prob, 0, width=16)
+    ds_scaled = utils.shuffle_sync(ds_scaled, 0, width=16)
+    if participates:
+        if dim0 < mdQRows.shape[2]:
+            utils.atomic_add_fp32(ds_scaled * kval0, utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)))
+            dk0 = ds_scaled * q0
+            dv0 = prob * do0
+        if dim1 < mdQRows.shape[2]:
+            utils.atomic_add_fp32(ds_scaled * kval1, utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim1)))
+            dk1 = ds_scaled * q1
+            dv1 = prob * do1
+        if dim2 < mdQRows.shape[2]:
+            utils.atomic_add_fp32(ds_scaled * kval2, utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim2)))
+            dk2 = ds_scaled * q2
+            dv2 = prob * do2
+        if dim3 < mdQRows.shape[2]:
+            utils.atomic_add_fp32(ds_scaled * kval3, utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim3)))
+            dk3 = ds_scaled * q3
+            dv3 = prob * do3
+    return dk0, dk1, dk2, dk3, dv0, dv1, dv2, dv3
+
+
 class FlashHSASyntheticDirectRowMicroBwdOneKernelSm100:
     """Key-owned fused backward that computes dQ, dK, and dV in one pass."""
 
@@ -3872,6 +4029,574 @@ class FlashHSASyntheticDirectRowMicroBwdOneKernelSm100:
                         utils.atomic_add_fp32(ds_scaled * kval3, utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim3)))
                         dk3 += ds_scaled * q3
                         dv3 += prob * do3
+
+        if active_key and key_row >= Int32(0):
+            if dim0 < mdKRows.shape[2]:
+                utils.atomic_add_fp32(dk0, utils.elem_pointer(mdKRows, (key_row, head_idx, dim0)))
+                utils.atomic_add_fp32(dv0, utils.elem_pointer(mdVRows, (key_row, head_idx, dim0)))
+            if dim1 < mdKRows.shape[2]:
+                utils.atomic_add_fp32(dk1, utils.elem_pointer(mdKRows, (key_row, head_idx, dim1)))
+                utils.atomic_add_fp32(dv1, utils.elem_pointer(mdVRows, (key_row, head_idx, dim1)))
+            if dim2 < mdKRows.shape[2]:
+                utils.atomic_add_fp32(dk2, utils.elem_pointer(mdKRows, (key_row, head_idx, dim2)))
+                utils.atomic_add_fp32(dv2, utils.elem_pointer(mdVRows, (key_row, head_idx, dim2)))
+            if dim3 < mdKRows.shape[2]:
+                utils.atomic_add_fp32(dk3, utils.elem_pointer(mdKRows, (key_row, head_idx, dim3)))
+                utils.atomic_add_fp32(dv3, utils.elem_pointer(mdVRows, (key_row, head_idx, dim3)))
+
+
+class FlashHSASyntheticDirectRowMicroBwdOneKernelPingPongSm100:
+    """Key-owned fused backward with ping-pong occurrence prefetch."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mUniqueKeyRowIdx: cute.Tensor,
+        mUniqueKeyMemberIdx: cute.Tensor,
+        mUniqueKeyUnionIdx: cute.Tensor,
+        mUniqueKeyOccurrenceRowPtr: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = (mUniqueKeyRowIdx.shape[0] + 1) // 2
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionToRowSlot,
+            mUniqueKeyRowIdx,
+            mUniqueKeyMemberIdx,
+            mUniqueKeyUnionIdx,
+            mUniqueKeyOccurrenceRowPtr,
+            softmax_scale,
+            mdQRows,
+            mdKRows,
+            mdVRows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mUniqueKeyRowIdx: cute.Tensor,
+        mUniqueKeyMemberIdx: cute.Tensor,
+        mUniqueKeyUnionIdx: cute.Tensor,
+        mUniqueKeyOccurrenceRowPtr: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        unique_key_pair_idx, head_idx, _ = cute.arch.block_idx()
+        key_in_cta = tidx // Int32(16)
+        lane = tidx % Int32(16)
+        dim0 = lane * Int32(4)
+        dim1 = dim0 + Int32(1)
+        dim2 = dim0 + Int32(2)
+        dim3 = dim0 + Int32(3)
+        key_count = Int32(mUniqueKeyRowIdx.shape[0])
+        unique_key_idx = unique_key_pair_idx * Int32(2) + key_in_cta
+        active_key = unique_key_idx < key_count
+        key_row = Int32(-1)
+        occ_start = Int32(0)
+        occ_end = Int32(0)
+        if active_key:
+            key_row = Int32(mUniqueKeyRowIdx[unique_key_idx])
+            occ_start = Int32(mUniqueKeyOccurrenceRowPtr[unique_key_idx])
+            occ_end = Int32(mUniqueKeyOccurrenceRowPtr[unique_key_idx + Int32(1)])
+
+        kval0 = Float32(0.0)
+        kval1 = Float32(0.0)
+        kval2 = Float32(0.0)
+        kval3 = Float32(0.0)
+        vval0 = Float32(0.0)
+        vval1 = Float32(0.0)
+        vval2 = Float32(0.0)
+        vval3 = Float32(0.0)
+        if active_key and key_row >= Int32(0):
+            if dim0 < mKRows.shape[2]:
+                kval0 = Float32(mKRows[key_row, head_idx, dim0])
+                vval0 = Float32(mVRows[key_row, head_idx, dim0])
+            if dim1 < mKRows.shape[2]:
+                kval1 = Float32(mKRows[key_row, head_idx, dim1])
+                vval1 = Float32(mVRows[key_row, head_idx, dim1])
+            if dim2 < mKRows.shape[2]:
+                kval2 = Float32(mKRows[key_row, head_idx, dim2])
+                vval2 = Float32(mVRows[key_row, head_idx, dim2])
+            if dim3 < mKRows.shape[2]:
+                kval3 = Float32(mKRows[key_row, head_idx, dim3])
+                vval3 = Float32(mVRows[key_row, head_idx, dim3])
+
+        dk0 = Float32(0.0)
+        dk1 = Float32(0.0)
+        dk2 = Float32(0.0)
+        dk3 = Float32(0.0)
+        dv0 = Float32(0.0)
+        dv1 = Float32(0.0)
+        dv2 = Float32(0.0)
+        dv3 = Float32(0.0)
+        scale_log2 = softmax_scale * Float32(_LOG2_E)
+
+        slot0_occ_idx = occ_start
+        slot0_valid = active_key and slot0_occ_idx < occ_end
+        slot0_member_idx = Int32(-1)
+        slot0_union_idx = Int32(-1)
+        if slot0_valid:
+            slot0_member_idx = Int32(mUniqueKeyMemberIdx[slot0_occ_idx])
+            slot0_union_idx = Int32(mUniqueKeyUnionIdx[slot0_occ_idx])
+        (
+            slot0_global_q_row0,
+            slot0_participates0,
+            slot0_q00,
+            slot0_q01,
+            slot0_q02,
+            slot0_q03,
+            slot0_do00,
+            slot0_do01,
+            slot0_do02,
+            slot0_do03,
+            slot0_dpsum_partial0,
+            slot0_lse_log20,
+        ) = _load_one_kernel_occurrence_row_state(
+            mQRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionToRowSlot,
+            slot0_valid,
+            slot0_member_idx,
+            slot0_union_idx,
+            Int32(0),
+            head_idx,
+            dim0,
+            dim1,
+            dim2,
+            dim3,
+        )
+        (
+            slot0_global_q_row1,
+            slot0_participates1,
+            slot0_q10,
+            slot0_q11,
+            slot0_q12,
+            slot0_q13,
+            slot0_do10,
+            slot0_do11,
+            slot0_do12,
+            slot0_do13,
+            slot0_dpsum_partial1,
+            slot0_lse_log21,
+        ) = _load_one_kernel_occurrence_row_state(
+            mQRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionToRowSlot,
+            slot0_valid,
+            slot0_member_idx,
+            slot0_union_idx,
+            Int32(1),
+            head_idx,
+            dim0,
+            dim1,
+            dim2,
+            dim3,
+        )
+
+        slot1_valid = Boolean(False)
+        slot1_member_idx = Int32(-1)
+        slot1_union_idx = Int32(-1)
+        (
+            slot1_global_q_row0,
+            slot1_participates0,
+            slot1_q00,
+            slot1_q01,
+            slot1_q02,
+            slot1_q03,
+            slot1_do00,
+            slot1_do01,
+            slot1_do02,
+            slot1_do03,
+            slot1_dpsum_partial0,
+            slot1_lse_log20,
+        ) = _load_one_kernel_occurrence_row_state(
+            mQRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionToRowSlot,
+            slot1_valid,
+            slot1_member_idx,
+            slot1_union_idx,
+            Int32(0),
+            head_idx,
+            dim0,
+            dim1,
+            dim2,
+            dim3,
+        )
+        (
+            slot1_global_q_row1,
+            slot1_participates1,
+            slot1_q10,
+            slot1_q11,
+            slot1_q12,
+            slot1_q13,
+            slot1_do10,
+            slot1_do11,
+            slot1_do12,
+            slot1_do13,
+            slot1_dpsum_partial1,
+            slot1_lse_log21,
+        ) = _load_one_kernel_occurrence_row_state(
+            mQRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionToRowSlot,
+            slot1_valid,
+            slot1_member_idx,
+            slot1_union_idx,
+            Int32(1),
+            head_idx,
+            dim0,
+            dim1,
+            dim2,
+            dim3,
+        )
+
+        for rel_occ in range(8):
+            next_rel_occ = rel_occ + 1
+            next_occ_idx = occ_start + Int32(next_rel_occ)
+            next_valid = Boolean(active_key and next_rel_occ < 8 and next_occ_idx < occ_end)
+            next_member_idx = Int32(-1)
+            next_union_idx = Int32(-1)
+            row0_dk0 = Float32(0.0)
+            row0_dk1 = Float32(0.0)
+            row0_dk2 = Float32(0.0)
+            row0_dk3 = Float32(0.0)
+            row0_dv0 = Float32(0.0)
+            row0_dv1 = Float32(0.0)
+            row0_dv2 = Float32(0.0)
+            row0_dv3 = Float32(0.0)
+            row1_dk0 = Float32(0.0)
+            row1_dk1 = Float32(0.0)
+            row1_dk2 = Float32(0.0)
+            row1_dk3 = Float32(0.0)
+            row1_dv0 = Float32(0.0)
+            row1_dv1 = Float32(0.0)
+            row1_dv2 = Float32(0.0)
+            row1_dv3 = Float32(0.0)
+            if next_valid:
+                next_member_idx = Int32(mUniqueKeyMemberIdx[next_occ_idx])
+                next_union_idx = Int32(mUniqueKeyUnionIdx[next_occ_idx])
+
+            if rel_occ % 2 == 0:
+                slot1_valid = next_valid
+                slot1_member_idx = next_member_idx
+                slot1_union_idx = next_union_idx
+                (
+                    slot1_global_q_row0,
+                    slot1_participates0,
+                    slot1_q00,
+                    slot1_q01,
+                    slot1_q02,
+                    slot1_q03,
+                    slot1_do00,
+                    slot1_do01,
+                    slot1_do02,
+                    slot1_do03,
+                    slot1_dpsum_partial0,
+                    slot1_lse_log20,
+                ) = _load_one_kernel_occurrence_row_state(
+                    mQRows,
+                    mOutRows,
+                    mdORows,
+                    mLSERows,
+                    mQRowIdx,
+                    mUnionToRowSlot,
+                    slot1_valid,
+                    slot1_member_idx,
+                    slot1_union_idx,
+                    Int32(0),
+                    head_idx,
+                    dim0,
+                    dim1,
+                    dim2,
+                    dim3,
+                )
+                (
+                    slot1_global_q_row1,
+                    slot1_participates1,
+                    slot1_q10,
+                    slot1_q11,
+                    slot1_q12,
+                    slot1_q13,
+                    slot1_do10,
+                    slot1_do11,
+                    slot1_do12,
+                    slot1_do13,
+                    slot1_dpsum_partial1,
+                    slot1_lse_log21,
+                ) = _load_one_kernel_occurrence_row_state(
+                    mQRows,
+                    mOutRows,
+                    mdORows,
+                    mLSERows,
+                    mQRowIdx,
+                    mUnionToRowSlot,
+                    slot1_valid,
+                    slot1_member_idx,
+                    slot1_union_idx,
+                    Int32(1),
+                    head_idx,
+                    dim0,
+                    dim1,
+                    dim2,
+                    dim3,
+                )
+                row0_dk0, row0_dk1, row0_dk2, row0_dk3, row0_dv0, row0_dv1, row0_dv2, row0_dv3 = (
+                    _accumulate_one_kernel_occurrence_row(
+                        lane,
+                        mdQRows,
+                        head_idx,
+                        slot0_global_q_row0,
+                        slot0_participates0,
+                        slot0_q00,
+                        slot0_q01,
+                        slot0_q02,
+                        slot0_q03,
+                        slot0_do00,
+                        slot0_do01,
+                        slot0_do02,
+                        slot0_do03,
+                        slot0_dpsum_partial0,
+                        slot0_lse_log20,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        dim0,
+                        dim1,
+                        dim2,
+                        dim3,
+                        scale_log2,
+                        softmax_scale,
+                    )
+                )
+                row1_dk0, row1_dk1, row1_dk2, row1_dk3, row1_dv0, row1_dv1, row1_dv2, row1_dv3 = (
+                    _accumulate_one_kernel_occurrence_row(
+                        lane,
+                        mdQRows,
+                        head_idx,
+                        slot0_global_q_row1,
+                        slot0_participates1,
+                        slot0_q10,
+                        slot0_q11,
+                        slot0_q12,
+                        slot0_q13,
+                        slot0_do10,
+                        slot0_do11,
+                        slot0_do12,
+                        slot0_do13,
+                        slot0_dpsum_partial1,
+                        slot0_lse_log21,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        dim0,
+                        dim1,
+                        dim2,
+                        dim3,
+                        scale_log2,
+                        softmax_scale,
+                    )
+                )
+            else:
+                slot0_valid = next_valid
+                slot0_member_idx = next_member_idx
+                slot0_union_idx = next_union_idx
+                (
+                    slot0_global_q_row0,
+                    slot0_participates0,
+                    slot0_q00,
+                    slot0_q01,
+                    slot0_q02,
+                    slot0_q03,
+                    slot0_do00,
+                    slot0_do01,
+                    slot0_do02,
+                    slot0_do03,
+                    slot0_dpsum_partial0,
+                    slot0_lse_log20,
+                ) = _load_one_kernel_occurrence_row_state(
+                    mQRows,
+                    mOutRows,
+                    mdORows,
+                    mLSERows,
+                    mQRowIdx,
+                    mUnionToRowSlot,
+                    slot0_valid,
+                    slot0_member_idx,
+                    slot0_union_idx,
+                    Int32(0),
+                    head_idx,
+                    dim0,
+                    dim1,
+                    dim2,
+                    dim3,
+                )
+                (
+                    slot0_global_q_row1,
+                    slot0_participates1,
+                    slot0_q10,
+                    slot0_q11,
+                    slot0_q12,
+                    slot0_q13,
+                    slot0_do10,
+                    slot0_do11,
+                    slot0_do12,
+                    slot0_do13,
+                    slot0_dpsum_partial1,
+                    slot0_lse_log21,
+                ) = _load_one_kernel_occurrence_row_state(
+                    mQRows,
+                    mOutRows,
+                    mdORows,
+                    mLSERows,
+                    mQRowIdx,
+                    mUnionToRowSlot,
+                    slot0_valid,
+                    slot0_member_idx,
+                    slot0_union_idx,
+                    Int32(1),
+                    head_idx,
+                    dim0,
+                    dim1,
+                    dim2,
+                    dim3,
+                )
+                row0_dk0, row0_dk1, row0_dk2, row0_dk3, row0_dv0, row0_dv1, row0_dv2, row0_dv3 = (
+                    _accumulate_one_kernel_occurrence_row(
+                        lane,
+                        mdQRows,
+                        head_idx,
+                        slot1_global_q_row0,
+                        slot1_participates0,
+                        slot1_q00,
+                        slot1_q01,
+                        slot1_q02,
+                        slot1_q03,
+                        slot1_do00,
+                        slot1_do01,
+                        slot1_do02,
+                        slot1_do03,
+                        slot1_dpsum_partial0,
+                        slot1_lse_log20,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        dim0,
+                        dim1,
+                        dim2,
+                        dim3,
+                        scale_log2,
+                        softmax_scale,
+                    )
+                )
+                row1_dk0, row1_dk1, row1_dk2, row1_dk3, row1_dv0, row1_dv1, row1_dv2, row1_dv3 = (
+                    _accumulate_one_kernel_occurrence_row(
+                        lane,
+                        mdQRows,
+                        head_idx,
+                        slot1_global_q_row1,
+                        slot1_participates1,
+                        slot1_q10,
+                        slot1_q11,
+                        slot1_q12,
+                        slot1_q13,
+                        slot1_do10,
+                        slot1_do11,
+                        slot1_do12,
+                        slot1_do13,
+                        slot1_dpsum_partial1,
+                        slot1_lse_log21,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        dim0,
+                        dim1,
+                        dim2,
+                        dim3,
+                        scale_log2,
+                        softmax_scale,
+                    )
+                )
+
+            dk0 += row0_dk0 + row1_dk0
+            dk1 += row0_dk1 + row1_dk1
+            dk2 += row0_dk2 + row1_dk2
+            dk3 += row0_dk3 + row1_dk3
+            dv0 += row0_dv0 + row1_dv0
+            dv1 += row0_dv1 + row1_dv1
+            dv2 += row0_dv2 + row1_dv2
+            dv3 += row0_dv3 + row1_dv3
 
         if active_key and key_row >= Int32(0):
             if dim0 < mdKRows.shape[2]:
@@ -4937,7 +5662,7 @@ _run_synthetic_direct_row_micro_bwd_kernel_key_owned.compile_cache = get_jit_cac
 )
 
 
-def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base(
     q_rows: torch.Tensor,
     k_rows: torch.Tensor,
     v_rows: torch.Tensor,
@@ -4973,9 +5698,9 @@ def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
         v_rows.shape[2],
         torch.cuda.get_device_capability(q_rows.device),
     )
-    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_one_kernel.compile_cache:
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base.compile_cache:
         kernel = FlashHSASyntheticDirectRowMicroBwdOneKernelSm100()
-        _run_synthetic_direct_row_micro_bwd_kernel_one_kernel.compile_cache[compile_key] = cute.compile(
+        _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
             to_cute_tensor(k_rows),
@@ -4996,7 +5721,7 @@ def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
             options="--enable-tvm-ffi",
         )
-    _run_synthetic_direct_row_micro_bwd_kernel_one_kernel.compile_cache[compile_key](
+    _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base.compile_cache[compile_key](
         q_rows,
         k_rows,
         v_rows,
@@ -5017,9 +5742,158 @@ def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
     )
 
 
-_run_synthetic_direct_row_micro_bwd_kernel_one_kernel.compile_cache = get_jit_cache(
+_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base.compile_cache = get_jit_cache(
     "hsa_synth_direct_row_micro_bwd_one_kernel"
 )
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    unique_key_row_idx: torch.Tensor,
+    unique_key_member_idx: torch.Tensor,
+    unique_key_union_idx: torch.Tensor,
+    unique_key_occurrence_row_ptr: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+):
+    _require_cute_runtime()
+    compile_key = (
+        "synthetic_direct_row_micro_bwd_one_kernel_pingpong_v1",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        out_rows.dtype,
+        dout_rows.dtype,
+        q_row_idx.shape[1],
+        union_to_row_slot.shape[2],
+        unique_key_row_idx.shape[0],
+        unique_key_member_idx.shape[0],
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong.compile_cache:
+        kernel = FlashHSASyntheticDirectRowMicroBwdOneKernelPingPongSm100()
+        _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(out_rows),
+            to_cute_tensor(dout_rows),
+            to_cute_tensor(lse_rows, assumed_align=4),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(union_to_row_slot, assumed_align=4),
+            to_cute_tensor(unique_key_row_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_member_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_union_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_occurrence_row_ptr, assumed_align=4, leading_dim=0),
+            Float32(softmax_scale),
+            to_cute_tensor(dq_rows, assumed_align=4),
+            to_cute_tensor(dk_rows, assumed_align=4),
+            to_cute_tensor(dv_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        Float32(softmax_scale),
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong.compile_cache = get_jit_cache(
+    "hsa_synth_direct_row_micro_bwd_one_kernel_pingpong"
+)
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    unique_key_row_idx: torch.Tensor,
+    unique_key_member_idx: torch.Tensor,
+    unique_key_union_idx: torch.Tensor,
+    unique_key_occurrence_row_ptr: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+    max_unique_key_occurrences: int | None = None,
+):
+    if _should_use_synthetic_one_kernel_bwd_pingpong(
+        q_rows,
+        q_row_idx,
+        union_to_row_slot,
+        max_unique_key_occurrences=max_unique_key_occurrences,
+    ):
+        return _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_pingpong(
+            q_rows,
+            k_rows,
+            v_rows,
+            out_rows,
+            dout_rows,
+            lse_rows,
+            q_row_idx,
+            union_to_row_slot,
+            unique_key_row_idx,
+            unique_key_member_idx,
+            unique_key_union_idx,
+            unique_key_occurrence_row_ptr,
+            dq_rows,
+            dk_rows,
+            dv_rows,
+            softmax_scale=softmax_scale,
+        )
+    return _run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=softmax_scale,
+    )
 
 
 def _run_synthetic_direct_row_micro_bwd_kernel_row_local(
@@ -5289,6 +6163,37 @@ def _should_use_synthetic_one_kernel_bwd(
         return supported
     try:
         return supported and q_row_idx.shape[0] <= 2048 and union_k_row_idx.shape[1] <= 12
+    except Exception:
+        return False
+
+
+def _should_use_synthetic_one_kernel_bwd_pingpong(
+    q_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    *,
+    max_unique_key_occurrences: int | None,
+) -> bool:
+    mode = _get_synthetic_one_kernel_bwd_pingpong_mode()
+    if mode == "off":
+        return False
+    try:
+        max_occ = int(max_unique_key_occurrences) if max_unique_key_occurrences is not None else 0
+        supported = (
+            q_rows.shape[-1] == 64
+            and q_row_idx.ndim >= 2
+            and q_row_idx.shape[1] == 2
+            and q_row_idx.shape[0] <= 2048
+            and union_to_row_slot.ndim >= 3
+            and union_to_row_slot.shape[2] <= 16
+            and max_occ <= 8
+        )
+    except Exception:
+        supported = False
+    if mode == "on":
+        return supported
+    try:
+        return supported and union_to_row_slot.shape[2] <= 12
     except Exception:
         return False
 
@@ -6409,6 +7314,7 @@ def run_hsa_bwd_sm100_synthetic_grid(
                     dk_accum,
                     dv_accum,
                     softmax_scale=softmax_scale,
+                    max_unique_key_occurrences=int(row_bucket_max_unique_key_occurrences[direct_bucket_idx]),
                 )
             elif row_compact_bwd_mode == "split":
                 _run_synthetic_direct_row_micro_bwd_kernel_dq_only(

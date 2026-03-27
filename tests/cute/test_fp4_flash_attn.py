@@ -2580,9 +2580,14 @@ def test_fp4_pv_cta_quant_pv_only_causal_oracle_matches_bf16_regular_loader(head
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_fp4_pv_cta_quant_pv_only_causal_oracle_direct_loader_informational(head_dim):
+def test_fp4_pv_cta_quant_pv_only_causal_oracle_matches_bf16_direct_loader(head_dim):
     _require_sm100()
-    _run_fp4_pv_causal_oracle_case(head_dim=head_dim, direct_loader=True, expect_close=False)
+    _run_fp4_pv_causal_oracle_case(
+        head_dim=head_dim,
+        direct_loader=True,
+        expect_close=True,
+        atol=2.5e-1,
+    )
 
 
 def test_fp4_pv_cta_quant_runtime_matches_legacy_path():

@@ -251,6 +251,7 @@ class FP4FlashAttentionForwardSm100:
         self.use_fp4_pv = use_fp4_pv
         self.fp4_pv_direct_loader = os.getenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "0") == "1"
         self.fp4_pv_force_cta_direct = os.getenv("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT", "0") == "1"
+        self.fp4_pv_manual_direct_loader = self.fp4_pv_direct_loader and self.fp4_pv_force_cta_direct
         # Keep the legacy env var name for the opt-in PV quantizer experiment even though the
         # current landing uses decode-centric block scales after the CTA-local amax reduction.
         self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
@@ -1801,26 +1802,26 @@ class FP4FlashAttentionForwardSm100:
             if const_expr(mPageTable is None):
                 if const_expr(not seqlen.has_cu_seqlens_k):
                     mK_cur = mK[None, None, kv_head_idx, batch_idx]
-                    if const_expr(not self.use_fp4_pv or not self.fp4_pv_direct_loader):
+                    if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                         mV_cur = mV[None, None, kv_head_idx, batch_idx]
                     if const_expr(self.use_fp4_qk):
                         mK_scale_cur = mK_scale[None, None, (kv_head_idx, batch_idx)]
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, kv_head_idx])
-                    if const_expr(not self.use_fp4_pv or not self.fp4_pv_direct_loader):
+                    if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                         mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, kv_head_idx])
                     if const_expr(self.use_fp4_qk):
                         mK_scale_cur = cute.domain_offset(
                             (seqlen.offset_k, 0), mK_scale[None, None, (kv_head_idx, batch_idx)]
                         )
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                if const_expr(not self.use_fp4_pv or not self.fp4_pv_direct_loader):
+                if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                     gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
                 if const_expr(self.use_fp4_qk):
                     gK_scale = cute.local_tile(
                         mK_scale_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0)
                     )
-                if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader):
+                if const_expr(self.use_fp4_pv and not self.fp4_pv_manual_direct_loader):
                     assert mV_scale is not None and sSFV is not None
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
@@ -1828,14 +1829,14 @@ class FP4FlashAttentionForwardSm100:
                 gK = cute.local_tile(
                     mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
                 )
-                if const_expr(not self.use_fp4_pv or not self.fp4_pv_direct_loader):
+                if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                     mV_cur = mV[None, None, kv_head_idx, None]
                     gV = cute.local_tile(
                         mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                     )
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
-            if const_expr(not self.use_fp4_pv or not self.fp4_pv_direct_loader):
+            if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                 tOgV = thr_mma_pv.partition_B(gV)
             load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
@@ -1849,7 +1850,7 @@ class FP4FlashAttentionForwardSm100:
                     cute.group_modes(sK, 0, 3),
                     cute.group_modes(tSgK, 0, 3),
                 )
-                if const_expr(self.use_fp4_pv and self.fp4_pv_direct_loader):
+                if const_expr(self.use_fp4_pv and self.fp4_pv_manual_direct_loader):
                     tVsV, tVgV = None, None
                 else:
                     tVsV, tVgV = cpasync.tma_partition(
@@ -1894,7 +1895,7 @@ class FP4FlashAttentionForwardSm100:
             )
             if const_expr(self.use_fp4_pv):
                 assert mV_scale is not None and sSFV is not None
-            if const_expr(self.use_fp4_pv and self.fp4_pv_direct_loader):
+            if const_expr(self.use_fp4_pv and self.fp4_pv_manual_direct_loader):
                 assert mV_storage is not None
                 load_V = partial(
                     self.load_v_fp4_pv_stage_public,
@@ -1974,7 +1975,7 @@ class FP4FlashAttentionForwardSm100:
                             )
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
-                    if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader):
+                    if const_expr(self.use_fp4_pv and not self.fp4_pv_manual_direct_loader):
                         if warp_idx == self.load_warp_ids[0]:
                             self.load_v_scale_stage_public(
                                 mV_scale,
@@ -2003,7 +2004,7 @@ class FP4FlashAttentionForwardSm100:
                             )
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
-                        if const_expr(self.use_fp4_pv and not self.fp4_pv_direct_loader):
+                        if const_expr(self.use_fp4_pv and not self.fp4_pv_manual_direct_loader):
                             if warp_idx == self.load_warp_ids[0]:
                                 self.load_v_scale_stage_public(
                                     mV_scale,
@@ -4103,6 +4104,9 @@ class FP4FlashAttentionForwardSm100:
             sV_stage,
             storage_dtype=self.v_storage_dtype,
         )
+        sV_stage_packed_flat = cute.group_modes(
+            cute.filter_zeros(sV_stage_packed), 0, cute.rank(sV_stage_packed)
+        )
         sV_stage_bytes_flat = cute.make_tensor(
             cute.recast_ptr(sV_stage.iterator, dtype=self.v_storage_dtype),
             (self.n_block_size * (self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width),),
@@ -4112,6 +4116,7 @@ class FP4FlashAttentionForwardSm100:
             storage_dtype=self.v_storage_dtype,
         )
         sV_block = sV_stage[None, None, 0]
+        mV_storage_vt = mV_storage
 
         zero_v = self.v_storage_dtype(0)
         for idx in cutlass.range(
@@ -4127,46 +4132,30 @@ class FP4FlashAttentionForwardSm100:
                     row_parity = row - row_pair * 2
                     raw_offset = row_pair * 64 + row_parity * 32 + self.fp4_pv_raw_byte_offset
                     if raw_offset < cute.size(sV_stage_bytes_flat.shape):
-                        sV_stage_bytes_flat[raw_offset] = mV_storage[
-                            batch_idx, kv_head_idx, Int32(0), block * (self.n_block_size // 2) + row_pair
+                        sV_stage_bytes_flat[raw_offset] = mV_storage_vt[
+                            Int32(0), block * (self.n_block_size // 2) + row_pair, kv_head_idx, batch_idx
                         ]
         else:
-            valid_packed_cols = self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width
-            low_nibble_mask = Int32(0x0F)
-            shift_bits = Int32(4)
-            for idx in cutlass.range(
-                tidx, self.n_block_size * valid_packed_cols, num_load_threads, unroll=1
-            ):
-                packed_col = idx // self.n_block_size
-                row = idx - packed_col * self.n_block_size
-                seqlen_idx = block * self.n_block_size + row
+            valid_source_bytes = self.head_dim_v_padded
+            num_row_pairs = self.n_block_size // 2
+            block_rowpair_base = block * num_row_pairs
+            packed_cols_per_row = cute.size(sV_stage_packed.shape[0][1])
+            for row_pair in cutlass.range_constexpr(num_row_pairs):
+                seqlen_idx = block * self.n_block_size + row_pair * 2
                 if seqlen_idx < seqlen_k:
-                    row_pair = row // 2
-                    row_parity = row - row_pair * 2
-                    src_d0 = packed_col * 2
-                    src_d1 = src_d0 + 1
-                    nibble_shift = row_parity * shift_bits
-                    src0_i32 = Int32(
-                        mV_storage[
-                            src_d0,
-                            block * (self.n_block_size // 2) + row_pair,
+                    for d_idx in cutlass.range(tidx, valid_source_bytes, num_load_threads, unroll=1):
+                        d_outer = d_idx // packed_cols_per_row
+                        packed_col = d_idx - d_outer * packed_cols_per_row
+                        raw_offset = cute.crd2idx(
+                            ((packed_col, row_pair), Int32(0), d_outer),
+                            sV_stage_packed.layout,
+                        )
+                        sV_stage_bytes_flat[raw_offset] = mV_storage_vt[
+                            d_idx,
+                            block_rowpair_base + row_pair,
                             kv_head_idx,
                             batch_idx,
                         ]
-                    )
-                    src1_i32 = Int32(
-                        mV_storage[
-                            src_d1,
-                            block * (self.n_block_size // 2) + row_pair,
-                            kv_head_idx,
-                            batch_idx,
-                        ]
-                    )
-                    nibble0 = (src0_i32 >> nibble_shift) & low_nibble_mask
-                    nibble1 = (src1_i32 >> nibble_shift) & low_nibble_mask
-                    sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = cutlass.Uint8(
-                        nibble0 | (nibble1 << shift_bits)
-                    )
 
         if (
             cute.arch.lane_idx() == 0
@@ -4174,15 +4163,20 @@ class FP4FlashAttentionForwardSm100:
             and kv_head_idx == 0
             and block == 0
         ):
+            d0 = Int32(0)
+            d1 = Int32(1)
+            d8 = Int32(8)
+            d16 = Int32(16)
+            row_pair0 = Int32(0)
             fa_logging.fa_printf(
                 2,
                 "FP4 PV producer Vt bytes[d,rowpair] d0/1 pair0, d8 pair0, d16 pair0: %d %d %d %d %d %d\n",
-                mV_storage[Int32(0), Int32(0), kv_head_idx, batch_idx],
-                mV_storage[Int32(1), Int32(0), kv_head_idx, batch_idx],
-                mV_storage[Int32(0), Int32(0), kv_head_idx, batch_idx],
-                mV_storage[Int32(1), Int32(0), kv_head_idx, batch_idx],
-                mV_storage[Int32(8), Int32(0), kv_head_idx, batch_idx],
-                mV_storage[Int32(16), Int32(0), kv_head_idx, batch_idx],
+                mV_storage_vt[d0, row_pair0, kv_head_idx, batch_idx],
+                mV_storage_vt[d1, row_pair0, kv_head_idx, batch_idx],
+                mV_storage_vt[d0, row_pair0, kv_head_idx, batch_idx],
+                mV_storage_vt[d1, row_pair0, kv_head_idx, batch_idx],
+                mV_storage_vt[d8, row_pair0, kv_head_idx, batch_idx],
+                mV_storage_vt[d16, row_pair0, kv_head_idx, batch_idx],
             )
             fa_logging.fa_printf(
                 2,
@@ -4265,15 +4259,56 @@ class FP4FlashAttentionForwardSm100:
                 Int32(cute.crd2idx((Int32(17), Int32(0)), sV_block.layout)),
             )
 
+        sSFV_logical = cute.make_tensor(
+            sSFV_stage.iterator,
+            tile_atom_to_shape_sfv_vt(
+                (self.head_dim_v_padded, self.n_block_size, 1, 1),
+                self.fp4_sf_vec_size,
+            ),
+        )
+        sSFV_logical_u8 = cute.make_tensor(
+            cute.recast_ptr(utils.elem_pointer(sSFV_logical, (0, 0, 0, 0)), dtype=cutlass.Uint8),
+            sSFV_logical.layout,
+        )
+        sSFV_logical_u8_flat = cute.group_modes(
+            cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
+        )
+        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
+        for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
+            sSFV_logical_u8_flat[idx] = one_scale_u8
+
+        num_d_groups = self.head_dim_v_padded // self.fp4_sf_vec_size
+        num_seq_groups = mV_scale.shape[3]
+        num_heads_kv = mV_scale.shape[1]
+        raw_scale_u8 = cute.make_tensor(
+            cute.recast_ptr(
+                utils.elem_pointer(mV_scale, (0,) * cute.rank(mV_scale)),
+                dtype=cutlass.Uint8,
+            ),
+            (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
+        )
+        slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
+        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
+            row = idx // num_d_groups
+            d_group = idx - row * num_d_groups
+            seqlen_idx = block * self.n_block_size + row
+            if seqlen_idx < seqlen_k:
+                d_idx = d_group * self.fp4_sf_vec_size
+                seq_group = seqlen_idx // self.fp4_sf_vec_size
+                tile_m = d_idx // 64
+                row_in_tile = d_idx - tile_m * 64
+                quad = row_in_tile // 16
+                row_mod16 = row_in_tile - quad * 16
+                raw_offset = (
+                    tile_m * 64 * num_seq_groups
+                    + (seq_group // 4) * 256
+                    + (seq_group % 4)
+                    + quad * 4
+                    + row_mod16 * 16
+                )
+                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
+
         if warp_idx == self.load_warp_ids[0]:
-            self.load_v_scale_stage_public(
-                mV_scale,
-                batch_idx,
-                kv_head_idx,
-                sSFV_stage,
-                block,
-                seqlen_k,
-            )
             self.debug_print_fp4_pv_public_inputs(
                 mV_storage,
                 mV_scale,
@@ -4310,6 +4345,7 @@ class FP4FlashAttentionForwardSm100:
             and kv_head_idx == 0
             and block == 0
         ):
+            mV_storage_vt = mV_storage
             row0 = Int32(0)
             row1 = Int32(1)
             d0 = Int32(0)
@@ -4325,28 +4361,28 @@ class FP4FlashAttentionForwardSm100:
             )
             fa_logging.fa_printf(
                 2,
-                "FP4 PV src V row0 packed bytes: %d %d %d %d\n",
-                mV_storage[batch_idx, row0, kv_head_idx, d0],
-                mV_storage[batch_idx, row0, kv_head_idx, d1],
-                mV_storage[batch_idx, row0, kv_head_idx, d2],
-                mV_storage[batch_idx, row0, kv_head_idx, d3],
+                "FP4 PV src Vt pair0 packed bytes[d0:d3]: %d %d %d %d\n",
+                mV_storage_vt[d0, row0, kv_head_idx, batch_idx],
+                mV_storage_vt[d1, row0, kv_head_idx, batch_idx],
+                mV_storage_vt[d2, row0, kv_head_idx, batch_idx],
+                mV_storage_vt[d3, row0, kv_head_idx, batch_idx],
             )
             if row1 < seqlen_k:
                 fa_logging.fa_printf(
                     2,
-                    "FP4 PV src V row1 packed bytes: %d %d %d %d\n",
-                    mV_storage[batch_idx, row1, kv_head_idx, d0],
-                    mV_storage[batch_idx, row1, kv_head_idx, d1],
-                    mV_storage[batch_idx, row1, kv_head_idx, d2],
-                    mV_storage[batch_idx, row1, kv_head_idx, d3],
+                    "FP4 PV src Vt pair1 packed bytes[d0:d3]: %d %d %d %d\n",
+                    mV_storage_vt[d0, row1, kv_head_idx, batch_idx],
+                    mV_storage_vt[d1, row1, kv_head_idx, batch_idx],
+                    mV_storage_vt[d2, row1, kv_head_idx, batch_idx],
+                    mV_storage_vt[d3, row1, kv_head_idx, batch_idx],
                 )
             fa_logging.fa_printf(
                 2,
-                "FP4 PV src v_scale row0 groups: %d %d %d %d\n",
-                mV_scale_u8[batch_idx, row0, kv_head_idx, d0],
-                mV_scale_u8[batch_idx, row0, kv_head_idx, d1],
-                mV_scale_u8[batch_idx, row0, kv_head_idx, d2],
-                mV_scale_u8[batch_idx, row0, kv_head_idx, d3],
+                "FP4 PV src SFVt group0 bytes[d0:d3]: %d %d %d %d\n",
+                mV_scale_u8[batch_idx, kv_head_idx, d0, row0],
+                mV_scale_u8[batch_idx, kv_head_idx, d1, row0],
+                mV_scale_u8[batch_idx, kv_head_idx, d2, row0],
+                mV_scale_u8[batch_idx, kv_head_idx, d3, row0],
             )
 
     @cute.jit
@@ -4491,6 +4527,30 @@ class FP4FlashAttentionForwardSm100:
             )
             fa_logging.fa_printf(
                 2,
+                "FP4 PV staged sV bytes[128:136]: %d %d %d %d %d %d %d %d\n",
+                sV_bytes_flat[Int32(128)],
+                sV_bytes_flat[Int32(129)],
+                sV_bytes_flat[Int32(130)],
+                sV_bytes_flat[Int32(131)],
+                sV_bytes_flat[Int32(132)],
+                sV_bytes_flat[Int32(133)],
+                sV_bytes_flat[Int32(134)],
+                sV_bytes_flat[Int32(135)],
+            )
+            fa_logging.fa_printf(
+                2,
+                "FP4 PV staged sV bytes[192:200]: %d %d %d %d %d %d %d %d\n",
+                sV_bytes_flat[Int32(192)],
+                sV_bytes_flat[Int32(193)],
+                sV_bytes_flat[Int32(194)],
+                sV_bytes_flat[Int32(195)],
+                sV_bytes_flat[Int32(196)],
+                sV_bytes_flat[Int32(197)],
+                sV_bytes_flat[Int32(198)],
+                sV_bytes_flat[Int32(199)],
+            )
+            fa_logging.fa_printf(
+                2,
                 "FP4 PV staged sV bytes[256,257,320,321,384,385,512,513,768,769]: %d %d %d %d %d %d %d %d %d %d\n",
                 sV_bytes_flat[Int32(256)],
                 sV_bytes_flat[Int32(257)],
@@ -4527,6 +4587,10 @@ class FP4FlashAttentionForwardSm100:
                 sV_bytes_flat[Int32(2062)],
                 sV_bytes_flat[Int32(2063)],
             )
+            for idx in cutlass.range_constexpr(512):
+                val = sV_bytes_flat[Int32(idx)]
+                if val != 0:
+                    fa_logging.fa_printf(2, "FP4 PV staged sV nz idx %d val %d\n", Int32(idx), val)
             fa_logging.fa_printf(
                 2,
                 "FP4 PV staged sSFV row0 bytes[0:8]: %d %d %d %d %d %d %d %d\n",
@@ -4627,8 +4691,20 @@ class FP4FlashAttentionForwardSm100:
         valid_n_limit: Int32,
         valid_d_limit: Int32,
     ):
-        tSrc_bytes = self.as_packed_byte_tensor(tSrc, storage_dtype=self.v_storage_dtype)
-        tDst_bytes = self.as_packed_byte_tensor(tDst, storage_dtype=self.v_storage_dtype)
+        tSrc_bytes = cute.make_tensor(
+            cute.recast_ptr(
+                utils.elem_pointer(tSrc, (0,) * cute.rank(tSrc)),
+                dtype=self.v_storage_dtype,
+            ),
+            cute.recast_layout(self.v_storage_dtype.width, tSrc.element_type.width, tSrc.layout),
+        )
+        tDst_bytes = cute.make_tensor(
+            cute.recast_ptr(
+                utils.elem_pointer(tDst, (0,) * cute.rank(tDst)),
+                dtype=self.v_storage_dtype,
+            ),
+            cute.recast_layout(self.v_storage_dtype.width, tDst.element_type.width, tDst.layout),
+        )
         tSrc_flat = cute.flatten(tSrc_bytes)
         tDst_flat = cute.flatten(tDst_bytes)
         tCoord_flat = cute.flatten(tCoord)
@@ -4642,6 +4718,7 @@ class FP4FlashAttentionForwardSm100:
                 tDst_flat[idx] = tSrc_flat[idx]
             else:
                 tDst_flat[idx] = zero_v
+
 
     @cute.jit
     def load_vt_fp4_pv_stage(

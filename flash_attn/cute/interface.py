@@ -419,6 +419,10 @@ FP4_DECODE_TABLE = torch.tensor(
     dtype=torch.float32,
 )
 
+_TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS = 64
+_TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS = 4
+_TK_NVFP4_TRANSPOSE_SCALE_ABS_ERR_MAX = 0.02
+
 
 def _unpack_fp4x2_tensor(packed: torch.Tensor) -> torch.Tensor:
     packed_i32 = packed.to(torch.int32)
@@ -486,6 +490,86 @@ def _quantize_nvfp4_transpose_scale_from_bf16(x: torch.Tensor) -> torch.Tensor:
     scale = groups.abs().amax(dim=-1) / 6.0
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
     return scale.to(torch.float8_e4m3fn).permute(0, 2, 1, 3).contiguous()
+
+
+@lru_cache(maxsize=None)
+def _get_tk_nvfp4_transpose_scale_offsets(head_dim: int, seqlen_groups: int) -> torch.Tensor:
+    offsets = torch.empty((head_dim, seqlen_groups), dtype=torch.long)
+    for dim in range(head_dim):
+        tile_m, row_in_tile = divmod(dim, _TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS)
+        j = row_in_tile % 32
+        grp = row_in_tile // 32
+        tile_base = tile_m * _TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS * seqlen_groups
+        for seq_group in range(seqlen_groups):
+            offsets[dim, seq_group] = (
+                tile_base
+                + (seq_group // _TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS) * 256
+                + j * 8
+                + grp * 4
+                + (seq_group % _TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS)
+            )
+    return offsets
+
+
+def _unswizzle_tk_nvfp4_transpose_scale_bytes(swizzled_scale: torch.Tensor) -> torch.Tensor:
+    """Invert the TK nvfp4_v5 transpose-scale byte swizzle into logical [B, D, H, S/16]."""
+    if swizzled_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"Expected torch.float8_e4m3fn scale tensor, got {swizzled_scale.dtype}")
+    if swizzled_scale.ndim != 4:
+        raise ValueError(f"Expected a 4D scale tensor, got {swizzled_scale.ndim}D")
+    batch_size, head_dim, num_heads, seqlen_groups = swizzled_scale.shape
+    if head_dim % _TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS != 0:
+        raise ValueError(
+            f"Expected head_dim divisible by {_TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS}, got {head_dim}."
+        )
+    if seqlen_groups % _TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS != 0:
+        raise ValueError(
+            f"Expected seqlen_groups divisible by {_TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS}, got {seqlen_groups}."
+        )
+
+    offsets = _get_tk_nvfp4_transpose_scale_offsets(head_dim, seqlen_groups).to(swizzled_scale.device)
+    src_u8 = swizzled_scale.view(torch.uint8).permute(0, 2, 1, 3).contiguous().view(batch_size, num_heads, -1)
+    logical_u8 = src_u8[..., offsets.reshape(-1)].view(batch_size, num_heads, head_dim, seqlen_groups)
+    logical = logical_u8.flatten().view(torch.float8_e4m3fn).view(batch_size, num_heads, head_dim, seqlen_groups)
+    return logical.permute(0, 2, 1, 3).contiguous()
+
+
+def _adapt_tk_nvfp4_transpose_scale(
+    swizzled_scale: torch.Tensor,
+    sg: torch.Tensor,
+    synth_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Adapt TK nvfp4_v5 transpose scales into the logical absolute decode-scale contract.
+
+    The live TK transpose-scale buffers can still carry invalid FP8 blocks on some slices.
+    We therefore treat the TK metadata as preferred-but-untrusted: unswizzle it, multiply by
+    the explicit per-head sg, and repair any non-finite, non-positive, or out-of-envelope blocks
+    against the synthesized logical BF16 reference.
+    """
+    if swizzled_scale.shape != synth_scale.shape:
+        raise ValueError("swizzled_scale and synth_scale must have the same shape.")
+    if sg.dtype != torch.float32:
+        raise TypeError(f"Expected sg dtype torch.float32, got {sg.dtype}")
+    if is_fake_mode():
+        return torch.empty_like(synth_scale)
+
+    _, head_dim, _, seqlen_groups = swizzled_scale.shape
+    if (
+        head_dim % _TK_NVFP4_TRANSPOSE_SCALE_TILE_ROWS != 0
+        or seqlen_groups % _TK_NVFP4_TRANSPOSE_SCALE_TILE_GROUPS != 0
+    ):
+        return synth_scale
+
+    tk_logical_scale = _unswizzle_tk_nvfp4_transpose_scale_bytes(swizzled_scale)
+    tk_abs_scale = tk_logical_scale.float() * sg[:, None, :, None]
+    synth_scale_f32 = synth_scale.float()
+    valid = (
+        torch.isfinite(tk_abs_scale)
+        & (tk_abs_scale > 0)
+        & ((tk_abs_scale - synth_scale_f32).abs() <= _TK_NVFP4_TRANSPOSE_SCALE_ABS_ERR_MAX)
+    )
+    repaired = torch.where(valid, tk_abs_scale, synth_scale_f32)
+    return repaired.to(torch.float8_e4m3fn)
 
 
 def _get_static_tensor_layout_key(tensor: Optional[torch.Tensor]) -> Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
@@ -848,17 +932,28 @@ def _flash_attn_bwd_fp4_qk(
             dk_scale_tensor=ref_dk_scale_tensor,
         )
     use_external_col_metadata = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_USE_EXTERNAL_COL_METADATA")
+    force_synth_col_scale = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_SYNTH_COL_SCALE")
     native_q_col_packed = q_col_packed
     native_k_col_packed = k_col_packed
     native_q_col_scale = q_col_scale
     native_k_col_scale = k_col_scale
     native_dq_scale_tensor = k_sg
     native_dk_scale_tensor = q_sg
-    if not is_fake_mode() and not use_external_col_metadata:
-        native_q_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(q)
-        native_k_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(k)
+    if not use_external_col_metadata:
         native_dq_scale_tensor = torch.ones_like(k_sg)
         native_dk_scale_tensor = torch.ones_like(q_sg)
+        if is_fake_mode():
+            native_q_col_scale = torch.empty_like(q_col_scale)
+            native_k_col_scale = torch.empty_like(k_col_scale)
+        else:
+            synth_q_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(q)
+            synth_k_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(k)
+            if force_synth_col_scale:
+                native_q_col_scale = synth_q_col_scale
+                native_k_col_scale = synth_k_col_scale
+            else:
+                native_q_col_scale = _adapt_tk_nvfp4_transpose_scale(q_col_scale, q_sg, synth_q_col_scale)
+                native_k_col_scale = _adapt_tk_nvfp4_transpose_scale(k_col_scale, k_sg, synth_k_col_scale)
     return _flash_attn_bwd(
         q,
         k,
@@ -1396,6 +1491,9 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
     v_packed_vt = None
     v_scale_vt = None
+    fp4_pv_direct_loader = _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None
+    fp4_pv_force_cta_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT") if is_fp4_pv else None
+    fp4_pv_manual_direct_loader = bool(fp4_pv_direct_loader and fp4_pv_force_cta_direct) if is_fp4_pv else None
     if is_fp4_pv:
         # FP4 PV consumes pretransposed packed operand-B data:
         #   external v       : (B, H_k, D_v, S_k_padded // 2)
@@ -1453,7 +1551,9 @@ def _flash_attn_fwd(
         get_broadcast_dims(k_scale) if is_fp4_qk else None,
         get_broadcast_dims(v_scale) if is_fp4_pv else None,
         "vt_packed_seq" if is_fp4_pv else None,
-        _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None,
+        fp4_pv_direct_loader,
+        _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE") if is_fp4_pv else None,
+        fp4_pv_force_cta_direct,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1489,9 +1589,13 @@ def _flash_attn_fwd(
             k_tensor = to_cute_fp4_tensor(k)
             q_scale_tensor = to_cute_tensor(q_scale)
             k_scale_tensor = to_cute_tensor(k_scale)
-            v_scale_tensor = to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
+            if is_fp4_pv and fp4_pv_manual_direct_loader:
+                v_scale_tensor = to_cute_tensor(v_scale, leading_dim=3)
+                v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1)
+            else:
+                v_scale_tensor = to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
+                v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
             q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
-            v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:

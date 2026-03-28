@@ -69,7 +69,7 @@
 
 ## Next Step
 - Land native FP4 backward `dQ`/`dK` by quantizing `dS` on-tile and consuming TK columnwise Q/K metadata directly.
-  - The main kernel work is in `flash_bwd_sm100.py`, not `fp4_flash_bwd_sm100.py`.
+  - The FP4-specific backward kernel work now lives in `fp4_flash_bwd_sm100.py`; keep `flash_bwd_sm100.py` as the plain SM100 reference path.
   - The missing low-level primitive is no longer the PTX transport; it is the `dS` quantization + staging contract.
 - Re-verify FP4 PV runtime on the narrowest slice first: dense noncausal MHA, `d64`, `nvfp4`, `num_splits=1`.
 - Keep the stable QK-only path intact while PV and backward native FP4 bring-up continue.

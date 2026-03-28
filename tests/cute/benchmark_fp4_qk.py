@@ -38,6 +38,7 @@ KIND_TO_HEADS = {
 FP4_PV_ENV_KEYS = (
     "FLASH_ATTN_FP4_PV_DIRECT_LOADER",
     "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE",
+    "FLASH_ATTN_FP4_PV_ENCODE_CENTRIC",
     "FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT",
 )
 
@@ -49,9 +50,18 @@ FP4_PV_MODE_TO_ENV = {
     "cta": {
         "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1",
     },
+    "cta_encode": {
+        "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1",
+        "FLASH_ATTN_FP4_PV_ENCODE_CENTRIC": "1",
+    },
     "cta_direct": {
         "FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1",
         "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1",
+    },
+    "cta_direct_encode": {
+        "FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1",
+        "FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE": "1",
+        "FLASH_ATTN_FP4_PV_ENCODE_CENTRIC": "1",
     },
     "cta_direct_force": {
         "FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1",
@@ -315,6 +325,11 @@ def _benchmark_fp4_pv_mode(
     rtol: float = 5e-2,
 ):
     try:
+        # Measure/report the warmed steady-state kernel, not the very first post-compile launch.
+        # Some FP4 PV modes, especially causal CTA quantization, need one warm run before the
+        # numerics settle to the values seen by the timed iterations below.
+        runner()
+        torch.cuda.synchronize()
         out, lse = runner()
         torch.cuda.synchronize()
         if not torch.isfinite(out.float()).all().item():
@@ -516,7 +531,7 @@ def main():
     parser.add_argument(
         "--pv-modes",
         default="legacy,cta,cta_direct",
-        help="Comma-separated FP4 PV modes: legacy,legacy_direct,cta,cta_direct,cta_direct_force",
+        help="Comma-separated FP4 PV modes: legacy,legacy_direct,cta,cta_encode,cta_direct,cta_direct_encode,cta_direct_force",
     )
     parser.add_argument(
         "--skip-qk-baseline-check",

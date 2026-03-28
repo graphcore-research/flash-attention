@@ -61,6 +61,7 @@ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreproces
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.fp4_flash_bwd_sm100 import FlashAttentionBackwardSm100 as FP4FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
@@ -1493,6 +1494,7 @@ def _flash_attn_fwd(
     v_scale_vt = None
     fp4_pv_direct_loader = _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None
     fp4_pv_force_cta_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT") if is_fp4_pv else None
+    fp4_pv_encode_centric = _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC") if is_fp4_pv else None
     fp4_pv_manual_direct_loader = bool(fp4_pv_direct_loader and fp4_pv_force_cta_direct) if is_fp4_pv else None
     if is_fp4_pv:
         # FP4 PV consumes pretransposed packed operand-B data:
@@ -1553,6 +1555,7 @@ def _flash_attn_fwd(
         "vt_packed_seq" if is_fp4_pv else None,
         fp4_pv_direct_loader,
         _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE") if is_fp4_pv else None,
+        fp4_pv_encode_centric,
         fp4_pv_force_cta_direct,
         fa_logging.get_fa_log_level(),
     )
@@ -2383,8 +2386,10 @@ def _flash_attn_bwd(
     else:
         num_threads = 384
     if use_fp4_bwd_qk:
-        cluster_size = 1
-        use_2cta_instrs = False
+        # Native FP4 backward d128 wants the 2-CTA SM100 layout: the 1-CTA path has no spare
+        # TMEM tail capacity for the extra FP4 scale staging, while d64 is fine on 1-CTA.
+        use_2cta_instrs = head_dim >= 128
+        cluster_size = 2 if use_2cta_instrs else 1
     fp4_bwd_native_skip_dk = bool(
         use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DK")
     )
@@ -2399,6 +2404,12 @@ def _flash_attn_bwd(
     )
     fp4_bwd_native_skip_qt_kt_loads = bool(
         use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_QT_KT_LOADS")
+    )
+    fp4_bwd_native_skip_dkv_epilogue = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DKV_EPILOGUE")
+    )
+    fp4_bwd_native_skip_dq_reduce = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DQ_REDUCE")
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
@@ -2506,6 +2517,8 @@ def _flash_attn_bwd(
             fp4_bwd_native_skip_ds_store if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_ds_quant if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_qt_kt_loads if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_dkv_epilogue if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_dq_reduce if use_fp4_bwd_qk else None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -2593,35 +2606,53 @@ def _flash_attn_bwd(
                 subtile_factor=subtile_factor,
             )
         else:
-            fp4_sf_dtype = None
-            fp4_sf_vec_size = 0
             if use_fp4_bwd_qk:
                 fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_bwd_qk_format)
-            fa_bwd_obj = FlashAttentionBackwardSm100(
-                head_dim,
-                head_dim_v,
-                is_causal=causal,
-                is_local=local,
-                qhead_per_kvhead=qhead_per_kvhead,
-                tile_m=m_block_size,
-                tile_n=n_block_size,
-                cluster_size=cluster_size,
-                use_2cta_instrs=use_2cta_instrs,
-                deterministic=deterministic,
-                score_mod=score_mod,
-                score_mod_bwd=score_mod_bwd,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                subtile_factor=subtile_factor,
-                use_fp4_bwd_qk=use_fp4_bwd_qk,
-                fp4_bwd_native_skip_dk=fp4_bwd_native_skip_dk,
-                fp4_bwd_native_skip_dq=fp4_bwd_native_skip_dq,
-                fp4_bwd_native_skip_ds_store=fp4_bwd_native_skip_ds_store,
-                fp4_bwd_native_skip_ds_quant=fp4_bwd_native_skip_ds_quant,
-                fp4_bwd_native_skip_qt_kt_loads=fp4_bwd_native_skip_qt_kt_loads,
-                fp4_sf_dtype=fp4_sf_dtype,
-                fp4_sf_vec_size=fp4_sf_vec_size,
-            )
+                fa_bwd_obj = FP4FlashAttentionBackwardSm100(
+                    head_dim,
+                    head_dim_v,
+                    is_causal=causal,
+                    is_local=local,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    tile_m=m_block_size,
+                    tile_n=n_block_size,
+                    cluster_size=cluster_size,
+                    use_2cta_instrs=use_2cta_instrs,
+                    deterministic=deterministic,
+                    score_mod=score_mod,
+                    score_mod_bwd=score_mod_bwd,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    subtile_factor=subtile_factor,
+                    use_fp4_bwd_qk=use_fp4_bwd_qk,
+                    fp4_bwd_native_skip_dk=fp4_bwd_native_skip_dk,
+                    fp4_bwd_native_skip_dq=fp4_bwd_native_skip_dq,
+                    fp4_bwd_native_skip_ds_store=fp4_bwd_native_skip_ds_store,
+                    fp4_bwd_native_skip_ds_quant=fp4_bwd_native_skip_ds_quant,
+                    fp4_bwd_native_skip_qt_kt_loads=fp4_bwd_native_skip_qt_kt_loads,
+                    fp4_bwd_native_skip_dkv_epilogue=fp4_bwd_native_skip_dkv_epilogue,
+                    fp4_bwd_native_skip_dq_reduce=fp4_bwd_native_skip_dq_reduce,
+                    fp4_sf_dtype=fp4_sf_dtype,
+                    fp4_sf_vec_size=fp4_sf_vec_size,
+                )
+            else:
+                fa_bwd_obj = FlashAttentionBackwardSm100(
+                    head_dim,
+                    head_dim_v,
+                    is_causal=causal,
+                    is_local=local,
+                    qhead_per_kvhead=qhead_per_kvhead,
+                    tile_m=m_block_size,
+                    tile_n=n_block_size,
+                    cluster_size=cluster_size,
+                    use_2cta_instrs=use_2cta_instrs,
+                    deterministic=deterministic,
+                    score_mod=score_mod,
+                    score_mod_bwd=score_mod_bwd,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                    subtile_factor=subtile_factor,
+                )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None

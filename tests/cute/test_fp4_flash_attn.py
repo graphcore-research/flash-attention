@@ -281,6 +281,7 @@ def _fp4_pv_online_softmax_reference(
                 "l_old": row_sum,
                 "l_new": l_new,
                 "inv_l_new": inv_l_new,
+                "scores_shifted": scores_f32 - m_new,
                 "o_new": out.clone(),
             }
         )
@@ -789,6 +790,33 @@ def test_fp4_pv_online_softmax_decode_and_encode_reference_share_recurrence():
             torch.testing.assert_close(decode_state[key], encode_state[key])
 
 
+def test_fp4_pv_online_softmax_encode_centric_rescale_contract_matches_reference():
+    score_blocks = [
+        torch.tensor([0.0, -0.5, 1.0], dtype=torch.float32),
+        torch.tensor([2.0, -1.0], dtype=torch.float32),
+    ]
+    value_blocks = [
+        torch.tensor([[1.0, 0.0], [0.0, 2.0], [2.0, 1.0]], dtype=torch.float32),
+        torch.tensor([[3.0, 4.0], [5.0, 6.0]], dtype=torch.float32),
+    ]
+    encode_scales = [torch.tensor(3.0, dtype=torch.float32), torch.tensor(5.0, dtype=torch.float32)]
+
+    states, _ = _fp4_pv_online_softmax_reference(score_blocks, value_blocks)
+    encoded_acc = None
+    prev_scale = torch.tensor(1.0, dtype=torch.float32)
+    for state, value_block, encode_scale in zip(states, value_blocks, encode_scales):
+        p_block = torch.exp(state["scores_shifted"])
+        pv_block = p_block @ value_block
+        if encoded_acc is None:
+            encoded_acc = encode_scale * pv_block
+        else:
+            correction_scale = state["alpha"] * encode_scale / prev_scale
+            encoded_acc = correction_scale * encoded_acc + encode_scale * pv_block
+        recovered = encoded_acc * (state["inv_l_new"] / encode_scale)
+        torch.testing.assert_close(recovered, state["o_new"])
+        prev_scale = encode_scale
+
+
 def test_fp4_pv_cta_quant_reference_warp_reduce_matches_full_block_amax():
     values = torch.tensor(
         [
@@ -947,6 +975,47 @@ def test_fp4_compile_cache_separates_pv_legacy_and_cta_quant(monkeypatch):
     assert len(_flash_attn_fwd.compile_cache) == 2
 
 
+def test_fp4_compile_cache_separates_pv_cta_decode_and_encode_centric(monkeypatch):
+    compile_calls = _install_fake_cuda_runtime(monkeypatch)
+
+    with FakeTensorMode():
+        q, k, v_packed, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            head_dim_v=64,
+        )
+        monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "1")
+        monkeypatch.delenv("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC", raising=False)
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+        monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC", "1")
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert len(compile_calls) == 2
+    assert len(_flash_attn_fwd.compile_cache) == 2
+
+
 def test_fp4_pv_cta_quant_direct_loader_dispatches_cta_quantizer(monkeypatch):
     _install_fake_cuda_runtime(monkeypatch)
     monkeypatch.setenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "1")
@@ -983,6 +1052,46 @@ def test_fp4_pv_cta_quant_direct_loader_dispatches_cta_quantizer(monkeypatch):
 
     assert kernel_state["fp4_pv_direct_loader"] is True
     assert kernel_state["fp4_pv_cta_quant"] is True
+
+
+def test_fp4_pv_cta_quant_encode_centric_dispatches_kernel_mode(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "1")
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC", "1")
+    kernel_state = {}
+    real_kernel_cls = _flash_attn_fwd.__globals__["FP4FlashAttentionForwardSm100"]
+
+    def wrapped_kernel(*args, **kwargs):
+        kernel = real_kernel_cls(*args, **kwargs)
+        kernel_state["fp4_pv_cta_quant"] = kernel.fp4_pv_cta_quant
+        kernel_state["fp4_pv_encode_centric_requested"] = kernel.fp4_pv_encode_centric_requested
+        kernel_state["fp4_pv_encode_centric"] = kernel.fp4_pv_encode_centric
+        return kernel
+
+    monkeypatch.setitem(_flash_attn_fwd.__globals__, "FP4FlashAttentionForwardSm100", wrapped_kernel)
+
+    with FakeTensorMode():
+        q, k, v_packed, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=64,
+            head_dim_v=64,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert kernel_state["fp4_pv_cta_quant"] is True
+    assert kernel_state["fp4_pv_encode_centric_requested"] is True
+    assert kernel_state["fp4_pv_encode_centric"] is False
 
 
 def test_fp4_d128_noncausal_uses_2cta_schedule(monkeypatch):
@@ -2750,6 +2859,25 @@ def test_fp4_pv_cta_quant_benchmark_regular_d128_causal_is_ok():
         skip_qk_baseline_check=True,
     )
     assert result["pv_cta_status"] == "ok"
+    assert result["pv_cta_direct_status"] == "ok"
+
+
+def test_fp4_pv_cta_quant_benchmark_regular_d128_long_causal_is_ok():
+    _require_sm100()
+    result = _benchmark_case(
+        kind="mha",
+        seqlen=2048,
+        head_dim=128,
+        causal=True,
+        batch_size=1,
+        scale_value=0.125,
+        warmup=1,
+        iters=1,
+        pv_modes=["legacy", "cta", "cta_direct"],
+        skip_qk_baseline_check=True,
+    )
+    assert result["pv_cta_status"] == "ok"
+    assert result["pv_cta_direct_status"] == "ok"
 
 
 @pytest.mark.parametrize("direct_loader", [False])

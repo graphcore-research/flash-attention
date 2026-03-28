@@ -256,6 +256,12 @@ class FP4FlashAttentionForwardSm100:
         # Keep the legacy env var name for the opt-in PV quantizer experiment even though the
         # current landing uses decode-centric block scales after the CTA-local amax reduction.
         self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
+        self.fp4_pv_encode_centric_requested = (
+            self.fp4_pv_cta_quant and os.getenv("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC", "0") == "1"
+        )
+        # The compile/runtime split is wired up, but the actual Blackwell PV scale
+        # contract for encode-centric FP4 still needs validation.
+        self.fp4_pv_encode_centric = False
         self.fp4_pv_fp32_online_rescale = use_fp4_pv and fp4_pv_fp32_online_rescale
         raw_debug_offset = os.getenv("FLASH_ATTN_FP4_PV_RAW_BYTE_OFFSET")
         self.fp4_pv_raw_byte_offset = int(raw_debug_offset) if raw_debug_offset is not None else -1
@@ -3288,21 +3294,8 @@ class FP4FlashAttentionForwardSm100:
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         row_sum_old = Float32(0.0) if const_expr(is_first) else softmax.row_sum[0]
+        online_state_stride = self.q_stage * self.m_block_size
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
-
-        if const_expr(not is_first):
-            # Keep the online-softmax recurrence state in its own FP32 buffer so
-            # correction/epilogue no longer overload sScale with both alpha and row stats.
-            self.store_fp4_pv_online_state(
-                sOnlineScale,
-                stage,
-                thr_tmem_load.thr_idx,
-                acc_scale,
-                row_sum_old,
-                row_sum_old,
-                Float32(1.0),
-            )
-            # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)

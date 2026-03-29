@@ -934,6 +934,7 @@ def _flash_attn_bwd_fp4_qk(
         )
     use_external_col_metadata = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_USE_EXTERNAL_COL_METADATA")
     force_synth_col_scale = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_SYNTH_COL_SCALE")
+    force_synth_col_metadata = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_SYNTH_COL_METADATA")
     native_q_col_packed = q_col_packed
     native_k_col_packed = k_col_packed
     native_q_col_scale = q_col_scale
@@ -949,7 +950,10 @@ def _flash_attn_bwd_fp4_qk(
         else:
             synth_q_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(q)
             synth_k_col_scale = _quantize_nvfp4_transpose_scale_from_bf16(k)
-            if force_synth_col_scale:
+            if force_synth_col_metadata:
+                native_q_col_packed, native_q_col_scale = _quantize_nvfp4_transpose_from_bf16(q)
+                native_k_col_packed, native_k_col_scale = _quantize_nvfp4_transpose_from_bf16(k)
+            elif force_synth_col_scale:
                 native_q_col_scale = synth_q_col_scale
                 native_k_col_scale = synth_k_col_scale
             else:
@@ -2405,11 +2409,28 @@ def _flash_attn_bwd(
     fp4_bwd_native_skip_qt_kt_loads = bool(
         use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_QT_KT_LOADS")
     )
+    fp4_bwd_native_skip_qt_loads = bool(
+        use_fp4_bwd_qk
+        and (
+            fp4_bwd_native_skip_qt_kt_loads
+            or _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_QT_LOADS")
+        )
+    )
+    fp4_bwd_native_skip_kt_loads = bool(
+        use_fp4_bwd_qk
+        and (
+            fp4_bwd_native_skip_qt_kt_loads
+            or _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_KT_LOADS")
+        )
+    )
     fp4_bwd_native_skip_dkv_epilogue = bool(
         use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DKV_EPILOGUE")
     )
     fp4_bwd_native_skip_dq_reduce = bool(
         use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_NATIVE_SKIP_DQ_REDUCE")
+    )
+    debug_fp4_bwd_host_trace = bool(
+        use_fp4_bwd_qk and _get_env_optional_bool("FLASH_ATTN_FP4_BWD_HOST_TRACE")
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
@@ -2517,6 +2538,8 @@ def _flash_attn_bwd(
             fp4_bwd_native_skip_ds_store if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_ds_quant if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_qt_kt_loads if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_qt_loads if use_fp4_bwd_qk else None,
+            fp4_bwd_native_skip_kt_loads if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_dkv_epilogue if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_dq_reduce if use_fp4_bwd_qk else None,
             get_broadcast_dims(q),
@@ -2529,6 +2552,8 @@ def _flash_attn_bwd(
             _get_static_tensor_layout_key(k_col_scale_fp4) if use_fp4_bwd_qk else None,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
+        if debug_fp4_bwd_host_trace:
+            print({"phase": "bwd_compile_start"}, flush=True)
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
@@ -2630,6 +2655,8 @@ def _flash_attn_bwd(
                     fp4_bwd_native_skip_ds_store=fp4_bwd_native_skip_ds_store,
                     fp4_bwd_native_skip_ds_quant=fp4_bwd_native_skip_ds_quant,
                     fp4_bwd_native_skip_qt_kt_loads=fp4_bwd_native_skip_qt_kt_loads,
+                    fp4_bwd_native_skip_qt_loads=fp4_bwd_native_skip_qt_loads,
+                    fp4_bwd_native_skip_kt_loads=fp4_bwd_native_skip_kt_loads,
                     fp4_bwd_native_skip_dkv_epilogue=fp4_bwd_native_skip_dkv_epilogue,
                     fp4_bwd_native_skip_dq_reduce=fp4_bwd_native_skip_dq_reduce,
                     fp4_sf_dtype=fp4_sf_dtype,
@@ -2691,7 +2718,11 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             options="--enable-tvm-ffi",
         )
+        if debug_fp4_bwd_host_trace:
+            print({"phase": "bwd_compile_done"}, flush=True)
     if not is_fake_mode():
+        if debug_fp4_bwd_host_trace:
+            print({"phase": "bwd_launch_start"}, flush=True)
         q_col_runtime = to_tvm_ffi_fp4x2_tensor(q_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
         k_col_runtime = to_tvm_ffi_fp4x2_tensor(k_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
         _flash_attn_bwd.compile_cache[compile_key](
@@ -2723,6 +2754,8 @@ def _flash_attn_bwd(
             aux_tensors,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         )
+        if debug_fp4_bwd_host_trace:
+            print({"phase": "bwd_launch_done"}, flush=True)
 
     # hdim 192 with swapAB needs 3 WGs (192/64=3) in postprocess too
     if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:

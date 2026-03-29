@@ -65,8 +65,6 @@ def make_public_fp4_col_tensor(mT: cute.Tensor):
             stride=(mT.stride[1], mT.stride[3], mT.stride[2], mT.stride[0]),
         ),
     )
-
-
 class FlashAttentionBackwardSm100:
     arch = 100
 
@@ -94,6 +92,8 @@ class FlashAttentionBackwardSm100:
         fp4_bwd_native_skip_ds_store: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_ds_quant: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_qt_kt_loads: cutlass.Constexpr[bool] = False,
+        fp4_bwd_native_skip_qt_loads: cutlass.Constexpr[bool] = False,
+        fp4_bwd_native_skip_kt_loads: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_dkv_epilogue: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_dq_reduce: cutlass.Constexpr[bool] = False,
         fp4_sf_dtype: Optional[str] = None,
@@ -139,6 +139,12 @@ class FlashAttentionBackwardSm100:
         )
         self.fp4_bwd_native_skip_qt_kt_loads = bool(
             use_fp4_bwd_qk and fp4_bwd_native_skip_qt_kt_loads
+        )
+        self.fp4_bwd_native_skip_qt_loads = bool(
+            use_fp4_bwd_qk and (fp4_bwd_native_skip_qt_kt_loads or fp4_bwd_native_skip_qt_loads)
+        )
+        self.fp4_bwd_native_skip_kt_loads = bool(
+            use_fp4_bwd_qk and (fp4_bwd_native_skip_qt_kt_loads or fp4_bwd_native_skip_kt_loads)
         )
         self.fp4_bwd_native_skip_dkv_epilogue = bool(
             use_fp4_bwd_qk and fp4_bwd_native_skip_dkv_epilogue
@@ -717,32 +723,14 @@ class FlashAttentionBackwardSm100:
         tCtfQcol_compact_s2t: cute.Tensor,
         B_idx: Int32,
     ):
-        sfdK_a_src = (
-            cute.group_modes(
-                tCsfdK_a_compact_s2t,
-                1,
-                3,
-            )
-            if const_expr(self.use_2cta_instrs)
-            else tCsfdK_a_compact_s2t[(None, None, None, None, 0)]
-        )
-        sfQcol_src = (
-            cute.group_modes(
-                tCsfQcol_compact_s2t,
-                1,
-                3,
-            )
-            if const_expr(self.use_2cta_instrs)
-            else tCsfQcol_compact_s2t[(None, None, None, None, B_idx)]
-        )
         cute.copy(
             tiled_copy_s2t_sfdK_a,
-            sfdK_a_src,
+            tCsfdK_a_compact_s2t[(None, None, None, None, 0)],
             tCtfdK_a_compact_s2t,
         )
         cute.copy(
             tiled_copy_s2t_sfQcol,
-            sfQcol_src,
+            tCsfQcol_compact_s2t[(None, None, None, None, B_idx)],
             tCtfQcol_compact_s2t,
         )
 
@@ -756,32 +744,14 @@ class FlashAttentionBackwardSm100:
         tCsfKcol_compact_s2t: cute.Tensor,
         tCtfKcol_compact_s2t: cute.Tensor,
     ):
-        sfdQ_a_src = (
-            cute.group_modes(
-                layout_utils.select(tCsfdQ_a_compact_s2t, mode=[0, 1, 3, 2, 4]),
-                1,
-                3,
-            )
-            if const_expr(self.use_2cta_instrs)
-            else tCsfdQ_a_compact_s2t[(None, None, None, None, 0)]
-        )
-        sfKcol_src = (
-            cute.group_modes(
-                tCsfKcol_compact_s2t,
-                1,
-                3,
-            )
-            if const_expr(self.use_2cta_instrs)
-            else tCsfKcol_compact_s2t[(None, None, None, None, 0)]
-        )
         cute.copy(
             tiled_copy_s2t_sfdQ_a,
-            sfdQ_a_src,
+            tCsfdQ_a_compact_s2t[(None, None, None, None, 0)],
             tCtfdQ_a_compact_s2t,
         )
         cute.copy(
             tiled_copy_s2t_sfKcol,
-            sfKcol_src,
+            tCsfKcol_compact_s2t[(None, None, None, None, 0)],
             tCtfKcol_compact_s2t,
         )
 
@@ -1131,8 +1101,11 @@ class FlashAttentionBackwardSm100:
         tma_atom_Qt = tma_tensor_Qt = None
         if const_expr(self.use_fp4_bwd_qk):
             assert mQ_col is not None
+            Qt_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+                self.cluster_shape_mnk, self.tiled_mma_dK.thr_id
+            )
             tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
-                Q_tma_op,
+                Qt_tma_op,
                 mQ_col,
                 cute.select(self.sQt_layout, mode=[0, 1, 2]),
                 self.mma_tiler_dsq,
@@ -1698,11 +1671,11 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        bidx, _, _ = cute.arch.block_idx()
+        block_idx_x, block_idx_y, _ = cute.arch.block_idx()
+        bidx = block_idx_x
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
             with cute.arch.elect_one():
@@ -1882,7 +1855,7 @@ class FlashAttentionBackwardSm100:
                     num_stages=self.Q_stage,
                     producer_group=pipeline_producer_group,
                     consumer_group=pipeline_consumer_group,
-                    tx_count=self.tma_copy_bytes["Q"],
+                    tx_count=self.tma_copy_bytes["Qt"] if const_expr(self.use_fp4_bwd_qk) else self.tma_copy_bytes["Q"],
                     cta_layout_vmnk=cluster_layout_vmnk,
                     defer_sync=True,
                 )
@@ -1891,7 +1864,7 @@ class FlashAttentionBackwardSm100:
                 num_stages=self.single_stage,
                 producer_group=pipeline_producer_group,
                 consumer_group=pipeline_consumer_group,
-                tx_count=self.tma_copy_bytes["K"],
+                tx_count=self.tma_copy_bytes["Kt"] if const_expr(self.use_fp4_bwd_qk) else self.tma_copy_bytes["K"],
                 cta_layout_vmnk=cluster_layout_vmnk,
                 defer_sync=True,
             )
@@ -2243,7 +2216,7 @@ class FlashAttentionBackwardSm100:
             tmem.free(tmem_ptr)
 
         # Compute
-        # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
+            # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
             tmem.wait_for_alloc()
@@ -2299,9 +2272,12 @@ class FlashAttentionBackwardSm100:
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            # Keep the TMEM allocator contract aligned with the reference kernel even when the
+            # native dQ reducer is debug-skipped: reduce warps still participate in the TMEM
+            # retrieval barrier before the final top-level TmemPtr rendezvous.
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
             if const_expr(not self.fp4_bwd_native_skip_dq_reduce):
-                tmem.wait_for_alloc()
-                tmem_ptr = tmem.retrieve_ptr(Float32)
                 self.dQacc_reduce(
                     mdQaccum,
                     sdQaccum,
@@ -2419,8 +2395,12 @@ class FlashAttentionBackwardSm100:
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
         )
-        producer_state_Qt = cutlass.pipeline.make_pipeline_state(
+        producer_state_Q_only = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
+        )
+        producer_state_Qt = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer,
+            self.Q_stage
         )
         producer_state_Kt = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.single_stage
@@ -2715,7 +2695,7 @@ class FlashAttentionBackwardSm100:
                         producer_state_dPsum.advance()
 
                         # Qt, for dK = dS.T @ Q
-                        if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                        if const_expr(not (self.fp4_bwd_native_skip_qt_loads or self.fp4_bwd_native_skip_kt_loads)):
                             pipeline_Qt.producer_acquire(
                                 producer_state_Q_Qt,
                                 extra_tx_count=self.tma_copy_bytes["K"],
@@ -2769,7 +2749,7 @@ class FlashAttentionBackwardSm100:
                             producer_state_O_Ot.advance()
 
                             # Qt, for dK = dS.T @ Q
-                            if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                            if const_expr(not self.fp4_bwd_native_skip_qt_loads):
                                 pipeline_Qt.producer_acquire(producer_state_Q_Qt)
                                 load_Qt(m_block, producer_state=producer_state_Q_Qt)
                                 pipeline_Qt.producer_commit(producer_state_Q_Qt)
@@ -2785,14 +2765,27 @@ class FlashAttentionBackwardSm100:
                         #### Prologue ####
                         if const_expr(should_load_Q):
                             # K & Q (for S)
-                            pipeline_Q.producer_acquire(
-                                producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
-                            )
-                            load_K(
-                                tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
-                            )
-                            load_Q(first_m_block, producer_state=producer_state_Q_LSE)
-                            pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            if const_expr(
+                                self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
+                            ):
+                                pipeline_Q.producer_acquire(
+                                    producer_state_Q_only, extra_tx_count=self.tma_copy_bytes["K"]
+                                )
+                                load_K(
+                                    tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_only)
+                                )
+                                load_Q(first_m_block, producer_state=producer_state_Q_only)
+                                pipeline_Q.producer_commit(producer_state_Q_only)
+                                producer_state_Q_only.advance()
+                            else:
+                                pipeline_Q.producer_acquire(
+                                    producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
+                                )
+                                load_K(
+                                    tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
+                                )
+                                load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -2836,7 +2829,7 @@ class FlashAttentionBackwardSm100:
                             producer_state_dO_dPsum.advance()
 
                         if const_expr(tma_atom_Kt is not None):
-                            if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                            if const_expr(not self.fp4_bwd_native_skip_kt_loads):
                                 pipeline_Kt.producer_acquire(producer_state_Kt)
                                 load_Kt(tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt))
                                 if const_expr(self.use_fp4_bwd_qk):
@@ -2854,7 +2847,7 @@ class FlashAttentionBackwardSm100:
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                             if const_expr(should_load_Q):
                                 if const_expr(tma_atom_Qt is not None):
-                                    if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                                    if const_expr(not self.fp4_bwd_native_skip_qt_loads):
                                         pipeline_Qt.producer_acquire(producer_state_Qt)
                                         load_Qt(m_block - 1, producer_state=producer_state_Qt)
                                         if const_expr(self.use_fp4_bwd_qk):
@@ -2870,9 +2863,17 @@ class FlashAttentionBackwardSm100:
                                         producer_state_Qt.advance()
 
                                 # Q (for S)
-                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
-                                load_Q(m_block, producer_state=producer_state_Q_LSE)
-                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                if const_expr(
+                                    self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
+                                ):
+                                    pipeline_Q.producer_acquire(producer_state_Q_only)
+                                    load_Q(m_block, producer_state=producer_state_Q_only)
+                                    pipeline_Q.producer_commit(producer_state_Q_only)
+                                    producer_state_Q_only.advance()
+                                else:
+                                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                    load_Q(m_block, producer_state=producer_state_Q_LSE)
+                                    pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                                 # LSE
                                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -2913,7 +2914,7 @@ class FlashAttentionBackwardSm100:
                         #### Tail ####
                         if const_expr(should_load_Q):
                             if const_expr(tma_atom_Qt is not None):
-                                if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                                if const_expr(not self.fp4_bwd_native_skip_qt_loads):
                                     pipeline_Qt.producer_acquire(producer_state_Qt)
                                     load_Qt(m_block_max - 1, producer_state=producer_state_Qt)
                                     if const_expr(self.use_fp4_bwd_qk):
@@ -2935,7 +2936,12 @@ class FlashAttentionBackwardSm100:
                     pipeline_dPsum.producer_tail(producer_state_dPsum)
                 else:
                     if const_expr(should_load_Q):
-                        pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+                        if const_expr(
+                            self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
+                        ):
+                            pipeline_Q.producer_tail(producer_state_Q_only)
+                        else:
+                            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
                         pipeline_LSE.producer_tail(producer_state_Q_LSE)
                         if const_expr(tma_atom_Qt is not None):
                             pipeline_Qt.producer_tail(producer_state_Qt)
@@ -3130,11 +3136,11 @@ class FlashAttentionBackwardSm100:
                     tA_addr=self.tmem_dS_offset,
                     cta_group=self.cta_group_size,
                 )
-
         pipeline_Q_consumer = pipeline_Q.make_consumer()
 
         consumer_state_Qt = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+            cutlass.pipeline.PipelineUserType.Consumer,
+            self.Q_stage
         )
         consumer_state_Q = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
@@ -3152,6 +3158,10 @@ class FlashAttentionBackwardSm100:
         )
         producer_phase_dKV = Int32(1)
         cta_group = pipeline_S_P.cta_group
+        # On the FP4 2-CTA hdim128 path, pipeline_dS is the dQ-side handoff for
+        # the TMEM-loaded dS tile. When dQ is skipped, the producer side is
+        # intentionally suppressed, so the consumer side must be suppressed too.
+        need_fp4_dS_consumer = not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_phase = Int32(0)
@@ -3205,9 +3215,10 @@ class FlashAttentionBackwardSm100:
                     for _ in cutlass.range(main_loop_iters, unroll=1):
                         # 1) S.T = K @ Q.T
                         pipeline_Q.consumer_wait(consumer_state_Q)
-                        pipeline_dQ.sync_object_empty.wait(
-                            0, producer_phase_acc
-                        )  # dQ tmem overlaps with S
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                            pipeline_dQ.sync_object_empty.wait(
+                                0, producer_phase_acc
+                            )  # dQ tmem overlaps with S
                         mma_qk_fn(B_idx=consumer_state_Q.index)
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
@@ -3261,10 +3272,10 @@ class FlashAttentionBackwardSm100:
                         accumulate_dV = True
 
                         # 5) dQ = dS @ K
-                        pipeline_dS.consumer_wait(consumer_state_dS)
-                        cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                        if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_dq):
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
+                            pipeline_dS.consumer_wait(consumer_state_dS)
+                            cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                            if const_expr(self.use_fp4_bwd_qk):
                                 self.copy_fp4_dsk_scales(
                                     tiled_copy_s2t_sfdQ_a,
                                     tCsfdQ_a_compact_s2t,
@@ -3274,38 +3285,51 @@ class FlashAttentionBackwardSm100:
                                     tCtfKcol_compact_s2t,
                                 )
                                 mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                        else:
-                            mma_dsk_fn()
-                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                        pipeline_dS.consumer_release(consumer_state_dS)
-                        consumer_state_dS.advance()
-                        dS_cluster_phase ^= 1
+                            else:
+                                mma_dsk_fn()
+                            if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                            pipeline_dS.consumer_release(consumer_state_dS)
+                            consumer_state_dS.advance()
+                            dS_cluster_phase ^= 1
 
                     # signal to the epilogue that dV is ready
-                    pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
-                    pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                        pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
                     # signal to the epilogue that dK is ready
-                    pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
-                    pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+                        pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                     producer_phase_dKV ^= 1
             elif const_expr(self.use_2cta_instrs):
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
+                    use_reference_q_consumer = const_expr(
+                        self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_qt_loads
+                    )
                     # -----------------------------------------------------------
                     ###### Prologue
                     # -----------------------------------------------------------
                     # 1. S  = Q0 @ K.T
                     # 2. dP = V @ dOt.T
                     # 3. dV = P @ dO
-
                     # 1) S = K @ Q
-                    pipeline_Q.consumer_wait(consumer_state_Q)
+                    if const_expr(use_reference_q_consumer):
+                        pipeline_Q.consumer_wait(consumer_state_Q)
+                    else:
+                        handle_Q = pipeline_Q_consumer.wait_and_advance()
                     pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-                    mma_qk_fn(B_idx=consumer_state_Q.index)
-                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-                    pipeline_Q.consumer_release(consumer_state_Q)
-                    consumer_state_Q.advance()
-
+                    if const_expr(use_reference_q_consumer):
+                        mma_qk_fn(B_idx=consumer_state_Q.index)
+                    else:
+                        mma_qk_fn(B_idx=handle_Q.index)
+                    pipeline_S_P.sync_object_full.arrive(
+                        0, pipeline_S_P.producer_mask, cta_group
+                    )
+                    if const_expr(use_reference_q_consumer):
+                        pipeline_Q.consumer_release(consumer_state_Q)
+                        consumer_state_Q.advance()
                     # 2) dP = V @ dOt.T
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
@@ -3319,7 +3343,12 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.consumer_release(consumer_state_dO)
                     consumer_state_dO.advance()
 
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_qt_kt_loads)):
+                    if const_expr(
+                        not (
+                            self.use_fp4_bwd_qk
+                            and (self.fp4_bwd_native_skip_kt_loads or self.fp4_bwd_native_skip_dq)
+                        )
+                    ):
                         pipeline_Kt.consumer_wait(consumer_state_Kt)
                     # -----------------------------------------------------------
                     ###### MAIN LOOP
@@ -3335,25 +3364,36 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.use_block_sparsity)
                         else m_block_max - m_block_min - 1
                     )
+                    handle_Q_next = handle_Q if const_expr(not use_reference_q_consumer) else None
 
                     for _ in cutlass.range(main_loop_iters, unroll=1):
                         # (1) S.T = K @ Q.T (next)
-                        pipeline_Q.consumer_wait(consumer_state_Q)
-                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
-                        mma_qk_fn(B_idx=consumer_state_Q.index)
+                        if const_expr(use_reference_q_consumer):
+                            pipeline_Q.consumer_wait(consumer_state_Q)
+                            if const_expr(
+                                not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)
+                            ):
+                                pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                            mma_qk_fn(B_idx=consumer_state_Q.index)
+                        else:
+                            handle_Q_next = pipeline_Q_consumer.wait_and_advance()
+                            if const_expr(
+                                not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)
+                            ):
+                                pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                            mma_qk_fn(B_idx=handle_Q_next.index)
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
-                        pipeline_Q.consumer_release(consumer_state_Q)
-                        consumer_state_Q.advance()
-
-                        # pipeline_dS.consumer_wait(consumer_state_dS)
+                        if const_expr(use_reference_q_consumer):
+                            pipeline_Q.consumer_release(consumer_state_Q)
+                            consumer_state_Q.advance()
                         # (2) dK += dS.T @ Q (cur)
-                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_qt_kt_loads)):
-                            pipeline_Qt.consumer_wait(consumer_state_Qt)
-                            pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
-                            if const_expr(self.use_fp4_bwd_qk):
-                                if const_expr(not self.fp4_bwd_native_skip_dk):
+                        if const_expr(self.use_fp4_bwd_qk):
+                            if const_expr(not self.fp4_bwd_native_skip_dk):
+                                if const_expr(not self.fp4_bwd_native_skip_qt_loads):
+                                    pipeline_Qt.consumer_wait(consumer_state_Qt)
+                                    pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
                                     self.copy_fp4_dsq_scales(
                                         tiled_copy_s2t_sfdK_a,
                                         tCsfdK_a_compact_s2t,
@@ -3368,11 +3408,31 @@ class FlashAttentionBackwardSm100:
                                         sQt[None, None, None, consumer_state_Qt.index],
                                         zero_init=not accumulate_dK,
                                     )
-                            else:
-                                mma_dsq_fn(B_idx=consumer_state_Qt.index, zero_init=not accumulate_dK)
+                                    pipeline_Qt.consumer_release(consumer_state_Qt)
+                                    consumer_state_Qt.advance()
+                                else:
+                                    pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                                    self.copy_fp4_dsq_scales(
+                                        tiled_copy_s2t_sfdK_a,
+                                        tCsfdK_a_compact_s2t,
+                                        tCtfdK_a_compact_s2t,
+                                        tiled_copy_s2t_sfQcol,
+                                        tCsfQcol_compact_s2t,
+                                        tCtfQcol_compact_s2t,
+                                        handle_Q.index,
+                                    )
+                                    mma_dsq_fn(
+                                        tdKrQ[None, None, None, handle_Q.index],
+                                        sQt[None, None, None, handle_Q.index],
+                                        zero_init=not accumulate_dK,
+                                    )
+                        else:
+                            pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                            mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dk)):
                             accumulate_dK = True
-                            pipeline_Qt.consumer_release(consumer_state_Qt)
-                            consumer_state_Qt.advance()
+                        if const_expr(not use_reference_q_consumer):
+                            handle_Q.release()
 
                         # (3) dP.T = V @ dO.T (next)
                         pipeline_dO.consumer_wait(consumer_state_dO)
@@ -3380,11 +3440,11 @@ class FlashAttentionBackwardSm100:
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                         # (5) dQ = dS @ K (cur)
-                        pipeline_dS.consumer_wait(consumer_state_dS)
-                        if const_expr(not self.use_fp4_bwd_qk):
+                        if const_expr(need_fp4_dS_consumer):
+                            pipeline_dS.consumer_wait(consumer_state_dS)
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
                             cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                        if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_dq):
+                            if const_expr(self.use_fp4_bwd_qk):
                                 self.copy_fp4_dsk_scales(
                                     tiled_copy_s2t_sfdQ_a,
                                     tCsfdQ_a_compact_s2t,
@@ -3394,13 +3454,15 @@ class FlashAttentionBackwardSm100:
                                     tCtfKcol_compact_s2t,
                                 )
                                 mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                        else:
-                            mma_dsk_fn()
-                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                        pipeline_dS.consumer_release(consumer_state_dS)
-                        consumer_state_dS.advance()
-                        if const_expr(not self.use_fp4_bwd_qk):
-                            dS_cluster_phase ^= 1
+                            else:
+                                mma_dsk_fn()
+                            if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                        if const_expr(need_fp4_dS_consumer):
+                            pipeline_dS.consumer_release(consumer_state_dS)
+                            consumer_state_dS.advance()
+                            if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
+                                dS_cluster_phase ^= 1
                         producer_phase_dQ ^= 1
 
                         # (4) dV += P.T @ dO (next)
@@ -3409,24 +3471,26 @@ class FlashAttentionBackwardSm100:
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
+                        if const_expr(not use_reference_q_consumer):
+                            handle_Q = handle_Q_next
 
                     pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
                     # signal to the epilogue that dV is ready
-                    pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
-                    pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
-                    pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                        pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
+                        pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
 
                     # -----------------------------------------------------------
                     # Tail: Remaining dK and dQ
                     # -----------------------------------------------------------
-                    # pipeline_dS.consumer_wait(consumer_state_dS)
-                    # dK += dS.T @ Q
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_qt_kt_loads)):
-                        pipeline_Qt.consumer_wait(consumer_state_Qt)
-                        pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
-                        if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_dk):
+                    # 1) dK += dS.T @ Q
+                    if const_expr(self.use_fp4_bwd_qk):
+                        if const_expr(not self.fp4_bwd_native_skip_dk):
+                            if const_expr(not self.fp4_bwd_native_skip_qt_loads):
+                                pipeline_Qt.consumer_wait(consumer_state_Qt)
+                                pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
                                 self.copy_fp4_dsq_scales(
                                     tiled_copy_s2t_sfdK_a,
                                     tCsfdK_a_compact_s2t,
@@ -3441,21 +3505,41 @@ class FlashAttentionBackwardSm100:
                                     sQt[None, None, None, consumer_state_Qt.index],
                                     zero_init=not accumulate_dK,
                                 )
-                        else:
-                            mma_dsq_fn(B_idx=consumer_state_Qt.index, zero_init=not accumulate_dK)
-                        pipeline_Qt.consumer_release(consumer_state_Qt)
-                        consumer_state_Qt.advance()
-                        # signal to the epilogue that dK is ready
-                        pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
-                        producer_phase_dKV ^= 1
+                                pipeline_Qt.consumer_release(consumer_state_Qt)
+                                consumer_state_Qt.advance()
+                            else:
+                                pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                                self.copy_fp4_dsq_scales(
+                                    tiled_copy_s2t_sfdK_a,
+                                    tCsfdK_a_compact_s2t,
+                                    tCtfdK_a_compact_s2t,
+                                    tiled_copy_s2t_sfQcol,
+                                    tCsfQcol_compact_s2t,
+                                    tCtfQcol_compact_s2t,
+                                    handle_Q.index,
+                                )
+                                mma_dsq_fn(
+                                    tdKrQ[None, None, None, handle_Q.index],
+                                    sQt[None, None, None, handle_Q.index],
+                                    zero_init=not accumulate_dK,
+                                )
+                    else:
+                        pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
+                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
 
-                    # dQ = dS @ K
-                    pipeline_dS.consumer_wait(consumer_state_dS)
-                    if const_expr(not self.use_fp4_bwd_qk):
+                    # signal to the epilogue that dK is ready
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
+                    producer_phase_dKV ^= 1
+
+                    # 2) dQ = dS @ K
+                    if const_expr(need_fp4_dS_consumer):
+                        pipeline_dS.consumer_wait(consumer_state_dS)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                    pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
-                    if const_expr(self.use_fp4_bwd_qk):
-                        if const_expr(not self.fp4_bwd_native_skip_dq):
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        if const_expr(self.use_fp4_bwd_qk):
                             self.copy_fp4_dsk_scales(
                                 tiled_copy_s2t_sfdQ_a,
                                 tCsfdQ_a_compact_s2t,
@@ -3465,15 +3549,19 @@ class FlashAttentionBackwardSm100:
                                 tCtfKcol_compact_s2t,
                             )
                             mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                    else:
-                        mma_dsk_fn()
-                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                    pipeline_dS.consumer_release(consumer_state_dS)
-                    consumer_state_dS.advance()
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_qt_kt_loads)):
+                        else:
+                            mma_dsk_fn()
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                    if const_expr(not use_reference_q_consumer):
+                        handle_Q.release()
+                    if const_expr(need_fp4_dS_consumer):
+                        pipeline_dS.consumer_release(consumer_state_dS)
+                        consumer_state_dS.advance()
+                    if const_expr(self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_kt_loads):
                         pipeline_Kt.consumer_release(consumer_state_Kt)
                         consumer_state_Kt.advance()
-                    if const_expr(not self.use_fp4_bwd_qk):
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
                         dS_cluster_phase ^= 1
                     producer_phase_dQ ^= 1
 
@@ -3497,7 +3585,8 @@ class FlashAttentionBackwardSm100:
                     # 2) dP = V @ dOt.T
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-                    pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                     mma_dov_fn(B_idx=consumer_state_dO.index)
                     pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
@@ -3507,7 +3596,10 @@ class FlashAttentionBackwardSm100:
                     mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
                     pipeline_dO.consumer_release(consumer_state_dO)
                     consumer_state_dO.advance()
-                    if const_expr(self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_qt_kt_loads):
+                    if const_expr(
+                        self.use_fp4_bwd_qk
+                        and not (self.fp4_bwd_native_skip_kt_loads or self.fp4_bwd_native_skip_dq)
+                    ):
                         pipeline_Kt.consumer_wait(consumer_state_Kt)
 
                     # -----------------------------------------------------------
@@ -3537,9 +3629,106 @@ class FlashAttentionBackwardSm100:
                         )
 
                         # (2) dK += dS.T @ Q
+                        if const_expr(need_fp4_dS_consumer):
+                            pipeline_dS.consumer_wait(consumer_state_dS)
+                            if const_expr(self.use_fp4_bwd_qk):
+                                if const_expr(not self.fp4_bwd_native_skip_qt_loads):
+                                    pipeline_Qt.consumer_wait(consumer_state_Qt)
+                                    if const_expr(not self.fp4_bwd_native_skip_dk):
+                                        self.copy_fp4_dsq_scales(
+                                            tiled_copy_s2t_sfdK_a,
+                                            tCsfdK_a_compact_s2t,
+                                            tCtfdK_a_compact_s2t,
+                                            tiled_copy_s2t_sfQcol,
+                                            tCsfQcol_compact_s2t,
+                                            tCtfQcol_compact_s2t,
+                                            consumer_state_Qt.index,
+                                        )
+                                        mma_dsq_fn(
+                                            tdKrQ[None, None, None, consumer_state_Qt.index],
+                                            sQt[None, None, None, consumer_state_Qt.index],
+                                            zero_init=not accumulate_dK,
+                                        )
+                                    pipeline_Qt.consumer_release(consumer_state_Qt)
+                                    consumer_state_Qt.advance()
+                                elif const_expr(not self.fp4_bwd_native_skip_dk):
+                                    self.copy_fp4_dsq_scales(
+                                        tiled_copy_s2t_sfdK_a,
+                                        tCsfdK_a_compact_s2t,
+                                        tCtfdK_a_compact_s2t,
+                                        tiled_copy_s2t_sfQcol,
+                                        tCsfQcol_compact_s2t,
+                                        tCtfQcol_compact_s2t,
+                                        handle_Q.index,
+                                    )
+                                    mma_dsq_fn(
+                                        tdKrQ[None, None, None, handle_Q.index],
+                                        sQt[None, None, None, handle_Q.index],
+                                        zero_init=not accumulate_dK,
+                                    )
+                            else:
+                                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                            accumulate_dK = True
+                        handle_Q.release()
+
+                        # (3) dQ = dS @ K
+                        if const_expr(self.use_fp4_bwd_qk):
+                            if const_expr(not self.fp4_bwd_native_skip_dq):
+                                self.copy_fp4_dsk_scales(
+                                    tiled_copy_s2t_sfdQ_a,
+                                    tCsfdQ_a_compact_s2t,
+                                    tCtfdQ_a_compact_s2t,
+                                    tiled_copy_s2t_sfKcol,
+                                    tCsfKcol_compact_s2t,
+                                    tCtfKcol_compact_s2t,
+                                )
+                                mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
+                        else:
+                            mma_dsk_fn()
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                            pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                        if const_expr(need_fp4_dS_consumer):
+                            pipeline_dS.consumer_release(consumer_state_dS)
+                            consumer_state_dS.advance()
+
+                        # (4) dP = V @ dO.T
+                        pipeline_dO.consumer_wait(consumer_state_dO)
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                        mma_dov_fn(B_idx=consumer_state_dO.index)
+                        pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+
+                        # (5) dV += P.T @ dO
+                        producer_phase_acc ^= 1
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                        mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                        pipeline_dO.consumer_release(consumer_state_dO)
+                        consumer_state_dO.advance()
+
+                        handle_Q = handle_Q_next
+
+                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+
+                    # signal to the epilogue that dV is ready
+                    # pipeline_dKV.producer_acquire(producer_state_dKV)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                    # pipeline_dKV.producer_commit(producer_state_dKV)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
+                    # producer_state_dKV.advance()
+                    # pipeline_dKV.producer_acquire(producer_state_dKV)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+
+                    # -----------------------------------------------------------
+                    # Tail: Remaining dK and dQ
+                    # -----------------------------------------------------------
+                    # 1) dK += dS.T @ Q
+                    if const_expr(need_fp4_dS_consumer):
                         pipeline_dS.consumer_wait(consumer_state_dS)
                         if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
+                            if const_expr(not self.fp4_bwd_native_skip_qt_loads):
                                 pipeline_Qt.consumer_wait(consumer_state_Qt)
                                 if const_expr(not self.fp4_bwd_native_skip_dk):
                                     self.copy_fp4_dsq_scales(
@@ -3571,101 +3760,13 @@ class FlashAttentionBackwardSm100:
                                 mma_dsq_fn(
                                     tdKrQ[None, None, None, handle_Q.index],
                                     sQt[None, None, None, handle_Q.index],
-                                    zero_init=not accumulate_dK,
-                                )
+                                        zero_init=not accumulate_dK,
+                                    )
                         else:
                             mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                        accumulate_dK = True
-                        handle_Q.release()
-
-                        # (3) dQ = dS @ K
-                        if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_dq):
-                                self.copy_fp4_dsk_scales(
-                                    tiled_copy_s2t_sfdQ_a,
-                                    tCsfdQ_a_compact_s2t,
-                                    tCtfdQ_a_compact_s2t,
-                                    tiled_copy_s2t_sfKcol,
-                                    tCsfKcol_compact_s2t,
-                                    tCtfKcol_compact_s2t,
-                                )
-                                mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                        else:
-                            mma_dsk_fn()
-                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                        pipeline_dS.consumer_release(consumer_state_dS)
-                        consumer_state_dS.advance()
-
-                        # (4) dP = V @ dO.T
-                        pipeline_dO.consumer_wait(consumer_state_dO)
-                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
-                        mma_dov_fn(B_idx=consumer_state_dO.index)
-                        pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
-
-                        # (5) dV += P.T @ dO
-                        producer_phase_acc ^= 1
-                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-                        mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
-                        pipeline_dO.consumer_release(consumer_state_dO)
-                        consumer_state_dO.advance()
-
-                        handle_Q = handle_Q_next
-
-                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-
-                    # signal to the epilogue that dV is ready
-                    # pipeline_dKV.producer_acquire(producer_state_dKV)
-                    pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
-                    # pipeline_dKV.producer_commit(producer_state_dKV)
-                    pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
-                    # producer_state_dKV.advance()
-                    # pipeline_dKV.producer_acquire(producer_state_dKV)
-                    pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
-
-                    # -----------------------------------------------------------
-                    # Tail: Remaining dK and dQ
-                    # -----------------------------------------------------------
-                    # 1) dK += dS.T @ Q
-                    pipeline_dS.consumer_wait(consumer_state_dS)
-                    if const_expr(self.use_fp4_bwd_qk):
-                        if const_expr(not self.fp4_bwd_native_skip_qt_kt_loads):
-                            pipeline_Qt.consumer_wait(consumer_state_Qt)
-                            if const_expr(not self.fp4_bwd_native_skip_dk):
-                                self.copy_fp4_dsq_scales(
-                                    tiled_copy_s2t_sfdK_a,
-                                    tCsfdK_a_compact_s2t,
-                                    tCtfdK_a_compact_s2t,
-                                    tiled_copy_s2t_sfQcol,
-                                    tCsfQcol_compact_s2t,
-                                    tCtfQcol_compact_s2t,
-                                    consumer_state_Qt.index,
-                                )
-                                mma_dsq_fn(
-                                    tdKrQ[None, None, None, consumer_state_Qt.index],
-                                    sQt[None, None, None, consumer_state_Qt.index],
-                                    zero_init=not accumulate_dK,
-                                )
-                            pipeline_Qt.consumer_release(consumer_state_Qt)
-                            consumer_state_Qt.advance()
-                        elif const_expr(not self.fp4_bwd_native_skip_dk):
-                            self.copy_fp4_dsq_scales(
-                                tiled_copy_s2t_sfdK_a,
-                                tCsfdK_a_compact_s2t,
-                                tCtfdK_a_compact_s2t,
-                                tiled_copy_s2t_sfQcol,
-                                tCsfQcol_compact_s2t,
-                                tCtfQcol_compact_s2t,
-                                handle_Q.index,
-                            )
-                            mma_dsq_fn(
-                                tdKrQ[None, None, None, handle_Q.index],
-                                sQt[None, None, None, handle_Q.index],
-                                zero_init=not accumulate_dK,
-                            )
-                    else:
-                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
                     # signal to the epilogue that dK is ready
-                    pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue)):
+                        pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
                     producer_phase_dKV ^= 1
 
                     # 2) dQ = dS @ K
@@ -3682,11 +3783,14 @@ class FlashAttentionBackwardSm100:
                             mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
                     else:
                         mma_dsk_fn()
-                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                    handle_Q.release()
-                    pipeline_dS.consumer_release(consumer_state_dS)
-                    consumer_state_dS.advance()
-                    if const_expr(self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_qt_kt_loads):
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                    if const_expr(not use_reference_q_consumer):
+                        handle_Q.release()
+                    if const_expr(need_fp4_dS_consumer):
+                        pipeline_dS.consumer_release(consumer_state_dS)
+                        consumer_state_dS.advance()
+                    if const_expr(self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_kt_loads):
                         pipeline_Kt.consumer_release(consumer_state_Kt)
                         consumer_state_Kt.advance()
 
@@ -3859,6 +3963,18 @@ class FlashAttentionBackwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
+        if const_expr(
+            self.use_fp4_bwd_qk
+            and self.fp4_bwd_native_skip_dq
+            and self.fp4_bwd_native_skip_dk
+            and self.fp4_bwd_native_skip_ds_store
+            and self.fp4_bwd_native_skip_ds_quant
+            and self.fp4_bwd_native_skip_qt_loads
+            and self.fp4_bwd_native_skip_kt_loads
+            and self.fp4_bwd_native_skip_dkv_epilogue
+        ):
+            return
+
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
             cute.make_layout(
@@ -3950,7 +4066,10 @@ class FlashAttentionBackwardSm100:
         dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
         exchange_stage = cta_rank_in_cluster ^ 1 if const_expr(self.use_2cta_instrs) else Int32(0)
-
+        # On the FP4 2-CTA hdim128 path, pipeline_dS is the dQ-side handoff for
+        # staged dS availability. Once the leader dK path is kept on the reference
+        # pipeline_dP -> dS contract, skip_dq can disable this pipeline again.
+        need_fp4_dS_pipeline = not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)
         consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
@@ -4061,10 +4180,11 @@ class FlashAttentionBackwardSm100:
                     # Signal S tmem load completion using pipeline_dS when 2cta hdim 128
                     # dQ is overlapped with S
                     if iter_idx > 0:
-                        cute.arch.fence_view_async_tmem_load()
-                        with cute.arch.elect_one():
-                            pipeline_dS.producer_commit(producer_state_dS)
-                        producer_state_dS.advance()
+                        if const_expr(need_fp4_dS_pipeline):
+                            cute.arch.fence_view_async_tmem_load()
+                            with cute.arch.elect_one():
+                                pipeline_dS.producer_commit(producer_state_dS)
+                            producer_state_dS.advance()
 
                 if const_expr(self.score_mod_bwd is not None):
                     tSrS_pre = cute.make_fragment_like(tSrS_t2r)
@@ -4242,7 +4362,8 @@ class FlashAttentionBackwardSm100:
                         tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
                         utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
                     if const_expr(stage == 0):
-                        pipeline_dS.producer_acquire(producer_state_dS)
+                        if const_expr(need_fp4_dS_pipeline):
+                            pipeline_dS.producer_acquire(producer_state_dS)
                         if const_expr(self.use_2cta_instrs and not self.use_fp4_bwd_qk):
                             tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
 
@@ -4322,9 +4443,10 @@ class FlashAttentionBackwardSm100:
             # Final signal for dS smem store completion
             if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
                 if process_tile:
-                    with cute.arch.elect_one():
-                        pipeline_dS.producer_commit(producer_state_dS)
-                    producer_state_dS.advance()
+                    if const_expr(need_fp4_dS_pipeline):
+                        with cute.arch.elect_one():
+                            pipeline_dS.producer_commit(producer_state_dS)
+                        producer_state_dS.advance()
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
@@ -4935,7 +5057,6 @@ class FlashAttentionBackwardSm100:
         )
 
         read_flag = const_expr(not deterministic_KV)
-
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
         # semaphore acquire

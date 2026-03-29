@@ -1428,10 +1428,32 @@ def _run_synthetic_case_with_saved_tensor_override(
         )
 
 
+def _run_benchmark_case_env(case_name: str, env_updates: dict[str, str | None]):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == case_name)
+    schedule, keep_ids, hash_ids, q_data, k_data, v_data = benchmark_hsa._build_case_tensors(case)
+
+    hsa_forward = lambda q, k, v: benchmark_hsa._run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates
+    )
+    q = q_data.clone().requires_grad_(True)
+    k = k_data.clone().requires_grad_(True)
+    v = v_data.clone().requires_grad_(True)
+    out = benchmark_hsa._unwrap_output(hsa_forward(q, k, v))
+    loss = out.float().square().mean()
+    dq, dk, dv = torch.autograd.grad(loss, (q, k, v))
+    return out.detach(), dq.detach(), dk.detach(), dv.detach()
+
+
 def _assert_finite_gradients(name, *grads):
     for grad in grads:
         assert grad is not None, f"{name}: missing gradient"
         assert torch.isfinite(grad).all(), f"{name}: non-finite gradient"
+
+
+def _assert_gradient_finite_status(name, grad, *, expected_nonfinite: int = 0):
+    nonfinite = int((~torch.isfinite(grad)).sum().item())
+    assert nonfinite == expected_nonfinite, f"{name}: expected {expected_nonfinite} non-finite elements, got {nonfinite}"
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -1920,6 +1942,62 @@ def test_hsa_synthetic_micro_saved_tensor_mix_has_finite_grads(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_train_eq_synthetic_micro_forward_finite_gradient_anchors(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "train-eq")
+
+    stable_synth_env = dict(benchmark_hsa._benchmark_env_for_case(case))
+    stable_synth_env.update(
+        {
+            "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K": "128",
+            "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS": "1",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD": "0",
+            "FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD": "0",
+            "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD": "off",
+        }
+    )
+
+    plain_out, plain_q, plain_k, plain_v = _run_benchmark_case_env(
+        "train-eq",
+        benchmark_hsa._plain_sparse_mask_baseline_env(case),
+    )
+    _assert_gradient_finite_status("train_eq_plain_sparse_mask_q_grad", plain_q)
+    _assert_finite_gradients("train_eq_plain_sparse_mask_grads", plain_q, plain_k, plain_v)
+
+    stable_out, stable_q, stable_k, stable_v = _run_benchmark_case_env("train-eq", stable_synth_env)
+    _assert_gradient_finite_status("train_eq_stable_synthetic_forward_q_grad", stable_q)
+    _assert_finite_gradients("train_eq_stable_synthetic_forward_grads", stable_q, stable_k, stable_v)
+
+    micro_out, micro_q, micro_k, micro_v = _run_benchmark_case_env(
+        "train-eq",
+        benchmark_hsa._sparse_mask_mixed_backward_baseline_env(case),
+    )
+    _assert_gradient_finite_status("train_eq_micro_synthetic_forward_q_grad", micro_q)
+    _assert_finite_gradients("train_eq_micro_synthetic_forward_grads", micro_q, micro_k, micro_v)
+
+    micro_bwd_out, micro_bwd_q, micro_bwd_k, micro_bwd_v = _run_benchmark_case_env(
+        "train-eq",
+        benchmark_hsa._one_kernel_synthetic_short_env(case),
+    )
+    _assert_gradient_finite_status("train_eq_micro_synthetic_one_kernel_q_grad", micro_bwd_q)
+    _assert_finite_gradients(
+        "train_eq_micro_synthetic_one_kernel_grads",
+        micro_bwd_q,
+        micro_bwd_k,
+        micro_bwd_v,
+    )
+
+    _assert_close(plain_out.float(), stable_out.float(), "train_eq_stable_synthetic_vs_plain_output", atol=2e-2, rtol=2e-2)
+    _assert_close(plain_out.float(), micro_out.float(), "train_eq_micro_synthetic_vs_plain_output", atol=2e-2, rtol=2e-2)
+    _assert_close(plain_out.float(), micro_bwd_out.float(), "train_eq_micro_synthetic_one_kernel_vs_plain_output", atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_micro_backward_routes_off_sparse_mask(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
     import flash_attn.cute.hsa as hsa_module
@@ -2203,9 +2281,10 @@ def test_hsa_synthetic_row_compact_backward_selector_honors_one_kernel_mode(monk
     q_rows = torch.empty((1, 1, 64))
     union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
     q_row_idx = torch.empty((8, 2), dtype=torch.int32)
-    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((0,), dtype=torch.int32)
 
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "on")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto")
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "on")
     mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
         q_rows,
@@ -2232,14 +2311,37 @@ def test_hsa_synthetic_row_compact_backward_selector_falls_back_when_one_kernel_
 
     q_rows = torch.empty((1, 1, 64))
     q_row_idx = torch.empty((8, 2), dtype=torch.int32)
-    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((0,), dtype=torch.int32)
 
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "auto")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto")
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "off")
     unsupported_union = torch.empty((8, 17), dtype=torch.int32)
     mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
         q_rows,
         unsupported_union,
+        q_row_idx,
+        unique_key_row_idx,
+        4,
+    )
+    assert mode == "legacy"
+
+
+def test_hsa_synthetic_row_compact_backward_selector_bucket_dense_unsupported_skips_split(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    q_rows = torch.empty((1, 1, 64))
+    union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "on")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "bucket_dense")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "on")
+    mode = synthetic_module._select_row_compact_synthetic_bwd_mode(
+        q_rows,
+        union_k_row_idx,
         q_row_idx,
         unique_key_row_idx,
         4,
@@ -2282,6 +2384,7 @@ def test_hsa_synthetic_one_kernel_backward_selector_honors_pingpong_mode(monkeyp
     dv_rows = torch.empty((1, 1, 64))
 
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "on")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "baseline")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
         q_rows,
         k_rows,
@@ -2305,6 +2408,7 @@ def test_hsa_synthetic_one_kernel_backward_selector_honors_pingpong_mode(monkeyp
 
     calls.clear()
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "baseline")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
         q_rows,
         k_rows,
@@ -2362,6 +2466,7 @@ def test_hsa_synthetic_one_kernel_backward_selector_falls_back_when_pingpong_uns
     dv_rows = torch.empty((1, 1, 64))
 
     monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "auto")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "baseline")
     synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
         q_rows,
         k_rows,
@@ -2382,6 +2487,383 @@ def test_hsa_synthetic_one_kernel_backward_selector_falls_back_when_pingpong_uns
         max_unique_key_occurrences=4,
     )
     assert calls == ["base"]
+
+
+def test_hsa_synthetic_one_kernel_backward_selector_honors_variant_mode(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _base(*args, **kwargs):
+        calls.append("base")
+
+    def _short(*args, **kwargs):
+        calls.append("short")
+
+    def _long(*args, **kwargs):
+        calls.append("long")
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_base", _base)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_short", _short)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_long", _long)
+
+    q_rows = torch.empty((1, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((1, 1, 64))
+    dout_rows = torch.empty((1, 1, 64))
+    lse_rows = torch.empty((1, 1))
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    union_to_row_slot = torch.empty((8, 2, 12), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+    unique_key_member_idx = torch.empty((16,), dtype=torch.int32)
+    unique_key_union_idx = torch.empty((16,), dtype=torch.int32)
+    unique_key_occurrence_row_ptr = torch.empty((7,), dtype=torch.int32)
+    dq_rows = torch.empty((1, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "baseline")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=4,
+    )
+    assert calls == ["base"]
+
+    calls.clear()
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "short")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=4,
+    )
+    assert calls == ["short"]
+
+    calls.clear()
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "long")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=4,
+    )
+    assert calls == ["long"]
+
+
+def test_hsa_synthetic_one_kernel_backward_variant_auto_resolves_bucket_dense(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto")
+    assert synthetic_module._select_synthetic_one_kernel_bwd_variant(torch.empty((8, 2), dtype=torch.int32)) == "bucket_dense"
+
+
+def test_hsa_synthetic_row_compact_one_kernel_dispatch_routes_bucket_dense(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _bucket_dense(*args, **kwargs):
+        calls.append("bucket_dense")
+
+    def _legacy(*args, **kwargs):
+        calls.append("legacy")
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense", _bucket_dense)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_one_kernel", _legacy)
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto")
+
+    q_rows = torch.empty((1, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((1, 1, 64))
+    dout_rows = torch.empty((1, 1, 64))
+    lse_rows = torch.empty((1, 1))
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    row_k_row_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
+    row_k_to_union_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_to_row_slot = torch.empty((8, 2, 12), dtype=torch.int32)
+    q_length = torch.empty((8,), dtype=torch.int32)
+    row_k_length = torch.empty((8, 2), dtype=torch.int32)
+    union_k_length = torch.empty((8,), dtype=torch.int32)
+    dq_rows = torch.empty((1, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        None,
+        None,
+        None,
+        None,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=0,
+        workspace={},
+    )
+    assert calls == ["bucket_dense"]
+
+
+def test_hsa_synthetic_one_kernel_long_keys_per_cta_selector(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", raising=False)
+    assert synthetic_module._select_synthetic_one_kernel_long_keys_per_cta() == 4
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", "8")
+    assert synthetic_module._select_synthetic_one_kernel_long_keys_per_cta() == 8
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", "16")
+    assert synthetic_module._select_synthetic_one_kernel_long_keys_per_cta() == 16
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", "auto")
+    assert synthetic_module._select_synthetic_one_kernel_long_keys_per_cta(torch.empty((1, 131072, 4, 64))) == 4
+
+
+def test_hsa_synthetic_one_kernel_backward_selector_warpgroup_aliases_long_8(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _long(*args, **kwargs):
+        calls.append(kwargs["keys_per_cta"])
+
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_one_kernel_long", _long)
+
+    q_rows = torch.empty((1, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((1, 1, 64))
+    dout_rows = torch.empty((1, 1, 64))
+    lse_rows = torch.empty((1, 1))
+    q_row_idx = torch.empty((4096, 2), dtype=torch.int32)
+    union_to_row_slot = torch.empty((8, 2, 12), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+    unique_key_member_idx = torch.empty((16,), dtype=torch.int32)
+    unique_key_union_idx = torch.empty((16,), dtype=torch.int32)
+    unique_key_occurrence_row_ptr = torch.empty((7,), dtype=torch.int32)
+    dq_rows = torch.empty((1, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "warpgroup")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", "16")
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        union_to_row_slot,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=4,
+    )
+    assert calls == [8]
+
+
+def test_hsa_synthetic_long_bwd_mode_selector_honors_env(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    q = torch.empty((1, 32768, 4, 64))
+    q_rows = torch.empty((1, 1, 64))
+    union_k_row_idx = torch.empty((8, 16), dtype=torch.int32)
+    q_row_idx = torch.empty((2048, 2), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "one_kernel")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "two_stage")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "two_stage"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "persistent")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "persistent"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "persistent_member_tiled")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "persistent_member_tiled"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "two_stage")
+    unsupported_union = torch.empty((8, 17), dtype=torch.int32)
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            unsupported_union,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "persistent_member_tiled")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            unsupported_union,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "persistent")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q,
+            q_rows,
+            unsupported_union,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
+
+
+def test_hsa_synthetic_long_bwd_mode_selector_auto_is_long_only(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    q_short = torch.empty((1, 16384, 4, 64))
+    q_long = torch.empty((1, 32768, 4, 64))
+    q_rows = torch.empty((1, 1, 64))
+    union_k_row_idx = torch.empty((8, 16), dtype=torch.int32)
+    q_row_idx = torch.empty((2048, 2), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((6,), dtype=torch.int32)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "auto")
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q_short,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
+    assert (
+        synthetic_module._select_synthetic_long_bwd_mode(
+            q_long,
+            q_rows,
+            union_k_row_idx,
+            q_row_idx,
+            unique_key_row_idx,
+            4,
+        )
+        == "one_kernel"
+    )
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):

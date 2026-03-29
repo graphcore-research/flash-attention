@@ -248,6 +248,84 @@ class StaticPersistentTileScheduler:
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
+class SyntheticLongPersistentTileScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        total_tiles: Int32
+        num_head: Int32
+        cluster_shape_m: cutlass.Constexpr[int] = 1
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "SyntheticLongPersistentTileScheduler.Params":
+            return SyntheticLongPersistentTileScheduler.Params(
+                args.num_block,
+                args.num_head,
+                cluster_shape_m=args.cluster_shape_mn[0],
+            )
+
+    def __init__(self, params: Params, tile_idx: Int32, head_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._head_idx = head_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return SyntheticLongPersistentTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(params: Params, *, loc=None, ip=None) -> "SyntheticLongPersistentTileScheduler":
+        blk_coord = cute.arch.block_idx()
+        return SyntheticLongPersistentTileScheduler(params, blk_coord[0], blk_coord[1], loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        max_ctas = Int32((sm_count // params.cluster_shape_m) * params.cluster_shape_m)
+        grid_x = cutlass.min(max_ctas * Int32(2), params.total_tiles)
+        return (grid_x, params.num_head, Int32(1))
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        is_valid = self._tile_idx < self.params.total_tiles
+        return WorkTileInfo(
+            (Int32(self._tile_idx), Int32(self._head_idx), Int32(0), Int32(0)),
+            is_valid,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx, self._head_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx, self._head_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return SyntheticLongPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
 class SingleTileLPTScheduler:
     @dataclass
     class Params(ParamsBase):

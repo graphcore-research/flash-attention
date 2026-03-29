@@ -83,6 +83,9 @@ LONG_CONTEXT_CASES = (
     BenchmarkCase(name="long-64k", batch_size=1, seqlen=65536, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
     BenchmarkCase(name="long-100k", batch_size=1, seqlen=100000, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
     BenchmarkCase(name="long-128k", batch_size=1, seqlen=131072, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-256k", batch_size=1, seqlen=262144, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-512k", batch_size=1, seqlen=524288, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
+    BenchmarkCase(name="long-1M", batch_size=1, seqlen=1048576, nheads=4, headdim=64, n_kv_heads=4, warmup_iters=1, benchmark_iters=1),
 )
 
 ALL_CASES = CANONICAL_CASES + LONG_CONTEXT_CASES
@@ -252,8 +255,18 @@ def _synthetic_bwd_kernel_mode_label() -> str:
         return "sparse_mask_bwd"
     one_kernel_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD", "off").strip().lower()
     if one_kernel_mode != "off":
+        variant = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto").strip().lower()
+        long_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE", "one_kernel").strip().lower()
+        long_keys_per_cta = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA", "4").strip().lower()
+        if variant == "warpgroup":
+            long_keys_per_cta = "8"
         pingpong_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off").strip().lower()
-        return f"one_kernel_{one_kernel_mode}_pingpong_{pingpong_mode}"
+        if variant == "bucket_dense":
+            return f"one_kernel_{one_kernel_mode}_variant_bucket_dense_long_{long_mode}_pingpong_{pingpong_mode}"
+        return (
+            f"one_kernel_{one_kernel_mode}_variant_{variant}_long_{long_mode}"
+            f"_keys_{long_keys_per_cta}_pingpong_{pingpong_mode}"
+        )
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
         return "legacy_fused"
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD", "off").strip().lower() in {"1", "true", "yes", "on"}:
@@ -272,10 +285,7 @@ def _benchmark_sparse_bwd_config_label() -> str:
 
 
 def _should_measure_previous_synthetic_baseline(case: BenchmarkCase) -> bool:
-    return (
-        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
-        and case.name != "sentence-only"
-    )
+    return case.name != "sentence-only"
 
 
 def _previous_synthetic_baseline_label() -> str:
@@ -304,10 +314,7 @@ def _previous_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | Non
 
 
 def _should_measure_short_synthetic_baseline(case: BenchmarkCase) -> bool:
-    return (
-        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
-        and case.name != "sentence-only"
-    )
+    return case.name != "sentence-only"
 
 
 def _short_synthetic_baseline_label() -> str:
@@ -325,15 +332,11 @@ def _short_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
 
 
 def _should_measure_one_kernel_synthetic_baseline(case: BenchmarkCase) -> bool:
-    return (
-        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
-        and case.name != "sentence-only"
-        and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
-    )
+    return case.name != "sentence-only" and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
 
 
 def _one_kernel_synthetic_baseline_label() -> str:
-    return "direct_micro_one_kernel_bwd_baseline"
+    return "direct_micro_one_kernel_bwd_legacy"
 
 
 def _one_kernel_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | None]:
@@ -341,6 +344,8 @@ def _one_kernel_synthetic_baseline_env(case: BenchmarkCase) -> dict[str, str | N
     env.update(
         {
             "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD": "on",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "baseline",
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "one_kernel",
             "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG": "off",
             "FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD": "off",
             "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
@@ -364,11 +369,117 @@ def _one_kernel_synthetic_pingpong_env(case: BenchmarkCase) -> dict[str, str | N
     return env
 
 
-def _should_measure_plain_sparse_mask_baseline(case: BenchmarkCase) -> bool:
-    return (
-        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
-        and case.name != "sentence-only"
+def _one_kernel_synthetic_short_label() -> str:
+    return "direct_micro_one_kernel_bwd_short"
+
+
+def _one_kernel_synthetic_short_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_baseline_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "short",
+        }
     )
+    return env
+
+
+def _one_kernel_synthetic_long_label() -> str:
+    return "direct_micro_one_kernel_bwd_long_4"
+
+
+def _one_kernel_synthetic_bucket_dense_label() -> str:
+    return "direct_micro_bucket_dense_bwd"
+
+
+def _one_kernel_synthetic_bucket_dense_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_previous_synthetic_baseline_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD": "on",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense",
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "one_kernel",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD": "2",
+            "FLASH_ATTN_HSA_SYNTHETIC_SPLIT_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_SHORT_BWD": "off",
+            "FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD": "off",
+        }
+    )
+    return env
+
+
+def _one_kernel_synthetic_long_env(case: BenchmarkCase, *, keys_per_cta: int = 4) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_baseline_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "long",
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "one_kernel",
+            "FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA": str(keys_per_cta),
+        }
+    )
+    return env
+
+
+def _one_kernel_synthetic_long_8_label() -> str:
+    return "direct_micro_one_kernel_bwd_long_8"
+
+
+def _one_kernel_synthetic_long_8_env(case: BenchmarkCase) -> dict[str, str | None]:
+    return _one_kernel_synthetic_long_env(case, keys_per_cta=8)
+
+
+def _one_kernel_synthetic_long_16_label() -> str:
+    return "direct_micro_one_kernel_bwd_long_16"
+
+
+def _one_kernel_synthetic_long_16_env(case: BenchmarkCase) -> dict[str, str | None]:
+    return _one_kernel_synthetic_long_env(case, keys_per_cta=16)
+
+
+def _one_kernel_synthetic_two_stage_label() -> str:
+    return "direct_micro_two_stage_bwd_long"
+
+
+def _one_kernel_synthetic_two_stage_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_long_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "two_stage",
+        }
+    )
+    return env
+
+
+def _one_kernel_synthetic_persistent_label() -> str:
+    return "direct_micro_persistent_bwd_long"
+
+
+def _one_kernel_synthetic_persistent_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_long_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "persistent",
+        }
+    )
+    return env
+
+
+def _one_kernel_synthetic_persistent_member_tiled_label() -> str:
+    return "direct_micro_persistent_member_tiled_bwd_long"
+
+
+def _one_kernel_synthetic_persistent_member_tiled_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_long_env(case))
+    env.update(
+        {
+            "FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE": "persistent_member_tiled",
+        }
+    )
+    return env
+
+
+def _should_measure_plain_sparse_mask_baseline(case: BenchmarkCase) -> bool:
+    return case.name != "sentence-only"
 
 
 def _plain_sparse_mask_baseline_label() -> str:
@@ -390,11 +501,7 @@ def _plain_sparse_mask_baseline_env(case: BenchmarkCase) -> dict[str, str | None
 
 
 def _should_measure_sparse_mask_mixed_backward_baseline(case: BenchmarkCase) -> bool:
-    return (
-        os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1"
-        and case.name != "sentence-only"
-        and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
-    )
+    return case.name != "sentence-only" and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
 
 
 def _sparse_mask_mixed_backward_baseline_label() -> str:
@@ -444,6 +551,10 @@ def _use_sparse_profile_mode() -> bool:
 
 def _use_geometry_sweep_mode() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_GEOMETRY_SWEEP", "0") == "1"
+
+
+def _include_long_experimental_comparators() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_BENCHMARK_INCLUDE_LONG_EXPERIMENTAL", "0") == "1"
 
 
 def _geometry_sweep_configs() -> tuple[tuple[int, int, int], ...]:
@@ -525,6 +636,98 @@ def _summarize_sparse_backward_occupancy(sparse_tensors, packed_masks, *, seqlen
         "active_block_density": active_blocks / total_blocks if total_blocks > 0 else 0.0,
         "active_fill_nominal": allowed_pairs / nominal_active_area if nominal_active_area > 0 else 0.0,
         "active_fill_valid": allowed_pairs / valid_active_area if valid_active_area > 0 else 0.0,
+    }
+
+
+def _summarize_long_tile_reuse(runtime, *, keys_per_tile: int = 8) -> dict[str, float | int]:
+    metadata = runtime.forward_synthetic_grid
+    if metadata is None or metadata.forward_execution_plan is None:
+        return {
+            "tile_keys": keys_per_tile,
+            "tiles": 0,
+            "avg_occurrences": 0.0,
+            "max_occurrences": 0,
+            "avg_unique_members": 0.0,
+            "max_unique_members": 0,
+        }
+    direct_plan = metadata.forward_execution_plan.get("direct_execution_plan")
+    if direct_plan is None:
+        return {
+            "tile_keys": keys_per_tile,
+            "tiles": 0,
+            "avg_occurrences": 0.0,
+            "max_occurrences": 0,
+            "avg_unique_members": 0.0,
+            "max_unique_members": 0,
+        }
+    row_plan = direct_plan.get("row_compact_plan")
+    if row_plan is None:
+        return {
+            "tile_keys": keys_per_tile,
+            "tiles": 0,
+            "avg_occurrences": 0.0,
+            "max_occurrences": 0,
+            "avg_unique_members": 0.0,
+            "max_unique_members": 0,
+        }
+
+    occ_counts: list[int] = []
+    unique_member_counts: list[int] = []
+    bucket_unique_ranges = row_plan["bucket_unique_key_range"]
+    bucket_occ_ptr_ranges = row_plan["bucket_unique_key_occurrence_ptr_range"]
+    bucket_packed_q = direct_plan["bucket_packed_q"]
+    bucket_packed_k = direct_plan["bucket_packed_k"]
+    bucket_max_occ = row_plan.get("bucket_max_unique_key_occurrences", [0] * len(bucket_packed_q))
+    all_member_idx = row_plan["bucket_unique_key_member_idx"].detach().cpu()
+    all_occ_ptr = row_plan["bucket_unique_key_occurrence_row_ptr"].detach().cpu()
+
+    for bucket_idx, packed_q in enumerate(bucket_packed_q):
+        if int(packed_q) != 2 or int(bucket_packed_k[bucket_idx]) > 16 or int(bucket_max_occ[bucket_idx]) > 8:
+            continue
+        unique_key_start, unique_key_end = bucket_unique_ranges[bucket_idx]
+        if unique_key_end <= unique_key_start:
+            continue
+        unique_ptr_start, unique_ptr_end = bucket_occ_ptr_ranges[bucket_idx]
+        occ_ptr = all_occ_ptr[unique_ptr_start:unique_ptr_end]
+        if occ_ptr.numel() <= 1:
+            continue
+        member_base = int(occ_ptr[0].item())
+        member_end = int(occ_ptr[-1].item())
+        member_idx = all_member_idx[member_base:member_end]
+        key_count = unique_key_end - unique_key_start
+        num_tiles = (key_count + keys_per_tile - 1) // keys_per_tile
+        for tile_idx in range(num_tiles):
+            key_start_rel = tile_idx * keys_per_tile
+            key_end_rel = min(key_start_rel + keys_per_tile, key_count)
+            occ_start = int(occ_ptr[key_start_rel].item())
+            occ_end = int(occ_ptr[key_end_rel].item())
+            tile_occ = occ_end - occ_start
+            occ_counts.append(tile_occ)
+            if tile_occ > 0:
+                tile_members = member_idx[(occ_start - member_base):(occ_end - member_base)]
+                unique_member_counts.append(int(tile_members.unique().numel()))
+            else:
+                unique_member_counts.append(0)
+
+    if not occ_counts:
+        return {
+            "tile_keys": keys_per_tile,
+            "tiles": 0,
+            "avg_occurrences": 0.0,
+            "max_occurrences": 0,
+            "avg_unique_members": 0.0,
+            "max_unique_members": 0,
+        }
+
+    occ_tensor = torch.tensor(occ_counts, dtype=torch.float32)
+    member_tensor = torch.tensor(unique_member_counts, dtype=torch.float32)
+    return {
+        "tile_keys": keys_per_tile,
+        "tiles": len(occ_counts),
+        "avg_occurrences": float(occ_tensor.mean().item()),
+        "max_occurrences": int(max(occ_counts)),
+        "avg_unique_members": float(member_tensor.mean().item()),
+        "max_unique_members": int(max(unique_member_counts)),
     }
 
 
@@ -712,6 +915,25 @@ def _measure_forward_backward_ms(
             torch.autograd.grad(loss, (q, k, v))
 
     return _measure_ms(_run, warmup_iters, benchmark_iters)
+
+
+def _measure_grad_finite_status(forward_fn, q_data, k_data, v_data, *, env_updates=None):
+    env_updates = env_updates or {}
+    with _temporary_env(**env_updates):
+        q = q_data.clone().requires_grad_(True)
+        k = k_data.clone().requires_grad_(True)
+        v = v_data.clone().requires_grad_(True)
+        loss = forward_fn(q, k, v).float().square().mean()
+        dq, dk, dv = torch.autograd.grad(loss, (q, k, v))
+    q_nonfinite = int((~torch.isfinite(dq)).sum().item())
+    k_nonfinite = int((~torch.isfinite(dk)).sum().item())
+    v_nonfinite = int((~torch.isfinite(dv)).sum().item())
+    return {
+        "finite": q_nonfinite == 0 and k_nonfinite == 0 and v_nonfinite == 0,
+        "q_nonfinite": q_nonfinite,
+        "k_nonfinite": k_nonfinite,
+        "v_nonfinite": v_nonfinite,
+    }
 
 
 def _event_self_device_us(event) -> float:
@@ -911,16 +1133,26 @@ def _run_long_case(case: BenchmarkCase):
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     env_updates = _benchmark_env_for_case(case)
 
-    with _temporary_env(**env_updates):
+    with _temporary_env(**_one_kernel_synthetic_long_env(case)):
         runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
     occupancy = _summarize_sparse_backward_occupancy(
         runtime.backward_sparse,
         runtime.backward_packed_masks,
         seqlen=case.seqlen,
     )
+    tile_reuse = _summarize_long_tile_reuse(runtime, keys_per_tile=8)
 
     hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
+    hsa_fwd_ms = _measure_forward_ms(
+        hsa_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=env_updates,
+    )
     hsa_bwd_ms = _measure_backward_ms(
         hsa_forward,
         q_data,
@@ -930,15 +1162,85 @@ def _run_long_case(case: BenchmarkCase):
         case.benchmark_iters,
         env_updates=env_updates,
     )
-    dense_causal_bwd_ms = _measure_backward_ms(
-        dense_causal_forward,
+    hsa_fwd_bwd_ms = _measure_forward_backward_ms(
+        hsa_forward,
         q_data,
         k_data,
         v_data,
         case.warmup_iters,
         case.benchmark_iters,
+        env_updates=env_updates,
     )
-    hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+    dense_causal_fwd_ms = None
+    dense_causal_bwd_ms = None
+    dense_causal_fwd_bwd_ms = None
+    dense_causal_bwd_status = "unavailable_skipped_very_long" if case.seqlen > 131072 else "unmeasured"
+    dense_causal_fwd_status = "unavailable_skipped_very_long" if case.seqlen > 131072 else "unmeasured"
+    dense_causal_fwd_bwd_status = "unavailable_skipped_very_long" if case.seqlen > 131072 else "unmeasured"
+    hsa_fwd_vs_dense = None
+    hsa_bwd_vs_dense = None
+    hsa_fwd_bwd_vs_dense = None
+    if case.seqlen <= 131072:
+        try:
+            dense_causal_fwd_ms = _measure_forward_ms(
+                dense_causal_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+            dense_causal_bwd_ms = _measure_backward_ms(
+                dense_causal_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+            dense_causal_fwd_bwd_ms = _measure_forward_backward_ms(
+                dense_causal_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+            hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
+            hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
+            hsa_fwd_bwd_vs_dense = hsa_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
+            dense_causal_fwd_status = "measured"
+            dense_causal_bwd_status = "measured"
+            dense_causal_fwd_bwd_status = "measured"
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            torch.cuda.empty_cache()
+            dense_causal_fwd_status = f"unavailable_{type(exc).__name__}"
+            dense_causal_bwd_status = f"unavailable_{type(exc).__name__}"
+            dense_causal_fwd_bwd_status = f"unavailable_{type(exc).__name__}"
+    hybrid_fwd_ms = None
+    hybrid_bwd_ms = None
+    hybrid_fwd_bwd_ms = None
+    hybrid_vs_dense = None
+    bucket_dense_fwd_ms = None
+    bucket_dense_bwd_ms = None
+    bucket_dense_fwd_bwd_ms = None
+    bucket_dense_vs_dense = None
+    bucket_dense_vs_hybrid = None
+    one_kernel_long_4_fwd_ms = None
+    one_kernel_long_4_bwd_ms = None
+    one_kernel_long_4_fwd_bwd_ms = None
+    one_kernel_long_4_vs_dense = None
+    one_kernel_long_4_vs_hybrid = None
+    one_kernel_long_8_fwd_ms = None
+    one_kernel_long_8_bwd_ms = None
+    one_kernel_long_8_fwd_bwd_ms = None
+    one_kernel_long_8_vs_dense = None
+    one_kernel_long_8_vs_hybrid = None
+    one_kernel_long_16_fwd_ms = None
+    one_kernel_long_16_bwd_ms = None
+    one_kernel_long_16_fwd_bwd_ms = None
+    one_kernel_long_16_vs_dense = None
+    one_kernel_long_16_vs_hybrid = None
     plain_sparse_mask_bwd_ms = None
     hsa_bwd_vs_plain_sparse_mask = None
     prev_synth_bwd_ms = None
@@ -947,6 +1249,16 @@ def _run_long_case(case: BenchmarkCase):
     hsa_bwd_vs_short = None
     one_kernel_synth_bwd_ms = None
     hsa_bwd_vs_one_kernel = None
+    one_kernel_short_bwd_ms = None
+    hsa_bwd_vs_one_kernel_short = None
+    one_kernel_long_bwd_ms = None
+    hsa_bwd_vs_one_kernel_long = None
+    two_stage_long_bwd_ms = None
+    hsa_bwd_vs_two_stage_long = None
+    persistent_long_bwd_ms = None
+    hsa_bwd_vs_persistent_long = None
+    persistent_member_tiled_long_bwd_ms = None
+    hsa_bwd_vs_persistent_member_tiled_long = None
     one_kernel_pingpong_bwd_ms = None
     hsa_bwd_vs_one_kernel_pingpong = None
     sparse_mask_mixed_bwd_ms = None
@@ -1042,6 +1354,89 @@ def _run_long_case(case: BenchmarkCase):
             env_updates=one_kernel_env_updates,
         )
         hsa_bwd_vs_one_kernel = hsa_bwd_ms / one_kernel_synth_bwd_ms if one_kernel_synth_bwd_ms > 0 else float("inf")
+        one_kernel_short_env_updates = _one_kernel_synthetic_short_env(case)
+        one_kernel_short_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_short_env_updates
+        )
+        one_kernel_short_bwd_ms = _measure_backward_ms(
+            one_kernel_short_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_short_env_updates,
+        )
+        hsa_bwd_vs_one_kernel_short = (
+            hsa_bwd_ms / one_kernel_short_bwd_ms if one_kernel_short_bwd_ms > 0 else float("inf")
+        )
+        one_kernel_long_env_updates = _one_kernel_synthetic_long_env(case)
+        one_kernel_long_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_long_env_updates
+        )
+        one_kernel_long_bwd_ms = _measure_backward_ms(
+            one_kernel_long_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_long_env_updates,
+        )
+        hsa_bwd_vs_one_kernel_long = (
+            hsa_bwd_ms / one_kernel_long_bwd_ms if one_kernel_long_bwd_ms > 0 else float("inf")
+        )
+        if _include_long_experimental_comparators():
+            two_stage_long_env_updates = _one_kernel_synthetic_two_stage_env(case)
+            two_stage_long_forward = lambda q, k, v: _run_sparse_attention(
+                q, k, v, keep_ids, hash_ids, schedule, env_updates=two_stage_long_env_updates
+            )
+            two_stage_long_bwd_ms = _measure_backward_ms(
+                two_stage_long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=two_stage_long_env_updates,
+            )
+            hsa_bwd_vs_two_stage_long = (
+                hsa_bwd_ms / two_stage_long_bwd_ms if two_stage_long_bwd_ms > 0 else float("inf")
+            )
+            persistent_long_env_updates = _one_kernel_synthetic_persistent_env(case)
+            persistent_long_forward = lambda q, k, v: _run_sparse_attention(
+                q, k, v, keep_ids, hash_ids, schedule, env_updates=persistent_long_env_updates
+            )
+            persistent_long_bwd_ms = _measure_backward_ms(
+                persistent_long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=persistent_long_env_updates,
+            )
+            hsa_bwd_vs_persistent_long = (
+                hsa_bwd_ms / persistent_long_bwd_ms if persistent_long_bwd_ms > 0 else float("inf")
+            )
+            persistent_member_tiled_long_env_updates = _one_kernel_synthetic_persistent_member_tiled_env(case)
+            persistent_member_tiled_long_forward = lambda q, k, v: _run_sparse_attention(
+                q, k, v, keep_ids, hash_ids, schedule, env_updates=persistent_member_tiled_long_env_updates
+            )
+            persistent_member_tiled_long_bwd_ms = _measure_backward_ms(
+                persistent_member_tiled_long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=persistent_member_tiled_long_env_updates,
+            )
+            hsa_bwd_vs_persistent_member_tiled_long = (
+                hsa_bwd_ms / persistent_member_tiled_long_bwd_ms
+                if persistent_member_tiled_long_bwd_ms > 0
+                else float("inf")
+            )
         one_kernel_pingpong_env_updates = _one_kernel_synthetic_pingpong_env(case)
         one_kernel_pingpong_forward = lambda q, k, v: _run_sparse_attention(
             q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_pingpong_env_updates
@@ -1063,6 +1458,35 @@ def _run_long_case(case: BenchmarkCase):
         sparse_mask_hsa_forward = lambda q, k, v: _run_sparse_attention(
             q, k, v, keep_ids, hash_ids, schedule, env_updates=sparse_mask_env_updates
         )
+        hybrid_fwd_ms = _measure_forward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        hybrid_bwd_ms = _measure_backward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        hybrid_fwd_bwd_ms = _measure_forward_backward_ms(
+            sparse_mask_hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=sparse_mask_env_updates,
+        )
+        if dense_causal_fwd_bwd_ms is not None and dense_causal_fwd_bwd_ms > 0:
+            hybrid_vs_dense = hybrid_fwd_bwd_ms / dense_causal_fwd_bwd_ms
         sparse_mask_mixed_bwd_ms = _measure_backward_ms(
             sparse_mask_hsa_forward,
             q_data,
@@ -1075,6 +1499,75 @@ def _run_long_case(case: BenchmarkCase):
         hsa_bwd_vs_sparse_mask_mixed = (
             hsa_bwd_ms / sparse_mask_mixed_bwd_ms if sparse_mask_mixed_bwd_ms > 0 else float("inf")
         )
+    if _should_measure_one_kernel_synthetic_baseline(case):
+        long_family_cases = [
+            (_one_kernel_synthetic_bucket_dense_label(), _one_kernel_synthetic_bucket_dense_env(case)),
+            (_one_kernel_synthetic_long_label(), _one_kernel_synthetic_long_env(case)),
+        ]
+        if _include_long_experimental_comparators():
+            long_family_cases.extend(
+                [
+                    (_one_kernel_synthetic_long_8_label(), _one_kernel_synthetic_long_8_env(case)),
+                    (_one_kernel_synthetic_long_16_label(), _one_kernel_synthetic_long_16_env(case)),
+                ]
+            )
+        for label, env in long_family_cases:
+            long_forward = lambda q, k, v, env=env: _run_sparse_attention(
+                q, k, v, keep_ids, hash_ids, schedule, env_updates=env
+            )
+            fwd_ms = _measure_forward_ms(
+                long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=env,
+            )
+            bwd_ms = _measure_backward_ms(
+                long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=env,
+            )
+            fwd_bwd_ms = _measure_forward_backward_ms(
+                long_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=env,
+            )
+            vs_dense = None if dense_causal_fwd_bwd_ms is None or dense_causal_fwd_bwd_ms <= 0 else fwd_bwd_ms / dense_causal_fwd_bwd_ms
+            vs_hybrid = None if hybrid_fwd_bwd_ms is None or hybrid_fwd_bwd_ms <= 0 else fwd_bwd_ms / hybrid_fwd_bwd_ms
+            if label == _one_kernel_synthetic_bucket_dense_label():
+                bucket_dense_fwd_ms = fwd_ms
+                bucket_dense_bwd_ms = bwd_ms
+                bucket_dense_fwd_bwd_ms = fwd_bwd_ms
+                bucket_dense_vs_dense = vs_dense
+                bucket_dense_vs_hybrid = vs_hybrid
+            elif label == _one_kernel_synthetic_long_label():
+                one_kernel_long_4_fwd_ms = fwd_ms
+                one_kernel_long_4_bwd_ms = bwd_ms
+                one_kernel_long_4_fwd_bwd_ms = fwd_bwd_ms
+                one_kernel_long_4_vs_dense = vs_dense
+                one_kernel_long_4_vs_hybrid = vs_hybrid
+            elif label == _one_kernel_synthetic_long_8_label():
+                one_kernel_long_8_fwd_ms = fwd_ms
+                one_kernel_long_8_bwd_ms = bwd_ms
+                one_kernel_long_8_fwd_bwd_ms = fwd_bwd_ms
+                one_kernel_long_8_vs_dense = vs_dense
+                one_kernel_long_8_vs_hybrid = vs_hybrid
+            else:
+                one_kernel_long_16_fwd_ms = fwd_ms
+                one_kernel_long_16_bwd_ms = bwd_ms
+                one_kernel_long_16_fwd_bwd_ms = fwd_bwd_ms
+                one_kernel_long_16_vs_dense = vs_dense
+                one_kernel_long_16_vs_hybrid = vs_hybrid
 
     line = (
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()} "
@@ -1084,9 +1577,25 @@ def _run_long_case(case: BenchmarkCase):
         f"active_block_density={occupancy['active_block_density']:.6f} "
         f"active_fill_nominal={occupancy['active_fill_nominal']:.6f} "
         f"active_fill_valid={occupancy['active_fill_valid']:.6f} "
-        f"hsa_bwd_ms={hsa_bwd_ms:.3f} dense_causal_bwd_ms={dense_causal_bwd_ms:.3f} "
-        f"hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x"
+        f"hsa_fwd_ms={hsa_fwd_ms:.3f} "
+        f"hsa_bwd_ms={hsa_bwd_ms:.3f} "
+        f"hsa_fwd_bwd_ms={hsa_fwd_bwd_ms:.3f}"
     )
+    if dense_causal_fwd_ms is not None and dense_causal_bwd_ms is not None and dense_causal_fwd_bwd_ms is not None:
+        line += (
+            f" dense_causal_fwd_ms={dense_causal_fwd_ms:.3f}"
+            f" dense_causal_bwd_ms={dense_causal_bwd_ms:.3f}"
+            f" dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_vs_dense={hsa_fwd_vs_dense:.2f}x"
+            f" hsa_bwd_vs_dense={hsa_bwd_vs_dense:.2f}x"
+            f" hsa_fwd_bwd_vs_dense={hsa_fwd_bwd_vs_dense:.2f}x"
+        )
+    else:
+        line += (
+            f" dense_causal_fwd_status={dense_causal_fwd_status}"
+            f" dense_causal_bwd_status={dense_causal_bwd_status}"
+            f" dense_causal_fwd_bwd_status={dense_causal_fwd_bwd_status}"
+        )
     if hdt_in_repo_dense_bwd_ms is not None and hdt_in_repo_dense_ratio is not None:
         line += (
             f" hdt_in_repo_dense_bwd_ms={hdt_in_repo_dense_bwd_ms:.3f}"
@@ -1122,6 +1631,36 @@ def _run_long_case(case: BenchmarkCase):
             f" one_kernel_bwd_ms={one_kernel_synth_bwd_ms:.3f}"
             f" hsa_bwd_vs_one_kernel={hsa_bwd_vs_one_kernel:.2f}x"
         )
+    if one_kernel_short_bwd_ms is not None:
+        line += (
+            f" one_kernel_short_label={_one_kernel_synthetic_short_label()}"
+            f" one_kernel_short_bwd_ms={one_kernel_short_bwd_ms:.3f}"
+            f" hsa_bwd_vs_one_kernel_short={hsa_bwd_vs_one_kernel_short:.2f}x"
+        )
+    if one_kernel_long_bwd_ms is not None:
+        line += (
+            f" one_kernel_long_label={_one_kernel_synthetic_long_label()}"
+            f" one_kernel_long_bwd_ms={one_kernel_long_bwd_ms:.3f}"
+            f" hsa_bwd_vs_one_kernel_long={hsa_bwd_vs_one_kernel_long:.2f}x"
+        )
+    if two_stage_long_bwd_ms is not None:
+        line += (
+            f" two_stage_long_label={_one_kernel_synthetic_two_stage_label()}"
+            f" two_stage_long_bwd_ms={two_stage_long_bwd_ms:.3f}"
+            f" hsa_bwd_vs_two_stage_long={hsa_bwd_vs_two_stage_long:.2f}x"
+        )
+    if persistent_long_bwd_ms is not None:
+        line += (
+            f" persistent_long_label={_one_kernel_synthetic_persistent_label()}"
+            f" persistent_long_bwd_ms={persistent_long_bwd_ms:.3f}"
+            f" hsa_bwd_vs_persistent_long={hsa_bwd_vs_persistent_long:.2f}x"
+        )
+    if persistent_member_tiled_long_bwd_ms is not None:
+        line += (
+            f" persistent_member_tiled_long_label={_one_kernel_synthetic_persistent_member_tiled_label()}"
+            f" persistent_member_tiled_long_bwd_ms={persistent_member_tiled_long_bwd_ms:.3f}"
+            f" hsa_bwd_vs_persistent_member_tiled_long={hsa_bwd_vs_persistent_member_tiled_long:.2f}x"
+        )
     if one_kernel_pingpong_bwd_ms is not None:
         line += (
             f" one_kernel_pingpong_label={_one_kernel_synthetic_pingpong_label()}"
@@ -1134,6 +1673,75 @@ def _run_long_case(case: BenchmarkCase):
             f" sparse_mask_mixed_bwd_ms={sparse_mask_mixed_bwd_ms:.3f}"
             f" hsa_bwd_vs_sparse_mask_mixed={hsa_bwd_vs_sparse_mask_mixed:.2f}x"
         )
+    if hybrid_fwd_bwd_ms is not None and hybrid_fwd_ms is not None and hybrid_bwd_ms is not None:
+        line += (
+            f" hybrid_label={_sparse_mask_mixed_backward_baseline_label()}"
+            f" hybrid_fwd_ms={hybrid_fwd_ms:.3f}"
+            f" hybrid_bwd_ms={hybrid_bwd_ms:.3f}"
+            f" hybrid_fwd_bwd_ms={hybrid_fwd_bwd_ms:.3f}"
+        )
+        if hybrid_vs_dense is not None:
+            line += f" hybrid_vs_dense={hybrid_vs_dense:.2f}x"
+    if bucket_dense_fwd_bwd_ms is not None and bucket_dense_fwd_ms is not None and bucket_dense_bwd_ms is not None:
+        line += (
+            f" bucket_dense_label={_one_kernel_synthetic_bucket_dense_label()}"
+            f" bucket_dense_fwd_ms={bucket_dense_fwd_ms:.3f}"
+            f" bucket_dense_bwd_ms={bucket_dense_bwd_ms:.3f}"
+            f" bucket_dense_fwd_bwd_ms={bucket_dense_fwd_bwd_ms:.3f}"
+        )
+        if bucket_dense_vs_dense is not None:
+            line += f" bucket_dense_vs_dense={bucket_dense_vs_dense:.2f}x"
+        if bucket_dense_vs_hybrid is not None:
+            line += f" bucket_dense_vs_hybrid={bucket_dense_vs_hybrid:.2f}x"
+    if one_kernel_long_4_fwd_bwd_ms is not None and one_kernel_long_4_fwd_ms is not None and one_kernel_long_4_bwd_ms is not None:
+        line += (
+            f" one_kernel_long_4_label={_one_kernel_synthetic_long_label()}"
+            f" one_kernel_long_4_fwd_ms={one_kernel_long_4_fwd_ms:.3f}"
+            f" one_kernel_long_4_bwd_ms={one_kernel_long_4_bwd_ms:.3f}"
+            f" one_kernel_long_4_fwd_bwd_ms={one_kernel_long_4_fwd_bwd_ms:.3f}"
+        )
+        if one_kernel_long_4_vs_dense is not None:
+            line += f" one_kernel_long_4_vs_dense={one_kernel_long_4_vs_dense:.2f}x"
+        if one_kernel_long_4_vs_hybrid is not None:
+            line += f" one_kernel_long_4_vs_hybrid={one_kernel_long_4_vs_hybrid:.2f}x"
+    if one_kernel_long_8_fwd_bwd_ms is not None and one_kernel_long_8_fwd_ms is not None and one_kernel_long_8_bwd_ms is not None:
+        line += (
+            f" one_kernel_long_8_label={_one_kernel_synthetic_long_8_label()}"
+            f" one_kernel_long_8_fwd_ms={one_kernel_long_8_fwd_ms:.3f}"
+            f" one_kernel_long_8_bwd_ms={one_kernel_long_8_bwd_ms:.3f}"
+            f" one_kernel_long_8_fwd_bwd_ms={one_kernel_long_8_fwd_bwd_ms:.3f}"
+        )
+        if one_kernel_long_8_vs_dense is not None:
+            line += f" one_kernel_long_8_vs_dense={one_kernel_long_8_vs_dense:.2f}x"
+        if one_kernel_long_8_vs_hybrid is not None:
+            line += f" one_kernel_long_8_vs_hybrid={one_kernel_long_8_vs_hybrid:.2f}x"
+    if one_kernel_long_16_fwd_bwd_ms is not None and one_kernel_long_16_fwd_ms is not None and one_kernel_long_16_bwd_ms is not None:
+        line += (
+            f" one_kernel_long_16_label={_one_kernel_synthetic_long_16_label()}"
+            f" one_kernel_long_16_fwd_ms={one_kernel_long_16_fwd_ms:.3f}"
+            f" one_kernel_long_16_bwd_ms={one_kernel_long_16_bwd_ms:.3f}"
+            f" one_kernel_long_16_fwd_bwd_ms={one_kernel_long_16_fwd_bwd_ms:.3f}"
+        )
+        if one_kernel_long_16_vs_dense is not None:
+            line += f" one_kernel_long_16_vs_dense={one_kernel_long_16_vs_dense:.2f}x"
+        if one_kernel_long_16_vs_hybrid is not None:
+            line += f" one_kernel_long_16_vs_hybrid={one_kernel_long_16_vs_hybrid:.2f}x"
+    line += (
+        f" long_tile_keys={tile_reuse['tile_keys']}"
+        f" long_tile_count={tile_reuse['tiles']}"
+        f" long_tile_occ_avg={tile_reuse['avg_occurrences']:.2f}"
+        f" long_tile_occ_max={tile_reuse['max_occurrences']}"
+        f" long_tile_unique_members_avg={tile_reuse['avg_unique_members']:.2f}"
+        f" long_tile_unique_members_max={tile_reuse['max_unique_members']}"
+        f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
+        f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
+        f" synthetic_one_kernel_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD', 'off')}"
+        f" synthetic_one_kernel_bwd_variant={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT', 'auto')}"
+        f" synthetic_one_kernel_long_keys_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA', '4')}"
+        f" synthetic_long_bwd_mode={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE', 'one_kernel')}"
+        f" synthetic_one_kernel_bwd_pingpong={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG', 'off')}"
+        f" synthetic_bwd_kernel_mode={_synthetic_bwd_kernel_mode_label()}"
+    )
     print(line)
 
 
@@ -1211,6 +1819,15 @@ def run_case(case: BenchmarkCase):
         case.warmup_iters,
         case.benchmark_iters,
     )
+    hsa_grad_status = None
+    if case.name == "train-eq" and os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1":
+        hsa_grad_status = _measure_grad_finite_status(
+            hsa_forward,
+            q_data,
+            k_data,
+            v_data,
+            env_updates=env_updates,
+        )
 
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
@@ -1231,6 +1848,14 @@ def run_case(case: BenchmarkCase):
     one_kernel_synth_bwd_ms = None
     one_kernel_synth_fwd_bwd_ms = None
     hsa_fwd_bwd_vs_one_kernel = None
+    one_kernel_short_fwd_ms = None
+    one_kernel_short_bwd_ms = None
+    one_kernel_short_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_one_kernel_short = None
+    one_kernel_long_fwd_ms = None
+    one_kernel_long_bwd_ms = None
+    one_kernel_long_fwd_bwd_ms = None
+    hsa_fwd_bwd_vs_one_kernel_long = None
     one_kernel_pingpong_fwd_ms = None
     one_kernel_pingpong_bwd_ms = None
     one_kernel_pingpong_fwd_bwd_ms = None
@@ -1375,6 +2000,74 @@ def run_case(case: BenchmarkCase):
         hsa_fwd_bwd_vs_one_kernel = (
             hsa_fwd_bwd_ms / one_kernel_synth_fwd_bwd_ms if one_kernel_synth_fwd_bwd_ms > 0 else float("inf")
         )
+        one_kernel_short_env_updates = _one_kernel_synthetic_short_env(case)
+        one_kernel_short_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_short_env_updates
+        )
+        one_kernel_short_fwd_ms = _measure_forward_ms(
+            one_kernel_short_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_short_env_updates,
+        )
+        one_kernel_short_bwd_ms = _measure_backward_ms(
+            one_kernel_short_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_short_env_updates,
+        )
+        one_kernel_short_fwd_bwd_ms = _measure_forward_backward_ms(
+            one_kernel_short_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_short_env_updates,
+        )
+        hsa_fwd_bwd_vs_one_kernel_short = (
+            hsa_fwd_bwd_ms / one_kernel_short_fwd_bwd_ms if one_kernel_short_fwd_bwd_ms > 0 else float("inf")
+        )
+        one_kernel_long_env_updates = _one_kernel_synthetic_long_env(case)
+        one_kernel_long_forward = lambda q, k, v: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_long_env_updates
+        )
+        one_kernel_long_fwd_ms = _measure_forward_ms(
+            one_kernel_long_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_long_env_updates,
+        )
+        one_kernel_long_bwd_ms = _measure_backward_ms(
+            one_kernel_long_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_long_env_updates,
+        )
+        one_kernel_long_fwd_bwd_ms = _measure_forward_backward_ms(
+            one_kernel_long_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=one_kernel_long_env_updates,
+        )
+        hsa_fwd_bwd_vs_one_kernel_long = (
+            hsa_fwd_bwd_ms / one_kernel_long_fwd_bwd_ms if one_kernel_long_fwd_bwd_ms > 0 else float("inf")
+        )
         one_kernel_pingpong_env_updates = _one_kernel_synthetic_pingpong_env(case)
         one_kernel_pingpong_forward = lambda q, k, v: _run_sparse_attention(
             q, k, v, keep_ids, hash_ids, schedule, env_updates=one_kernel_pingpong_env_updates
@@ -1487,6 +2180,13 @@ def run_case(case: BenchmarkCase):
         f"hsa_fwd_bwd_ms={hsa_fwd_bwd_ms:.3f} dense_causal_fwd_bwd_ms={dense_causal_fwd_bwd_ms:.3f} "
         f"hsa_fwd_bwd_vs_dense={hsa_fwd_bwd_vs_dense:.2f}x"
     )
+    if hsa_grad_status is not None:
+        line += (
+            f" hsa_grads_finite={1 if hsa_grad_status['finite'] else 0}"
+            f" hsa_q_nonfinite={hsa_grad_status['q_nonfinite']}"
+            f" hsa_k_nonfinite={hsa_grad_status['k_nonfinite']}"
+            f" hsa_v_nonfinite={hsa_grad_status['v_nonfinite']}"
+        )
     if hdt_vendor_status == "measured":
         line += (
             f" hdt_in_repo_dense_fwd_ms={hdt_in_repo_dense_fwd_ms:.3f}"
@@ -1544,6 +2244,30 @@ def run_case(case: BenchmarkCase):
             f" hsa_fwd_bwd_vs_one_kernel={hsa_fwd_bwd_vs_one_kernel:.2f}x"
         )
     if (
+        one_kernel_short_fwd_bwd_ms is not None
+        and one_kernel_short_bwd_ms is not None
+        and one_kernel_short_fwd_ms is not None
+    ):
+        line += (
+            f" one_kernel_short_label={_one_kernel_synthetic_short_label()}"
+            f" one_kernel_short_fwd_ms={one_kernel_short_fwd_ms:.3f}"
+            f" one_kernel_short_bwd_ms={one_kernel_short_bwd_ms:.3f}"
+            f" one_kernel_short_fwd_bwd_ms={one_kernel_short_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_one_kernel_short={hsa_fwd_bwd_vs_one_kernel_short:.2f}x"
+        )
+    if (
+        one_kernel_long_fwd_bwd_ms is not None
+        and one_kernel_long_bwd_ms is not None
+        and one_kernel_long_fwd_ms is not None
+    ):
+        line += (
+            f" one_kernel_long_label={_one_kernel_synthetic_long_label()}"
+            f" one_kernel_long_fwd_ms={one_kernel_long_fwd_ms:.3f}"
+            f" one_kernel_long_bwd_ms={one_kernel_long_bwd_ms:.3f}"
+            f" one_kernel_long_fwd_bwd_ms={one_kernel_long_fwd_bwd_ms:.3f}"
+            f" hsa_fwd_bwd_vs_one_kernel_long={hsa_fwd_bwd_vs_one_kernel_long:.2f}x"
+        )
+    if (
         one_kernel_pingpong_fwd_bwd_ms is not None
         and one_kernel_pingpong_bwd_ms is not None
         and one_kernel_pingpong_fwd_ms is not None
@@ -1572,6 +2296,9 @@ def run_case(case: BenchmarkCase):
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
             f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
             f" synthetic_one_kernel_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD', 'off')}"
+            f" synthetic_one_kernel_bwd_variant={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT', 'auto')}"
+            f" synthetic_one_kernel_long_keys_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA', '4')}"
+            f" synthetic_long_bwd_mode={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE', 'one_kernel')}"
             f" synthetic_one_kernel_bwd_pingpong={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG', 'off')}"
             f" synthetic_fused_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD', 'off').strip().lower() in {'1', 'true', 'yes', 'on'} else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"

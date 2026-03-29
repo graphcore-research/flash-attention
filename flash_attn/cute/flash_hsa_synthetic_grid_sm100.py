@@ -3378,13 +3378,13 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
 
         if active_row:
             if dim0 < mdQRows.shape[2]:
-                mdQRows[global_q_row, head_idx, dim0] = dq0.to(mdQRows.element_type)
-            if dim1 < mdQRows.shape[2]:
-                mdQRows[global_q_row, head_idx, dim1] = dq1.to(mdQRows.element_type)
-            if dim2 < mdQRows.shape[2]:
-                mdQRows[global_q_row, head_idx, dim2] = dq2.to(mdQRows.element_type)
-            if dim3 < mdQRows.shape[2]:
-                mdQRows[global_q_row, head_idx, dim3] = dq3.to(mdQRows.element_type)
+                copy_utils.atomic_add_fp32x4(
+                    dq0,
+                    dq1,
+                    dq2,
+                    dq3,
+                    utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
+                )
 
 
 class FlashHSASyntheticDirectRowMicroBwdFusedSm100:
@@ -7033,7 +7033,7 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
     if qgroups_per_cta not in (1, 2):
         qgroups_per_cta = 1
     compile_key = (
-        "synthetic_direct_row_micro_bwd_bucket_dense_v5",
+        "synthetic_direct_row_micro_bwd_bucket_dense_v6",
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,

@@ -4672,6 +4672,8 @@ class FlashAttentionBackwardSm100:
                 with cute.arch.elect_one():
                     pipeline_dQ.consumer_release(dQ_consumer_state)
                 dQ_consumer_state.advance()
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                    cute.arch.sync_warp()
 
                 gdQaccum_cur = gdQaccum[None, None, m_block]
 
@@ -4703,7 +4705,7 @@ class FlashAttentionBackwardSm100:
                             cta_rank_in_cluster,
                             lock_value,
                         )
-                    if const_expr(debug_skip_dq_reduce_sync_site != 1):
+                    if const_expr(debug_skip_dq_reduce_sync_site != 1 and debug_skip_dq_reduce_sync_site != 3):
                         self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp:
@@ -4715,7 +4717,7 @@ class FlashAttentionBackwardSm100:
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
-                    if const_expr(debug_skip_dq_reduce_sync_site != 2):
+                    if const_expr(debug_skip_dq_reduce_sync_site != 2 and debug_skip_dq_reduce_sync_site != 3):
                         self.reduce_sync_barrier.arrive_and_wait()
                     dQ_tma_store_producer_state.advance()
                     # Directly add to gmem, much slower

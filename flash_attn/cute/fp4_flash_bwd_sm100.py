@@ -3305,6 +3305,8 @@ class FlashAttentionBackwardSm100:
                     # 2) dP = V @ dOt.T
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                     mma_dov_fn(B_idx=consumer_state_dO.index)
                     pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
@@ -4405,11 +4407,10 @@ class FlashAttentionBackwardSm100:
                             producer_state_dS.advance()
                         if const_expr(self.use_fp4_bwd_qk):
                             peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(
+                            if tidx == 0:
+                                cute.arch.mbarrier_arrive(
                                     dS_cluster_full_mbar_ptr,
-                                    Int32(0),
-                                    peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+                                    peer_cta_rank_in_cluster,
                                 )
 
             # Epilogue
@@ -4672,8 +4673,6 @@ class FlashAttentionBackwardSm100:
                 with cute.arch.elect_one():
                     pipeline_dQ.consumer_release(dQ_consumer_state)
                 dQ_consumer_state.advance()
-                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
-                    cute.arch.sync_warp()
 
                 gdQaccum_cur = gdQaccum[None, None, m_block]
 

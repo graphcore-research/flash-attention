@@ -9,7 +9,9 @@ try:
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
     from cutlass import Boolean, Float32, Int32
+    from cutlass.cutlass_dsl import T, dsl_user_op
     from cutlass.cute.nvgpu import warp
+    from cutlass._mlir.dialects import llvm
     from quack import layout_utils
 
     from flash_attn.cute.cache_utils import get_jit_cache
@@ -1355,6 +1357,7 @@ def _get_synthetic_one_kernel_bwd_variant() -> str:
         "long",
         "warpgroup",
         "bucket_dense",
+        "bucket_dense_two_pass",
         "bucket_dense_dualrow",
         "bucket_dense_tc",
         "auto",
@@ -3147,6 +3150,164 @@ class FlashHSASyntheticDirectRowMicroBwdShortSm100:
                 mdQRows[global_q_row, head_idx, dim3] = dq3
 
 
+@cute.jit
+def _bucket_dense_prob_ds_from_loaded_kv(
+    lane16: Int32,
+    participates: Boolean,
+    q0: Float32,
+    q1: Float32,
+    q2: Float32,
+    q3: Float32,
+    do0: Float32,
+    do1: Float32,
+    do2: Float32,
+    do3: Float32,
+    dpsum: Float32,
+    lse_log2: Float32,
+    kval0: Float32,
+    kval1: Float32,
+    kval2: Float32,
+    kval3: Float32,
+    vval0: Float32,
+    vval1: Float32,
+    vval2: Float32,
+    vval3: Float32,
+    scale_log2: Float32,
+    softmax_scale: Float32,
+):
+    score_partial = Float32(0.0)
+    dprob_partial = Float32(0.0)
+    if participates:
+        score_partial = q0 * kval0 + q1 * kval1 + q2 * kval2 + q3 * kval3
+        dprob_partial = do0 * vval0 + do1 * vval1 + do2 * vval2 + do3 * vval3
+    score = utils.warp_reduce(score_partial, lambda a, b: a + b, width=16)
+    dprob = utils.warp_reduce(dprob_partial, lambda a, b: a + b, width=16)
+    prob = Float32(0.0)
+    ds_scaled = Float32(0.0)
+    if lane16 == Int32(0) and participates:
+        prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+        ds_scaled = prob * (dprob - dpsum) * softmax_scale
+    prob = utils.shuffle_sync(prob, 0, width=16)
+    ds_scaled = utils.shuffle_sync(ds_scaled, 0, width=16)
+    return prob, ds_scaled
+
+
+@cute.jit
+def _dot4_packed_f32x2(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    b0: Float32,
+    b1: Float32,
+    b2: Float32,
+    b3: Float32,
+):
+    acc0, acc1 = cute.arch.mul_packed_f32x2((a0, a1), (b0, b1))
+    acc0, acc1 = cute.arch.fma_packed_f32x2((a2, a3), (b2, b3), (acc0, acc1))
+    return acc0 + acc1
+
+
+@cute.jit
+def _scale4_packed_f32x2(
+    scale: Float32,
+    x0: Float32,
+    x1: Float32,
+    x2: Float32,
+    x3: Float32,
+):
+    scale_pair = (scale, scale)
+    y01_0, y01_1 = cute.arch.mul_packed_f32x2((x0, x1), scale_pair)
+    y23_0, y23_1 = cute.arch.mul_packed_f32x2((x2, x3), scale_pair)
+    return y01_0, y01_1, y23_0, y23_1
+
+
+@cute.jit
+def _fma_accum4_packed_f32x2(
+    acc0: Float32,
+    acc1: Float32,
+    acc2: Float32,
+    acc3: Float32,
+    scale: Float32,
+    x0: Float32,
+    x1: Float32,
+    x2: Float32,
+    x3: Float32,
+):
+    scale_pair = (scale, scale)
+    out01_0, out01_1 = cute.arch.fma_packed_f32x2((x0, x1), scale_pair, (acc0, acc1))
+    out23_0, out23_1 = cute.arch.fma_packed_f32x2((x2, x3), scale_pair, (acc2, acc3))
+    return out01_0, out01_1, out23_0, out23_1
+
+
+@cute.jit
+def _bucket_dense_prob_ds_from_loaded_kv_packed(
+    lane16: Int32,
+    participates: Boolean,
+    q0: Float32,
+    q1: Float32,
+    q2: Float32,
+    q3: Float32,
+    do0: Float32,
+    do1: Float32,
+    do2: Float32,
+    do3: Float32,
+    dpsum: Float32,
+    lse_log2: Float32,
+    kval0: Float32,
+    kval1: Float32,
+    kval2: Float32,
+    kval3: Float32,
+    vval0: Float32,
+    vval1: Float32,
+    vval2: Float32,
+    vval3: Float32,
+    scale_log2: Float32,
+    softmax_scale: Float32,
+):
+    score_partial = Float32(0.0)
+    dprob_partial = Float32(0.0)
+    if participates:
+        score_partial = _dot4_packed_f32x2(q0, q1, q2, q3, kval0, kval1, kval2, kval3)
+        dprob_partial = _dot4_packed_f32x2(do0, do1, do2, do3, vval0, vval1, vval2, vval3)
+    score = utils.warp_reduce(score_partial, lambda a, b: a + b, width=16)
+    dprob = utils.warp_reduce(dprob_partial, lambda a, b: a + b, width=16)
+    prob = Float32(0.0)
+    ds_scaled = Float32(0.0)
+    if lane16 == Int32(0) and participates:
+        prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
+        ds_scaled = prob * (dprob - dpsum) * softmax_scale
+    prob = utils.shuffle_sync(prob, 0, width=16)
+    ds_scaled = utils.shuffle_sync(ds_scaled, 0, width=16)
+    return prob, ds_scaled
+
+
+@dsl_user_op
+def _load_bf16x4_as_f32(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Tuple[Float32, Float32, Float32, Float32]:
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    out_f32x4 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [gmem_ptr_i64],
+        "{\n\t"
+        ".reg .b16 h0, h1, h2, h3;\n\t"
+        "ld.global.v4.b16 {h0, h1, h2, h3}, [$4];\n\t"
+        "cvt.rn.f32.bf16 $0, h0;\n\t"
+        "cvt.rn.f32.bf16 $1, h1;\n\t"
+        "cvt.rn.f32.bf16 $2, h2;\n\t"
+        "cvt.rn.f32.bf16 $3, h3;\n\t"
+        "}\n",
+        "=f,=f,=f,=f,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x4, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x4, [1], loc=loc, ip=ip))
+    out2 = Float32(llvm.extractvalue(T.f32(), out_f32x4, [2], loc=loc, ip=ip))
+    out3 = Float32(llvm.extractvalue(T.f32(), out_f32x4, [3], loc=loc, ip=ip))
+    return out0, out1, out2, out3
+
+
 class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
     """Qgroup-owned bucket-dense backward over compressed 2xU row-compact buckets."""
 
@@ -3260,24 +3421,38 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
         out2 = Float32(0.0)
         out3 = Float32(0.0)
         if active_row:
-            if dim0 < mQRows.shape[2]:
-                q0 = Float32(mQRows[global_q_row, head_idx, dim0])
-                out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
-                do0 = Float32(mdORows[global_q_row, head_idx, dim0])
-            if dim1 < mQRows.shape[2]:
-                q1 = Float32(mQRows[global_q_row, head_idx, dim1])
-                out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
-                do1 = Float32(mdORows[global_q_row, head_idx, dim1])
-            if dim2 < mQRows.shape[2]:
-                q2 = Float32(mQRows[global_q_row, head_idx, dim2])
-                out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
-                do2 = Float32(mdORows[global_q_row, head_idx, dim2])
-            if dim3 < mQRows.shape[2]:
-                q3 = Float32(mQRows[global_q_row, head_idx, dim3])
-                out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
-                do3 = Float32(mdORows[global_q_row, head_idx, dim3])
+            if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                q0, q1, q2, q3 = _load_bf16x4_as_f32(
+                    utils.elem_pointer(mQRows, (global_q_row, head_idx, dim0)),
+                )
+                out0, out1, out2, out3 = _load_bf16x4_as_f32(
+                    utils.elem_pointer(mOutRows, (global_q_row, head_idx, dim0)),
+                )
+                do0, do1, do2, do3 = _load_bf16x4_as_f32(
+                    utils.elem_pointer(mdORows, (global_q_row, head_idx, dim0)),
+                )
+            else:
+                if dim0 < mQRows.shape[2]:
+                    q0 = Float32(mQRows[global_q_row, head_idx, dim0])
+                    out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
+                    do0 = Float32(mdORows[global_q_row, head_idx, dim0])
+                if dim1 < mQRows.shape[2]:
+                    q1 = Float32(mQRows[global_q_row, head_idx, dim1])
+                    out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
+                    do1 = Float32(mdORows[global_q_row, head_idx, dim1])
+                if dim2 < mQRows.shape[2]:
+                    q2 = Float32(mQRows[global_q_row, head_idx, dim2])
+                    out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
+                    do2 = Float32(mdORows[global_q_row, head_idx, dim2])
+                if dim3 < mQRows.shape[2]:
+                    q3 = Float32(mQRows[global_q_row, head_idx, dim3])
+                    out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
+                    do3 = Float32(mdORows[global_q_row, head_idx, dim3])
 
-        dpsum_partial = out0 * do0 + out1 * do1 + out2 * do2 + out3 * do3
+        if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+            dpsum_partial = _dot4_packed_f32x2(out0, out1, out2, out3, do0, do1, do2, do3)
+        else:
+            dpsum_partial = out0 * do0 + out1 * do1 + out2 * do2 + out3 * do3
         dpsum = utils.warp_reduce(dpsum_partial, lambda a, b: a + b, width=16)
         lse_log2 = Float32(0.0)
         if active_row:
@@ -3297,41 +3472,84 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
             if qgroup_valid and union_slot_i < union_k_length:
                 union_key_row = Int32(mUnionKRowIdx[qgroup_idx, union_slot_i])
             participates = Boolean(False)
-            score_partial = Float32(0.0)
-            dprob_partial = Float32(0.0)
+            kval0 = Float32(0.0)
+            kval1 = Float32(0.0)
+            kval2 = Float32(0.0)
+            kval3 = Float32(0.0)
+            vval0 = Float32(0.0)
+            vval1 = Float32(0.0)
+            vval2 = Float32(0.0)
+            vval3 = Float32(0.0)
             if active_row and union_slot_i < union_k_length and union_key_row >= Int32(0):
                 row_slot = Int32(mUnionToRowSlot[qgroup_idx, row_idx, union_slot_i])
                 participates = row_slot >= Int32(0)
                 if participates:
-                    if dim0 < mQRows.shape[2]:
+                    if cutlass.const_expr(mKRows.element_type is cutlass.BFloat16):
+                        kval0, kval1, kval2, kval3 = _load_bf16x4_as_f32(
+                            utils.elem_pointer(mKRows, (union_key_row, head_idx, dim0)),
+                        )
+                        vval0, vval1, vval2, vval3 = _load_bf16x4_as_f32(
+                            utils.elem_pointer(mVRows, (union_key_row, head_idx, dim0)),
+                        )
+                    else:
                         kval0 = Float32(mKRows[union_key_row, head_idx, dim0])
-                        vval0 = Float32(mVRows[union_key_row, head_idx, dim0])
-                        score_partial += q0 * kval0
-                        dprob_partial += do0 * vval0
-                    if dim1 < mQRows.shape[2]:
                         kval1 = Float32(mKRows[union_key_row, head_idx, dim1])
-                        vval1 = Float32(mVRows[union_key_row, head_idx, dim1])
-                        score_partial += q1 * kval1
-                        dprob_partial += do1 * vval1
-                    if dim2 < mQRows.shape[2]:
                         kval2 = Float32(mKRows[union_key_row, head_idx, dim2])
-                        vval2 = Float32(mVRows[union_key_row, head_idx, dim2])
-                        score_partial += q2 * kval2
-                        dprob_partial += do2 * vval2
-                    if dim3 < mQRows.shape[2]:
                         kval3 = Float32(mKRows[union_key_row, head_idx, dim3])
+                        vval0 = Float32(mVRows[union_key_row, head_idx, dim0])
+                        vval1 = Float32(mVRows[union_key_row, head_idx, dim1])
+                        vval2 = Float32(mVRows[union_key_row, head_idx, dim2])
                         vval3 = Float32(mVRows[union_key_row, head_idx, dim3])
-                        score_partial += q3 * kval3
-                        dprob_partial += do3 * vval3
-            score = utils.warp_reduce(score_partial, lambda a, b: a + b, width=16)
-            dprob = utils.warp_reduce(dprob_partial, lambda a, b: a + b, width=16)
-            prob = Float32(0.0)
-            ds_scaled = Float32(0.0)
-            if lane16 == Int32(0) and participates:
-                prob = cute.math.exp2(score * scale_log2 - lse_log2, fastmath=True)
-                ds_scaled = prob * (dprob - dpsum) * softmax_scale
-            prob = utils.shuffle_sync(prob, 0, width=16)
-            ds_scaled = utils.shuffle_sync(ds_scaled, 0, width=16)
+            if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv_packed(
+                    lane16,
+                    participates,
+                    q0,
+                    q1,
+                    q2,
+                    q3,
+                    do0,
+                    do1,
+                    do2,
+                    do3,
+                    dpsum,
+                    lse_log2,
+                    kval0,
+                    kval1,
+                    kval2,
+                    kval3,
+                    vval0,
+                    vval1,
+                    vval2,
+                    vval3,
+                    scale_log2,
+                    softmax_scale,
+                )
+            else:
+                prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv(
+                    lane16,
+                    participates,
+                    q0,
+                    q1,
+                    q2,
+                    q3,
+                    do0,
+                    do1,
+                    do2,
+                    do3,
+                    dpsum,
+                    lse_log2,
+                    kval0,
+                    kval1,
+                    kval2,
+                    kval3,
+                    vval0,
+                    vval1,
+                    vval2,
+                    vval3,
+                    scale_log2,
+                    softmax_scale,
+                )
 
             dk0 = Float32(0.0)
             dk1 = Float32(0.0)
@@ -3342,25 +3560,24 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
             dv2 = Float32(0.0)
             dv3 = Float32(0.0)
             if participates:
-                if dim0 < mQRows.shape[2]:
-                    kval0 = Float32(mKRows[union_key_row, head_idx, dim0])
+                if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                    dq0, dq1, dq2, dq3 = _fma_accum4_packed_f32x2(
+                        dq0, dq1, dq2, dq3, ds_scaled, kval0, kval1, kval2, kval3
+                    )
+                    dk0, dk1, dk2, dk3 = _scale4_packed_f32x2(ds_scaled, q0, q1, q2, q3)
+                    dv0, dv1, dv2, dv3 = _scale4_packed_f32x2(prob, do0, do1, do2, do3)
+                else:
                     dq0 += ds_scaled * kval0
-                    dk0 = ds_scaled * q0
-                    dv0 = prob * do0
-                if dim1 < mQRows.shape[2]:
-                    kval1 = Float32(mKRows[union_key_row, head_idx, dim1])
                     dq1 += ds_scaled * kval1
-                    dk1 = ds_scaled * q1
-                    dv1 = prob * do1
-                if dim2 < mQRows.shape[2]:
-                    kval2 = Float32(mKRows[union_key_row, head_idx, dim2])
                     dq2 += ds_scaled * kval2
-                    dk2 = ds_scaled * q2
-                    dv2 = prob * do2
-                if dim3 < mQRows.shape[2]:
-                    kval3 = Float32(mKRows[union_key_row, head_idx, dim3])
                     dq3 += ds_scaled * kval3
+                    dk0 = ds_scaled * q0
+                    dk1 = ds_scaled * q1
+                    dk2 = ds_scaled * q2
                     dk3 = ds_scaled * q3
+                    dv0 = prob * do0
+                    dv1 = prob * do1
+                    dv2 = prob * do2
                     dv3 = prob * do3
             partner_lane = lane16 + (Int32(1) - row_idx) * Int32(16)
             partner_dk0 = utils.shuffle_sync(dk0, partner_lane, width=32)
@@ -3372,19 +3589,33 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
             partner_dv2 = utils.shuffle_sync(dv2, partner_lane, width=32)
             partner_dv3 = utils.shuffle_sync(dv3, partner_lane, width=32)
             if lane < Int32(16) and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                    dk0, dk1 = cute.arch.add_packed_f32x2((dk0, dk1), (partner_dk0, partner_dk1))
+                    dk2, dk3 = cute.arch.add_packed_f32x2((dk2, dk3), (partner_dk2, partner_dk3))
+                    dv0, dv1 = cute.arch.add_packed_f32x2((dv0, dv1), (partner_dv0, partner_dv1))
+                    dv2, dv3 = cute.arch.add_packed_f32x2((dv2, dv3), (partner_dv2, partner_dv3))
+                else:
+                    dk0 += partner_dk0
+                    dk1 += partner_dk1
+                    dk2 += partner_dk2
+                    dk3 += partner_dk3
+                    dv0 += partner_dv0
+                    dv1 += partner_dv1
+                    dv2 += partner_dv2
+                    dv3 += partner_dv3
                 if dim0 < mdKRows.shape[2]:
                     copy_utils.atomic_add_fp32x4(
-                        dk0 + partner_dk0,
-                        dk1 + partner_dk1,
-                        dk2 + partner_dk2,
-                        dk3 + partner_dk3,
+                        dk0,
+                        dk1,
+                        dk2,
+                        dk3,
                         utils.elem_pointer(mdKRows, (union_key_row, head_idx, dim0)),
                     )
                     copy_utils.atomic_add_fp32x4(
-                        dv0 + partner_dv0,
-                        dv1 + partner_dv1,
-                        dv2 + partner_dv2,
-                        dv3 + partner_dv3,
+                        dv0,
+                        dv1,
+                        dv2,
+                        dv3,
                         utils.elem_pointer(mdVRows, (union_key_row, head_idx, dim0)),
                     )
 
@@ -3397,6 +3628,419 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                     dq3,
                     utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
                 )
+
+
+class FlashHSASyntheticDirectRowMicroBwdBucketDenseTwoPassStage1Sm100:
+    """Bucket-dense pass 1: compute dQ and store packed Q/dO/P/dS workspace."""
+
+    arch = 100
+
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mRowKRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mRowKToUnionIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mRowKLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mPackedQ: cute.Tensor,
+        mPackedDO: cute.Tensor,
+        mPackedProb: cute.Tensor,
+        mPackedDS: cute.Tensor,
+        mdQRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        del mRowKRowIdx, mRowKToUnionIdx, mRowKLength
+        grid_x = (mQRowIdx.shape[0] + self.qgroups_per_cta - 1) // self.qgroups_per_cta
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionKRowIdx,
+            mUnionToRowSlot,
+            mQLength,
+            mUnionKLength,
+            softmax_scale,
+            mPackedQ,
+            mPackedDO,
+            mPackedProb,
+            mPackedDS,
+            mdQRows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mPackedQ: cute.Tensor,
+        mPackedDO: cute.Tensor,
+        mPackedProb: cute.Tensor,
+        mPackedDS: cute.Tensor,
+        mdQRows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qgroup_pair_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        row_idx = lane // Int32(16)
+        lane16 = lane % Int32(16)
+        dim0 = lane16 * Int32(4)
+        dim1 = dim0 + Int32(1)
+        dim2 = dim0 + Int32(2)
+        dim3 = dim0 + Int32(3)
+        qgroup_base = qgroup_pair_idx * Int32(self.qgroups_per_cta)
+        qgroup_idx = qgroup_base + warp_idx
+        qgroup_count = Int32(mQRowIdx.shape[0])
+        qgroup_valid = qgroup_idx < qgroup_count
+
+        q_length = Int32(0)
+        if qgroup_valid:
+            q_length = Int32(mQLength[qgroup_idx])
+        global_q_row = Int32(-1)
+        active_row = Boolean(False)
+        packed_row = Int32(-1)
+        if qgroup_valid:
+            packed_row = qgroup_idx * Int32(2) + row_idx
+        if qgroup_valid and row_idx < q_length:
+            global_q_row = Int32(mQRowIdx[qgroup_idx, row_idx])
+            active_row = global_q_row >= Int32(0)
+
+        q0 = Float32(0.0)
+        q1 = Float32(0.0)
+        q2 = Float32(0.0)
+        q3 = Float32(0.0)
+        do0 = Float32(0.0)
+        do1 = Float32(0.0)
+        do2 = Float32(0.0)
+        do3 = Float32(0.0)
+        out0 = Float32(0.0)
+        out1 = Float32(0.0)
+        out2 = Float32(0.0)
+        out3 = Float32(0.0)
+        if active_row:
+            if dim0 < mQRows.shape[2]:
+                q0 = Float32(mQRows[global_q_row, head_idx, dim0])
+                out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
+                do0 = Float32(mdORows[global_q_row, head_idx, dim0])
+            if dim1 < mQRows.shape[2]:
+                q1 = Float32(mQRows[global_q_row, head_idx, dim1])
+                out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
+                do1 = Float32(mdORows[global_q_row, head_idx, dim1])
+            if dim2 < mQRows.shape[2]:
+                q2 = Float32(mQRows[global_q_row, head_idx, dim2])
+                out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
+                do2 = Float32(mdORows[global_q_row, head_idx, dim2])
+            if dim3 < mQRows.shape[2]:
+                q3 = Float32(mQRows[global_q_row, head_idx, dim3])
+                out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
+                do3 = Float32(mdORows[global_q_row, head_idx, dim3])
+
+        if qgroup_valid:
+            if dim0 < mPackedQ.shape[2]:
+                mPackedQ[packed_row, head_idx, dim0] = q0.to(mPackedQ.element_type)
+                mPackedDO[packed_row, head_idx, dim0] = do0.to(mPackedDO.element_type)
+            if dim1 < mPackedQ.shape[2]:
+                mPackedQ[packed_row, head_idx, dim1] = q1.to(mPackedQ.element_type)
+                mPackedDO[packed_row, head_idx, dim1] = do1.to(mPackedDO.element_type)
+            if dim2 < mPackedQ.shape[2]:
+                mPackedQ[packed_row, head_idx, dim2] = q2.to(mPackedQ.element_type)
+                mPackedDO[packed_row, head_idx, dim2] = do2.to(mPackedDO.element_type)
+            if dim3 < mPackedQ.shape[2]:
+                mPackedQ[packed_row, head_idx, dim3] = q3.to(mPackedQ.element_type)
+                mPackedDO[packed_row, head_idx, dim3] = do3.to(mPackedDO.element_type)
+
+        dpsum_partial = out0 * do0 + out1 * do1 + out2 * do2 + out3 * do3
+        dpsum = utils.warp_reduce(dpsum_partial, lambda a, b: a + b, width=16)
+        lse_log2 = Float32(0.0)
+        if active_row:
+            lse_log2 = Float32(mLSERows[global_q_row, head_idx]) * Float32(_LOG2_E)
+        scale_log2 = softmax_scale * Float32(_LOG2_E)
+        dq0 = Float32(0.0)
+        dq1 = Float32(0.0)
+        dq2 = Float32(0.0)
+        dq3 = Float32(0.0)
+        union_k_length = Int32(0)
+        if qgroup_valid:
+            union_k_length = Int32(mUnionKLength[qgroup_idx])
+
+        for union_slot in range(mPackedProb.shape[2]):
+            union_slot_i = Int32(union_slot)
+            union_key_row = Int32(-1)
+            if qgroup_valid and union_slot_i < union_k_length:
+                union_key_row = Int32(mUnionKRowIdx[qgroup_idx, union_slot_i])
+            participates = Boolean(False)
+            kval0 = Float32(0.0)
+            kval1 = Float32(0.0)
+            kval2 = Float32(0.0)
+            kval3 = Float32(0.0)
+            vval0 = Float32(0.0)
+            vval1 = Float32(0.0)
+            vval2 = Float32(0.0)
+            vval3 = Float32(0.0)
+            if active_row and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                row_slot = Int32(mUnionToRowSlot[qgroup_idx, row_idx, union_slot_i])
+                participates = row_slot >= Int32(0)
+                if participates:
+                    kval0 = Float32(mKRows[union_key_row, head_idx, dim0])
+                    kval1 = Float32(mKRows[union_key_row, head_idx, dim1])
+                    kval2 = Float32(mKRows[union_key_row, head_idx, dim2])
+                    kval3 = Float32(mKRows[union_key_row, head_idx, dim3])
+                    vval0 = Float32(mVRows[union_key_row, head_idx, dim0])
+                    vval1 = Float32(mVRows[union_key_row, head_idx, dim1])
+                    vval2 = Float32(mVRows[union_key_row, head_idx, dim2])
+                    vval3 = Float32(mVRows[union_key_row, head_idx, dim3])
+            prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv(
+                lane16,
+                participates,
+                q0,
+                q1,
+                q2,
+                q3,
+                do0,
+                do1,
+                do2,
+                do3,
+                dpsum,
+                lse_log2,
+                kval0,
+                kval1,
+                kval2,
+                kval3,
+                vval0,
+                vval1,
+                vval2,
+                vval3,
+                scale_log2,
+                softmax_scale,
+            )
+            if qgroup_valid and lane16 == Int32(0):
+                mPackedProb[packed_row, head_idx, union_slot_i] = prob.to(mPackedProb.element_type)
+                mPackedDS[packed_row, head_idx, union_slot_i] = ds_scaled.to(mPackedDS.element_type)
+
+            if participates:
+                dq0 += ds_scaled * kval0
+                dq1 += ds_scaled * kval1
+                dq2 += ds_scaled * kval2
+                dq3 += ds_scaled * kval3
+
+        if active_row and dim0 < mdQRows.shape[2]:
+            copy_utils.atomic_add_fp32x4(
+                dq0,
+                dq1,
+                dq2,
+                dq3,
+                utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
+            )
+
+
+class FlashHSASyntheticDirectRowMicroBwdBucketDenseTwoPassReductionSm100:
+    """Bucket-dense pass 2: key-owned linear dK/dV reduction from packed Q/dO/P/dS."""
+
+    arch = 100
+
+    def __init__(self, *, keys_per_cta: int = 8, max_occurrences: int = 8):
+        self.keys_per_cta = keys_per_cta
+        self.max_occurrences = max_occurrences
+        self.num_threads = 16 * keys_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mPackedQ: cute.Tensor,
+        mPackedDO: cute.Tensor,
+        mPackedProb: cute.Tensor,
+        mPackedDS: cute.Tensor,
+        mUniqueKeyRowIdx: cute.Tensor,
+        mUniqueKeyMemberIdx: cute.Tensor,
+        mUniqueKeyUnionIdx: cute.Tensor,
+        mUniqueKeyOccurrenceRowPtr: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = (mUniqueKeyRowIdx.shape[0] + self.keys_per_cta - 1) // self.keys_per_cta
+        grid_y = mPackedQ.shape[1]
+        self.kernel(
+            mPackedQ,
+            mPackedDO,
+            mPackedProb,
+            mPackedDS,
+            mUniqueKeyRowIdx,
+            mUniqueKeyMemberIdx,
+            mUniqueKeyUnionIdx,
+            mUniqueKeyOccurrenceRowPtr,
+            mdKRows,
+            mdVRows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mPackedQ: cute.Tensor,
+        mPackedDO: cute.Tensor,
+        mPackedProb: cute.Tensor,
+        mPackedDS: cute.Tensor,
+        mUniqueKeyRowIdx: cute.Tensor,
+        mUniqueKeyMemberIdx: cute.Tensor,
+        mUniqueKeyUnionIdx: cute.Tensor,
+        mUniqueKeyOccurrenceRowPtr: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        unique_key_group_idx, head_idx, _ = cute.arch.block_idx()
+        key_in_cta = tidx // Int32(16)
+        lane = tidx % Int32(16)
+        dim0 = lane * Int32(4)
+        dim1 = dim0 + Int32(1)
+        dim2 = dim0 + Int32(2)
+        dim3 = dim0 + Int32(3)
+        key_count = Int32(mUniqueKeyRowIdx.shape[0])
+        unique_key_idx = unique_key_group_idx * Int32(self.keys_per_cta) + key_in_cta
+        active_key = unique_key_idx < key_count
+        key_row = Int32(-1)
+        occ_start = Int32(0)
+        occ_end = Int32(0)
+        if active_key:
+            key_row = Int32(mUniqueKeyRowIdx[unique_key_idx])
+            occ_start = Int32(mUniqueKeyOccurrenceRowPtr[unique_key_idx])
+            occ_end = Int32(mUniqueKeyOccurrenceRowPtr[unique_key_idx + Int32(1)])
+
+        dk0 = Float32(0.0)
+        dk1 = Float32(0.0)
+        dk2 = Float32(0.0)
+        dk3 = Float32(0.0)
+        dv0 = Float32(0.0)
+        dv1 = Float32(0.0)
+        dv2 = Float32(0.0)
+        dv3 = Float32(0.0)
+
+        for rel_occ in range(self.max_occurrences):
+            occ_idx = occ_start + Int32(rel_occ)
+            occurrence_valid = active_key and occ_idx < occ_end
+            member_idx = Int32(-1)
+            union_idx = Int32(-1)
+            packed_row0 = Int32(-1)
+            packed_row1 = Int32(-1)
+            if occurrence_valid:
+                member_idx = Int32(mUniqueKeyMemberIdx[occ_idx])
+                union_idx = Int32(mUniqueKeyUnionIdx[occ_idx])
+                packed_row0 = member_idx * Int32(2)
+                packed_row1 = packed_row0 + Int32(1)
+
+            ds0 = Float32(0.0)
+            ds1 = Float32(0.0)
+            prob0 = Float32(0.0)
+            prob1 = Float32(0.0)
+            q00 = Float32(0.0)
+            q01 = Float32(0.0)
+            q02 = Float32(0.0)
+            q03 = Float32(0.0)
+            q10 = Float32(0.0)
+            q11 = Float32(0.0)
+            q12 = Float32(0.0)
+            q13 = Float32(0.0)
+            do00 = Float32(0.0)
+            do01 = Float32(0.0)
+            do02 = Float32(0.0)
+            do03 = Float32(0.0)
+            do10 = Float32(0.0)
+            do11 = Float32(0.0)
+            do12 = Float32(0.0)
+            do13 = Float32(0.0)
+            if occurrence_valid and union_idx >= Int32(0):
+                prob0 = Float32(mPackedProb[packed_row0, head_idx, union_idx])
+                prob1 = Float32(mPackedProb[packed_row1, head_idx, union_idx])
+                ds0 = Float32(mPackedDS[packed_row0, head_idx, union_idx])
+                ds1 = Float32(mPackedDS[packed_row1, head_idx, union_idx])
+                if dim0 < mPackedQ.shape[2]:
+                    q00 = Float32(mPackedQ[packed_row0, head_idx, dim0])
+                    q10 = Float32(mPackedQ[packed_row1, head_idx, dim0])
+                    do00 = Float32(mPackedDO[packed_row0, head_idx, dim0])
+                    do10 = Float32(mPackedDO[packed_row1, head_idx, dim0])
+                if dim1 < mPackedQ.shape[2]:
+                    q01 = Float32(mPackedQ[packed_row0, head_idx, dim1])
+                    q11 = Float32(mPackedQ[packed_row1, head_idx, dim1])
+                    do01 = Float32(mPackedDO[packed_row0, head_idx, dim1])
+                    do11 = Float32(mPackedDO[packed_row1, head_idx, dim1])
+                if dim2 < mPackedQ.shape[2]:
+                    q02 = Float32(mPackedQ[packed_row0, head_idx, dim2])
+                    q12 = Float32(mPackedQ[packed_row1, head_idx, dim2])
+                    do02 = Float32(mPackedDO[packed_row0, head_idx, dim2])
+                    do12 = Float32(mPackedDO[packed_row1, head_idx, dim2])
+                if dim3 < mPackedQ.shape[2]:
+                    q03 = Float32(mPackedQ[packed_row0, head_idx, dim3])
+                    q13 = Float32(mPackedQ[packed_row1, head_idx, dim3])
+                    do03 = Float32(mPackedDO[packed_row0, head_idx, dim3])
+                    do13 = Float32(mPackedDO[packed_row1, head_idx, dim3])
+
+            if occurrence_valid and union_idx >= Int32(0):
+                if dim0 < mPackedQ.shape[2]:
+                    dk0 += ds0 * q00 + ds1 * q10
+                    dv0 += prob0 * do00 + prob1 * do10
+                if dim1 < mPackedQ.shape[2]:
+                    dk1 += ds0 * q01 + ds1 * q11
+                    dv1 += prob0 * do01 + prob1 * do11
+                if dim2 < mPackedQ.shape[2]:
+                    dk2 += ds0 * q02 + ds1 * q12
+                    dv2 += prob0 * do02 + prob1 * do12
+                if dim3 < mPackedQ.shape[2]:
+                    dk3 += ds0 * q03 + ds1 * q13
+                    dv3 += prob0 * do03 + prob1 * do13
+
+        if active_key and key_row >= Int32(0) and dim0 < mdKRows.shape[2]:
+            copy_utils.atomic_add_fp32x4(
+                dk0,
+                dk1,
+                dk2,
+                dk3,
+                utils.elem_pointer(mdKRows, (key_row, head_idx, dim0)),
+            )
+            copy_utils.atomic_add_fp32x4(
+                dv0,
+                dv1,
+                dv2,
+                dv3,
+                utils.elem_pointer(mdVRows, (key_row, head_idx, dim0)),
+            )
 
 
 class FlashHSASyntheticDirectRowMicroBwdBucketDenseDualrowSm100:
@@ -7738,7 +8382,7 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
     if qgroups_per_cta not in (1, 2, 4):
         qgroups_per_cta = 1
     compile_key = (
-        "synthetic_direct_row_micro_bwd_bucket_dense_v6",
+        "synthetic_direct_row_micro_bwd_bucket_dense_v15",
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -7803,6 +8447,269 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
 _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense.compile_cache = get_jit_cache(
     "hsa_synth_direct_row_micro_bwd_bucket_dense"
 )
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    row_k_row_idx: torch.Tensor,
+    union_k_row_idx: torch.Tensor,
+    row_k_to_union_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    q_length: torch.Tensor,
+    row_k_length: torch.Tensor,
+    union_k_length: torch.Tensor,
+    packed_q: torch.Tensor,
+    packed_do: torch.Tensor,
+    packed_prob: torch.Tensor,
+    packed_ds: torch.Tensor,
+    dq_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+):
+    _require_cute_runtime()
+    qgroups_per_cta = _get_synthetic_qgroups_per_cta_bwd()
+    if qgroups_per_cta not in (1, 2):
+        qgroups_per_cta = 1
+    compile_key = (
+        "synthetic_direct_row_micro_bwd_bucket_dense_two_pass_stage1_v5",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        out_rows.dtype,
+        dout_rows.dtype,
+        packed_q.dtype,
+        packed_do.dtype,
+        packed_prob.dtype,
+        packed_ds.dtype,
+        q_row_idx.shape[1],
+        union_k_row_idx.shape[1],
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        qgroups_per_cta,
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1.compile_cache:
+        kernel = FlashHSASyntheticDirectRowMicroBwdBucketDenseTwoPassStage1Sm100(qgroups_per_cta=qgroups_per_cta)
+        _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(out_rows),
+            to_cute_tensor(dout_rows),
+            to_cute_tensor(lse_rows, assumed_align=4),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_row_idx, assumed_align=4),
+            to_cute_tensor(union_k_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_to_union_idx, assumed_align=4),
+            to_cute_tensor(union_to_row_slot, assumed_align=4),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(row_k_length, assumed_align=4),
+            to_cute_tensor(union_k_length, assumed_align=4, leading_dim=0),
+            Float32(softmax_scale),
+            to_cute_tensor(packed_q),
+            to_cute_tensor(packed_do),
+            to_cute_tensor(packed_prob),
+            to_cute_tensor(packed_ds),
+            to_cute_tensor(dq_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        Float32(softmax_scale),
+        packed_q,
+        packed_do,
+        packed_prob,
+        packed_ds,
+        dq_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1.compile_cache = get_jit_cache(
+    "hsa_synth_direct_row_micro_bwd_bucket_dense_two_pass_stage1"
+)
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction(
+    packed_q: torch.Tensor,
+    packed_do: torch.Tensor,
+    packed_prob: torch.Tensor,
+    packed_ds: torch.Tensor,
+    unique_key_row_idx: torch.Tensor,
+    unique_key_member_idx: torch.Tensor,
+    unique_key_union_idx: torch.Tensor,
+    unique_key_occurrence_row_ptr: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    max_unique_key_occurrences: int,
+):
+    _require_cute_runtime()
+    compile_key = (
+        "synthetic_direct_row_micro_bwd_bucket_dense_two_pass_reduction_v4",
+        packed_q.dtype,
+        packed_do.dtype,
+        packed_prob.dtype,
+        packed_ds.dtype,
+        unique_key_row_idx.shape[0],
+        unique_key_member_idx.shape[0],
+        packed_q.shape[1],
+        packed_q.shape[2],
+        packed_prob.shape[2],
+        max_unique_key_occurrences,
+        torch.cuda.get_device_capability(packed_q.device),
+    )
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction.compile_cache:
+        kernel = FlashHSASyntheticDirectRowMicroBwdBucketDenseTwoPassReductionSm100(
+            keys_per_cta=8,
+            max_occurrences=max_unique_key_occurrences,
+        )
+        _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(packed_q),
+            to_cute_tensor(packed_do),
+            to_cute_tensor(packed_prob),
+            to_cute_tensor(packed_ds),
+            to_cute_tensor(unique_key_row_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_member_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_union_idx, assumed_align=4, leading_dim=0),
+            to_cute_tensor(unique_key_occurrence_row_ptr, assumed_align=4, leading_dim=0),
+            to_cute_tensor(dk_rows, assumed_align=4),
+            to_cute_tensor(dv_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction.compile_cache[compile_key](
+        packed_q,
+        packed_do,
+        packed_prob,
+        packed_ds,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dk_rows,
+        dv_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction.compile_cache = get_jit_cache(
+    "hsa_synth_direct_row_micro_bwd_bucket_dense_two_pass_reduction"
+)
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    row_k_row_idx: torch.Tensor,
+    union_k_row_idx: torch.Tensor,
+    row_k_to_union_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    q_length: torch.Tensor,
+    row_k_length: torch.Tensor,
+    union_k_length: torch.Tensor,
+    unique_key_row_idx: torch.Tensor,
+    unique_key_member_idx: torch.Tensor,
+    unique_key_union_idx: torch.Tensor,
+    unique_key_occurrence_row_ptr: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+    max_unique_key_occurrences: int,
+    workspace: dict,
+):
+    packed_rows = int(q_row_idx.shape[0] * q_row_idx.shape[1])
+    two_pass_workspace = workspace.setdefault("bucket_dense_two_pass", {})
+    workspace_key = (
+        str(q_rows.device),
+        packed_rows,
+        q_rows.shape[1],
+        q_rows.shape[2],
+        union_k_row_idx.shape[1],
+        str(q_rows.dtype),
+        str(dout_rows.dtype),
+    )
+    bufs = two_pass_workspace.get(workspace_key)
+    if bufs is None:
+        bufs = {
+            "packed_q": torch.empty((packed_rows, q_rows.shape[1], q_rows.shape[2]), dtype=q_rows.dtype, device=q_rows.device),
+            "packed_do": torch.empty(
+                (packed_rows, dout_rows.shape[1], dout_rows.shape[2]), dtype=dout_rows.dtype, device=dout_rows.device
+            ),
+            "packed_prob": torch.empty((packed_rows, q_rows.shape[1], 16), dtype=torch.bfloat16, device=q_rows.device),
+            "packed_ds": torch.empty((packed_rows, q_rows.shape[1], 16), dtype=torch.bfloat16, device=q_rows.device),
+        }
+        two_pass_workspace[workspace_key] = bufs
+    packed_q = bufs["packed_q"]
+    packed_do = bufs["packed_do"]
+    packed_prob = bufs["packed_prob"]
+    packed_ds = bufs["packed_ds"]
+
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_stage1(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        packed_q,
+        packed_do,
+        packed_prob,
+        packed_ds,
+        dq_rows,
+        softmax_scale=softmax_scale,
+    )
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass_reduction(
+        packed_q,
+        packed_do,
+        packed_prob,
+        packed_ds,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dk_rows,
+        dv_rows,
+        max_unique_key_occurrences=max_unique_key_occurrences,
+    )
 
 
 def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow(
@@ -9499,6 +10406,22 @@ def _can_use_synthetic_bucket_dense_bwd(
         return False
 
 
+def _can_use_synthetic_bucket_dense_two_pass_bwd(
+    q_rows: torch.Tensor,
+    union_k_row_idx: torch.Tensor,
+    q_row_idx: torch.Tensor,
+) -> bool:
+    try:
+        qgroups_per_cta_bwd = _get_synthetic_qgroups_per_cta_bwd()
+        return (
+            _can_use_synthetic_bucket_dense_bwd(q_rows, union_k_row_idx, q_row_idx)
+            and q_rows.shape[0] >= 65536
+            and qgroups_per_cta_bwd in (1, 2)
+        )
+    except Exception:
+        return False
+
+
 def _should_use_synthetic_one_kernel_bwd(
     q_rows: torch.Tensor,
     union_k_row_idx: torch.Tensor,
@@ -9510,7 +10433,7 @@ def _should_use_synthetic_one_kernel_bwd(
     if mode == "off":
         return False
     variant = _get_synthetic_one_kernel_bwd_variant()
-    if variant in {"auto", "bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc"}:
+    if variant in {"auto", "bucket_dense", "bucket_dense_two_pass", "bucket_dense_dualrow", "bucket_dense_tc"}:
         supported = _can_use_synthetic_bucket_dense_bwd(q_rows, union_k_row_idx, q_row_idx)
         return supported
     supported = _can_use_synthetic_split_bwd(
@@ -9567,6 +10490,7 @@ def _select_synthetic_one_kernel_bwd_variant(q_row_idx: torch.Tensor) -> str:
         "long",
         "warpgroup",
         "bucket_dense",
+        "bucket_dense_two_pass",
         "bucket_dense_dualrow",
         "bucket_dense_tc",
     }:
@@ -9697,7 +10621,13 @@ def _select_row_compact_synthetic_bwd_mode(
         max_unique_key_occurrences,
     ):
         return "one_kernel"
-    if one_kernel_mode != "off" and variant in {"auto", "bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc"}:
+    if one_kernel_mode != "off" and variant in {
+        "auto",
+        "bucket_dense",
+        "bucket_dense_two_pass",
+        "bucket_dense_dualrow",
+        "bucket_dense_tc",
+    }:
         return "legacy"
     if _synthetic_split_bwd_enabled() and _can_use_synthetic_split_bwd(
         q_rows,
@@ -9846,6 +10776,62 @@ def _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
 ):
     variant = _select_synthetic_one_kernel_bwd_variant(q_row_idx)
     if variant == "bucket_dense":
+        return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
+            q_rows,
+            k_rows,
+            v_rows,
+            out_rows,
+            dout_rows,
+            lse_rows,
+            q_row_idx,
+            row_k_row_idx,
+            union_k_row_idx,
+            row_k_to_union_idx,
+            union_to_row_slot,
+            q_length,
+            row_k_length,
+            union_k_length,
+            dq_rows,
+            dk_rows,
+            dv_rows,
+            softmax_scale=softmax_scale,
+        )
+    if variant == "bucket_dense_two_pass":
+        two_pass_supported = (
+            _can_use_synthetic_bucket_dense_two_pass_bwd(q_rows, union_k_row_idx, q_row_idx)
+            and unique_key_row_idx is not None
+            and unique_key_member_idx is not None
+            and unique_key_union_idx is not None
+            and unique_key_occurrence_row_ptr is not None
+            and max_unique_key_occurrences > 0
+        )
+        if two_pass_supported:
+            return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass(
+                q_rows,
+                k_rows,
+                v_rows,
+                out_rows,
+                dout_rows,
+                lse_rows,
+                q_row_idx,
+                row_k_row_idx,
+                union_k_row_idx,
+                row_k_to_union_idx,
+                union_to_row_slot,
+                q_length,
+                row_k_length,
+                union_k_length,
+                unique_key_row_idx,
+                unique_key_member_idx,
+                unique_key_union_idx,
+                unique_key_occurrence_row_ptr,
+                dq_rows,
+                dk_rows,
+                dv_rows,
+                softmax_scale=softmax_scale,
+                max_unique_key_occurrences=max_unique_key_occurrences,
+                workspace=workspace,
+            )
         return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
             q_rows,
             k_rows,

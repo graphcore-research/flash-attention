@@ -2607,6 +2607,16 @@ def test_hsa_synthetic_one_kernel_backward_variant_explicit_bucket_dense_tc(monk
     assert synthetic_module._select_synthetic_one_kernel_bwd_variant(torch.empty((8, 2), dtype=torch.int32)) == "bucket_dense_tc"
 
 
+def test_hsa_synthetic_one_kernel_backward_variant_explicit_bucket_dense_two_pass(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "bucket_dense_two_pass")
+    assert (
+        synthetic_module._select_synthetic_one_kernel_bwd_variant(torch.empty((8, 2), dtype=torch.int32))
+        == "bucket_dense_two_pass"
+    )
+
+
 def test_hsa_synthetic_one_kernel_backward_variant_explicit_bucket_dense_dualrow(monkeypatch):
     import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
 
@@ -2743,6 +2753,144 @@ def test_hsa_synthetic_row_compact_one_kernel_dispatch_routes_bucket_dense_tc(mo
         workspace={},
     )
     assert calls == ["bucket_dense_tc"]
+
+
+def test_hsa_synthetic_row_compact_one_kernel_dispatch_routes_bucket_dense_two_pass(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _bucket_dense_two_pass(*args, **kwargs):
+        calls.append("bucket_dense_two_pass")
+
+    def _bucket_dense(*args, **kwargs):
+        calls.append("bucket_dense")
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass",
+        _bucket_dense_two_pass,
+    )
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense", _bucket_dense)
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "bucket_dense_two_pass")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD", "2")
+
+    q_rows = torch.empty((65536, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((65536, 1, 64))
+    dout_rows = torch.empty((65536, 1, 64))
+    lse_rows = torch.empty((65536, 1))
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    row_k_row_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
+    row_k_to_union_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_to_row_slot = torch.empty((8, 2, 12), dtype=torch.int32)
+    q_length = torch.empty((8,), dtype=torch.int32)
+    row_k_length = torch.empty((8, 2), dtype=torch.int32)
+    union_k_length = torch.empty((8,), dtype=torch.int32)
+    unique_key_row_idx = torch.empty((1,), dtype=torch.int32)
+    unique_key_member_idx = torch.empty((1,), dtype=torch.int32)
+    unique_key_union_idx = torch.empty((1,), dtype=torch.int32)
+    unique_key_occurrence_row_ptr = torch.tensor([0, 1], dtype=torch.int32)
+    dq_rows = torch.empty((65536, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        unique_key_row_idx,
+        unique_key_member_idx,
+        unique_key_union_idx,
+        unique_key_occurrence_row_ptr,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=1,
+        workspace={},
+    )
+    assert calls == ["bucket_dense_two_pass"]
+
+
+def test_hsa_synthetic_row_compact_one_kernel_dispatch_bucket_dense_two_pass_falls_back_below_long_gate(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    calls = []
+
+    def _bucket_dense_two_pass(*args, **kwargs):
+        calls.append("bucket_dense_two_pass")
+
+    def _bucket_dense(*args, **kwargs):
+        calls.append("bucket_dense")
+
+    monkeypatch.setattr(
+        synthetic_module,
+        "_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_two_pass",
+        _bucket_dense_two_pass,
+    )
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense", _bucket_dense)
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "bucket_dense_two_pass")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA_BWD", "2")
+
+    q_rows = torch.empty((32768, 1, 64))
+    k_rows = torch.empty((1, 1, 64))
+    v_rows = torch.empty((1, 1, 64))
+    out_rows = torch.empty((32768, 1, 64))
+    dout_rows = torch.empty((32768, 1, 64))
+    lse_rows = torch.empty((32768, 1))
+    q_row_idx = torch.empty((8, 2), dtype=torch.int32)
+    row_k_row_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_k_row_idx = torch.empty((8, 12), dtype=torch.int32)
+    row_k_to_union_idx = torch.empty((8, 2, 12), dtype=torch.int32)
+    union_to_row_slot = torch.empty((8, 2, 12), dtype=torch.int32)
+    q_length = torch.empty((8,), dtype=torch.int32)
+    row_k_length = torch.empty((8, 2), dtype=torch.int32)
+    union_k_length = torch.empty((8,), dtype=torch.int32)
+    dq_rows = torch.empty((32768, 1, 64))
+    dk_rows = torch.empty((1, 1, 64))
+    dv_rows = torch.empty((1, 1, 64))
+
+    synthetic_module._run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        None,
+        None,
+        None,
+        None,
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        softmax_scale=1.0,
+        max_unique_key_occurrences=0,
+        workspace={},
+    )
+    assert calls == ["bucket_dense"]
 
 
 def test_hsa_synthetic_row_compact_one_kernel_dispatch_routes_bucket_dense_dualrow(monkeypatch):

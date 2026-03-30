@@ -369,8 +369,15 @@ class FlashAttentionBackwardSm100:
             self.sdQaccum_stage = 2 if not self.is_causal else 1
         else:
             if self.use_2cta_instrs:
-                self.dQ_reduce_ncol = 16 if self.deterministic else 8
-                self.sdQaccum_stage = 2 if self.deterministic else 4
+                # The FP4 d128 2-CTA lane is still under bring-up; keep its dQ reduction on the
+                # more conservative 2-stage / 16-col schedule for now instead of the wider
+                # 4-stage non-deterministic path.
+                if self.use_fp4_bwd_qk and self.tile_hdim == 128:
+                    self.dQ_reduce_ncol = 16
+                    self.sdQaccum_stage = 2
+                else:
+                    self.dQ_reduce_ncol = 16 if self.deterministic else 8
+                    self.sdQaccum_stage = 2 if self.deterministic else 4
                 self.dQ_reduce_ncol_t2r = 32
             else:
                 self.dQ_reduce_ncol = 32
@@ -4408,10 +4415,18 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.use_fp4_bwd_qk):
                             peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
                             if tidx == 0:
+                                # The FP4 path does not use the 2-CTA cp.async exchange that normally
+                                # signals dS readiness. Explicitly arrive on both the local and peer
+                                # full barriers so each relay warp observes this iteration's dS publish.
+                                cute.arch.mbarrier_arrive(dS_cluster_full_mbar_ptr)
                                 cute.arch.mbarrier_arrive(
                                     dS_cluster_full_mbar_ptr,
                                     peer_cta_rank_in_cluster,
                                 )
+                        # FP4 d128 keeps the dS publish/leader handoff on this deferred path.
+                        # Reconverge the warp here before the next iteration consumes LSE/S_P again.
+                        if const_expr(self.use_fp4_bwd_qk):
+                            cute.arch.sync_warp()
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block

@@ -906,7 +906,16 @@ def _flash_attn_bwd_fp4_qk(
     ref_dq_scale_tensor = torch.ones_like(k_sg)
     ref_dk_scale_tensor = torch.ones_like(q_sg)
     enable_native_fp4_bwd = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE")
-    if _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_REFERENCE") or not enable_native_fp4_bwd:
+    allow_unsafe_native_d128 = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ALLOW_UNSAFE_D128")
+    # Native FP4 backward d128 is still under bring-up. Keep the stable BF16 bridge as the
+    # default there until the 2-CTA native lane is verified, while allowing an internal
+    # override for kernel debugging.
+    use_reference_bridge = (
+        _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_REFERENCE")
+        or not enable_native_fp4_bwd
+        or (head_dim >= 128 and not allow_unsafe_native_d128)
+    )
+    if use_reference_bridge:
         return _flash_attn_bwd(
             q,
             k,

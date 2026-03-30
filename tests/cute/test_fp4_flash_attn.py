@@ -1774,6 +1774,109 @@ def test_fp4_bwd_qk_native_uses_adapted_tk_scales_by_default(monkeypatch):
     torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
 
 
+def test_fp4_bwd_qk_native_d128_uses_bridge_by_default(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=128,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=64,
+        seqlen_k=64,
+        device="cpu",
+    )
+
+    _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+    )
+
+    assert "q_col_packed_fp4" not in captured["kwargs"]
+    assert "k_col_packed_fp4" not in captured["kwargs"]
+    torch.testing.assert_close(captured["kwargs"]["dq_scale_tensor"], torch.ones_like(k_sg))
+    torch.testing.assert_close(captured["kwargs"]["dk_scale_tensor"], torch.ones_like(q_sg))
+
+
+def test_fp4_bwd_qk_native_d128_can_force_unsafe_native(monkeypatch):
+    captured = {}
+
+    def fake_bwd(q, k, v, out, dout, lse, **bwd_kwargs):
+        captured["kwargs"] = bwd_kwargs
+        return (
+            torch.zeros_like(q),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+        )
+
+    monkeypatch.setattr("flash_attn.cute.interface._get_device_arch", lambda: 100)
+    monkeypatch.setattr("flash_attn.cute.interface._flash_attn_bwd", fake_bwd)
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE", "1")
+    monkeypatch.setenv("FLASH_ATTN_FP4_BWD_ALLOW_UNSAFE_D128", "1")
+
+    q, k, v, out, dout, lse, q_scale, k_scale, q_col, k_col, q_col_scale, k_col_scale, q_sg, k_sg = _make_fake_fp4_bwd_inputs(
+        fp4_qk_format="nvfp4",
+        head_dim=128,
+        num_heads=2,
+        batch_size=1,
+        seqlen_q=64,
+        seqlen_k=64,
+        device="cpu",
+    )
+    q.fill_(0x22)
+    k.fill_(0x44)
+    q_scale.fill_(1.0)
+    k_scale.fill_(1.0)
+    q_col.fill_(0x22)
+    k_col.fill_(0x44)
+    q_sg.fill_(2.0)
+    k_sg.fill_(0.5)
+
+    _flash_attn_bwd_fp4_qk(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        q_scale,
+        k_scale,
+        q_sg,
+        k_sg,
+        q_col_packed=q_col,
+        k_col_packed=k_col,
+        q_col_scale=q_col_scale,
+        k_col_scale=k_col_scale,
+    )
+
+    assert captured["kwargs"]["q_col_packed_fp4"] is q_col
+    assert captured["kwargs"]["k_col_packed_fp4"] is k_col
+
+
 def test_fp4_bwd_qk_native_can_force_synthesized_tk_scales(monkeypatch):
     captured = {}
 

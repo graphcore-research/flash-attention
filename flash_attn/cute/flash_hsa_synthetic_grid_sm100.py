@@ -9,9 +9,12 @@ try:
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
     from cutlass import Boolean, Float32, Int32
+    from cutlass.cute.nvgpu import warp
+    from quack import layout_utils
 
     from flash_attn.cute.cache_utils import get_jit_cache
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
+    from flash_attn.cute import ampere_helpers as sm80_utils
     from flash_attn.cute import copy_utils, utils
     from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SyntheticLongPersistentTileScheduler
     from flash_attn.cute.utils import scalar_to_ssa, ssa_to_scalar
@@ -1346,7 +1349,16 @@ def _get_synthetic_one_kernel_bwd_variant() -> str:
     import os
 
     value = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT", "auto").strip().lower()
-    if value not in {"baseline", "short", "long", "warpgroup", "bucket_dense", "auto"}:
+    if value not in {
+        "baseline",
+        "short",
+        "long",
+        "warpgroup",
+        "bucket_dense",
+        "bucket_dense_dualrow",
+        "bucket_dense_tc",
+        "auto",
+    }:
         value = "auto"
     return value
 
@@ -3385,6 +3397,699 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                     dq3,
                     utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
                 )
+
+
+class FlashHSASyntheticDirectRowMicroBwdBucketDenseDualrowSm100:
+    """Full-warp dual-row bucket-dense backward that reuses each K/V fragment across both q rows."""
+
+    arch = 100
+
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mRowKRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mRowKToUnionIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mRowKLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        del mRowKRowIdx, mRowKToUnionIdx, mRowKLength
+        grid_x = (mQRowIdx.shape[0] + self.qgroups_per_cta - 1) // self.qgroups_per_cta
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionKRowIdx,
+            mUnionToRowSlot,
+            mQLength,
+            mUnionKLength,
+            softmax_scale,
+            mdQRows,
+            mdKRows,
+            mdVRows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qgroup_pair_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane32 = tidx % cute.arch.WARP_SIZE
+        dim0 = lane32 * Int32(2)
+        dim1 = dim0 + Int32(1)
+        qgroup_base = qgroup_pair_idx * Int32(self.qgroups_per_cta)
+        qgroup_idx = qgroup_base + warp_idx
+        qgroup_count = Int32(mQRowIdx.shape[0])
+        qgroup_valid = qgroup_idx < qgroup_count
+
+        smem = cutlass.utils.SmemAllocator()
+        dkdv_layout = cute.make_layout((16, 64, self.qgroups_per_cta), stride=(64, 1, 16 * 64))
+        dq_layout = cute.make_layout((2, 64, self.qgroups_per_cta), stride=(64, 1, 2 * 64))
+        sDQ = smem.allocate_tensor(cutlass.Float32, dq_layout, byte_alignment=16)
+        sDK = smem.allocate_tensor(cutlass.Float32, dkdv_layout, byte_alignment=16)
+        sDV = smem.allocate_tensor(cutlass.Float32, dkdv_layout, byte_alignment=16)
+
+        q_length = Int32(0)
+        union_k_length = Int32(0)
+        if qgroup_valid:
+            q_length = Int32(mQLength[qgroup_idx])
+            union_k_length = Int32(mUnionKLength[qgroup_idx])
+
+        global_q_row0 = Int32(-1)
+        global_q_row1 = Int32(-1)
+        active_row0 = Boolean(False)
+        active_row1 = Boolean(False)
+        if qgroup_valid and q_length > Int32(0):
+            global_q_row0 = Int32(mQRowIdx[qgroup_idx, Int32(0)])
+            active_row0 = global_q_row0 >= Int32(0)
+        if qgroup_valid and q_length > Int32(1):
+            global_q_row1 = Int32(mQRowIdx[qgroup_idx, Int32(1)])
+            active_row1 = global_q_row1 >= Int32(0)
+
+        q00 = Float32(0.0)
+        q01 = Float32(0.0)
+        q10 = Float32(0.0)
+        q11 = Float32(0.0)
+        out00 = Float32(0.0)
+        out01 = Float32(0.0)
+        out10 = Float32(0.0)
+        out11 = Float32(0.0)
+        do00 = Float32(0.0)
+        do01 = Float32(0.0)
+        do10 = Float32(0.0)
+        do11 = Float32(0.0)
+        if active_row0:
+            if dim0 < mQRows.shape[2]:
+                q00 = Float32(mQRows[global_q_row0, head_idx, dim0])
+                out00 = Float32(mOutRows[global_q_row0, head_idx, dim0])
+                do00 = Float32(mdORows[global_q_row0, head_idx, dim0])
+            if dim1 < mQRows.shape[2]:
+                q01 = Float32(mQRows[global_q_row0, head_idx, dim1])
+                out01 = Float32(mOutRows[global_q_row0, head_idx, dim1])
+                do01 = Float32(mdORows[global_q_row0, head_idx, dim1])
+        if active_row1:
+            if dim0 < mQRows.shape[2]:
+                q10 = Float32(mQRows[global_q_row1, head_idx, dim0])
+                out10 = Float32(mOutRows[global_q_row1, head_idx, dim0])
+                do10 = Float32(mdORows[global_q_row1, head_idx, dim0])
+            if dim1 < mQRows.shape[2]:
+                q11 = Float32(mQRows[global_q_row1, head_idx, dim1])
+                out11 = Float32(mOutRows[global_q_row1, head_idx, dim1])
+                do11 = Float32(mdORows[global_q_row1, head_idx, dim1])
+
+        dpsum0_partial = out00 * do00 + out01 * do01
+        dpsum1_partial = out10 * do10 + out11 * do11
+        dpsum0 = utils.warp_reduce(dpsum0_partial, lambda a, b: a + b, width=32)
+        dpsum1 = utils.warp_reduce(dpsum1_partial, lambda a, b: a + b, width=32)
+        lse0_log2 = Float32(0.0)
+        lse1_log2 = Float32(0.0)
+        if active_row0:
+            lse0_log2 = Float32(mLSERows[global_q_row0, head_idx]) * Float32(_LOG2_E)
+        if active_row1:
+            lse1_log2 = Float32(mLSERows[global_q_row1, head_idx]) * Float32(_LOG2_E)
+        scale_log2 = softmax_scale * Float32(_LOG2_E)
+        dq00 = Float32(0.0)
+        dq01 = Float32(0.0)
+        dq10 = Float32(0.0)
+        dq11 = Float32(0.0)
+
+        for union_slot in range(mUnionKRowIdx.shape[1]):
+            union_slot_i = Int32(union_slot)
+            union_key_row = Int32(-1)
+            if qgroup_valid and union_slot_i < union_k_length:
+                union_key_row = Int32(mUnionKRowIdx[qgroup_idx, union_slot_i])
+            participates0 = Boolean(False)
+            participates1 = Boolean(False)
+            if qgroup_valid and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                if active_row0:
+                    participates0 = Int32(mUnionToRowSlot[qgroup_idx, Int32(0), union_slot_i]) >= Int32(0)
+                if active_row1:
+                    participates1 = Int32(mUnionToRowSlot[qgroup_idx, Int32(1), union_slot_i]) >= Int32(0)
+
+            kval0 = Float32(0.0)
+            kval1 = Float32(0.0)
+            vval0 = Float32(0.0)
+            vval1 = Float32(0.0)
+            if qgroup_valid and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                if dim0 < mQRows.shape[2]:
+                    kval0 = Float32(mKRows[union_key_row, head_idx, dim0])
+                    vval0 = Float32(mVRows[union_key_row, head_idx, dim0])
+                if dim1 < mQRows.shape[2]:
+                    kval1 = Float32(mKRows[union_key_row, head_idx, dim1])
+                    vval1 = Float32(mVRows[union_key_row, head_idx, dim1])
+
+            score_partial0 = Float32(0.0)
+            dprob_partial0 = Float32(0.0)
+            score_partial1 = Float32(0.0)
+            dprob_partial1 = Float32(0.0)
+            if participates0:
+                score_partial0 = q00 * kval0 + q01 * kval1
+                dprob_partial0 = do00 * vval0 + do01 * vval1
+            if participates1:
+                score_partial1 = q10 * kval0 + q11 * kval1
+                dprob_partial1 = do10 * vval0 + do11 * vval1
+            score0 = utils.warp_reduce(score_partial0, lambda a, b: a + b, width=32)
+            dprob0 = utils.warp_reduce(dprob_partial0, lambda a, b: a + b, width=32)
+            score1 = utils.warp_reduce(score_partial1, lambda a, b: a + b, width=32)
+            dprob1 = utils.warp_reduce(dprob_partial1, lambda a, b: a + b, width=32)
+
+            prob0 = Float32(0.0)
+            prob1 = Float32(0.0)
+            ds0 = Float32(0.0)
+            ds1 = Float32(0.0)
+            if lane32 == Int32(0):
+                if participates0:
+                    prob0 = cute.math.exp2(score0 * scale_log2 - lse0_log2, fastmath=True)
+                    ds0 = prob0 * (dprob0 - dpsum0) * softmax_scale
+                if participates1:
+                    prob1 = cute.math.exp2(score1 * scale_log2 - lse1_log2, fastmath=True)
+                    ds1 = prob1 * (dprob1 - dpsum1) * softmax_scale
+            prob0 = utils.shuffle_sync(prob0, 0, width=32)
+            prob1 = utils.shuffle_sync(prob1, 0, width=32)
+            ds0 = utils.shuffle_sync(ds0, 0, width=32)
+            ds1 = utils.shuffle_sync(ds1, 0, width=32)
+
+            dk_dim0 = Float32(0.0)
+            dk_dim1 = Float32(0.0)
+            dv_dim0 = Float32(0.0)
+            dv_dim1 = Float32(0.0)
+            if participates0:
+                dq00 += ds0 * kval0
+                dq01 += ds0 * kval1
+                dk_dim0 += ds0 * q00
+                dk_dim1 += ds0 * q01
+                dv_dim0 += prob0 * do00
+                dv_dim1 += prob0 * do01
+            if participates1:
+                dq10 += ds1 * kval0
+                dq11 += ds1 * kval1
+                dk_dim0 += ds1 * q10
+                dk_dim1 += ds1 * q11
+                dv_dim0 += prob1 * do10
+                dv_dim1 += prob1 * do11
+
+            if qgroup_valid and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                if dim0 < mdKRows.shape[2]:
+                    sDK[union_slot_i, dim0, warp_idx] = dk_dim0
+                    sDV[union_slot_i, dim0, warp_idx] = dv_dim0
+                if dim1 < mdKRows.shape[2]:
+                    sDK[union_slot_i, dim1, warp_idx] = dk_dim1
+                    sDV[union_slot_i, dim1, warp_idx] = dv_dim1
+            cute.arch.sync_warp()
+
+            if lane32 < Int32(16) and qgroup_valid and union_slot_i < union_k_length and union_key_row >= Int32(0):
+                dim4_base = lane32 * Int32(4)
+                if dim4_base < mdKRows.shape[2]:
+                    copy_utils.atomic_add_fp32x4(
+                        Float32(sDK[union_slot_i, dim4_base + Int32(0), warp_idx]),
+                        Float32(sDK[union_slot_i, dim4_base + Int32(1), warp_idx]),
+                        Float32(sDK[union_slot_i, dim4_base + Int32(2), warp_idx]),
+                        Float32(sDK[union_slot_i, dim4_base + Int32(3), warp_idx]),
+                        utils.elem_pointer(mdKRows, (union_key_row, head_idx, dim4_base)),
+                    )
+                    copy_utils.atomic_add_fp32x4(
+                        Float32(sDV[union_slot_i, dim4_base + Int32(0), warp_idx]),
+                        Float32(sDV[union_slot_i, dim4_base + Int32(1), warp_idx]),
+                        Float32(sDV[union_slot_i, dim4_base + Int32(2), warp_idx]),
+                        Float32(sDV[union_slot_i, dim4_base + Int32(3), warp_idx]),
+                        utils.elem_pointer(mdVRows, (union_key_row, head_idx, dim4_base)),
+                    )
+            cute.arch.sync_warp()
+
+        if dim0 < mdQRows.shape[2]:
+            sDQ[Int32(0), dim0, warp_idx] = dq00
+            sDQ[Int32(1), dim0, warp_idx] = dq10
+        if dim1 < mdQRows.shape[2]:
+            sDQ[Int32(0), dim1, warp_idx] = dq01
+            sDQ[Int32(1), dim1, warp_idx] = dq11
+        cute.arch.sync_warp()
+
+        if lane32 < Int32(16):
+            dim4_base = lane32 * Int32(4)
+            if active_row0 and dim4_base < mdQRows.shape[2]:
+                copy_utils.atomic_add_fp32x4(
+                    Float32(sDQ[Int32(0), dim4_base + Int32(0), warp_idx]),
+                    Float32(sDQ[Int32(0), dim4_base + Int32(1), warp_idx]),
+                    Float32(sDQ[Int32(0), dim4_base + Int32(2), warp_idx]),
+                    Float32(sDQ[Int32(0), dim4_base + Int32(3), warp_idx]),
+                    utils.elem_pointer(mdQRows, (global_q_row0, head_idx, dim4_base)),
+                )
+            if active_row1 and dim4_base < mdQRows.shape[2]:
+                copy_utils.atomic_add_fp32x4(
+                    Float32(sDQ[Int32(1), dim4_base + Int32(0), warp_idx]),
+                    Float32(sDQ[Int32(1), dim4_base + Int32(1), warp_idx]),
+                    Float32(sDQ[Int32(1), dim4_base + Int32(2), warp_idx]),
+                    Float32(sDQ[Int32(1), dim4_base + Int32(3), warp_idx]),
+                    utils.elem_pointer(mdQRows, (global_q_row1, head_idx, dim4_base)),
+                )
+
+
+class FlashHSASyntheticDirectRowMicroBwdBucketDenseTcSm100:
+    """Tensor-core bucket-dense backward over padded 16x16 compressed buckets."""
+
+    arch = 100
+
+    def __init__(self, *, qgroups_per_cta: int = 2):
+        self.qgroups_per_cta = qgroups_per_cta
+        self.num_threads = 32 * qgroups_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mRowKRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mRowKToUnionIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mRowKLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        del mRowKRowIdx, mRowKToUnionIdx, mRowKLength
+        grid_x = (mQRowIdx.shape[0] + self.qgroups_per_cta - 1) // self.qgroups_per_cta
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mOutRows,
+            mdORows,
+            mLSERows,
+            mQRowIdx,
+            mUnionKRowIdx,
+            mUnionToRowSlot,
+            mQLength,
+            mUnionKLength,
+            softmax_scale,
+            mdQRows,
+            mdKRows,
+            mdVRows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mOutRows: cute.Tensor,
+        mdORows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mUnionKRowIdx: cute.Tensor,
+        mUnionToRowSlot: cute.Tensor,
+        mQLength: cute.Tensor,
+        mUnionKLength: cute.Tensor,
+        softmax_scale: Float32,
+        mdQRows: cute.Tensor,
+        mdKRows: cute.Tensor,
+        mdVRows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qgroup_pair_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane32 = tidx % cute.arch.WARP_SIZE
+        row_idx = lane32 // Int32(16)
+        lane16 = lane32 % Int32(16)
+        dim0 = lane16 * Int32(4)
+        dim1 = dim0 + Int32(1)
+        dim2 = dim0 + Int32(2)
+        dim3 = dim0 + Int32(3)
+        qgroup_base = qgroup_pair_idx * Int32(self.qgroups_per_cta)
+        qgroup_idx = qgroup_base + warp_idx
+        qgroup_count = Int32(mQRowIdx.shape[0])
+        qgroup_valid = qgroup_idx < qgroup_count
+
+        smem = cutlass.utils.SmemAllocator()
+        tile64_layout = cute.tile_to_shape(
+            sm80_utils.get_smem_layout_atom(mQRows.element_type, 64),
+            (16, 64, self.qgroups_per_cta),
+            (0, 1, 2),
+        )
+        tile16_layout = cute.tile_to_shape(
+            sm80_utils.get_smem_layout_atom(mQRows.element_type, 16),
+            (16, 16, self.qgroups_per_cta),
+            (0, 1, 2),
+        )
+        rowmeta_layout = cute.make_layout((2, self.qgroups_per_cta), stride=(1, 2))
+        unionmeta_layout = cute.make_layout((16, self.qgroups_per_cta), stride=(1, 16))
+        unionmask_layout = cute.make_layout((2, 16, self.qgroups_per_cta), stride=(16, 1, 32))
+        sQ = smem.allocate_tensor(mQRows.element_type, tile64_layout, byte_alignment=16)
+        sO = smem.allocate_tensor(mOutRows.element_type, tile64_layout, byte_alignment=16)
+        sdO = smem.allocate_tensor(mdORows.element_type, tile64_layout, byte_alignment=16)
+        sK = smem.allocate_tensor(mKRows.element_type, tile64_layout, byte_alignment=16)
+        sV = smem.allocate_tensor(mVRows.element_type, tile64_layout, byte_alignment=16)
+        sP = smem.allocate_tensor(mQRows.element_type, tile16_layout, byte_alignment=16)
+        sdS = smem.allocate_tensor(mQRows.element_type, tile16_layout, byte_alignment=16)
+        sDQ = smem.allocate_tensor(cutlass.Float32, tile64_layout, byte_alignment=16)
+        sDK = smem.allocate_tensor(cutlass.Float32, tile64_layout, byte_alignment=16)
+        sDV = smem.allocate_tensor(cutlass.Float32, tile64_layout, byte_alignment=16)
+        sDPsum = smem.allocate_tensor(cutlass.Float32, rowmeta_layout, byte_alignment=16)
+        sLSELog2 = smem.allocate_tensor(cutlass.Float32, rowmeta_layout, byte_alignment=16)
+        sUnionKeyRow = smem.allocate_tensor(cutlass.Int32, unionmeta_layout, byte_alignment=16)
+        sUnionRowMask = smem.allocate_tensor(cutlass.Int32, unionmask_layout, byte_alignment=16)
+
+        q_length = Int32(0)
+        union_k_length = Int32(0)
+        if qgroup_valid:
+            q_length = Int32(mQLength[qgroup_idx])
+            union_k_length = Int32(mUnionKLength[qgroup_idx])
+
+        for elem_idx in cutlass.range(lane32, Int32(16) * Int32(16), cute.arch.WARP_SIZE, unroll=1):
+            row = elem_idx // Int32(16)
+            col = elem_idx - row * Int32(16)
+            sP[row, col, warp_idx] = Float32(0.0).to(sP.element_type)
+            sdS[row, col, warp_idx] = Float32(0.0).to(sdS.element_type)
+        for elem_idx in cutlass.range(lane32, Int32(16) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            row = elem_idx // Int32(64)
+            col = elem_idx - row * Int32(64)
+            sDQ[row, col, warp_idx] = Float32(0.0)
+            sDK[row, col, warp_idx] = Float32(0.0)
+            sDV[row, col, warp_idx] = Float32(0.0)
+        for elem_idx in cutlass.range(lane32, Int32(2) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            row = elem_idx // Int32(64)
+            dim_idx = elem_idx - row * Int32(64)
+            if qgroup_valid and row < q_length:
+                global_q_row = Int32(mQRowIdx[qgroup_idx, row])
+                if global_q_row >= Int32(0):
+                    sQ[row, dim_idx, warp_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                    sO[row, dim_idx, warp_idx] = mOutRows[global_q_row, head_idx, dim_idx]
+                    sdO[row, dim_idx, warp_idx] = mdORows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row, dim_idx, warp_idx] = Float32(0.0).to(sQ.element_type)
+                    sO[row, dim_idx, warp_idx] = Float32(0.0).to(sO.element_type)
+                    sdO[row, dim_idx, warp_idx] = Float32(0.0).to(sdO.element_type)
+            else:
+                sQ[row, dim_idx, warp_idx] = Float32(0.0).to(sQ.element_type)
+                sO[row, dim_idx, warp_idx] = Float32(0.0).to(sO.element_type)
+                sdO[row, dim_idx, warp_idx] = Float32(0.0).to(sdO.element_type)
+        for elem_idx in cutlass.range(lane32, Int32(16) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            row = elem_idx // Int32(64)
+            dim_idx = elem_idx - row * Int32(64)
+            if qgroup_valid and row < union_k_length:
+                union_key_row = Int32(mUnionKRowIdx[qgroup_idx, row])
+                if union_key_row >= Int32(0):
+                    sK[row, dim_idx, warp_idx] = mKRows[union_key_row, head_idx, dim_idx]
+                    sV[row, dim_idx, warp_idx] = mVRows[union_key_row, head_idx, dim_idx]
+                else:
+                    sK[row, dim_idx, warp_idx] = Float32(0.0).to(sK.element_type)
+                    sV[row, dim_idx, warp_idx] = Float32(0.0).to(sV.element_type)
+                if dim_idx == Int32(0):
+                    sUnionKeyRow[row, warp_idx] = union_key_row
+            else:
+                sK[row, dim_idx, warp_idx] = Float32(0.0).to(sK.element_type)
+                sV[row, dim_idx, warp_idx] = Float32(0.0).to(sV.element_type)
+                if dim_idx == Int32(0):
+                    sUnionKeyRow[row, warp_idx] = Int32(-1)
+        for elem_idx in cutlass.range(lane32, Int32(2) * Int32(16), cute.arch.WARP_SIZE, unroll=1):
+            row = elem_idx // Int32(16)
+            union_slot = elem_idx - row * Int32(16)
+            participates = Int32(0)
+            if qgroup_valid and row < q_length and union_slot < union_k_length:
+                row_slot = Int32(mUnionToRowSlot[qgroup_idx, row, union_slot])
+                participates = Int32(1) if row_slot >= Int32(0) else Int32(0)
+            sUnionRowMask[row, union_slot, warp_idx] = participates
+        cute.arch.barrier()
+
+        dpsum_partial = Float32(0.0)
+        if qgroup_valid and row_idx < q_length:
+            if dim0 < mQRows.shape[2]:
+                dpsum_partial += Float32(sO[row_idx, dim0, warp_idx]) * Float32(sdO[row_idx, dim0, warp_idx])
+            if dim1 < mQRows.shape[2]:
+                dpsum_partial += Float32(sO[row_idx, dim1, warp_idx]) * Float32(sdO[row_idx, dim1, warp_idx])
+            if dim2 < mQRows.shape[2]:
+                dpsum_partial += Float32(sO[row_idx, dim2, warp_idx]) * Float32(sdO[row_idx, dim2, warp_idx])
+            if dim3 < mQRows.shape[2]:
+                dpsum_partial += Float32(sO[row_idx, dim3, warp_idx]) * Float32(sdO[row_idx, dim3, warp_idx])
+        dpsum = utils.warp_reduce(dpsum_partial, lambda a, b: a + b, width=16)
+        if lane16 == Int32(0):
+            if qgroup_valid and row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[qgroup_idx, row_idx])
+                sDPsum[row_idx, warp_idx] = dpsum
+                sLSELog2[row_idx, warp_idx] = (
+                    Float32(mLSERows[global_q_row, head_idx]) * Float32(_LOG2_E)
+                    if global_q_row >= Int32(0)
+                    else Float32(0.0)
+                )
+            else:
+                sDPsum[row_idx, warp_idx] = Float32(0.0)
+                sLSELog2[row_idx, warp_idx] = Float32(0.0)
+        cute.arch.barrier()
+
+        q_tile = sQ[None, None, warp_idx]
+        do_tile = sdO[None, None, warp_idx]
+        k_tile = sK[None, None, warp_idx]
+        v_tile = sV[None, None, warp_idx]
+        p_tile = sP[None, None, warp_idx]
+        ds_tile = sdS[None, None, warp_idx]
+        q_t = layout_utils.transpose_view(q_tile)
+        do_t = layout_utils.transpose_view(do_tile)
+        k_t = layout_utils.transpose_view(k_tile)
+        p_t = layout_utils.transpose_view(p_tile)
+        ds_t = layout_utils.transpose_view(ds_tile)
+
+        tiled_mma_sdp = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(mQRows.element_type, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+        tiled_mma_dkv = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(mQRows.element_type, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+        tiled_mma_dq = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(mQRows.element_type, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+        thr_mma_sdp = tiled_mma_sdp.get_slice(lane32)
+        thr_mma_dkv = tiled_mma_dkv.get_slice(lane32)
+        thr_mma_dq = tiled_mma_dq.get_slice(lane32)
+        smem_copy_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), mQRows.element_type
+        )
+        smem_copy_atom_t = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), mQRows.element_type
+        )
+        smem_thr_copy_QdO = utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_sdp).get_slice(lane32)
+        smem_thr_copy_KV = utils.make_tiled_copy_B(smem_copy_atom, tiled_mma_sdp).get_slice(lane32)
+        smem_thr_copy_PdSt = utils.make_tiled_copy_A(smem_copy_atom_t, tiled_mma_dkv).get_slice(lane32)
+        smem_thr_copy_QdOt = utils.make_tiled_copy_B(smem_copy_atom_t, tiled_mma_dkv).get_slice(lane32)
+        smem_thr_copy_dS = utils.make_tiled_copy_A(smem_copy_atom, tiled_mma_dq).get_slice(lane32)
+        smem_thr_copy_Kt = utils.make_tiled_copy_B(smem_copy_atom_t, tiled_mma_dq).get_slice(lane32)
+
+        tSrQ = utils.mma_make_fragment_A(q_tile, thr_mma_sdp)
+        tSrK = utils.mma_make_fragment_B(k_tile, thr_mma_sdp)
+        tdPrdO = utils.mma_make_fragment_A(do_tile, thr_mma_sdp)
+        tdPrV = utils.mma_make_fragment_B(v_tile, thr_mma_sdp)
+        tdVrP = utils.mma_make_fragment_A(p_t, thr_mma_dkv)
+        tdVrdO = utils.mma_make_fragment_B(do_t, thr_mma_dkv)
+        tdKrdS = utils.mma_make_fragment_A(ds_t, thr_mma_dkv)
+        tdKrQ = utils.mma_make_fragment_B(q_t, thr_mma_dkv)
+        tdQrdS = utils.mma_make_fragment_A(ds_tile, thr_mma_dq)
+        tdQrK = utils.mma_make_fragment_B(k_t, thr_mma_dq)
+
+        tSsQ = smem_thr_copy_QdO.partition_S(q_tile)
+        tSsK = smem_thr_copy_KV.partition_S(k_tile)
+        tdPsdO = smem_thr_copy_QdO.partition_S(do_tile)
+        tdPsV = smem_thr_copy_KV.partition_S(v_tile)
+        tdVsPt = smem_thr_copy_PdSt.partition_S(p_t)
+        tdKsdSt = smem_thr_copy_PdSt.partition_S(ds_t)
+        tdVsdOt = smem_thr_copy_QdOt.partition_S(do_t)
+        tdKsQt = smem_thr_copy_QdOt.partition_S(q_t)
+        tdQsdS = smem_thr_copy_dS.partition_S(ds_tile)
+        tdQsKt = smem_thr_copy_Kt.partition_S(k_t)
+
+        acc_shape_16 = thr_mma_sdp.partition_shape_C((16, 16))
+        acc_S = cute.make_fragment(acc_shape_16, Float32)
+        acc_dP = cute.make_fragment(acc_shape_16, Float32)
+        acc_S.fill(0.0)
+        acc_dP.fill(0.0)
+        sm80_utils.gemm(
+            thr_mma_sdp, acc_S, tSrQ, tSrK, tSsQ, tSsK, smem_thr_copy_QdO, smem_thr_copy_KV
+        )
+        sm80_utils.gemm(
+            thr_mma_sdp, acc_dP, tdPrdO, tdPrV, tdPsdO, tdPsV, smem_thr_copy_QdO, smem_thr_copy_KV
+        )
+
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
+        c16 = cute.make_identity_tensor((16, 16))
+        tCc16 = layout_utils.reshape_acc_to_mn(thr_mma_sdp.partition_C(c16))
+        scale_log2 = softmax_scale * Float32(_LOG2_E)
+        for mi in cutlass.range_constexpr(cute.size(tCc16.shape[0])):
+            for ni in cutlass.range_constexpr(cute.size(tCc16.shape[1])):
+                row = tCc16[mi, ni][0]
+                col = tCc16[mi, ni][1]
+                prob = Float32(0.0)
+                ds_scaled = Float32(0.0)
+                if qgroup_valid and row < q_length and col < union_k_length:
+                    if sUnionRowMask[row, col, warp_idx] != Int32(0) and sUnionKeyRow[col, warp_idx] >= Int32(0):
+                        prob = cute.math.exp2(
+                            acc_S_mn[mi, ni] * scale_log2 - Float32(sLSELog2[row, warp_idx]),
+                            fastmath=True,
+                        )
+                        ds_scaled = prob * (acc_dP_mn[mi, ni] - Float32(sDPsum[row, warp_idx])) * softmax_scale
+                sP[row, col, warp_idx] = prob.to(sP.element_type)
+                sdS[row, col, warp_idx] = ds_scaled.to(sdS.element_type)
+        cute.arch.barrier()
+
+        dq0 = Float32(0.0)
+        dq1 = Float32(0.0)
+        dq2 = Float32(0.0)
+        dq3 = Float32(0.0)
+        if qgroup_valid and row_idx < q_length:
+            for union_slot in range(16):
+                union_slot_i = Int32(union_slot)
+                if (
+                    union_slot_i < union_k_length
+                    and sUnionRowMask[row_idx, union_slot_i, warp_idx] != Int32(0)
+                    and sUnionKeyRow[union_slot_i, warp_idx] >= Int32(0)
+                ):
+                    ds_scaled = Float32(sdS[row_idx, union_slot_i, warp_idx])
+                    if dim0 < mQRows.shape[2]:
+                        dq0 += ds_scaled * Float32(sK[union_slot_i, dim0, warp_idx])
+                    if dim1 < mQRows.shape[2]:
+                        dq1 += ds_scaled * Float32(sK[union_slot_i, dim1, warp_idx])
+                    if dim2 < mQRows.shape[2]:
+                        dq2 += ds_scaled * Float32(sK[union_slot_i, dim2, warp_idx])
+                    if dim3 < mQRows.shape[2]:
+                        dq3 += ds_scaled * Float32(sK[union_slot_i, dim3, warp_idx])
+            if dim0 < mQRows.shape[2]:
+                sDQ[row_idx, dim0, warp_idx] = dq0
+                sDQ[row_idx, dim1, warp_idx] = dq1
+                sDQ[row_idx, dim2, warp_idx] = dq2
+                sDQ[row_idx, dim3, warp_idx] = dq3
+        cute.arch.barrier()
+
+        if qgroup_valid and row_idx < q_length:
+            global_q_row = Int32(mQRowIdx[qgroup_idx, row_idx])
+            if global_q_row >= Int32(0) and dim0 < mdQRows.shape[2]:
+                copy_utils.atomic_add_fp32x4(
+                    Float32(sDQ[row_idx, dim0, warp_idx]),
+                    Float32(sDQ[row_idx, dim1, warp_idx]),
+                    Float32(sDQ[row_idx, dim2, warp_idx]),
+                    Float32(sDQ[row_idx, dim3, warp_idx]),
+                    utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
+                )
+        if qgroup_valid:
+            for union_slot in range(row_idx, 16, 2):
+                union_slot_i = Int32(union_slot)
+                if union_slot_i < union_k_length:
+                    union_key_row = Int32(sUnionKeyRow[union_slot_i, warp_idx])
+                    if union_key_row >= Int32(0) and dim0 < mdKRows.shape[2]:
+                        dk0 = Float32(0.0)
+                        dk1 = Float32(0.0)
+                        dk2 = Float32(0.0)
+                        dk3 = Float32(0.0)
+                        dv0 = Float32(0.0)
+                        dv1 = Float32(0.0)
+                        dv2 = Float32(0.0)
+                        dv3 = Float32(0.0)
+                        if q_length > Int32(0) and sUnionRowMask[0, union_slot_i, warp_idx] != Int32(0):
+                            ds0 = Float32(sdS[0, union_slot_i, warp_idx])
+                            p0 = Float32(sP[0, union_slot_i, warp_idx])
+                            if dim0 < mQRows.shape[2]:
+                                dk0 += ds0 * Float32(sQ[0, dim0, warp_idx])
+                                dv0 += p0 * Float32(sdO[0, dim0, warp_idx])
+                            if dim1 < mQRows.shape[2]:
+                                dk1 += ds0 * Float32(sQ[0, dim1, warp_idx])
+                                dv1 += p0 * Float32(sdO[0, dim1, warp_idx])
+                            if dim2 < mQRows.shape[2]:
+                                dk2 += ds0 * Float32(sQ[0, dim2, warp_idx])
+                                dv2 += p0 * Float32(sdO[0, dim2, warp_idx])
+                            if dim3 < mQRows.shape[2]:
+                                dk3 += ds0 * Float32(sQ[0, dim3, warp_idx])
+                                dv3 += p0 * Float32(sdO[0, dim3, warp_idx])
+                        if q_length > Int32(1) and sUnionRowMask[1, union_slot_i, warp_idx] != Int32(0):
+                            ds1 = Float32(sdS[1, union_slot_i, warp_idx])
+                            p1 = Float32(sP[1, union_slot_i, warp_idx])
+                            if dim0 < mQRows.shape[2]:
+                                dk0 += ds1 * Float32(sQ[1, dim0, warp_idx])
+                                dv0 += p1 * Float32(sdO[1, dim0, warp_idx])
+                            if dim1 < mQRows.shape[2]:
+                                dk1 += ds1 * Float32(sQ[1, dim1, warp_idx])
+                                dv1 += p1 * Float32(sdO[1, dim1, warp_idx])
+                            if dim2 < mQRows.shape[2]:
+                                dk2 += ds1 * Float32(sQ[1, dim2, warp_idx])
+                                dv2 += p1 * Float32(sdO[1, dim2, warp_idx])
+                            if dim3 < mQRows.shape[2]:
+                                dk3 += ds1 * Float32(sQ[1, dim3, warp_idx])
+                                dv3 += p1 * Float32(sdO[1, dim3, warp_idx])
+                        copy_utils.atomic_add_fp32x4(
+                            dk0,
+                            dk1,
+                            dk2,
+                            dk3,
+                            utils.elem_pointer(mdKRows, (union_key_row, head_idx, dim0)),
+                        )
+                        copy_utils.atomic_add_fp32x4(
+                            dv0,
+                            dv1,
+                            dv2,
+                            dv3,
+                            utils.elem_pointer(mdVRows, (union_key_row, head_idx, dim0)),
+                        )
 
 
 class FlashHSASyntheticDirectRowMicroBwdFusedSm100:
@@ -7030,7 +7735,7 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
 ):
     _require_cute_runtime()
     qgroups_per_cta = _get_synthetic_qgroups_per_cta_bwd()
-    if qgroups_per_cta not in (1, 2):
+    if qgroups_per_cta not in (1, 2, 4):
         qgroups_per_cta = 1
     compile_key = (
         "synthetic_direct_row_micro_bwd_bucket_dense_v6",
@@ -7097,6 +7802,192 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
 
 _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense.compile_cache = get_jit_cache(
     "hsa_synth_direct_row_micro_bwd_bucket_dense"
+)
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    row_k_row_idx: torch.Tensor,
+    union_k_row_idx: torch.Tensor,
+    row_k_to_union_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    q_length: torch.Tensor,
+    row_k_length: torch.Tensor,
+    union_k_length: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+):
+    _require_cute_runtime()
+    qgroups_per_cta = _get_synthetic_qgroups_per_cta_bwd()
+    if qgroups_per_cta not in (1, 2):
+        qgroups_per_cta = 1
+    compile_key = (
+        "synthetic_direct_row_micro_bwd_bucket_dense_dualrow_v1",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        out_rows.dtype,
+        dout_rows.dtype,
+        q_row_idx.shape[1],
+        union_k_row_idx.shape[1],
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        qgroups_per_cta,
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow.compile_cache:
+        kernel = FlashHSASyntheticDirectRowMicroBwdBucketDenseDualrowSm100(qgroups_per_cta=qgroups_per_cta)
+        _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(out_rows),
+            to_cute_tensor(dout_rows),
+            to_cute_tensor(lse_rows, assumed_align=4),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_row_idx, assumed_align=4),
+            to_cute_tensor(union_k_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_to_union_idx, assumed_align=4),
+            to_cute_tensor(union_to_row_slot, assumed_align=4),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(row_k_length, assumed_align=4),
+            to_cute_tensor(union_k_length, assumed_align=4, leading_dim=0),
+            Float32(softmax_scale),
+            to_cute_tensor(dq_rows, assumed_align=4),
+            to_cute_tensor(dk_rows, assumed_align=4),
+            to_cute_tensor(dv_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        Float32(softmax_scale),
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow.compile_cache = get_jit_cache(
+    "hsa_synth_direct_row_micro_bwd_bucket_dense_dualrow"
+)
+
+
+def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    dout_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    row_k_row_idx: torch.Tensor,
+    union_k_row_idx: torch.Tensor,
+    row_k_to_union_idx: torch.Tensor,
+    union_to_row_slot: torch.Tensor,
+    q_length: torch.Tensor,
+    row_k_length: torch.Tensor,
+    union_k_length: torch.Tensor,
+    dq_rows: torch.Tensor,
+    dk_rows: torch.Tensor,
+    dv_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+):
+    _require_cute_runtime()
+    qgroups_per_cta = _get_synthetic_qgroups_per_cta_bwd()
+    if qgroups_per_cta not in (1, 2):
+        qgroups_per_cta = 1
+    compile_key = (
+        "synthetic_direct_row_micro_bwd_bucket_dense_tc_v6",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        out_rows.dtype,
+        dout_rows.dtype,
+        q_row_idx.shape[1],
+        union_k_row_idx.shape[1],
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        qgroups_per_cta,
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    if compile_key not in _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc.compile_cache:
+        kernel = FlashHSASyntheticDirectRowMicroBwdBucketDenseTcSm100(qgroups_per_cta=qgroups_per_cta)
+        _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(out_rows),
+            to_cute_tensor(dout_rows),
+            to_cute_tensor(lse_rows, assumed_align=4),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_row_idx, assumed_align=4),
+            to_cute_tensor(union_k_row_idx, assumed_align=4),
+            to_cute_tensor(row_k_to_union_idx, assumed_align=4),
+            to_cute_tensor(union_to_row_slot, assumed_align=4),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(row_k_length, assumed_align=4),
+            to_cute_tensor(union_k_length, assumed_align=4, leading_dim=0),
+            Float32(softmax_scale),
+            to_cute_tensor(dq_rows, assumed_align=4),
+            to_cute_tensor(dk_rows, assumed_align=4),
+            to_cute_tensor(dv_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        out_rows,
+        dout_rows,
+        lse_rows,
+        q_row_idx,
+        row_k_row_idx,
+        union_k_row_idx,
+        row_k_to_union_idx,
+        union_to_row_slot,
+        q_length,
+        row_k_length,
+        union_k_length,
+        Float32(softmax_scale),
+        dq_rows,
+        dk_rows,
+        dv_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc.compile_cache = get_jit_cache(
+    "hsa_synth_direct_row_micro_bwd_bucket_dense_tc"
 )
 
 
@@ -8602,7 +9493,7 @@ def _can_use_synthetic_bucket_dense_bwd(
             and q_row_idx.shape[1] == 2
             and union_k_row_idx.ndim >= 2
             and union_k_row_idx.shape[1] <= 16
-            and qgroups_per_cta_bwd in (1, 2)
+            and qgroups_per_cta_bwd in (1, 2, 4)
         )
     except Exception:
         return False
@@ -8619,7 +9510,7 @@ def _should_use_synthetic_one_kernel_bwd(
     if mode == "off":
         return False
     variant = _get_synthetic_one_kernel_bwd_variant()
-    if variant in {"auto", "bucket_dense"}:
+    if variant in {"auto", "bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc"}:
         supported = _can_use_synthetic_bucket_dense_bwd(q_rows, union_k_row_idx, q_row_idx)
         return supported
     supported = _can_use_synthetic_split_bwd(
@@ -8670,7 +9561,15 @@ def _should_use_synthetic_one_kernel_bwd_pingpong(
 
 def _select_synthetic_one_kernel_bwd_variant(q_row_idx: torch.Tensor) -> str:
     variant = _get_synthetic_one_kernel_bwd_variant()
-    if variant in {"baseline", "short", "long", "warpgroup", "bucket_dense"}:
+    if variant in {
+        "baseline",
+        "short",
+        "long",
+        "warpgroup",
+        "bucket_dense",
+        "bucket_dense_dualrow",
+        "bucket_dense_tc",
+    }:
         return variant
     del q_row_idx
     return "bucket_dense"
@@ -8798,7 +9697,7 @@ def _select_row_compact_synthetic_bwd_mode(
         max_unique_key_occurrences,
     ):
         return "one_kernel"
-    if one_kernel_mode != "off" and variant in {"auto", "bucket_dense"}:
+    if one_kernel_mode != "off" and variant in {"auto", "bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc"}:
         return "legacy"
     if _synthetic_split_bwd_enabled() and _can_use_synthetic_split_bwd(
         q_rows,
@@ -8948,6 +9847,48 @@ def _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
     variant = _select_synthetic_one_kernel_bwd_variant(q_row_idx)
     if variant == "bucket_dense":
         return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
+            q_rows,
+            k_rows,
+            v_rows,
+            out_rows,
+            dout_rows,
+            lse_rows,
+            q_row_idx,
+            row_k_row_idx,
+            union_k_row_idx,
+            row_k_to_union_idx,
+            union_to_row_slot,
+            q_length,
+            row_k_length,
+            union_k_length,
+            dq_rows,
+            dk_rows,
+            dv_rows,
+            softmax_scale=softmax_scale,
+        )
+    if variant == "bucket_dense_dualrow":
+        return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_dualrow(
+            q_rows,
+            k_rows,
+            v_rows,
+            out_rows,
+            dout_rows,
+            lse_rows,
+            q_row_idx,
+            row_k_row_idx,
+            union_k_row_idx,
+            row_k_to_union_idx,
+            union_to_row_slot,
+            q_length,
+            row_k_length,
+            union_k_length,
+            dq_rows,
+            dk_rows,
+            dv_rows,
+            softmax_scale=softmax_scale,
+        )
+    if variant == "bucket_dense_tc":
+        return _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense_tc(
             q_rows,
             k_rows,
             v_rows,

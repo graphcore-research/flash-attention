@@ -261,8 +261,8 @@ def _synthetic_bwd_kernel_mode_label() -> str:
         if variant == "warpgroup":
             long_keys_per_cta = "8"
         pingpong_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off").strip().lower()
-        if variant == "bucket_dense":
-            return f"one_kernel_{one_kernel_mode}_variant_bucket_dense_long_{long_mode}_pingpong_{pingpong_mode}"
+        if variant in {"bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc"}:
+            return f"one_kernel_{one_kernel_mode}_variant_{variant}_long_{long_mode}_pingpong_{pingpong_mode}"
         return (
             f"one_kernel_{one_kernel_mode}_variant_{variant}_long_{long_mode}"
             f"_keys_{long_keys_per_cta}_pingpong_{pingpong_mode}"
@@ -391,6 +391,14 @@ def _one_kernel_synthetic_bucket_dense_label() -> str:
     return "direct_micro_bucket_dense_bwd"
 
 
+def _one_kernel_synthetic_bucket_dense_tc_label() -> str:
+    return "direct_micro_bucket_dense_tc_bwd"
+
+
+def _one_kernel_synthetic_bucket_dense_dualrow_label() -> str:
+    return "direct_micro_bucket_dense_dualrow_bwd"
+
+
 def _one_kernel_synthetic_bucket_dense_env(case: BenchmarkCase) -> dict[str, str | None]:
     env = dict(_previous_synthetic_baseline_env(case))
     env.update(
@@ -405,6 +413,18 @@ def _one_kernel_synthetic_bucket_dense_env(case: BenchmarkCase) -> dict[str, str
             "FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD": "off",
         }
     )
+    return env
+
+
+def _one_kernel_synthetic_bucket_dense_tc_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_bucket_dense_env(case))
+    env.update({"FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense_tc"})
+    return env
+
+
+def _one_kernel_synthetic_bucket_dense_dualrow_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_bucket_dense_env(case))
+    env.update({"FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense_dualrow"})
     return env
 
 
@@ -547,6 +567,17 @@ def _get_selected_cases(*, env_var: str, default: tuple[BenchmarkCase, ...]) -> 
 
 def _use_sparse_profile_mode() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_PROFILE_SPARSE_MASK", "0") == "1"
+
+
+def _use_bucket_dense_long_profile_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_PROFILE_BUCKET_DENSE_LONG", "0") == "1"
+
+
+def _get_bucket_dense_long_profile_target_mode() -> str:
+    value = os.environ.get("FLASH_ATTN_HSA_PROFILE_TARGET_MODE", "all").strip().lower()
+    if value not in {"all", "bucket_dense", "bucket_dense_dualrow", "bucket_dense_tc", "hybrid", "long4"}:
+        value = "all"
+    return value
 
 
 def _use_geometry_sweep_mode() -> bool:
@@ -1044,6 +1075,129 @@ def _profile_sparse_mask_case(case: BenchmarkCase):
             print(f"dense_fa4_backward_neighbor case={case.name} self_cuda_us={value_us:.1f} kernel={key}")
 
 
+def _profile_bucket_dense_long_case(case: BenchmarkCase, target_mode: str):
+    build_hsa_schedule, _, _, _ = _lazy_flash_attn_imports()
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
+    q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
+    k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+    v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
+
+    mode_specs = {
+        "bucket_dense": {
+            "env": _one_kernel_synthetic_bucket_dense_env(case),
+            "patterns": ("FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100",),
+        },
+        "bucket_dense_dualrow": {
+            "env": _one_kernel_synthetic_bucket_dense_dualrow_env(case),
+            "patterns": ("FlashHSASyntheticDirectRowMicroBwdBucketDenseDualrowSm100",),
+        },
+        "bucket_dense_tc": {
+            "env": _one_kernel_synthetic_bucket_dense_tc_env(case),
+            "patterns": ("FlashHSASyntheticDirectRowMicroBwdBucketDenseTcSm100",),
+        },
+        "hybrid": {
+            "env": _sparse_mask_mixed_backward_baseline_env(case),
+            "patterns": (
+                "FlashAttentionBackwardSm100",
+                "flash_attncuteflash_bwd_sm100",
+                "FlashAttentionBackwardPreprocess",
+                "flash_attncuteflash_bwd_preprocess",
+                "FlashAttentionBackwardPostprocess",
+                "flash_attncuteflash_bwd_postprocess",
+            ),
+        },
+        "long4": {
+            "env": _one_kernel_synthetic_long_env(case, keys_per_cta=4),
+            "patterns": (
+                "FlashHSASyntheticDirectRowMicroBwdOneKernelWritebackSm100",
+                "FlashHSASyntheticDirectRowMicroBwdOneKernelSm100",
+            ),
+        },
+    }
+    selected_labels = (
+        ["bucket_dense", "bucket_dense_dualrow", "hybrid", "long4"] if target_mode == "all" else [target_mode]
+    )
+    warmups = max(1, min(case.warmup_iters, 2))
+    benchmark_iters = max(1, min(case.benchmark_iters, 2))
+
+    print(
+        f"bucket_dense_long_profile_case={case.name} target_mode={target_mode} "
+        f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim})"
+    )
+    for label in selected_labels:
+        env_updates = mode_specs[label]["env"]
+        include_patterns = mode_specs[label]["patterns"]
+        forward_fn = lambda q, k, v, env_updates=env_updates: _run_sparse_attention(
+            q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates
+        )
+
+        fwd_ms = _measure_forward_ms(
+            forward_fn,
+            q_data,
+            k_data,
+            v_data,
+            warmups,
+            benchmark_iters,
+            env_updates=env_updates,
+        )
+        bwd_ms = _measure_backward_ms(
+            forward_fn,
+            q_data,
+            k_data,
+            v_data,
+            warmups,
+            benchmark_iters,
+            env_updates=env_updates,
+        )
+        fwd_bwd_ms = _measure_forward_backward_ms(
+            forward_fn,
+            q_data,
+            k_data,
+            v_data,
+            warmups,
+            benchmark_iters,
+            env_updates=env_updates,
+        )
+
+        with _temporary_env(**env_updates):
+            q = q_data.clone().requires_grad_(True)
+            k = k_data.clone().requires_grad_(True)
+            v = v_data.clone().requires_grad_(True)
+            loss = _unwrap_output(forward_fn(q, k, v)).float().square().mean()
+
+            for _ in range(warmups):
+                torch.autograd.grad(loss, (q, k, v), retain_graph=True)
+            torch.cuda.synchronize()
+
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=False,
+                profile_memory=False,
+            ) as prof:
+                torch.autograd.grad(loss, (q, k, v), retain_graph=True)
+                torch.cuda.synchronize()
+
+        top_rows = _top_cuda_rows(prof, limit=8)
+        backward_rows = _top_cuda_rows(prof, include_patterns=include_patterns, limit=6)
+        backward_kernel_key, backward_kernel_us = backward_rows[0] if backward_rows else ("", 0.0)
+        print(
+            f"bucket_dense_long_profile_mode case={case.name} label={label} "
+            f"fwd_ms={fwd_ms:.3f} bwd_ms={bwd_ms:.3f} fwd_bwd_ms={fwd_bwd_ms:.3f} "
+            f"backward_kernel_key={json.dumps(backward_kernel_key)} "
+            f"backward_kernel_self_cuda_us={backward_kernel_us:.1f}"
+        )
+        for key, value_us in top_rows:
+            print(
+                f"bucket_dense_long_profile_row case={case.name} label={label} "
+                f"self_cuda_us={value_us:.1f} kernel={json.dumps(key)}"
+            )
+
+
 def _run_geometry_sweep_case(case: BenchmarkCase, *, block_q: int, block_k: int, subtile_factor: int):
     build_hsa_schedule, flash_attn_func, _, hsa_reference_attention = _lazy_flash_attn_imports()
     device = "cuda"
@@ -1226,6 +1380,16 @@ def _run_long_case(case: BenchmarkCase):
     bucket_dense_fwd_bwd_ms = None
     bucket_dense_vs_dense = None
     bucket_dense_vs_hybrid = None
+    bucket_dense_tc_fwd_ms = None
+    bucket_dense_tc_bwd_ms = None
+    bucket_dense_tc_fwd_bwd_ms = None
+    bucket_dense_tc_vs_dense = None
+    bucket_dense_tc_vs_hybrid = None
+    bucket_dense_dualrow_fwd_ms = None
+    bucket_dense_dualrow_bwd_ms = None
+    bucket_dense_dualrow_fwd_bwd_ms = None
+    bucket_dense_dualrow_vs_dense = None
+    bucket_dense_dualrow_vs_hybrid = None
     one_kernel_long_4_fwd_ms = None
     one_kernel_long_4_bwd_ms = None
     one_kernel_long_4_fwd_bwd_ms = None
@@ -1502,11 +1666,13 @@ def _run_long_case(case: BenchmarkCase):
     if _should_measure_one_kernel_synthetic_baseline(case):
         long_family_cases = [
             (_one_kernel_synthetic_bucket_dense_label(), _one_kernel_synthetic_bucket_dense_env(case)),
+            (_one_kernel_synthetic_bucket_dense_dualrow_label(), _one_kernel_synthetic_bucket_dense_dualrow_env(case)),
             (_one_kernel_synthetic_long_label(), _one_kernel_synthetic_long_env(case)),
         ]
         if _include_long_experimental_comparators():
             long_family_cases.extend(
                 [
+                    (_one_kernel_synthetic_bucket_dense_tc_label(), _one_kernel_synthetic_bucket_dense_tc_env(case)),
                     (_one_kernel_synthetic_long_8_label(), _one_kernel_synthetic_long_8_env(case)),
                     (_one_kernel_synthetic_long_16_label(), _one_kernel_synthetic_long_16_env(case)),
                 ]
@@ -1550,6 +1716,18 @@ def _run_long_case(case: BenchmarkCase):
                 bucket_dense_fwd_bwd_ms = fwd_bwd_ms
                 bucket_dense_vs_dense = vs_dense
                 bucket_dense_vs_hybrid = vs_hybrid
+            elif label == _one_kernel_synthetic_bucket_dense_dualrow_label():
+                bucket_dense_dualrow_fwd_ms = fwd_ms
+                bucket_dense_dualrow_bwd_ms = bwd_ms
+                bucket_dense_dualrow_fwd_bwd_ms = fwd_bwd_ms
+                bucket_dense_dualrow_vs_dense = vs_dense
+                bucket_dense_dualrow_vs_hybrid = vs_hybrid
+            elif label == _one_kernel_synthetic_bucket_dense_tc_label():
+                bucket_dense_tc_fwd_ms = fwd_ms
+                bucket_dense_tc_bwd_ms = bwd_ms
+                bucket_dense_tc_fwd_bwd_ms = fwd_bwd_ms
+                bucket_dense_tc_vs_dense = vs_dense
+                bucket_dense_tc_vs_hybrid = vs_hybrid
             elif label == _one_kernel_synthetic_long_label():
                 one_kernel_long_4_fwd_ms = fwd_ms
                 one_kernel_long_4_bwd_ms = bwd_ms
@@ -1693,6 +1871,36 @@ def _run_long_case(case: BenchmarkCase):
             line += f" bucket_dense_vs_dense={bucket_dense_vs_dense:.2f}x"
         if bucket_dense_vs_hybrid is not None:
             line += f" bucket_dense_vs_hybrid={bucket_dense_vs_hybrid:.2f}x"
+    if (
+        bucket_dense_dualrow_fwd_bwd_ms is not None
+        and bucket_dense_dualrow_fwd_ms is not None
+        and bucket_dense_dualrow_bwd_ms is not None
+    ):
+        line += (
+            f" bucket_dense_dualrow_label={_one_kernel_synthetic_bucket_dense_dualrow_label()}"
+            f" bucket_dense_dualrow_fwd_ms={bucket_dense_dualrow_fwd_ms:.3f}"
+            f" bucket_dense_dualrow_bwd_ms={bucket_dense_dualrow_bwd_ms:.3f}"
+            f" bucket_dense_dualrow_fwd_bwd_ms={bucket_dense_dualrow_fwd_bwd_ms:.3f}"
+        )
+        if bucket_dense_dualrow_vs_dense is not None:
+            line += f" bucket_dense_dualrow_vs_dense={bucket_dense_dualrow_vs_dense:.2f}x"
+        if bucket_dense_dualrow_vs_hybrid is not None:
+            line += f" bucket_dense_dualrow_vs_hybrid={bucket_dense_dualrow_vs_hybrid:.2f}x"
+    if (
+        bucket_dense_tc_fwd_bwd_ms is not None
+        and bucket_dense_tc_fwd_ms is not None
+        and bucket_dense_tc_bwd_ms is not None
+    ):
+        line += (
+            f" bucket_dense_tc_label={_one_kernel_synthetic_bucket_dense_tc_label()}"
+            f" bucket_dense_tc_fwd_ms={bucket_dense_tc_fwd_ms:.3f}"
+            f" bucket_dense_tc_bwd_ms={bucket_dense_tc_bwd_ms:.3f}"
+            f" bucket_dense_tc_fwd_bwd_ms={bucket_dense_tc_fwd_bwd_ms:.3f}"
+        )
+        if bucket_dense_tc_vs_dense is not None:
+            line += f" bucket_dense_tc_vs_dense={bucket_dense_tc_vs_dense:.2f}x"
+        if bucket_dense_tc_vs_hybrid is not None:
+            line += f" bucket_dense_tc_vs_hybrid={bucket_dense_tc_vs_hybrid:.2f}x"
     if one_kernel_long_4_fwd_bwd_ms is not None and one_kernel_long_4_fwd_ms is not None and one_kernel_long_4_bwd_ms is not None:
         line += (
             f" one_kernel_long_4_label={_one_kernel_synthetic_long_label()}"
@@ -2344,6 +2552,13 @@ def _run_cases_once():
     print(f"device={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
     if _use_geometry_sweep_mode():
         _run_geometry_sweep_once()
+        return
+    if _use_bucket_dense_long_profile_mode():
+        for case in _get_selected_cases(
+            env_var="FLASH_ATTN_HSA_PROFILE_CASES",
+            default=(LONG_CONTEXT_CASES[4], LONG_CONTEXT_CASES[6], LONG_CONTEXT_CASES[7]),
+        ):
+            _profile_bucket_dense_long_case(case, _get_bucket_dense_long_profile_target_mode())
         return
     if _use_sparse_profile_mode():
         for case in _get_selected_cases(

@@ -2917,14 +2917,17 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.producer_tail(producer_state_O_Ot)
                     pipeline_dPsum.producer_tail(producer_state_dPsum)
                 else:
-                    if const_expr(should_load_Q):
-                        pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
-                        pipeline_LSE.producer_tail(producer_state_Q_LSE)
-                        if const_expr(tma_atom_Qt is not None):
-                            pipeline_Qt.producer_tail(producer_state_Qt)
-                    if const_expr(should_load_dO):
-                        pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
-                        pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+                    if const_expr(
+                        not (self.use_2cta_instrs and self.use_fp4_bwd_qk and self.tile_hdim == 128)
+                    ):
+                        if const_expr(should_load_Q):
+                            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+                            pipeline_LSE.producer_tail(producer_state_Q_LSE)
+                            if const_expr(tma_atom_Qt is not None):
+                                pipeline_Qt.producer_tail(producer_state_Qt)
+                        if const_expr(should_load_dO):
+                            pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
+                            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -4215,6 +4218,8 @@ class FlashAttentionBackwardSm100:
                         cute.arch.fence_view_async_tmem_load()
                         # Without this barrier, we could have 1 warp writing to P in tmem while
                         # another warp is still reading S from tmem.
+                        if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                            cute.arch.sync_warp()
                         self.compute_sync_barrier.arrive_and_wait()
                     cute.copy(
                         thr_copy_r2t,
@@ -4697,6 +4702,9 @@ class FlashAttentionBackwardSm100:
                 )
                 tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
 
+                use_atomic_dq_reduce = const_expr(
+                    self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
+                )
                 for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
                     smem_idx = dQ_tma_store_producer_state.index
                     tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
@@ -4721,8 +4729,22 @@ class FlashAttentionBackwardSm100:
                         )
                     if const_expr(debug_skip_dq_reduce_sync_site != 1 and debug_skip_dq_reduce_sync_site != 3):
                         self.reduce_sync_barrier.arrive_and_wait()
-                    # Copy from shared memory to global memory
-                    if is_tma_warp:
+                    # Copy from shared memory to global memory. The FP4 2-CTA d128 lane is
+                    # currently more stable with the direct atomic fallback than the bulk-add path.
+                    if const_expr(use_atomic_dq_reduce):
+                        tdQgdQ = thr_copy_dQaccum_r2s.partition_D(
+                            gdQaccum_cur[None, stage + stage_offset]
+                        )
+                        assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
+                        for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
+                            copy_utils.atomic_add_fp32x4(
+                                tdQrdQ_r2s[4 * i],
+                                tdQrdQ_r2s[4 * i + 1],
+                                tdQrdQ_r2s[4 * i + 2],
+                                tdQrdQ_r2s[4 * i + 3],
+                                utils.elem_pointer(tdQgdQ, 4 * i),
+                            )
+                    elif is_tma_warp:
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
                                 sdQaccum[None, smem_idx].iterator,
@@ -4734,17 +4756,6 @@ class FlashAttentionBackwardSm100:
                     if const_expr(debug_skip_dq_reduce_sync_site != 2 and debug_skip_dq_reduce_sync_site != 3):
                         self.reduce_sync_barrier.arrive_and_wait()
                     dQ_tma_store_producer_state.advance()
-                    # Directly add to gmem, much slower
-                    # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])
-                    # assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
-                    # for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
-                    #     copy_utils.atomic_add_fp32x4(
-                    #         tdQrdQ_r2s[4 * i],
-                    #         tdQrdQ_r2s[4 * i + 1],
-                    #         tdQrdQ_r2s[4 * i + 2],
-                    #         tdQrdQ_r2s[4 * i + 3],
-                    #         utils.elem_pointer(tdQgdQ, 4 * i),
-                    #     )
                     # semaphore release for prior m_block
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if m_block > m_block_min:

@@ -524,9 +524,7 @@ class FlashAttentionBackwardSm100:
             1,
         )
         self.tdS_layout = cute.slice_(tdS_layout, (None, None, None, 0))
-        fp4_dq_tiler = (
-            self.mma_tiler_dsq if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs) else self.mma_tiler_dsk
-        )
+        fp4_dq_tiler = self.mma_tiler_dsk
         tdS_dq_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_dQ,
             fp4_dq_tiler,
@@ -1286,7 +1284,10 @@ class FlashAttentionBackwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sQt: cute.struct.Align[
-                    cute.struct.MemRange[self.q_dtype, sQt_size],
+                    cute.struct.MemRange[
+                        self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
+                        sQt_size,
+                    ],
                     self.buffer_align_bytes,
                 ]
                 sdOt: cute.struct.Align[
@@ -1298,7 +1299,10 @@ class FlashAttentionBackwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sKt: cute.struct.Align[
-                    cute.struct.MemRange[self.k_dtype, sKt_size],
+                    cute.struct.MemRange[
+                        self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype,
+                        sKt_size,
+                    ],
                     self.buffer_align_bytes,
                 ]
                 sdS: cute.struct.Align[
@@ -2272,9 +2276,6 @@ class FlashAttentionBackwardSm100:
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            # Keep the TMEM allocator contract aligned with the reference kernel even when the
-            # native dQ reducer is debug-skipped: reduce warps still participate in the TMEM
-            # retrieval barrier before the final top-level TmemPtr rendezvous.
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             if const_expr(not self.fp4_bwd_native_skip_dq_reduce):
@@ -2306,8 +2307,6 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        if const_expr(self.use_fp4_bwd_qk):
-            return
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_phase = Int32(0)
 
@@ -2328,10 +2327,10 @@ class FlashAttentionBackwardSm100:
             if process_tile:
                 num_iters = m_block_max - m_block_min
                 for _ in cutlass.range(num_iters, unroll=1):
-                    # Wait for dS_xchg from peer CTA
+                    # Wait for the compute side to publish this iteration's dS readiness
+                    # before unblocking the leader dQ MMA on either path.
                     cute.arch.mbarrier_wait(dS_cluster_full_mbar_ptr, phase=dS_cluster_phase)
 
-                    # Arrive on MMA leader warp
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dS_cluster_leader_mbar_ptr, Int32(0))
 
@@ -2393,9 +2392,6 @@ class FlashAttentionBackwardSm100:
         should_load_dO: bool = True,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
-        )
-        producer_state_Q_only = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
         )
         producer_state_Qt = cutlass.pipeline.make_pipeline_state(
@@ -2765,27 +2761,14 @@ class FlashAttentionBackwardSm100:
                         #### Prologue ####
                         if const_expr(should_load_Q):
                             # K & Q (for S)
-                            if const_expr(
-                                self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
-                            ):
-                                pipeline_Q.producer_acquire(
-                                    producer_state_Q_only, extra_tx_count=self.tma_copy_bytes["K"]
-                                )
-                                load_K(
-                                    tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_only)
-                                )
-                                load_Q(first_m_block, producer_state=producer_state_Q_only)
-                                pipeline_Q.producer_commit(producer_state_Q_only)
-                                producer_state_Q_only.advance()
-                            else:
-                                pipeline_Q.producer_acquire(
-                                    producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
-                                )
-                                load_K(
-                                    tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
-                                )
-                                load_Q(first_m_block, producer_state=producer_state_Q_LSE)
-                                pipeline_Q.producer_commit(producer_state_Q_LSE)
+                            pipeline_Q.producer_acquire(
+                                producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
+                            )
+                            load_K(
+                                tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
+                            )
+                            load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+                            pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -2863,17 +2846,9 @@ class FlashAttentionBackwardSm100:
                                         producer_state_Qt.advance()
 
                                 # Q (for S)
-                                if const_expr(
-                                    self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
-                                ):
-                                    pipeline_Q.producer_acquire(producer_state_Q_only)
-                                    load_Q(m_block, producer_state=producer_state_Q_only)
-                                    pipeline_Q.producer_commit(producer_state_Q_only)
-                                    producer_state_Q_only.advance()
-                                else:
-                                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
-                                    load_Q(m_block, producer_state=producer_state_Q_LSE)
-                                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                                load_Q(m_block, producer_state=producer_state_Q_LSE)
+                                pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                                 # LSE
                                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
@@ -2936,12 +2911,7 @@ class FlashAttentionBackwardSm100:
                     pipeline_dPsum.producer_tail(producer_state_dPsum)
                 else:
                     if const_expr(should_load_Q):
-                        if const_expr(
-                            self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
-                        ):
-                            pipeline_Q.producer_tail(producer_state_Q_only)
-                        else:
-                            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+                        pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
                         pipeline_LSE.producer_tail(producer_state_Q_LSE)
                         if const_expr(tma_atom_Qt is not None):
                             pipeline_Qt.producer_tail(producer_state_Qt)
@@ -3274,7 +3244,9 @@ class FlashAttentionBackwardSm100:
                         # 5) dQ = dS @ K
                         if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
                             pipeline_dS.consumer_wait(consumer_state_dS)
-                            cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
+                            cute.arch.mbarrier_wait(
+                                dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase
+                            )
                             if const_expr(self.use_fp4_bwd_qk):
                                 self.copy_fp4_dsk_scales(
                                     tiled_copy_s2t_sfdQ_a,
@@ -3344,10 +3316,7 @@ class FlashAttentionBackwardSm100:
                     consumer_state_dO.advance()
 
                     if const_expr(
-                        not (
-                            self.use_fp4_bwd_qk
-                            and (self.fp4_bwd_native_skip_kt_loads or self.fp4_bwd_native_skip_dq)
-                        )
+                        not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_kt_loads)
                     ):
                         pipeline_Kt.consumer_wait(consumer_state_Kt)
                     # -----------------------------------------------------------
@@ -3442,9 +3411,11 @@ class FlashAttentionBackwardSm100:
                         # (5) dQ = dS @ K (cur)
                         if const_expr(need_fp4_dS_consumer):
                             pipeline_dS.consumer_wait(consumer_state_dS)
-                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
-                            cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                            if const_expr(self.use_fp4_bwd_qk):
+                            cute.arch.mbarrier_wait(
+                                dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase
+                            )
+                        if const_expr(self.use_fp4_bwd_qk):
+                            if const_expr(not self.fp4_bwd_native_skip_dq):
                                 self.copy_fp4_dsk_scales(
                                     tiled_copy_s2t_sfdQ_a,
                                     tCsfdQ_a_compact_s2t,
@@ -3454,15 +3425,14 @@ class FlashAttentionBackwardSm100:
                                     tCtfKcol_compact_s2t,
                                 )
                                 mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                            else:
-                                mma_dsk_fn()
-                            if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
-                                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                        else:
+                            mma_dsk_fn()
+                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                            pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         if const_expr(need_fp4_dS_consumer):
                             pipeline_dS.consumer_release(consumer_state_dS)
                             consumer_state_dS.advance()
-                            if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
-                                dS_cluster_phase ^= 1
+                            dS_cluster_phase ^= 1
                         producer_phase_dQ ^= 1
 
                         # (4) dV += P.T @ dO (next)
@@ -3535,11 +3505,13 @@ class FlashAttentionBackwardSm100:
                     # 2) dQ = dS @ K
                     if const_expr(need_fp4_dS_consumer):
                         pipeline_dS.consumer_wait(consumer_state_dS)
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
-                        cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                        if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
-                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
-                        if const_expr(self.use_fp4_bwd_qk):
+                        cute.arch.mbarrier_wait(
+                            dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase
+                        )
+                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
+                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                    if const_expr(self.use_fp4_bwd_qk):
+                        if const_expr(not self.fp4_bwd_native_skip_dq):
                             self.copy_fp4_dsk_scales(
                                 tiled_copy_s2t_sfdQ_a,
                                 tCsfdQ_a_compact_s2t,
@@ -3549,8 +3521,8 @@ class FlashAttentionBackwardSm100:
                                 tCtfKcol_compact_s2t,
                             )
                             mma_dsk_fn(tdQrK[None, None, None, 0], zero_init=True)
-                        else:
-                            mma_dsk_fn()
+                    else:
+                        mma_dsk_fn()
                     if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                     if const_expr(not use_reference_q_consumer):
@@ -3558,11 +3530,10 @@ class FlashAttentionBackwardSm100:
                     if const_expr(need_fp4_dS_consumer):
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
+                        dS_cluster_phase ^= 1
                     if const_expr(self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_kt_loads):
                         pipeline_Kt.consumer_release(consumer_state_Kt)
                         consumer_state_Kt.advance()
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)):
-                        dS_cluster_phase ^= 1
                     producer_phase_dQ ^= 1
 
                     producer_phase_acc ^= 1
@@ -3597,8 +3568,7 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.consumer_release(consumer_state_dO)
                     consumer_state_dO.advance()
                     if const_expr(
-                        self.use_fp4_bwd_qk
-                        and not (self.fp4_bwd_native_skip_kt_loads or self.fp4_bwd_native_skip_dq)
+                        self.use_fp4_bwd_qk and not self.fp4_bwd_native_skip_kt_loads
                     ):
                         pipeline_Kt.consumer_wait(consumer_state_Kt)
 
@@ -3785,8 +3755,7 @@ class FlashAttentionBackwardSm100:
                         mma_dsk_fn()
                     if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                    if const_expr(not use_reference_q_consumer):
-                        handle_Q.release()
+                    handle_Q.release()
                     if const_expr(need_fp4_dS_consumer):
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
@@ -3963,18 +3932,6 @@ class FlashAttentionBackwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
-        if const_expr(
-            self.use_fp4_bwd_qk
-            and self.fp4_bwd_native_skip_dq
-            and self.fp4_bwd_native_skip_dk
-            and self.fp4_bwd_native_skip_ds_store
-            and self.fp4_bwd_native_skip_ds_quant
-            and self.fp4_bwd_native_skip_qt_loads
-            and self.fp4_bwd_native_skip_kt_loads
-            and self.fp4_bwd_native_skip_dkv_epilogue
-        ):
-            return
-
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
             cute.make_layout(
@@ -4158,7 +4115,6 @@ class FlashAttentionBackwardSm100:
                     m_block = m_block_min + iter_idx
                     m_block_oob = False
                     is_full_block = False
-                # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
                 tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
                 if const_expr(prefetch_LSE and not self.shuffle_LSE):
@@ -4441,12 +4397,20 @@ class FlashAttentionBackwardSm100:
                         )
 
             # Final signal for dS smem store completion
-            if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
-                if process_tile:
-                    if const_expr(need_fp4_dS_pipeline):
-                        with cute.arch.elect_one():
-                            pipeline_dS.producer_commit(producer_state_dS)
-                        producer_state_dS.advance()
+                if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
+                    if process_tile:
+                        if const_expr(need_fp4_dS_pipeline):
+                            with cute.arch.elect_one():
+                                pipeline_dS.producer_commit(producer_state_dS)
+                            producer_state_dS.advance()
+                        if const_expr(self.use_fp4_bwd_qk):
+                            peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    dS_cluster_full_mbar_ptr,
+                                    Int32(0),
+                                    peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+                                )
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
@@ -4621,6 +4585,7 @@ class FlashAttentionBackwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        debug_skip_dq_reduce_sync_site = 0
         dQ_consumer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
@@ -4738,7 +4703,8 @@ class FlashAttentionBackwardSm100:
                             cta_rank_in_cluster,
                             lock_value,
                         )
-                    self.reduce_sync_barrier.arrive_and_wait()
+                    if const_expr(debug_skip_dq_reduce_sync_site != 1):
+                        self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp:
                         with cute.arch.elect_one():
@@ -4749,7 +4715,8 @@ class FlashAttentionBackwardSm100:
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
-                    self.reduce_sync_barrier.arrive_and_wait()
+                    if const_expr(debug_skip_dq_reduce_sync_site != 2):
+                        self.reduce_sync_barrier.arrive_and_wait()
                     dQ_tma_store_producer_state.advance()
                     # Directly add to gmem, much slower
                     # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])

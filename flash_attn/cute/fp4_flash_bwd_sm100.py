@@ -369,12 +369,9 @@ class FlashAttentionBackwardSm100:
             self.sdQaccum_stage = 2 if not self.is_causal else 1
         else:
             if self.use_2cta_instrs:
-                # The FP4 d128 2-CTA lane is still under bring-up; keep its dQ reduction on the
-                # more conservative 2-stage / 16-col schedule for now instead of the wider
-                # 4-stage non-deterministic path.
                 if self.use_fp4_bwd_qk and self.tile_hdim == 128:
                     self.dQ_reduce_ncol = 16
-                    self.sdQaccum_stage = 2
+                    self.sdQaccum_stage = 1
                 else:
                     self.dQ_reduce_ncol = 16 if self.deterministic else 8
                     self.sdQaccum_stage = 2 if self.deterministic else 4
@@ -2917,17 +2914,14 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.producer_tail(producer_state_O_Ot)
                     pipeline_dPsum.producer_tail(producer_state_dPsum)
                 else:
-                    if const_expr(
-                        not (self.use_2cta_instrs and self.use_fp4_bwd_qk and self.tile_hdim == 128)
-                    ):
-                        if const_expr(should_load_Q):
-                            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
-                            pipeline_LSE.producer_tail(producer_state_Q_LSE)
-                            if const_expr(tma_atom_Qt is not None):
-                                pipeline_Qt.producer_tail(producer_state_Qt)
-                        if const_expr(should_load_dO):
-                            pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
-                            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+                    if const_expr(should_load_Q):
+                        pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+                        pipeline_LSE.producer_tail(producer_state_Q_LSE)
+                        if const_expr(tma_atom_Qt is not None):
+                            pipeline_Qt.producer_tail(producer_state_Qt)
+                    if const_expr(should_load_dO):
+                        pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
+                        pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -3315,8 +3309,6 @@ class FlashAttentionBackwardSm100:
                     # 2) dP = V @ dOt.T
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-                    if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
-                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                     mma_dov_fn(B_idx=consumer_state_dO.index)
                     pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
@@ -4218,8 +4210,6 @@ class FlashAttentionBackwardSm100:
                         cute.arch.fence_view_async_tmem_load()
                         # Without this barrier, we could have 1 warp writing to P in tmem while
                         # another warp is still reading S from tmem.
-                        if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
-                            cute.arch.sync_warp()
                         self.compute_sync_barrier.arrive_and_wait()
                     cute.copy(
                         thr_copy_r2t,
@@ -4244,6 +4234,8 @@ class FlashAttentionBackwardSm100:
                 # ---------------------------------------------
                 pipeline_dPsum.consumer_wait(consumer_state_dPsum)
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                    cute.arch.sync_warp()
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 ### Now delayed to after loop
                 # consumer_state_S_P_dP.advance()
@@ -4420,18 +4412,12 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.use_fp4_bwd_qk):
                             peer_cta_rank_in_cluster = cta_rank_in_cluster ^ 1
                             if tidx == 0:
-                                # The FP4 path does not use the 2-CTA cp.async exchange that normally
-                                # signals dS readiness. Explicitly arrive on both the local and peer
-                                # full barriers so each relay warp observes this iteration's dS publish.
-                                cute.arch.mbarrier_arrive(dS_cluster_full_mbar_ptr)
+                                # Match the reference 2-CTA exchange contract: each CTA publishes
+                                # this iteration's dS readiness to the peer CTA's local full barrier.
                                 cute.arch.mbarrier_arrive(
                                     dS_cluster_full_mbar_ptr,
                                     peer_cta_rank_in_cluster,
                                 )
-                        # FP4 d128 keeps the dS publish/leader handoff on this deferred path.
-                        # Reconverge the warp here before the next iteration consumes LSE/S_P again.
-                        if const_expr(self.use_fp4_bwd_qk):
-                            cute.arch.sync_warp()
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
@@ -4607,6 +4593,9 @@ class FlashAttentionBackwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         debug_skip_dq_reduce_sync_site = 0
+        use_atomic_fp4_dq_reduce = const_expr(
+            self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
+        )
         dQ_consumer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
@@ -4702,69 +4691,107 @@ class FlashAttentionBackwardSm100:
                 )
                 tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
 
-                use_atomic_dq_reduce = const_expr(
-                    self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128
-                )
-                for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
-                    smem_idx = dQ_tma_store_producer_state.index
-                    tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
-                    tdQrdQ_r2s = cute.make_tensor(tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape)
-                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_view_async_shared()
-                    # semaphore acquire
-                    if const_expr(self.deterministic and stage == 0):
-                        if const_expr(self.spt):
-                            _, n_block_max_for_m_block = block_info.get_n_block_min_max(
-                                seqlen, m_block
+                if const_expr(use_atomic_fp4_dq_reduce):
+                    for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
+                        tdQrdQ_r2s = tdQrdQ[None, stage]
+                        # semaphore acquire
+                        if const_expr(self.deterministic and stage == 0):
+                            if const_expr(self.spt):
+                                _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                    seqlen, m_block
+                                )
+                                lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                            else:
+                                lock_value = n_block_cta_group
+                            barrier.wait_eq(
+                                mdQ_semaphore_cur[(m_block, None)].iterator,
+                                tidx,
+                                cta_rank_in_cluster,
+                                lock_value,
                             )
-                            lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
-                        else:
-                            lock_value = n_block_cta_group
-                        barrier.wait_eq(
-                            mdQ_semaphore_cur[(m_block, None)].iterator,
-                            tidx,
-                            cta_rank_in_cluster,
-                            lock_value,
-                        )
-                    if const_expr(debug_skip_dq_reduce_sync_site != 1 and debug_skip_dq_reduce_sync_site != 3):
-                        self.reduce_sync_barrier.arrive_and_wait()
-                    # Copy from shared memory to global memory. The FP4 2-CTA d128 lane is
-                    # currently more stable with the direct atomic fallback than the bulk-add path.
-                    if const_expr(use_atomic_dq_reduce):
+                        if const_expr(
+                            debug_skip_dq_reduce_sync_site != 1 and debug_skip_dq_reduce_sync_site != 3
+                        ):
+                            self.reduce_sync_barrier.arrive_and_wait()
                         tdQgdQ = thr_copy_dQaccum_r2s.partition_D(
                             gdQaccum_cur[None, stage + stage_offset]
                         )
                         assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
                         for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
-                            copy_utils.atomic_add_fp32x4(
-                                tdQrdQ_r2s[4 * i],
-                                tdQrdQ_r2s[4 * i + 1],
-                                tdQrdQ_r2s[4 * i + 2],
-                                tdQrdQ_r2s[4 * i + 3],
-                                utils.elem_pointer(tdQgdQ, 4 * i),
+                            utils.atomic_add_fp32(
+                                tdQrdQ_r2s[4 * i], utils.elem_pointer(tdQgdQ, 4 * i)
                             )
-                    elif is_tma_warp:
-                        with cute.arch.elect_one():
-                            copy_utils.cpasync_reduce_bulk_add_f32(
-                                sdQaccum[None, smem_idx].iterator,
-                                gdQaccum_cur[None, stage + stage_offset].iterator,
-                                self.tma_copy_bytes["dQ"] // 1,
+                            utils.atomic_add_fp32(
+                                tdQrdQ_r2s[4 * i + 1], utils.elem_pointer(tdQgdQ, 4 * i + 1)
                             )
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
-                    if const_expr(debug_skip_dq_reduce_sync_site != 2 and debug_skip_dq_reduce_sync_site != 3):
-                        self.reduce_sync_barrier.arrive_and_wait()
-                    dQ_tma_store_producer_state.advance()
-                    # semaphore release for prior m_block
-                    if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                        if m_block > m_block_min:
-                            barrier.arrive_inc(
-                                mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                            utils.atomic_add_fp32(
+                                tdQrdQ_r2s[4 * i + 2], utils.elem_pointer(tdQgdQ, 4 * i + 2)
+                            )
+                            utils.atomic_add_fp32(
+                                tdQrdQ_r2s[4 * i + 3], utils.elem_pointer(tdQgdQ, 4 * i + 3)
+                            )
+                        if const_expr(
+                            debug_skip_dq_reduce_sync_site != 2 and debug_skip_dq_reduce_sync_site != 3
+                        ):
+                            self.reduce_sync_barrier.arrive_and_wait()
+                        # semaphore release for prior m_block
+                        if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                            if m_block > m_block_min:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                    tidx,
+                                    cta_rank_in_cluster,
+                                    1,
+                                )
+                else:
+                    for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
+                        smem_idx = dQ_tma_store_producer_state.index
+                        tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
+                        tdQrdQ_r2s = cute.make_tensor(tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape)
+                        # semaphore acquire
+                        if const_expr(self.deterministic and stage == 0):
+                            if const_expr(self.spt):
+                                _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                    seqlen, m_block
+                                )
+                                lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
+                            else:
+                                lock_value = n_block_cta_group
+                            barrier.wait_eq(
+                                mdQ_semaphore_cur[(m_block, None)].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
-                                1,
+                                lock_value,
                             )
+                        cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                        cute.arch.fence_view_async_shared()
+                        if const_expr(
+                            debug_skip_dq_reduce_sync_site != 1 and debug_skip_dq_reduce_sync_site != 3
+                        ):
+                            self.reduce_sync_barrier.arrive_and_wait()
+                        if is_tma_warp:
+                            with cute.arch.elect_one():
+                                copy_utils.cpasync_reduce_bulk_add_f32(
+                                    sdQaccum[None, smem_idx].iterator,
+                                    gdQaccum_cur[None, stage + stage_offset].iterator,
+                                    self.tma_copy_bytes["dQ"] // 1,
+                                )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
+                        if const_expr(
+                            debug_skip_dq_reduce_sync_site != 2 and debug_skip_dq_reduce_sync_site != 3
+                        ):
+                            self.reduce_sync_barrier.arrive_and_wait()
+                        dQ_tma_store_producer_state.advance()
+                        # semaphore release for prior m_block
+                        if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                            if m_block > m_block_min:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                    tidx,
+                                    cta_rank_in_cluster,
+                                    1,
+                                )
 
                 if const_expr(self.tile_hdim == 192):
                     if const_expr(self.sdQaccum_stage > 1):
@@ -4778,16 +4805,18 @@ class FlashAttentionBackwardSm100:
                 # NOTE: arrive_inc calls red_release which issues membar
                 if const_expr(self.deterministic and not delay_semaphore_release):
                     if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
-                        if is_tma_warp:
-                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                        if const_expr(not use_atomic_fp4_dq_reduce):
+                            if is_tma_warp:
+                                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                         self.reduce_sync_barrier.arrive_and_wait()
                     barrier.arrive_inc(
                         mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1
                     )
 
             if process_tile:
-                if is_tma_warp:
-                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                if const_expr(not use_atomic_fp4_dq_reduce):
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):

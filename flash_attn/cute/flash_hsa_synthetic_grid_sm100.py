@@ -3014,14 +3014,17 @@ class FlashHSASyntheticDirectRowMicroBwdShortSm100:
         dq2 = Float32(0.0)
         dq3 = Float32(0.0)
         union_k_length = Int32(0)
+        partner_lane = lane16 + (Int32(1) - row_idx) * Int32(16)
         if qgroup_valid:
             union_k_length = Int32(mUnionKLength[qgroup_idx])
 
         for union_slot in range(mUnionKRowIdx.shape[1]):
             union_slot_i = Int32(union_slot)
             union_key_row = Int32(-1)
+            slot_valid = Boolean(False)
             if qgroup_valid and union_slot_i < union_k_length:
                 union_key_row = Int32(mUnionKRowIdx[qgroup_idx, union_slot_i])
+                slot_valid = union_key_row >= Int32(0)
             participates = Boolean(False)
             kval0 = Float32(0.0)
             kval1 = Float32(0.0)
@@ -3432,22 +3435,18 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                     utils.elem_pointer(mdORows, (global_q_row, head_idx, dim0)),
                 )
             else:
-                if dim0 < mQRows.shape[2]:
-                    q0 = Float32(mQRows[global_q_row, head_idx, dim0])
-                    out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
-                    do0 = Float32(mdORows[global_q_row, head_idx, dim0])
-                if dim1 < mQRows.shape[2]:
-                    q1 = Float32(mQRows[global_q_row, head_idx, dim1])
-                    out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
-                    do1 = Float32(mdORows[global_q_row, head_idx, dim1])
-                if dim2 < mQRows.shape[2]:
-                    q2 = Float32(mQRows[global_q_row, head_idx, dim2])
-                    out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
-                    do2 = Float32(mdORows[global_q_row, head_idx, dim2])
-                if dim3 < mQRows.shape[2]:
-                    q3 = Float32(mQRows[global_q_row, head_idx, dim3])
-                    out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
-                    do3 = Float32(mdORows[global_q_row, head_idx, dim3])
+                q0 = Float32(mQRows[global_q_row, head_idx, dim0])
+                out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
+                do0 = Float32(mdORows[global_q_row, head_idx, dim0])
+                q1 = Float32(mQRows[global_q_row, head_idx, dim1])
+                out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
+                do1 = Float32(mdORows[global_q_row, head_idx, dim1])
+                q2 = Float32(mQRows[global_q_row, head_idx, dim2])
+                out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
+                do2 = Float32(mdORows[global_q_row, head_idx, dim2])
+                q3 = Float32(mQRows[global_q_row, head_idx, dim3])
+                out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
+                do3 = Float32(mdORows[global_q_row, head_idx, dim3])
 
         if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
             dpsum_partial = _dot4_packed_f32x2(out0, out1, out2, out3, do0, do1, do2, do3)
@@ -3469,8 +3468,10 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
         for union_slot in range(mUnionKRowIdx.shape[1]):
             union_slot_i = Int32(union_slot)
             union_key_row = Int32(-1)
+            slot_valid = Boolean(False)
             if qgroup_valid and union_slot_i < union_k_length:
                 union_key_row = Int32(mUnionKRowIdx[qgroup_idx, union_slot_i])
+                slot_valid = union_key_row >= Int32(0)
             participates = Boolean(False)
             kval0 = Float32(0.0)
             kval1 = Float32(0.0)
@@ -3480,7 +3481,7 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
             vval1 = Float32(0.0)
             vval2 = Float32(0.0)
             vval3 = Float32(0.0)
-            if active_row and union_slot_i < union_k_length and union_key_row >= Int32(0):
+            if active_row and slot_valid:
                 row_slot = Int32(mUnionToRowSlot[qgroup_idx, row_idx, union_slot_i])
                 participates = row_slot >= Int32(0)
                 if participates:
@@ -3500,56 +3501,59 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                         vval1 = Float32(mVRows[union_key_row, head_idx, dim1])
                         vval2 = Float32(mVRows[union_key_row, head_idx, dim2])
                         vval3 = Float32(mVRows[union_key_row, head_idx, dim3])
-            if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
-                prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv_packed(
-                    lane16,
-                    participates,
-                    q0,
-                    q1,
-                    q2,
-                    q3,
-                    do0,
-                    do1,
-                    do2,
-                    do3,
-                    dpsum,
-                    lse_log2,
-                    kval0,
-                    kval1,
-                    kval2,
-                    kval3,
-                    vval0,
-                    vval1,
-                    vval2,
-                    vval3,
-                    scale_log2,
-                    softmax_scale,
-                )
-            else:
-                prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv(
-                    lane16,
-                    participates,
-                    q0,
-                    q1,
-                    q2,
-                    q3,
-                    do0,
-                    do1,
-                    do2,
-                    do3,
-                    dpsum,
-                    lse_log2,
-                    kval0,
-                    kval1,
-                    kval2,
-                    kval3,
-                    vval0,
-                    vval1,
-                    vval2,
-                    vval3,
-                    scale_log2,
-                    softmax_scale,
-                )
+            prob = Float32(0.0)
+            ds_scaled = Float32(0.0)
+            if slot_valid:
+                if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                    prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv_packed(
+                        lane16,
+                        participates,
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                        do0,
+                        do1,
+                        do2,
+                        do3,
+                        dpsum,
+                        lse_log2,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        scale_log2,
+                        softmax_scale,
+                    )
+                else:
+                    prob, ds_scaled = _bucket_dense_prob_ds_from_loaded_kv(
+                        lane16,
+                        participates,
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                        do0,
+                        do1,
+                        do2,
+                        do3,
+                        dpsum,
+                        lse_log2,
+                        kval0,
+                        kval1,
+                        kval2,
+                        kval3,
+                        vval0,
+                        vval1,
+                        vval2,
+                        vval3,
+                        scale_log2,
+                        softmax_scale,
+                    )
 
             dk0 = Float32(0.0)
             dk1 = Float32(0.0)
@@ -3579,31 +3583,46 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                     dv1 = prob * do1
                     dv2 = prob * do2
                     dv3 = prob * do3
-            partner_lane = lane16 + (Int32(1) - row_idx) * Int32(16)
-            partner_dk0 = utils.shuffle_sync(dk0, partner_lane, width=32)
-            partner_dk1 = utils.shuffle_sync(dk1, partner_lane, width=32)
-            partner_dk2 = utils.shuffle_sync(dk2, partner_lane, width=32)
-            partner_dk3 = utils.shuffle_sync(dk3, partner_lane, width=32)
-            partner_dv0 = utils.shuffle_sync(dv0, partner_lane, width=32)
-            partner_dv1 = utils.shuffle_sync(dv1, partner_lane, width=32)
-            partner_dv2 = utils.shuffle_sync(dv2, partner_lane, width=32)
-            partner_dv3 = utils.shuffle_sync(dv3, partner_lane, width=32)
-            if lane < Int32(16) and union_slot_i < union_k_length and union_key_row >= Int32(0):
-                if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
-                    dk0, dk1 = cute.arch.add_packed_f32x2((dk0, dk1), (partner_dk0, partner_dk1))
-                    dk2, dk3 = cute.arch.add_packed_f32x2((dk2, dk3), (partner_dk2, partner_dk3))
-                    dv0, dv1 = cute.arch.add_packed_f32x2((dv0, dv1), (partner_dv0, partner_dv1))
-                    dv2, dv3 = cute.arch.add_packed_f32x2((dv2, dv3), (partner_dv2, partner_dv3))
-                else:
-                    dk0 += partner_dk0
-                    dk1 += partner_dk1
-                    dk2 += partner_dk2
-                    dk3 += partner_dk3
-                    dv0 += partner_dv0
-                    dv1 += partner_dv1
-                    dv2 += partner_dv2
-                    dv3 += partner_dv3
-                if dim0 < mdKRows.shape[2]:
+            if slot_valid:
+                partner_dk0 = utils.shuffle_sync(
+                    dk0, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dk1 = utils.shuffle_sync(
+                    dk1, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dk2 = utils.shuffle_sync(
+                    dk2, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dk3 = utils.shuffle_sync(
+                    dk3, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dv0 = utils.shuffle_sync(
+                    dv0, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dv1 = utils.shuffle_sync(
+                    dv1, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dv2 = utils.shuffle_sync(
+                    dv2, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                partner_dv3 = utils.shuffle_sync(
+                    dv3, lane16 + (Int32(1) - row_idx) * Int32(16), width=32
+                )
+                if lane < Int32(16):
+                    if cutlass.const_expr(mQRows.element_type is cutlass.BFloat16):
+                        dk0, dk1 = cute.arch.add_packed_f32x2((dk0, dk1), (partner_dk0, partner_dk1))
+                        dk2, dk3 = cute.arch.add_packed_f32x2((dk2, dk3), (partner_dk2, partner_dk3))
+                        dv0, dv1 = cute.arch.add_packed_f32x2((dv0, dv1), (partner_dv0, partner_dv1))
+                        dv2, dv3 = cute.arch.add_packed_f32x2((dv2, dv3), (partner_dv2, partner_dv3))
+                    else:
+                        dk0 += partner_dk0
+                        dk1 += partner_dk1
+                        dk2 += partner_dk2
+                        dk3 += partner_dk3
+                        dv0 += partner_dv0
+                        dv1 += partner_dv1
+                        dv2 += partner_dv2
+                        dv3 += partner_dv3
                     copy_utils.atomic_add_fp32x4(
                         dk0,
                         dk1,
@@ -3620,14 +3639,13 @@ class FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100:
                     )
 
         if active_row:
-            if dim0 < mdQRows.shape[2]:
-                copy_utils.atomic_add_fp32x4(
-                    dq0,
-                    dq1,
-                    dq2,
-                    dq3,
-                    utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
-                )
+            copy_utils.atomic_add_fp32x4(
+                dq0,
+                dq1,
+                dq2,
+                dq3,
+                utils.elem_pointer(mdQRows, (global_q_row, head_idx, dim0)),
+            )
 
 
 class FlashHSASyntheticDirectRowMicroBwdBucketDenseTwoPassStage1Sm100:
@@ -8382,7 +8400,7 @@ def _run_synthetic_direct_row_micro_bwd_kernel_bucket_dense(
     if qgroups_per_cta not in (1, 2, 4):
         qgroups_per_cta = 1
     compile_key = (
-        "synthetic_direct_row_micro_bwd_bucket_dense_v15",
+        "synthetic_direct_row_micro_bwd_bucket_dense_v17",
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,

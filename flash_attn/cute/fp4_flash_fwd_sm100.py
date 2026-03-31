@@ -910,14 +910,17 @@ class FP4FlashAttentionForwardSm100:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mQ,
-            cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            cta_layout_vmnk.shape,
-        )
+        if const_expr(not self.pack_gqa_local):
+            tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mQ,
+                cute.select(sQ_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+        else:
+            tma_atom_Q = None
 
         tma_atom_K = None
         tma_atom_V = None
@@ -1851,9 +1854,12 @@ class FP4FlashAttentionForwardSm100:
             tSgK = thr_mma_qk.partition_B(gK)
             if const_expr(not self.use_fp4_pv or not self.fp4_pv_manual_direct_loader):
                 tOgV = thr_mma_pv.partition_B(gV)
-            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
-            )
+            if const_expr(not self.pack_gqa_local):
+                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
+                )
+            else:
+                load_Q_fn = None
 
             if const_expr(self.use_tma_KV):
                 tKsK, tKgK = cpasync.tma_partition(
@@ -1968,24 +1974,78 @@ class FP4FlashAttentionForwardSm100:
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
                         # load_Q(block=0, stage=0)  # Q0
-                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
-                        load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
-                        if const_expr(self.use_fp4_qk):
-                            self.load_scale_stage(
-                                gQ_scale[None, None, 0],
-                                sSFA[None, None, None, 0],
+                        if const_expr(not self.pack_gqa_local):
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+                            load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 0],
+                                    sSFA[None, None, None, 0],
+                                )
+                        else:
+                            assert gmem_tiled_copy_Q is not None
+                            assert mQ_storage_cur is not None
+                            self.load_Q_packed_local(
+                                pack_gqa,
+                                mQ_storage_cur,
+                                kv_head_idx,
+                                sQ[None, None, None, 0],
+                                gmem_tiled_copy_Q,
+                                pipeline_q,
+                                block=0,
+                                stage=0,
+                                phase=q_producer_phase,
+                                seqlen=seqlen.seqlen_q,
                             )
+                            if const_expr(self.use_fp4_qk):
+                                assert gmem_tiled_copy_Q_scale is not None
+                                self.load_scale_packed_local(
+                                    pack_gqa,
+                                    gQ_scale[None, None, 0],
+                                    sSFA[None, None, None, 0],
+                                    gmem_tiled_copy_Q_scale,
+                                    block=0,
+                                    seqlen=seqlen.seqlen_q,
+                                )
+                            pipeline_q.producer_commit_w_index(0)
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
-                        pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
-                        load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
-                        if const_expr(self.use_fp4_qk):
-                            self.load_scale_stage(
-                                gQ_scale[None, None, 1],
-                                sSFA[None, None, None, 1],
+                        if const_expr(not self.pack_gqa_local):
+                            pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
+                            tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
+                            load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
+                            if const_expr(self.use_fp4_qk):
+                                self.load_scale_stage(
+                                    gQ_scale[None, None, 1],
+                                    sSFA[None, None, None, 1],
+                                )
+                        else:
+                            assert gmem_tiled_copy_Q is not None
+                            assert mQ_storage_cur is not None
+                            self.load_Q_packed_local(
+                                pack_gqa,
+                                mQ_storage_cur,
+                                kv_head_idx,
+                                sQ[None, None, None, 1],
+                                gmem_tiled_copy_Q,
+                                pipeline_q,
+                                block=1,
+                                stage=1,
+                                phase=q_producer_phase,
+                                seqlen=seqlen.seqlen_q,
                             )
+                            if const_expr(self.use_fp4_qk):
+                                assert gmem_tiled_copy_Q_scale is not None
+                                self.load_scale_packed_local(
+                                    pack_gqa,
+                                    gQ_scale[None, None, 1],
+                                    sSFA[None, None, None, 1],
+                                    gmem_tiled_copy_Q_scale,
+                                    block=1,
+                                    seqlen=seqlen.seqlen_q,
+                                )
+                            pipeline_q.producer_commit_w_index(1)
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     if const_expr(self.use_fp4_pv and not self.fp4_pv_manual_direct_loader):
@@ -2053,7 +2113,7 @@ class FP4FlashAttentionForwardSm100:
 
         pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail
-        if (
+        if const_expr(not self.pack_gqa_local) and (
             const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]
         ):
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)

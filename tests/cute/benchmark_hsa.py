@@ -261,7 +261,14 @@ def _synthetic_bwd_kernel_mode_label() -> str:
         if variant == "warpgroup":
             long_keys_per_cta = "8"
         pingpong_mode = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG", "off").strip().lower()
-        if variant in {"bucket_dense", "bucket_dense_two_pass", "bucket_dense_dualrow", "bucket_dense_tc"}:
+        if variant in {
+            "bucket_dense",
+            "bucket_dense_saved_packed",
+            "bucket_dense_saved_prob",
+            "bucket_dense_two_pass",
+            "bucket_dense_dualrow",
+            "bucket_dense_tc",
+        }:
             return f"one_kernel_{one_kernel_mode}_variant_{variant}_long_{long_mode}_pingpong_{pingpong_mode}"
         return (
             f"one_kernel_{one_kernel_mode}_variant_{variant}_long_{long_mode}"
@@ -395,6 +402,14 @@ def _one_kernel_synthetic_bucket_dense_two_pass_label() -> str:
     return "direct_micro_bucket_dense_two_pass_bwd"
 
 
+def _one_kernel_synthetic_bucket_dense_saved_prob_label() -> str:
+    return "direct_micro_bucket_dense_saved_prob_bwd"
+
+
+def _one_kernel_synthetic_bucket_dense_saved_packed_label() -> str:
+    return "direct_micro_bucket_dense_saved_packed_bwd"
+
+
 def _one_kernel_synthetic_bucket_dense_tc_label() -> str:
     return "direct_micro_bucket_dense_tc_bwd"
 
@@ -429,6 +444,18 @@ def _one_kernel_synthetic_bucket_dense_tc_env(case: BenchmarkCase) -> dict[str, 
 def _one_kernel_synthetic_bucket_dense_two_pass_env(case: BenchmarkCase) -> dict[str, str | None]:
     env = dict(_one_kernel_synthetic_bucket_dense_env(case))
     env.update({"FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense_two_pass"})
+    return env
+
+
+def _one_kernel_synthetic_bucket_dense_saved_prob_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_bucket_dense_env(case))
+    env.update({"FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense_saved_prob"})
+    return env
+
+
+def _one_kernel_synthetic_bucket_dense_saved_packed_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_one_kernel_synthetic_bucket_dense_env(case))
+    env.update({"FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT": "bucket_dense_saved_packed"})
     return env
 
 
@@ -588,6 +615,8 @@ def _get_bucket_dense_long_profile_target_mode() -> str:
     if value not in {
         "all",
         "bucket_dense",
+        "bucket_dense_saved_packed",
+        "bucket_dense_saved_prob",
         "bucket_dense_two_pass",
         "bucket_dense_dualrow",
         "bucket_dense_tc",
@@ -1109,6 +1138,17 @@ def _profile_bucket_dense_long_case(case: BenchmarkCase, target_mode: str):
             "env": _one_kernel_synthetic_bucket_dense_env(case),
             "patterns": ("FlashHSASyntheticDirectRowMicroBwdBucketDenseSm100",),
         },
+        "bucket_dense_saved_packed": {
+            "env": _one_kernel_synthetic_bucket_dense_saved_packed_env(case),
+            "patterns": (
+                "FlashHSASyntheticDirectMicroBwdDensePackedInputSm100",
+                "FlashHSASyntheticDirectMicroBwdMaskedPackedInputSm100",
+            ),
+        },
+        "bucket_dense_saved_prob": {
+            "env": _one_kernel_synthetic_bucket_dense_saved_prob_env(case),
+            "patterns": ("FlashHSASyntheticDirectRowMicroBwdBucketDenseSavedProbSm100",),
+        },
         "bucket_dense_two_pass": {
             "env": _one_kernel_synthetic_bucket_dense_two_pass_env(case),
             "patterns": (
@@ -1144,7 +1184,15 @@ def _profile_bucket_dense_long_case(case: BenchmarkCase, target_mode: str):
         },
     }
     selected_labels = (
-        ["bucket_dense", "bucket_dense_two_pass", "bucket_dense_dualrow", "hybrid", "long4"]
+        [
+            "bucket_dense",
+            "bucket_dense_saved_packed",
+            "bucket_dense_saved_prob",
+            "bucket_dense_two_pass",
+            "bucket_dense_dualrow",
+            "hybrid",
+            "long4",
+        ]
         if target_mode == "all"
         else [target_mode]
     )
@@ -1407,6 +1455,11 @@ def _run_long_case(case: BenchmarkCase):
     bucket_dense_fwd_bwd_ms = None
     bucket_dense_vs_dense = None
     bucket_dense_vs_hybrid = None
+    bucket_dense_saved_prob_fwd_ms = None
+    bucket_dense_saved_prob_bwd_ms = None
+    bucket_dense_saved_prob_fwd_bwd_ms = None
+    bucket_dense_saved_prob_vs_dense = None
+    bucket_dense_saved_prob_vs_hybrid = None
     bucket_dense_two_pass_fwd_ms = None
     bucket_dense_two_pass_bwd_ms = None
     bucket_dense_two_pass_fwd_bwd_ms = None
@@ -1702,6 +1755,18 @@ def _run_long_case(case: BenchmarkCase):
         ]
         if case.seqlen >= 65536:
             long_family_cases.append(
+                (
+                    _one_kernel_synthetic_bucket_dense_saved_packed_label(),
+                    _one_kernel_synthetic_bucket_dense_saved_packed_env(case),
+                )
+            )
+            long_family_cases.append(
+                (
+                    _one_kernel_synthetic_bucket_dense_saved_prob_label(),
+                    _one_kernel_synthetic_bucket_dense_saved_prob_env(case),
+                )
+            )
+            long_family_cases.append(
                 (_one_kernel_synthetic_bucket_dense_two_pass_label(), _one_kernel_synthetic_bucket_dense_two_pass_env(case))
             )
         long_family_cases.append(
@@ -1754,6 +1819,12 @@ def _run_long_case(case: BenchmarkCase):
                 bucket_dense_fwd_bwd_ms = fwd_bwd_ms
                 bucket_dense_vs_dense = vs_dense
                 bucket_dense_vs_hybrid = vs_hybrid
+            elif label == _one_kernel_synthetic_bucket_dense_saved_prob_label():
+                bucket_dense_saved_prob_fwd_ms = fwd_ms
+                bucket_dense_saved_prob_bwd_ms = bwd_ms
+                bucket_dense_saved_prob_fwd_bwd_ms = fwd_bwd_ms
+                bucket_dense_saved_prob_vs_dense = vs_dense
+                bucket_dense_saved_prob_vs_hybrid = vs_hybrid
             elif label == _one_kernel_synthetic_bucket_dense_two_pass_label():
                 bucket_dense_two_pass_fwd_ms = fwd_ms
                 bucket_dense_two_pass_bwd_ms = bwd_ms
@@ -1915,6 +1986,21 @@ def _run_long_case(case: BenchmarkCase):
             line += f" bucket_dense_vs_dense={bucket_dense_vs_dense:.2f}x"
         if bucket_dense_vs_hybrid is not None:
             line += f" bucket_dense_vs_hybrid={bucket_dense_vs_hybrid:.2f}x"
+    if (
+        bucket_dense_saved_prob_fwd_bwd_ms is not None
+        and bucket_dense_saved_prob_fwd_ms is not None
+        and bucket_dense_saved_prob_bwd_ms is not None
+    ):
+        line += (
+            f" bucket_dense_saved_prob_label={_one_kernel_synthetic_bucket_dense_saved_prob_label()}"
+            f" bucket_dense_saved_prob_fwd_ms={bucket_dense_saved_prob_fwd_ms:.3f}"
+            f" bucket_dense_saved_prob_bwd_ms={bucket_dense_saved_prob_bwd_ms:.3f}"
+            f" bucket_dense_saved_prob_fwd_bwd_ms={bucket_dense_saved_prob_fwd_bwd_ms:.3f}"
+        )
+        if bucket_dense_saved_prob_vs_dense is not None:
+            line += f" bucket_dense_saved_prob_vs_dense={bucket_dense_saved_prob_vs_dense:.2f}x"
+        if bucket_dense_saved_prob_vs_hybrid is not None:
+            line += f" bucket_dense_saved_prob_vs_hybrid={bucket_dense_saved_prob_vs_hybrid:.2f}x"
     if (
         bucket_dense_two_pass_fwd_bwd_ms is not None
         and bucket_dense_two_pass_fwd_ms is not None

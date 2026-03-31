@@ -328,6 +328,7 @@ class HSABlockSparseRuntime:
     synthetic_grid: Optional[HSASyntheticGridMetadata] = None
     synthetic_forward_workspace: Optional[dict] = None
     synthetic_backward_workspace: Optional[dict] = None
+    synthetic_forward_prob_token: int = 0
 
     def to(self, device: torch.device | str):
         def _move_aux(tensor: torch.Tensor) -> torch.Tensor:
@@ -363,6 +364,7 @@ class HSABlockSparseRuntime:
             synthetic_grid=None if self.synthetic_grid is None else self.synthetic_grid.to(device=device),
             synthetic_forward_workspace=None,
             synthetic_backward_workspace=None,
+            synthetic_forward_prob_token=0,
         )
 
 
@@ -6157,6 +6159,7 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         ctx.hash_ids = hash_ids
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
+        ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
         ctx.save_for_backward(
             q,
             k,
@@ -6206,6 +6209,7 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
                     ctx.deterministic,
                     ctx.keep_ids,
                     ctx.hash_ids,
+                    forward_prob_token=ctx.synthetic_forward_prob_token,
                     runtime=ctx.block_sparse_runtime,
                 )
             else:

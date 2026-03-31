@@ -372,10 +372,11 @@ class FlashAttentionBackwardSm100:
                 if self.use_fp4_bwd_qk and self.tile_hdim == 128:
                     self.dQ_reduce_ncol = 16
                     self.sdQaccum_stage = 2
+                    self.dQ_reduce_ncol_t2r = 16
                 else:
                     self.dQ_reduce_ncol = 16 if self.deterministic else 8
                     self.sdQaccum_stage = 2 if self.deterministic else 4
-                self.dQ_reduce_ncol_t2r = 32
+                    self.dQ_reduce_ncol_t2r = 32
             else:
                 self.dQ_reduce_ncol = 32
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
@@ -3545,6 +3546,7 @@ class FlashAttentionBackwardSm100:
             else:
                 if is_leader_cta and process_tile:
                     accumulate_dK = False
+                    use_split_dq_phase = const_expr(self.use_fp4_bwd_qk and self.tile_hdim == 128)
                     # -----------------------------------------------------------
                     ###### Prologue
                     # -----------------------------------------------------------
@@ -3562,11 +3564,16 @@ class FlashAttentionBackwardSm100:
                     pipeline_dO.consumer_wait(consumer_state_dO)
                     pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                     if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
-                        pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                        if const_expr(use_split_dq_phase):
+                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                        else:
+                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                     mma_dov_fn(B_idx=consumer_state_dO.index)
                     pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                     producer_phase_acc ^= 1
+                    if const_expr(use_split_dq_phase):
+                        producer_phase_dQ ^= 1
                     # 3) dV = P.T @ dO
                     pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                     mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
@@ -3669,12 +3676,17 @@ class FlashAttentionBackwardSm100:
                         # (4) dP = V @ dO.T
                         pipeline_dO.consumer_wait(consumer_state_dO)
                         if const_expr(not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq_reduce)):
-                            pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                            if const_expr(use_split_dq_phase):
+                                pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                            else:
+                                pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                         mma_dov_fn(B_idx=consumer_state_dO.index)
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                         # (5) dV += P.T @ dO
                         producer_phase_acc ^= 1
+                        if const_expr(use_split_dq_phase):
+                            producer_phase_dQ ^= 1
                         pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
                         pipeline_dO.consumer_release(consumer_state_dO)
@@ -3735,8 +3747,8 @@ class FlashAttentionBackwardSm100:
                                 mma_dsq_fn(
                                     tdKrQ[None, None, None, handle_Q.index],
                                     sQt[None, None, None, handle_Q.index],
-                                        zero_init=not accumulate_dK,
-                                    )
+                                    zero_init=not accumulate_dK,
+                                )
                         else:
                             mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
                     # signal to the epilogue that dK is ready
@@ -4134,12 +4146,16 @@ class FlashAttentionBackwardSm100:
                     m_block = m_block_min + iter_idx
                     m_block_oob = False
                     is_full_block = False
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                    cute.arch.sync_warp()
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
                 tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
                 if const_expr(prefetch_LSE and not self.shuffle_LSE):
                     cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
 
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                    cute.arch.sync_warp()
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 #### TMEM->RMEM (Load S from TMEM)
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
@@ -4160,6 +4176,7 @@ class FlashAttentionBackwardSm100:
                             with cute.arch.elect_one():
                                 pipeline_dS.producer_commit(producer_state_dS)
                             producer_state_dS.advance()
+                            cute.arch.sync_warp()
 
                 if const_expr(self.score_mod_bwd is not None):
                     tSrS_pre = cute.make_fragment_like(tSrS_t2r)
@@ -4223,6 +4240,8 @@ class FlashAttentionBackwardSm100:
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()
+                        if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                            cute.arch.sync_warp()
                         # Without this barrier, we could have 1 warp writing to P in tmem while
                         # another warp is still reading S from tmem.
                         self.compute_sync_barrier.arrive_and_wait()
@@ -4259,6 +4278,8 @@ class FlashAttentionBackwardSm100:
                     tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                     cute.arch.fence_view_async_tmem_load()
+                    if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                        cute.arch.sync_warp()
                     self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
@@ -4379,6 +4400,8 @@ class FlashAttentionBackwardSm100:
                         )
                     cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
 
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs and self.tile_hdim == 128):
+                    cute.arch.sync_warp()
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 # Normally we'd need syncwarp here since only 1 thread will signal in

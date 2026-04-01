@@ -288,6 +288,26 @@ def _measure_triplet_or_status(
         }
 
 
+def _measure_forward_diff_or_status(reference_output, forward_fn, q_data, k_data, v_data, *, env_updates=None):
+    env_updates = env_updates or {}
+    try:
+        with _temporary_env(**env_updates):
+            output = forward_fn(q_data, k_data, v_data)
+        diff = (output.float() - reference_output.float()).abs()
+        return {
+            "max_diff": float(diff.max().item()),
+            "mean_diff": float(diff.mean().item()),
+            "status": "measured",
+        }
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+        torch.cuda.empty_cache()
+        return {
+            "max_diff": None,
+            "mean_diff": None,
+            "status": f"failed_{type(exc).__name__}",
+        }
+
+
 def _append_labeled_triplet_fields(
     parts: list[str],
     *,
@@ -332,6 +352,24 @@ def _append_dense_triplet_fields(
         )
     else:
         parts.append(f"dense_fa4_status={status}")
+
+
+def _append_sparse_plain_triplet_fields(
+    parts: list[str],
+    *,
+    fwd_ms,
+    bwd_ms,
+    fwd_bwd_ms,
+):
+    _append_labeled_triplet_fields(
+        parts,
+        prefix="sparse_mask_plain",
+        label=_plain_sparse_mask_baseline_label(),
+        fwd_ms=fwd_ms,
+        bwd_ms=bwd_ms,
+        fwd_bwd_ms=fwd_bwd_ms,
+        status="measured",
+    )
 
 
 @contextmanager
@@ -703,6 +741,16 @@ def _plain_sparse_mask_baseline_env(case: BenchmarkCase) -> dict[str, str | None
     return env
 
 
+def _unpacked_direct_fwd_label() -> str:
+    return "hsa_unpacked_direct_fwd"
+
+
+def _unpacked_direct_fwd_env(case: BenchmarkCase) -> dict[str, str | None]:
+    env = dict(_plain_sparse_mask_baseline_env(case))
+    env.update({"FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD": "1"})
+    return env
+
+
 def _should_measure_sparse_mask_mixed_backward_baseline(case: BenchmarkCase) -> bool:
     return case.name != "sentence-only" and (case.n_kv_heads is None or case.n_kv_heads == case.nheads)
 
@@ -736,6 +784,10 @@ def _is_long_context_case(case: BenchmarkCase) -> bool:
     return case.name in LONG_CONTEXT_CASE_NAMES
 
 
+def _should_validate_unpacked_direct_outputs(case: BenchmarkCase) -> bool:
+    return not _is_long_context_case(case) or case.name in {"long-16k", "long-32k"}
+
+
 def _get_selected_cases(*, env_var: str, default: tuple[BenchmarkCase, ...]) -> list[BenchmarkCase]:
     selected = [name.strip() for name in os.environ.get(env_var, "").split(",")]
     selected = [name for name in selected if name]
@@ -750,6 +802,10 @@ def _get_selected_cases(*, env_var: str, default: tuple[BenchmarkCase, ...]) -> 
 
 def _use_sparse_profile_mode() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_PROFILE_SPARSE_MASK", "0") == "1"
+
+
+def _use_unpacked_direct_compare_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "0").strip().lower() in {"compare", "sweep"}
 
 
 def _use_bucket_dense_long_profile_mode() -> bool:
@@ -1003,6 +1059,187 @@ def _build_case_tensors(case: BenchmarkCase):
     return schedule, keep_ids, hash_ids, q_data, k_data, v_data
 
 
+def _unpacked_direct_comparison_status(plain_status: str, unpacked_status: str, correctness_status: str) -> str:
+    if plain_status != "measured":
+        return f"plain_{plain_status}"
+    if unpacked_status != "measured":
+        return f"unpacked_{unpacked_status}"
+    if correctness_status.startswith("failed_"):
+        return f"correctness_{correctness_status}"
+    return "measured"
+
+
+def _benchmark_unpacked_direct_case(case: BenchmarkCase) -> dict[str, object]:
+    schedule, keep_ids, hash_ids, q_data, k_data, v_data = _build_case_tensors(case)
+    plain_env = _plain_sparse_mask_baseline_env(case)
+    unpacked_env = _unpacked_direct_fwd_env(case)
+    plain_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=plain_env
+    )
+    unpacked_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=unpacked_env
+    )
+
+    plain_result = _measure_triplet_or_status(
+        plain_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=plain_env,
+    )
+    unpacked_result = _measure_triplet_or_status(
+        unpacked_forward,
+        q_data,
+        k_data,
+        v_data,
+        case.warmup_iters,
+        case.benchmark_iters,
+        env_updates=unpacked_env,
+    )
+
+    correctness_status = "skipped_missing_measurement"
+    max_diff = None
+    mean_diff = None
+    if plain_result["status"] == "measured" and unpacked_result["status"] == "measured":
+        if _should_validate_unpacked_direct_outputs(case):
+            with _temporary_env(**plain_env):
+                plain_output = plain_forward(q_data, k_data, v_data)
+            correctness = _measure_forward_diff_or_status(
+                plain_output,
+                unpacked_forward,
+                q_data,
+                k_data,
+                v_data,
+                env_updates=unpacked_env,
+            )
+            correctness_status = correctness["status"]
+            max_diff = correctness["max_diff"]
+            mean_diff = correctness["mean_diff"]
+        else:
+            correctness_status = "skipped_long_gt_32k"
+
+    plain_fwd_ms = plain_result["fwd_ms"]
+    unpacked_fwd_ms = unpacked_result["fwd_ms"]
+    speedup = None
+    if plain_fwd_ms is not None and unpacked_fwd_ms is not None and unpacked_fwd_ms > 0:
+        speedup = float(plain_fwd_ms / unpacked_fwd_ms)
+
+    return {
+        "case": case.name,
+        "plain_sparse_fwd_ms": plain_result["fwd_ms"],
+        "plain_sparse_bwd_ms": plain_result["bwd_ms"],
+        "plain_sparse_fwd_bwd_ms": plain_result["fwd_bwd_ms"],
+        "plain_sparse_status": plain_result["status"],
+        "unpacked_direct_fwd_ms": unpacked_result["fwd_ms"],
+        "unpacked_direct_bwd_ms": unpacked_result["bwd_ms"],
+        "unpacked_direct_fwd_bwd_ms": unpacked_result["fwd_bwd_ms"],
+        "unpacked_direct_status": unpacked_result["status"],
+        "speedup": speedup,
+        "correctness_status": correctness_status,
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "status": _unpacked_direct_comparison_status(
+            str(plain_result["status"]),
+            str(unpacked_result["status"]),
+            correctness_status,
+        ),
+    }
+
+
+def _empty_unpacked_direct_case_result(case_name: str, *, status: str) -> dict[str, object]:
+    return {
+        "case": case_name,
+        "plain_sparse_fwd_ms": None,
+        "plain_sparse_bwd_ms": None,
+        "plain_sparse_fwd_bwd_ms": None,
+        "plain_sparse_status": status,
+        "unpacked_direct_fwd_ms": None,
+        "unpacked_direct_bwd_ms": None,
+        "unpacked_direct_fwd_bwd_ms": None,
+        "unpacked_direct_status": status,
+        "speedup": None,
+        "correctness_status": "skipped_case_failure",
+        "max_diff": None,
+        "mean_diff": None,
+        "status": status,
+    }
+
+
+def _run_unpacked_direct_case_subprocess(case: BenchmarkCase) -> dict[str, object]:
+    child_env = os.environ.copy()
+    child_env["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD"] = "1"
+    child_env["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_CASE"] = case.name
+    result = subprocess.run(
+        [sys.executable, __file__],
+        env=child_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        status = f"child_exit_{result.returncode}"
+        stderr = result.stderr.strip().splitlines()
+        if stderr:
+            status = f"{status}_{stderr[-1][:120]}"
+        return _empty_unpacked_direct_case_result(case.name, status=status)
+
+    stdout_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not stdout_lines:
+        return _empty_unpacked_direct_case_result(case.name, status="child_empty_output")
+    try:
+        payload = json.loads(stdout_lines[-1])
+    except json.JSONDecodeError:
+        return _empty_unpacked_direct_case_result(case.name, status="child_bad_output")
+    if not isinstance(payload, dict) or payload.get("case") != case.name:
+        return _empty_unpacked_direct_case_result(case.name, status="child_bad_payload")
+    return payload
+
+
+def _format_unpacked_direct_case_report(result: dict[str, object]) -> str:
+    parts = [
+        f"unpacked_direct_sweep_case={result['case']}",
+        f"status={result['status']}",
+        f"plain_sparse_status={result['plain_sparse_status']}",
+        f"unpacked_direct_status={result['unpacked_direct_status']}",
+        f"correctness_status={result['correctness_status']}",
+    ]
+    plain_fwd_ms = result.get("plain_sparse_fwd_ms")
+    if plain_fwd_ms is not None:
+        parts.append(f"plain_sparse_fwd_ms={plain_fwd_ms:.3f}")
+    plain_bwd_ms = result.get("plain_sparse_bwd_ms")
+    if plain_bwd_ms is not None:
+        parts.append(f"plain_sparse_bwd_ms={plain_bwd_ms:.3f}")
+    plain_fwd_bwd_ms = result.get("plain_sparse_fwd_bwd_ms")
+    if plain_fwd_bwd_ms is not None:
+        parts.append(f"plain_sparse_fwd_bwd_ms={plain_fwd_bwd_ms:.3f}")
+    unpacked_fwd_ms = result.get("unpacked_direct_fwd_ms")
+    if unpacked_fwd_ms is not None:
+        parts.append(f"unpacked_direct_fwd_ms={unpacked_fwd_ms:.3f}")
+    unpacked_bwd_ms = result.get("unpacked_direct_bwd_ms")
+    if unpacked_bwd_ms is not None:
+        parts.append(f"unpacked_direct_bwd_ms={unpacked_bwd_ms:.3f}")
+    unpacked_fwd_bwd_ms = result.get("unpacked_direct_fwd_bwd_ms")
+    if unpacked_fwd_bwd_ms is not None:
+        parts.append(f"unpacked_direct_fwd_bwd_ms={unpacked_fwd_bwd_ms:.3f}")
+    speedup = result.get("speedup")
+    if speedup is not None:
+        parts.append(f"plain_sparse_fwd_vs_unpacked_direct={speedup:.3f}x")
+    max_diff = result.get("max_diff")
+    if max_diff is not None:
+        parts.append(f"max_diff={max_diff:.6f}")
+    mean_diff = result.get("mean_diff")
+    if mean_diff is not None:
+        parts.append(f"mean_diff={mean_diff:.6f}")
+    return " ".join(parts)
+
+
+def _run_unpacked_direct_sweep(cases: list[BenchmarkCase] | tuple[BenchmarkCase, ...]):
+    for case in cases:
+        print(_format_unpacked_direct_case_report(_run_unpacked_direct_case_subprocess(case)))
+
+
 def _measure_external_hdt_case() -> dict[str, object]:
     by_name = {candidate.name: candidate for candidate in ALL_CASES}
     case_name = os.environ["FLASH_ATTN_HSA_EXTERNAL_HDT_CASE"]
@@ -1087,6 +1324,21 @@ def _get_synthetic_grid_summary(schedule, q, k):
     runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
     hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
     return summarize_synthetic_grid(runtime)
+
+
+def _get_sparse24_feasibility_summary(schedule, q, k, *, use_synthetic_grid: bool):
+    from flash_attn.cute.hsa_sparse24_analysis import (
+        analyze_hsa_sparse24_feasibility,
+        summarize_hsa_sparse24_feasibility,
+    )
+
+    report = analyze_hsa_sparse24_feasibility(
+        schedule,
+        q,
+        k,
+        use_synthetic_grid=use_synthetic_grid,
+    )
+    return summarize_hsa_sparse24_feasibility(report)
 
 
 def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
@@ -1500,7 +1752,7 @@ def _run_long_case(case: BenchmarkCase):
     (
         build_hsa_schedule,
         flash_attn_func,
-        flash_attn_hsa_func,
+        _,
         _,
         hsa_reference_attention,
         _,
@@ -1513,7 +1765,7 @@ def _run_long_case(case: BenchmarkCase):
     q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
-    env_updates = _benchmark_env_for_case(case)
+    env_updates = _plain_sparse_mask_baseline_env(case)
 
     with _temporary_env(**_one_kernel_synthetic_long_env(case)):
         runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
@@ -1525,9 +1777,6 @@ def _run_long_case(case: BenchmarkCase):
     tile_reuse = _summarize_long_tile_reuse(runtime, keys_per_tile=8)
 
     hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
-    mask_mod_forward = lambda q, k, v: _unwrap_output(
-        flash_attn_hsa_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids)
-    )
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
     sliding_log_tokens = _log_sliding_window_tokens(case.seqlen)
     sliding_log_window = (max(0, sliding_log_tokens - 1), 0)
@@ -1578,14 +1827,6 @@ def _run_long_case(case: BenchmarkCase):
     hsa_fwd_vs_dense = None
     hsa_bwd_vs_dense = None
     hsa_fwd_bwd_vs_dense = None
-    mask_mod_result = _measure_triplet_or_status(
-        mask_mod_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
     sliding_log_result = _measure_triplet_or_status(
         sliding_log_forward,
         q_data,
@@ -1676,8 +1917,8 @@ def _run_long_case(case: BenchmarkCase):
     one_kernel_long_16_fwd_bwd_ms = None
     one_kernel_long_16_vs_dense = None
     one_kernel_long_16_vs_hybrid = None
-    plain_sparse_mask_bwd_ms = None
-    hsa_bwd_vs_plain_sparse_mask = None
+    plain_sparse_mask_bwd_ms = hsa_bwd_ms
+    hsa_bwd_vs_plain_sparse_mask = 1.0
     prev_synth_bwd_ms = None
     hsa_bwd_vs_prev = None
     short_synth_bwd_ms = None
@@ -2081,14 +2322,11 @@ def _run_long_case(case: BenchmarkCase):
             f" dense_causal_fwd_bwd_status={dense_causal_fwd_bwd_status}"
         )
     primary_parts: list[str] = []
-    _append_labeled_triplet_fields(
+    _append_sparse_plain_triplet_fields(
         primary_parts,
-        prefix="mask_mod_fa4",
-        label="plain_fa4_mask_mod_hsa",
-        fwd_ms=mask_mod_result["fwd_ms"],
-        bwd_ms=mask_mod_result["bwd_ms"],
-        fwd_bwd_ms=mask_mod_result["fwd_bwd_ms"],
-        status=mask_mod_result["status"],
+        fwd_ms=hsa_fwd_ms,
+        bwd_ms=hsa_bwd_ms,
+        fwd_bwd_ms=hsa_fwd_bwd_ms,
     )
     _append_labeled_triplet_fields(
         primary_parts,
@@ -2364,7 +2602,7 @@ def run_case(case: BenchmarkCase):
     (
         build_hsa_schedule,
         flash_attn_func,
-        flash_attn_hsa_func,
+        _,
         _,
         hsa_reference_attention,
         schedule_to_attend_mask,
@@ -2378,12 +2616,9 @@ def run_case(case: BenchmarkCase):
     q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
-    env_updates = _benchmark_env_for_case(case)
+    env_updates = _plain_sparse_mask_baseline_env(case)
 
     hsa_forward = lambda q, k, v: _run_sparse_attention(q, k, v, keep_ids, hash_ids, schedule, env_updates=env_updates)
-    mask_mod_forward = lambda q, k, v: _unwrap_output(
-        flash_attn_hsa_func(q, k, v, keep_ids=keep_ids, hash_ids=hash_ids)
-    )
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
     sliding_log_tokens = _log_sliding_window_tokens(case.seqlen)
     sliding_log_window = (max(0, sliding_log_tokens - 1), 0)
@@ -2404,6 +2639,14 @@ def run_case(case: BenchmarkCase):
     synthetic_summary = None
     if os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1":
         synthetic_summary = _get_synthetic_grid_summary(schedule, q_data, k_data)
+    sparse24_summary = None
+    if os.environ.get("FLASH_ATTN_HSA_REPORT_SPARSE24", "0") == "1":
+        sparse24_summary = _get_sparse24_feasibility_summary(
+            schedule,
+            q_data,
+            k_data,
+            use_synthetic_grid=os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1",
+        )
 
     hsa_fwd_ms = _measure_forward_ms(
         hsa_forward,
@@ -2469,14 +2712,6 @@ def run_case(case: BenchmarkCase):
     hsa_bwd_vs_dense = hsa_bwd_ms / dense_causal_bwd_ms if dense_causal_bwd_ms > 0 else float("inf")
     hsa_fwd_vs_dense = hsa_fwd_ms / dense_causal_fwd_ms if dense_causal_fwd_ms > 0 else float("inf")
     hsa_fwd_bwd_vs_dense = hsa_fwd_bwd_ms / dense_causal_fwd_bwd_ms if dense_causal_fwd_bwd_ms > 0 else float("inf")
-    mask_mod_result = _measure_triplet_or_status(
-        mask_mod_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
     sliding_log_result = _measure_triplet_or_status(
         sliding_log_forward,
         q_data,
@@ -2495,10 +2730,10 @@ def run_case(case: BenchmarkCase):
     )
     dense_fa4_status = "measured"
     hybrid_status = "unavailable_unsupported_case"
-    plain_sparse_mask_fwd_ms = None
-    plain_sparse_mask_bwd_ms = None
-    plain_sparse_mask_fwd_bwd_ms = None
-    hsa_fwd_bwd_vs_plain_sparse_mask = None
+    plain_sparse_mask_fwd_ms = hsa_fwd_ms
+    plain_sparse_mask_bwd_ms = hsa_bwd_ms
+    plain_sparse_mask_fwd_bwd_ms = hsa_fwd_bwd_ms
+    hsa_fwd_bwd_vs_plain_sparse_mask = 1.0
     prev_synth_fwd_ms = None
     prev_synth_bwd_ms = None
     prev_synth_fwd_bwd_ms = None
@@ -2527,41 +2762,6 @@ def run_case(case: BenchmarkCase):
     sparse_mask_mixed_bwd_ms = None
     sparse_mask_mixed_fwd_bwd_ms = None
     hsa_fwd_bwd_vs_sparse_mask_mixed = None
-    if _should_measure_plain_sparse_mask_baseline(case):
-        plain_env_updates = _plain_sparse_mask_baseline_env(case)
-        plain_hsa_forward = lambda q, k, v: _run_sparse_attention(
-            q, k, v, keep_ids, hash_ids, schedule, env_updates=plain_env_updates
-        )
-        plain_sparse_mask_fwd_ms = _measure_forward_ms(
-            plain_hsa_forward,
-            q_data,
-            k_data,
-            v_data,
-            case.warmup_iters,
-            case.benchmark_iters,
-            env_updates=plain_env_updates,
-        )
-        plain_sparse_mask_bwd_ms = _measure_backward_ms(
-            plain_hsa_forward,
-            q_data,
-            k_data,
-            v_data,
-            case.warmup_iters,
-            case.benchmark_iters,
-            env_updates=plain_env_updates,
-        )
-        plain_sparse_mask_fwd_bwd_ms = _measure_forward_backward_ms(
-            plain_hsa_forward,
-            q_data,
-            k_data,
-            v_data,
-            case.warmup_iters,
-            case.benchmark_iters,
-            env_updates=plain_env_updates,
-        )
-        hsa_fwd_bwd_vs_plain_sparse_mask = (
-            hsa_fwd_bwd_ms / plain_sparse_mask_fwd_bwd_ms if plain_sparse_mask_fwd_bwd_ms > 0 else float("inf")
-        )
     if _should_measure_previous_synthetic_baseline(case):
         prev_env_updates = _previous_synthetic_baseline_env(case)
         prev_hsa_forward = lambda q, k, v: _run_sparse_attention(
@@ -2852,14 +3052,11 @@ def run_case(case: BenchmarkCase):
             f" hsa_v_nonfinite={hsa_grad_status['v_nonfinite']}"
         )
     primary_parts: list[str] = []
-    _append_labeled_triplet_fields(
+    _append_sparse_plain_triplet_fields(
         primary_parts,
-        prefix="mask_mod_fa4",
-        label="plain_fa4_mask_mod_hsa",
-        fwd_ms=mask_mod_result["fwd_ms"],
-        bwd_ms=mask_mod_result["bwd_ms"],
-        fwd_bwd_ms=mask_mod_result["fwd_bwd_ms"],
-        status=mask_mod_result["status"],
+        fwd_ms=hsa_fwd_ms,
+        bwd_ms=hsa_bwd_ms,
+        fwd_bwd_ms=hsa_fwd_bwd_ms,
     )
     _append_labeled_triplet_fields(
         primary_parts,
@@ -3014,12 +3211,15 @@ def run_case(case: BenchmarkCase):
         line += (
             f" synthetic_micro_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD', '0') == '1' else 0}"
             f" synthetic_micro_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD', '0') == '1' else 0}"
+            f" unpacked_direct_fwd={1 if os.environ.get('FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD', '0') == '1' else 0}"
             f" synthetic_one_kernel_bwd={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD', 'off')}"
             f" synthetic_one_kernel_bwd_variant={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_VARIANT', 'auto')}"
             f" synthetic_one_kernel_long_keys_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_LONG_KEYS_PER_CTA', '4')}"
             f" synthetic_long_bwd_mode={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_LONG_BWD_MODE', 'one_kernel')}"
             f" synthetic_one_kernel_bwd_pingpong={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_ONE_KERNEL_BWD_PINGPONG', 'off')}"
             f" synthetic_fused_bwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_FUSED_BWD', 'off').strip().lower() in {'1', 'true', 'yes', 'on'} else 0}"
+            f" synthetic_parse_sparse_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD', '0') == '1' else 0}"
+            f" synthetic_parse_sparse_packed_kv_fwd={1 if os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_PACKED_KV_FWD', '0') == '1' else 0}"
             f" synthetic_mode_label={_synthetic_mode_label()}"
             f" synthetic_bwd_kernel_mode={_synthetic_bwd_kernel_mode_label()}"
             f" synth_qgroups_per_cta={os.environ.get('FLASH_ATTN_HSA_SYNTHETIC_QGROUPS_PER_CTA', '2')}"
@@ -3055,12 +3255,35 @@ def run_case(case: BenchmarkCase):
             f" synth_fwd_avg_union_k={synthetic_summary['forward_avg_union_k']:.2f}"
             f" synth_bwd_avg_fill={synthetic_summary['backward_avg_fill']:.4f}"
         )
+    if sparse24_summary is not None:
+        line += (
+            f" sparse24_group={sparse24_summary['nnz_per_group']}of{sparse24_summary['group_size']}"
+            f" sparse24_phys_segments={sparse24_summary['physical_segments']}"
+            f" sparse24_phys_partial={sparse24_summary['physical_partial_segments']}"
+            f" sparse24_phys_full={sparse24_summary['physical_full_segments']}"
+            f" sparse24_phys_eligible={sparse24_summary['physical_eligible_segments']}"
+            f" sparse24_phys_pair_coverage={sparse24_summary['physical_pair_coverage']:.4f}"
+            f" sparse24_phys_top_failure={sparse24_summary['physical_top_failure_reason']}"
+            f" sparse24_synth_segments={sparse24_summary['synthetic_segments']}"
+            f" sparse24_synth_eligible={sparse24_summary['synthetic_eligible_segments']}"
+            f" sparse24_synth_pair_coverage={sparse24_summary['synthetic_pair_coverage']:.4f}"
+            f" sparse24_synth_fill_before={sparse24_summary['synthetic_avg_tile_fill_before_packing']:.4f}"
+            f" sparse24_synth_fill_after={sparse24_summary['synthetic_avg_bucket_fill_after_packing']:.4f}"
+            f" sparse24_synth_top_failure={sparse24_summary['synthetic_top_failure_reason']}"
+            f" sparse24_direct_segments={sparse24_summary['synthetic_direct_segments']}"
+            f" sparse24_direct_eligible={sparse24_summary['synthetic_direct_eligible_segments']}"
+            f" sparse24_direct_pair_coverage={sparse24_summary['synthetic_direct_pair_coverage']:.4f}"
+            f" sparse24_direct_avg_fill={sparse24_summary['synthetic_avg_direct_fill']:.4f}"
+        )
     print(line)
 
 
 def _run_cases_once():
     _ensure_cuda_ready()
     print(f"device={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
+    if _use_unpacked_direct_compare_mode():
+        _run_unpacked_direct_sweep(_get_selected_cases(env_var="FLASH_ATTN_HSA_CASES", default=ALL_CASES))
+        return
     if _use_geometry_sweep_mode():
         _run_geometry_sweep_once()
         return
@@ -3091,6 +3314,16 @@ def main():
             payload = _measure_external_hdt_case()
         except Exception as exc:
             payload = {"status": f"failed_{type(exc).__name__}"}
+        print(json.dumps(payload), flush=True)
+        return
+
+    if os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD", "0") == "1":
+        case_name = os.environ["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_CASE"]
+        by_name = {candidate.name: candidate for candidate in ALL_CASES}
+        try:
+            payload = _benchmark_unpacked_direct_case(by_name[case_name])
+        except Exception as exc:
+            payload = _empty_unpacked_direct_case_result(case_name, status=f"failed_{type(exc).__name__}")
         print(json.dumps(payload), flush=True)
         return
 

@@ -29,29 +29,43 @@ def copy_gmem_to_smem_u128(gmem_ptr: cute.Pointer, smem_ptr: cute.Pointer, *, lo
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
-    stride_seqlen, stride_headdim, stride_nheads_kv, *batch_strides = T.stride
-    assert cute.size(T.shape[head_idx]) == nheads_kv * qhead_per_kvhead
-    shape_unpacked = ((qhead_per_kvhead, T.shape[0]), *T.shape[1:head_idx], nheads_kv, *T.shape[head_idx + 1:])
-    stride_unpacked = ((stride_nheads_kv, stride_seqlen), *T.stride[1:head_idx], *T.stride[head_idx:])
-    return cute.make_tensor(T.iterator, cute.make_layout(shape_unpacked, stride=stride_unpacked))
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        nheads_kv,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_packed = (
+        (head_stride, T.stride[0]),
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
 
 
 def pack_gqa_layout_seqmajor(T, qhead_per_kvhead, nheads_kv, head_idx):
-    seqlen_stride = T.stride[0][1]
-    head_stride = T.stride[0][0]
-    shape_unpacked = (
-        T.shape[0][1],
+    """Pack GQA with the sequence submode first inside the folded row mode.
+
+    This keeps the flattened packed row order as ``(seqlen_idx, qhead_idx)``,
+    which is friendlier to TMA tiling when the head grouping factor does not
+    divide the Blackwell FP4 MMA M tile.
+    """
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (T.shape[0], qhead_per_kvhead),
         *[T.shape[i] for i in range(1, head_idx)],
-        T.shape[head_idx] * qhead_per_kvhead,
+        nheads_kv,
         *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
     )
-    stride_unpacked = (
-        seqlen_stride,
+    stride_packed = (
+        (T.stride[0], head_stride),
         *[T.stride[i] for i in range(1, head_idx)],
-        head_stride,
+        head_stride * qhead_per_kvhead,
         *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
     )
-    return cute.make_tensor(T.iterator, cute.make_layout(shape_unpacked, stride=stride_unpacked))
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
 
 
 class PackGQA:
@@ -226,7 +240,7 @@ class PackGQA:
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0
         num_threads = gmem_tiled_copy.size
-        tPrOPtr = self.compute_ptr(mO[:, None], tOcO_row, tidx, block, threads_per_row, num_threads)
+        tPrOPtr = self.compute_ptr(mO[None, 0], tOcO_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
             o_ptr_i64 = utils.shuffle_sync(
                 tPrOPtr[m // threads_per_row], m % threads_per_row, width=threads_per_row

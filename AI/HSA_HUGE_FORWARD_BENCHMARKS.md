@@ -26,6 +26,27 @@ Format: forward milliseconds.
 | `5M` | `101.037 ms` | `14.771 ms` | `6.84x` |
 | `10M` | `200.884 ms` | `62.296 ms` | `3.22x` |
 
+## Huge FA4 Forward Baselines
+
+These were measured with a separate bespoke huge-sequence FA4 runner using the
+same synthetic metadata pattern.
+
+Format: forward milliseconds.
+
+| Sequence | Sliding Log FA4 | Log Window | Sliding Flop-Matched FA4 | Flop Window | Dense FA4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `2M` | `2.107 ms` | `21` | `1.598 ms` | `1` | `2259.884 ms` |
+| `5M` | `4.715 ms` | `23` | `3.693 ms` | `1` | `32116.601 ms` |
+| `10M` | `8.922 ms` | `24` | `6.998 ms` | `1` | `53722.395 ms` |
+
+Associated exact schedule pair counts for this huge synthetic pattern:
+
+| Sequence | Allowed Pairs |
+| --- | ---: |
+| `2M` | `780,337` |
+| `5M` | `1,950,840` |
+| `10M` | `3,901,680` |
+
 ## Setup Cost Breakdown
 
 These runs were dominated by host/runtime setup rather than the kernel itself.
@@ -50,6 +71,8 @@ Interpretation:
 
 - Hybrid forward remains substantially faster than the plain sparse HSA
   baseline through `10M`.
+- For this huge synthetic pattern, the exact flop-matched sliding-window FA4
+  baseline collapses to a `1`-token causal window at `2M`, `5M`, and `10M`.
 - The huge-length wall is mostly host/runtime setup, not the forward kernel.
 - At `10M`, the run still fit on the device in this forward-only mode; observed
   HBM usage was about `56.9 GB`.

@@ -26,6 +26,10 @@ def _load_hsa_module():
     return hsa_mod
 
 
+def _use_hsa_unpacked_direct_fwd() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "0") == "1"
+
+
 @dataclass
 class HSARuntimeState:
     sentence_stream: object
@@ -916,6 +920,9 @@ def run_hsa_fwd_sm100_blocksparse(
                 )
             )
         return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream
-    hsa_mod = _load_hsa_module()
-    out, lse = hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)
+    if _use_hsa_unpacked_direct_fwd():
+        out, lse = _run_hsa_fwd_sm100_direct(q, k, v, schedule, softmax_scale)
+    else:
+        hsa_mod = _load_hsa_module()
+        out, lse = hsa_mod._run_hsa_blocksparse_forward(q, k, v, schedule, softmax_scale)
     return out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream

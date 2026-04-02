@@ -891,6 +891,10 @@ def _include_long_experimental_comparators() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_BENCHMARK_INCLUDE_LONG_EXPERIMENTAL", "0") == "1"
 
 
+def _get_unpacked_direct_child_timeout_s() -> float:
+    return float(os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_TIMEOUT_S", "180"))
+
+
 def _geometry_sweep_configs() -> tuple[tuple[int, int, int], ...]:
     return (
         (64, 128, 1),
@@ -1202,6 +1206,91 @@ def _benchmark_unpacked_direct_case(case: BenchmarkCase) -> dict[str, object]:
     }
 
 
+def _benchmark_unpacked_direct_forward_only_case(case: BenchmarkCase) -> dict[str, object]:
+    schedule, keep_ids, hash_ids, q_data, k_data, v_data = _build_case_tensors(case)
+    plain_env = _plain_sparse_mask_baseline_env(case)
+    unpacked_env = _unpacked_direct_fwd_env(case)
+    plain_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=plain_env
+    )
+    unpacked_forward = lambda q, k, v: _run_sparse_attention(
+        q, k, v, keep_ids, hash_ids, schedule, env_updates=unpacked_env
+    )
+
+    def _measure_forward_only(forward_fn, *, env_updates):
+        try:
+            return {
+                "fwd_ms": _measure_forward_ms(
+                    forward_fn,
+                    q_data,
+                    k_data,
+                    v_data,
+                    case.warmup_iters,
+                    case.benchmark_iters,
+                    env_updates=env_updates,
+                ),
+                "status": "measured",
+            }
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            torch.cuda.empty_cache()
+            return {
+                "fwd_ms": None,
+                "status": f"unavailable_{type(exc).__name__}",
+            }
+
+    plain_result = _measure_forward_only(plain_forward, env_updates=plain_env)
+    unpacked_result = _measure_forward_only(unpacked_forward, env_updates=unpacked_env)
+
+    correctness_status = "skipped_missing_measurement"
+    max_diff = None
+    mean_diff = None
+    if plain_result["status"] == "measured" and unpacked_result["status"] == "measured":
+        if _should_validate_unpacked_direct_outputs(case):
+            with _temporary_env(**plain_env):
+                plain_output = plain_forward(q_data, k_data, v_data)
+            correctness = _measure_forward_diff_or_status(
+                plain_output,
+                unpacked_forward,
+                q_data,
+                k_data,
+                v_data,
+                env_updates=unpacked_env,
+            )
+            correctness_status = correctness["status"]
+            max_diff = correctness["max_diff"]
+            mean_diff = correctness["mean_diff"]
+        else:
+            correctness_status = "skipped_long_gt_32k"
+
+    plain_fwd_ms = plain_result["fwd_ms"]
+    unpacked_fwd_ms = unpacked_result["fwd_ms"]
+    speedup = None
+    if plain_fwd_ms is not None and unpacked_fwd_ms is not None and unpacked_fwd_ms > 0:
+        speedup = float(plain_fwd_ms / unpacked_fwd_ms)
+
+    return {
+        "case": case.name,
+        "plain_sparse_fwd_ms": plain_fwd_ms,
+        "plain_sparse_bwd_ms": None,
+        "plain_sparse_fwd_bwd_ms": None,
+        "plain_sparse_status": plain_result["status"],
+        "unpacked_direct_fwd_ms": unpacked_fwd_ms,
+        "unpacked_direct_bwd_ms": None,
+        "unpacked_direct_fwd_bwd_ms": None,
+        "unpacked_direct_status": unpacked_result["status"],
+        "speedup": speedup,
+        "correctness_status": correctness_status,
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "status": _unpacked_direct_comparison_status(
+            str(plain_result["status"]),
+            str(unpacked_result["status"]),
+            correctness_status,
+        ),
+        "mode": "forward_only",
+    }
+
+
 def _empty_unpacked_direct_case_result(case_name: str, *, status: str) -> dict[str, object]:
     return {
         "case": case_name,
@@ -1222,16 +1311,26 @@ def _empty_unpacked_direct_case_result(case_name: str, *, status: str) -> dict[s
 
 
 def _run_unpacked_direct_case_subprocess(case: BenchmarkCase) -> dict[str, object]:
+    return _run_unpacked_direct_case_subprocess_mode(case, mode="full")
+
+
+def _run_unpacked_direct_case_subprocess_mode(case: BenchmarkCase, *, mode: str) -> dict[str, object]:
     child_env = os.environ.copy()
     child_env["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD"] = "1"
     child_env["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_CASE"] = case.name
-    result = subprocess.run(
-        [sys.executable, __file__],
-        env=child_env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    child_env["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_MODE"] = mode
+    try:
+        result = subprocess.run(
+            [sys.executable, __file__],
+            env=child_env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_get_unpacked_direct_child_timeout_s(),
+        )
+    except subprocess.TimeoutExpired:
+        timeout_s = int(_get_unpacked_direct_child_timeout_s())
+        return _empty_unpacked_direct_case_result(case.name, status=f"child_timeout_{timeout_s}s")
     if result.returncode != 0:
         status = f"child_exit_{result.returncode}"
         stderr = result.stderr.strip().splitlines()
@@ -1393,6 +1492,83 @@ def _get_sparse24_feasibility_summary(schedule, q, k, *, use_synthetic_grid: boo
         use_synthetic_grid=use_synthetic_grid,
     )
     return summarize_hsa_sparse24_feasibility(report)
+
+
+def _get_approx_sparse_gemm_forward_summary(schedule, q, k, v, *, use_synthetic_grid: bool):
+    from flash_attn.cute.hsa_approx_sparse_gemm_analysis import (
+        analyze_hsa_approx_sparse_gemm_forward,
+        summarize_hsa_approx_sparse_gemm_forward,
+    )
+
+    def _parse_optional_int(env_name: str) -> int | None:
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            return None
+        value = int(raw)
+        return None if value <= 0 else value
+
+    report = analyze_hsa_approx_sparse_gemm_forward(
+        schedule,
+        q,
+        k,
+        v,
+        use_synthetic_grid=use_synthetic_grid,
+        group_size=int(os.environ.get("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_GROUP_SIZE", "4")),
+        nnz_per_group=int(os.environ.get("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_NNZ_PER_GROUP", "2")),
+        warmup_iters=int(os.environ.get("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_WARMUP_ITERS", "5")),
+        benchmark_iters=int(os.environ.get("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_BENCH_ITERS", "20")),
+        max_buckets=_parse_optional_int("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_MAX_BUCKETS"),
+        max_members=_parse_optional_int("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_MAX_MEMBERS"),
+    )
+    return summarize_hsa_approx_sparse_gemm_forward(report)
+
+
+def _get_shared_sparse_gemm_forward_summary(schedule, q, k, v, *, use_synthetic_grid: bool):
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import (
+        analyze_hsa_shared_sparse_gemm_forward,
+        summarize_hsa_shared_sparse_gemm_forward,
+    )
+
+    def _parse_optional_int(env_name: str) -> int | None:
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            return None
+        value = int(raw)
+        return None if value <= 0 else value
+
+    def _parse_bool(env_name: str, default: bool) -> bool:
+        raw = os.environ.get(env_name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    report = analyze_hsa_shared_sparse_gemm_forward(
+        schedule,
+        q,
+        k,
+        v,
+        use_synthetic_grid=use_synthetic_grid,
+        group_size=int(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_GROUP_SIZE", "4")),
+        nnz_per_group=int(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_NNZ_PER_GROUP", "2")),
+        bucketizer=os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_BUCKETIZER", "exact_jaccard"),
+        min_jaccard=float(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MIN_JACCARD", "0.5")),
+        max_support_rows=int(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_SUPPORT_ROWS", "128")),
+        max_qgroups_per_bucket=int(
+            os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_QGROUPS_PER_BUCKET", "32")
+        ),
+        max_buckets=_parse_optional_int("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_BUCKETS"),
+        max_qgroups=_parse_optional_int("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_QGROUPS"),
+        warmup_iters=int(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_WARMUP_ITERS", "5")),
+        benchmark_iters=int(os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_BENCH_ITERS", "20")),
+        enable_sparse_payload=_parse_bool("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_SEMI_STRUCTURED", True),
+        enable_custom_masked=_parse_bool("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_CUSTOM_MASKED", True),
+        enable_fa4_packed=_parse_bool("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_FA4_PACKED", True),
+        enable_shared_cta=_parse_bool("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_SHARED_CTA", True),
+        shared_cta_qgroups_per_cta=int(
+            os.environ.get("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_SHARED_CTA_QGROUPS_PER_CTA", "2")
+        ),
+    )
+    return summarize_hsa_shared_sparse_gemm_forward(report)
 
 
 def _measure_backward_ms(forward_fn, q_data, k_data, v_data, warmup_iters, benchmark_iters, *, env_updates=None):
@@ -2863,6 +3039,24 @@ def run_case(case: BenchmarkCase):
             k_data,
             use_synthetic_grid=os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1",
         )
+    approx_sparse_gemm_summary = None
+    if os.environ.get("FLASH_ATTN_HSA_REPORT_APPROX_SPARSE_GEMM", "0") == "1":
+        approx_sparse_gemm_summary = _get_approx_sparse_gemm_forward_summary(
+            schedule,
+            q_data,
+            k_data,
+            v_data,
+            use_synthetic_grid=os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1",
+        )
+    shared_sparse_gemm_summary = None
+    if os.environ.get("FLASH_ATTN_HSA_REPORT_SHARED_SPARSE_GEMM", "0") == "1":
+        shared_sparse_gemm_summary = _get_shared_sparse_gemm_forward_summary(
+            schedule,
+            q_data,
+            k_data,
+            v_data,
+            use_synthetic_grid=os.environ.get("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "0") == "1",
+        )
 
     hsa_fwd_ms = _measure_forward_ms(
         hsa_forward,
@@ -3491,6 +3685,90 @@ def run_case(case: BenchmarkCase):
             f" sparse24_direct_pair_coverage={sparse24_summary['synthetic_direct_pair_coverage']:.4f}"
             f" sparse24_direct_avg_fill={sparse24_summary['synthetic_avg_direct_fill']:.4f}"
         )
+    if approx_sparse_gemm_summary is not None:
+        line += (
+            f" approx_sparse_gemm_status={approx_sparse_gemm_summary['status']}"
+            f" approx_sparse_gemm_group={approx_sparse_gemm_summary['nnz_per_group']}of{approx_sparse_gemm_summary['group_size']}"
+            f" approx_sparse_gemm_plan={approx_sparse_gemm_summary['plan_mode']}"
+            f" approx_sparse_gemm_sampled_buckets={approx_sparse_gemm_summary['sampled_buckets']}"
+            f" approx_sparse_gemm_sampled_members={approx_sparse_gemm_summary['sampled_members']}"
+            f" approx_sparse_gemm_available_members={approx_sparse_gemm_summary['available_members']}"
+        )
+        if approx_sparse_gemm_summary["status"] == "measured":
+            line += (
+                f" approx_sparse_gemm_avg_q={approx_sparse_gemm_summary['avg_q_len']:.2f}"
+                f" approx_sparse_gemm_avg_k={approx_sparse_gemm_summary['avg_union_k_len']:.2f}"
+                f" approx_sparse_gemm_max_k={approx_sparse_gemm_summary['max_union_k_len']}"
+                f" approx_sparse_gemm_dense_qk_ms={approx_sparse_gemm_summary['dense_qk_ms']:.3f}"
+                f" approx_sparse_gemm_sparse_qk_ms={approx_sparse_gemm_summary['sparse_qk_precompressed_ms']:.3f}"
+                f" approx_sparse_gemm_sparse_qk_e2e_ms={approx_sparse_gemm_summary['sparse_qk_end_to_end_ms']:.3f}"
+                f" approx_sparse_gemm_qk_speedup={approx_sparse_gemm_summary['sparse_qk_precompressed_speedup']:.2f}x"
+                f" approx_sparse_gemm_qk_e2e_speedup={approx_sparse_gemm_summary['sparse_qk_end_to_end_speedup']:.2f}x"
+                f" approx_sparse_gemm_dense_fwd_ms={approx_sparse_gemm_summary['dense_fwd_ms']:.3f}"
+                f" approx_sparse_gemm_sparse_fwd_ms={approx_sparse_gemm_summary['sparse_fwd_precompressed_ms']:.3f}"
+                f" approx_sparse_gemm_sparse_fwd_e2e_ms={approx_sparse_gemm_summary['sparse_fwd_end_to_end_ms']:.3f}"
+                f" approx_sparse_gemm_fwd_speedup={approx_sparse_gemm_summary['sparse_fwd_precompressed_speedup']:.2f}x"
+                f" approx_sparse_gemm_fwd_e2e_speedup={approx_sparse_gemm_summary['sparse_fwd_end_to_end_speedup']:.2f}x"
+                f" approx_sparse_gemm_out_max_diff={approx_sparse_gemm_summary['output_max_diff']:.6f}"
+                f" approx_sparse_gemm_out_mean_diff={approx_sparse_gemm_summary['output_mean_diff']:.6f}"
+                f" approx_sparse_gemm_out_rel_l1={approx_sparse_gemm_summary['output_relative_l1_error']:.6f}"
+                f" approx_sparse_gemm_retained_abs={approx_sparse_gemm_summary['retained_abs_fraction']:.4f}"
+                f" approx_sparse_gemm_retained_l2={approx_sparse_gemm_summary['retained_l2_fraction']:.4f}"
+            )
+    if shared_sparse_gemm_summary is not None:
+        line += (
+            f" shared_sparse_gemm_status={shared_sparse_gemm_summary['status']}"
+            f" shared_sparse_gemm_group={shared_sparse_gemm_summary['nnz_per_group']}of{shared_sparse_gemm_summary['group_size']}"
+            f" shared_sparse_gemm_bucketizer={shared_sparse_gemm_summary['bucketizer']}"
+            f" shared_sparse_gemm_jaccard={shared_sparse_gemm_summary['min_jaccard']:.2f}"
+            f" shared_sparse_gemm_max_support_rows={shared_sparse_gemm_summary['max_support_rows']}"
+            f" shared_sparse_gemm_max_qgroups_per_bucket={shared_sparse_gemm_summary['max_qgroups_per_bucket']}"
+            f" shared_sparse_gemm_available_qgroups={shared_sparse_gemm_summary['available_qgroups']}"
+            f" shared_sparse_gemm_sampled_qgroups={shared_sparse_gemm_summary['sampled_qgroups']}"
+            f" shared_sparse_gemm_exact_groups={shared_sparse_gemm_summary['exact_group_count']}"
+            f" shared_sparse_gemm_merged_groups={shared_sparse_gemm_summary['merged_group_count']}"
+            f" shared_sparse_gemm_buckets={shared_sparse_gemm_summary['bucket_count']}"
+        )
+        if shared_sparse_gemm_summary["status"] == "measured":
+            line += (
+                f" shared_sparse_gemm_valid_main_heads={shared_sparse_gemm_summary['valid_main_heads']}/{shared_sparse_gemm_summary['total_heads']}"
+                f" shared_sparse_gemm_valid_resid_heads={shared_sparse_gemm_summary['valid_residual_heads']}/{shared_sparse_gemm_summary['total_heads']}"
+                f" shared_sparse_gemm_custom_masked_status={shared_sparse_gemm_summary['custom_masked_status']}"
+                f" shared_sparse_gemm_avg_queries={shared_sparse_gemm_summary['avg_queries_per_bucket']:.2f}"
+                f" shared_sparse_gemm_avg_support_rows={shared_sparse_gemm_summary['avg_support_rows']:.2f}"
+                f" shared_sparse_gemm_max_support_rows_seen={shared_sparse_gemm_summary['max_support_rows_seen']}"
+                f" shared_sparse_gemm_dense_qk_ms={shared_sparse_gemm_summary['dense_qk_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_main_qk_ms={shared_sparse_gemm_summary['sparse_main_qk_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_exact_qk_ms={shared_sparse_gemm_summary['sparse_exact_qk_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_main_qk_speedup={shared_sparse_gemm_summary['sparse_main_qk_speedup']:.2f}x"
+                f" shared_sparse_gemm_sparse_exact_qk_speedup={shared_sparse_gemm_summary['sparse_exact_qk_speedup']:.2f}x"
+                f" shared_sparse_gemm_dense_fwd_ms={shared_sparse_gemm_summary['dense_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_main_fwd_ms={shared_sparse_gemm_summary['sparse_main_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_exact_fwd_ms={shared_sparse_gemm_summary['sparse_exact_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_sparse_main_fwd_speedup={shared_sparse_gemm_summary['sparse_main_fwd_speedup']:.2f}x"
+                f" shared_sparse_gemm_sparse_exact_fwd_speedup={shared_sparse_gemm_summary['sparse_exact_fwd_speedup']:.2f}x"
+                f" shared_sparse_gemm_custom_masked_fwd_ms={shared_sparse_gemm_summary['custom_masked_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_custom_masked_fwd_speedup={shared_sparse_gemm_summary['custom_masked_fwd_speedup']:.2f}x"
+                f" shared_sparse_gemm_custom_masked_out_max_diff={shared_sparse_gemm_summary['custom_masked_output_max_diff']:.6f}"
+                f" shared_sparse_gemm_custom_masked_out_mean_diff={shared_sparse_gemm_summary['custom_masked_output_mean_diff']:.6f}"
+                f" shared_sparse_gemm_fa4_packed_status={shared_sparse_gemm_summary['fa4_packed_status']}"
+                f" shared_sparse_gemm_fa4_packed_fwd_ms={shared_sparse_gemm_summary['fa4_packed_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_fa4_packed_fwd_speedup={shared_sparse_gemm_summary['fa4_packed_fwd_speedup']:.2f}x"
+                f" shared_sparse_gemm_fa4_packed_out_max_diff={shared_sparse_gemm_summary['fa4_packed_output_max_diff']:.6f}"
+                f" shared_sparse_gemm_fa4_packed_out_mean_diff={shared_sparse_gemm_summary['fa4_packed_output_mean_diff']:.6f}"
+                f" shared_sparse_gemm_shared_cta_status={shared_sparse_gemm_summary['shared_cta_status']}"
+                f" shared_sparse_gemm_shared_cta_qgcta={shared_sparse_gemm_summary['shared_cta_qgroups_per_cta']}"
+                f" shared_sparse_gemm_shared_cta_fwd_ms={shared_sparse_gemm_summary['shared_cta_fwd_ms']:.3f}"
+                f" shared_sparse_gemm_shared_cta_fwd_speedup={shared_sparse_gemm_summary['shared_cta_fwd_speedup']:.2f}x"
+                f" shared_sparse_gemm_shared_cta_out_max_diff={shared_sparse_gemm_summary['shared_cta_output_max_diff']:.6f}"
+                f" shared_sparse_gemm_shared_cta_out_mean_diff={shared_sparse_gemm_summary['shared_cta_output_mean_diff']:.6f}"
+                f" shared_sparse_gemm_main_out_max_diff={shared_sparse_gemm_summary['main_output_max_diff']:.6f}"
+                f" shared_sparse_gemm_main_out_mean_diff={shared_sparse_gemm_summary['main_output_mean_diff']:.6f}"
+                f" shared_sparse_gemm_exact_out_max_diff={shared_sparse_gemm_summary['exact_output_max_diff']:.6f}"
+                f" shared_sparse_gemm_exact_out_mean_diff={shared_sparse_gemm_summary['exact_output_mean_diff']:.6f}"
+                f" shared_sparse_gemm_main_retained_abs={shared_sparse_gemm_summary['main_retained_abs_fraction']:.4f}"
+                f" shared_sparse_gemm_main_retained_l2={shared_sparse_gemm_summary['main_retained_l2_fraction']:.4f}"
+            )
     print(line)
 
 
@@ -3539,9 +3817,13 @@ def main():
 
     if os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD", "0") == "1":
         case_name = os.environ["FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_CASE"]
+        mode = os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_MODE", "full").strip().lower()
         by_name = {candidate.name: candidate for candidate in ALL_CASES}
         try:
-            payload = _benchmark_unpacked_direct_case(by_name[case_name])
+            if mode == "forward_only":
+                payload = _benchmark_unpacked_direct_forward_only_case(by_name[case_name])
+            else:
+                payload = _benchmark_unpacked_direct_case(by_name[case_name])
         except Exception as exc:
             payload = _empty_unpacked_direct_case_result(case_name, status=f"failed_{type(exc).__name__}")
         print(json.dumps(payload), flush=True)

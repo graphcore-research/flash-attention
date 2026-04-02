@@ -1,4 +1,5 @@
 import importlib.util
+import math
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,9 @@ def _safe_cuda_capability():
 
 try:
     from flash_attn.cute import (
+        analyze_hsa_approx_sparse_gemm_forward,
+        analyze_hsa_shared_sparse_gemm_forward,
+        analyze_hsa_sparse24_feasibility,
         hybrid_backward_to_attend_mask,
         backward_packed_masks_to_attend_mask,
         backward_descriptors_to_attend_mask,
@@ -30,9 +34,15 @@ try:
         get_hsa_mask_mod,
         hsa_reference_attention,
         schedule_to_attend_mask,
+        summarize_hsa_approx_sparse_gemm_forward,
+        summarize_hsa_shared_sparse_gemm_forward,
+        summarize_hsa_sparse24_feasibility,
     )
     _IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - import guard for unsupported envs
+    analyze_hsa_approx_sparse_gemm_forward = None
+    analyze_hsa_shared_sparse_gemm_forward = None
+    analyze_hsa_sparse24_feasibility = None
     build_hsa_schedule = None
     backward_descriptors_to_attend_mask = None
     backward_packed_masks_to_attend_mask = None
@@ -47,6 +57,9 @@ except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     get_hsa_mask_mod = None
     hsa_reference_attention = None
     schedule_to_attend_mask = None
+    summarize_hsa_approx_sparse_gemm_forward = None
+    summarize_hsa_shared_sparse_gemm_forward = None
+    summarize_hsa_sparse24_feasibility = None
     _IMPORT_ERROR = exc
 
 
@@ -1621,6 +1634,282 @@ def test_benchmark_hsa_external_hdt_adapter_smoke():
     assert attention_fn is not None or status.startswith(("missing_", "import_failed_", "missing_loader"))
 
 
+def test_hsa_sparse24_dense_block_is_ineligible():
+    from flash_attn.cute.hsa_sparse24_analysis import _classify_mask_matrix
+
+    result = _classify_mask_matrix(torch.ones((4, 4), dtype=torch.bool))
+
+    assert not result["eligible"]
+    assert "dense_segment" in result["failure_reasons"]
+
+
+def test_hsa_sparse24_shared_column_block_is_b_side_eligible():
+    from flash_attn.cute.hsa_sparse24_analysis import _classify_mask_matrix
+
+    mask = torch.tensor(
+        [
+            [1, 0, 1, 0],
+            [1, 0, 1, 0],
+            [1, 0, 1, 0],
+            [1, 0, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+
+    result = _classify_mask_matrix(mask)
+
+    assert result["eligible"]
+    assert result["operand"] == "B"
+    assert result["support_nnz"] == 2
+
+
+def test_hsa_sparse24_row_prefix_block_requires_output_mask():
+    from flash_attn.cute.hsa_sparse24_analysis import _classify_mask_matrix
+
+    mask = torch.tensor(
+        [
+            [1, 0, 0, 0],
+            [1, 1, 0, 0],
+            [1, 1, 1, 0],
+            [1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+
+    result = _classify_mask_matrix(mask)
+
+    assert not result["eligible"]
+    assert "row_dependent_columns" in result["failure_reasons"]
+    assert "requires_output_mask" in result["failure_reasons"]
+
+
+def test_hsa_sparse24_bitmap_row_variation_is_ineligible():
+    from flash_attn.cute.hsa_sparse24_analysis import _classify_mask_matrix
+
+    mask = torch.tensor(
+        [
+            [1, 0, 1, 0],
+            [0, 1, 1, 0],
+            [1, 0, 0, 1],
+            [0, 1, 0, 1],
+        ],
+        dtype=torch.bool,
+    )
+
+    result = _classify_mask_matrix(mask)
+
+    assert not result["eligible"]
+    assert "row_dependent_columns" in result["failure_reasons"]
+    assert "requires_output_mask" in result["failure_reasons"]
+
+
+def test_hsa_approx_sparse_gemm_prunes_top2_of4():
+    from flash_attn.cute.hsa_approx_sparse_gemm_analysis import _prune_dense_matrix_topk_per_group
+
+    x = torch.tensor(
+        [
+            [1.0, -4.0, 3.0, 2.0, -8.0, 7.0, 6.0, -5.0],
+            [-1.0, 2.0, -3.0, 4.0, 5.0, -6.0, 7.0, -8.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    pruned = _prune_dense_matrix_topk_per_group(x, group_size=4, nnz_per_group=2)
+
+    assert pruned.shape == x.shape
+    for row_idx in range(pruned.shape[0]):
+        for group_start in range(0, pruned.shape[1], 4):
+            group = pruned[row_idx, group_start:group_start + 4]
+            assert int((group != 0).sum().item()) == 2
+
+    assert pruned[0, 1].item() == pytest.approx(-4.0)
+    assert pruned[0, 2].item() == pytest.approx(3.0)
+    assert pruned[0, 0].item() == pytest.approx(0.0)
+    assert pruned[0, 3].item() == pytest.approx(0.0)
+
+
+def test_hsa_approx_sparse_gemm_summary_unavailable_status():
+    summary = summarize_hsa_approx_sparse_gemm_forward(
+        {
+            "status": "requires_synthetic_grid",
+            "group_size": 4,
+            "nnz_per_group": 2,
+            "sampled_members": 0,
+            "available_members": 0,
+        }
+    )
+
+    assert summary["status"] == "requires_synthetic_grid"
+    assert summary["group_size"] == 4
+    assert summary["nnz_per_group"] == 2
+    assert summary["sampled_members"] == 0
+    assert math.isnan(summary["dense_qk_ms"])
+
+
+def test_hsa_shared_sparse_gemm_exact_support_grouping_is_deterministic():
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import _group_qgroups_by_exact_support
+
+    entries = [
+        {
+            "qgroup_idx": 7,
+            "packed_q": 2,
+            "q_count": 2,
+            "union_rows": torch.tensor([4, 6], dtype=torch.int32),
+            "mask_words": torch.tensor([0b11, 0b10], dtype=torch.int32),
+        },
+        {
+            "qgroup_idx": 4,
+            "packed_q": 2,
+            "q_count": 1,
+            "union_rows": torch.tensor([9, 11], dtype=torch.int32),
+            "mask_words": torch.tensor([0b01, 0b00], dtype=torch.int32),
+        },
+        {
+            "qgroup_idx": 3,
+            "packed_q": 2,
+            "q_count": 2,
+            "union_rows": torch.tensor([4, 6], dtype=torch.int32),
+            "mask_words": torch.tensor([0b11, 0b10], dtype=torch.int32),
+        },
+    ]
+
+    first = _group_qgroups_by_exact_support(entries, max_qgroups_per_bucket=4)
+    second = _group_qgroups_by_exact_support(list(reversed(entries)), max_qgroups_per_bucket=4)
+
+    first_ids = [group["qgroup_ids"] for group in first]
+    second_ids = [group["qgroup_ids"] for group in second]
+
+    assert first_ids == [[3, 7], [4]]
+    assert second_ids == first_ids
+
+
+def test_hsa_shared_sparse_gemm_greedy_merge_respects_constraints():
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import (
+        _greedy_merge_support_groups,
+        _make_support_group,
+    )
+
+    def _entry(qgroup_idx: int, support_rows: list[int]):
+        return {
+            "qgroup_idx": qgroup_idx,
+            "packed_q": 2,
+            "q_count": 2,
+            "union_rows": torch.tensor(support_rows, dtype=torch.int32),
+            "mask_words": torch.tensor([0b1111, 0b1111], dtype=torch.int32),
+        }
+
+    groups = [
+        _make_support_group([_entry(0, [1, 2, 3, 4])]),
+        _make_support_group([_entry(1, [1, 2, 3, 5])]),
+        _make_support_group([_entry(2, [20, 21, 22, 23])]),
+        _make_support_group([_entry(3, [1, 2, 3, 4])]),
+    ]
+
+    merged = _greedy_merge_support_groups(
+        groups,
+        min_jaccard=0.5,
+        max_support_rows=5,
+        max_qgroups_per_bucket=2,
+    )
+
+    merged_ids = [group["qgroup_ids"] for group in merged]
+
+    assert merged_ids == [[0, 1], [2], [3]]
+    assert len(merged[0]["support_rows"]) == 5
+
+
+def test_hsa_shared_sparse_gemm_coarse_window_merge_grows_buckets():
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import (
+        _coarse_window_merge_support_groups,
+        _encode_mask_rows_to_words,
+        _make_support_group,
+    )
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import _decode_mask_words
+
+    def _entry(qgroup_idx: int, support_rows: list[int]):
+        return {
+            "qgroup_idx": qgroup_idx,
+            "packed_q": 2,
+            "q_count": 2,
+            "union_rows": torch.tensor(support_rows, dtype=torch.int32),
+            "mask_words": torch.tensor([0b1111, 0b1111], dtype=torch.int32),
+        }
+
+    groups = [
+        _make_support_group([_entry(0, [0, 1, 2, 3])]),
+        _make_support_group([_entry(1, [4, 5, 6, 7])]),
+        _make_support_group([_entry(2, [8, 9, 10, 11])]),
+        _make_support_group([_entry(3, [20, 21, 22, 23])]),
+    ]
+
+    merged = _coarse_window_merge_support_groups(
+        groups,
+        max_support_rows=12,
+        max_qgroups_per_bucket=4,
+    )
+
+    merged_ids = [group["qgroup_ids"] for group in merged]
+
+    assert merged_ids == [[0, 1, 2], [3]]
+    assert len(merged[0]["support_rows"]) == 12
+
+    mask_rows = torch.tensor(
+        [
+            [True, False, True, True, False, False, True, False],
+            [False, True, False, False, True, True, False, True],
+        ],
+        dtype=torch.bool,
+    )
+    words = _encode_mask_rows_to_words(mask_rows)
+    decoded = _decode_mask_words(words.flatten(), rows=2, cols=8, words_per_row=words.shape[1])
+    torch.testing.assert_close(decoded, mask_rows)
+
+
+def test_hsa_shared_sparse_gemm_main_plus_residual_reconstructs_dense_qk():
+    from flash_attn.cute.hsa_shared_sparse_gemm_analysis import _split_dense_matrix_main_and_residual
+
+    q = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
+            [0.5, -1.5, 2.5, -3.5, 4.5, -5.5, 6.5, -7.5],
+        ],
+        dtype=torch.float32,
+    )
+    k = torch.tensor(
+        [
+            [1.0, 2.0, -3.0, 4.0, -5.0, 6.0, 7.0, -8.0],
+            [-8.0, 7.0, 6.0, -5.0, 4.0, -3.0, 2.0, 1.0],
+            [2.0, -1.0, 0.5, -0.25, -4.0, 3.0, -2.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    main, residual = _split_dense_matrix_main_and_residual(k, group_size=4, nnz_per_group=2)
+
+    dense_scores = q @ k.transpose(0, 1)
+    split_scores = q @ main.transpose(0, 1) + q @ residual.transpose(0, 1)
+
+    torch.testing.assert_close(split_scores, dense_scores, atol=1e-6, rtol=1e-6)
+
+
+def test_hsa_shared_sparse_gemm_summary_unavailable_status():
+    summary = summarize_hsa_shared_sparse_gemm_forward(
+        {
+            "status": "requires_synthetic_grid",
+            "group_size": 4,
+            "nnz_per_group": 2,
+            "available_qgroups": 0,
+            "sampled_qgroups": 0,
+        }
+    )
+
+    assert summary["status"] == "requires_synthetic_grid"
+    assert summary["group_size"] == 4
+    assert summary["nnz_per_group"] == 2
+    assert summary["sampled_qgroups"] == 0
+    assert math.isnan(summary["dense_qk_ms"])
+
+
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_synthetic_grid_runtime_builds_metadata(monkeypatch):
     import flash_attn.cute.hsa as hsa_module
@@ -1643,6 +1932,230 @@ def test_hsa_synthetic_grid_runtime_builds_metadata(monkeypatch):
     assert runtime.synthetic_grid.num_tiles > 0
     assert runtime.forward_synthetic_grid.forward_execution_plan is not None
     assert runtime.forward_synthetic_grid.forward_execution_plan["bucket_size"]
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_approx_sparse_gemm_forward_summary_runs_on_runtime_metadata(monkeypatch):
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "32")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "1")
+
+    report = analyze_hsa_approx_sparse_gemm_forward(
+        schedule,
+        q,
+        k,
+        v,
+        use_synthetic_grid=True,
+        warmup_iters=0,
+        benchmark_iters=1,
+        max_members=8,
+    )
+    summary = summarize_hsa_approx_sparse_gemm_forward(report)
+
+    assert summary["status"] == "measured"
+    assert summary["sampled_members"] > 0
+    assert math.isfinite(summary["dense_qk_ms"])
+    assert math.isfinite(summary["sparse_qk_precompressed_ms"])
+    assert math.isfinite(summary["dense_fwd_ms"])
+    assert math.isfinite(summary["sparse_fwd_precompressed_ms"])
+    assert summary["output_max_diff"] >= 0.0
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("case_name", ["mixed-small", "train-eq", "train-gqa"])
+def test_hsa_shared_sparse_gemm_forward_summary_runs_on_benchmark_cases(monkeypatch, case_name):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == case_name)
+    schedule, _keep_ids, _hash_ids, q, k, v = benchmark_hsa._build_case_tensors(case)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "64")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "1")
+
+    report = analyze_hsa_shared_sparse_gemm_forward(
+        schedule,
+        q,
+        k,
+        v,
+        use_synthetic_grid=True,
+        warmup_iters=0,
+        benchmark_iters=1,
+        max_buckets=4,
+        max_qgroups=16,
+    )
+    summary = summarize_hsa_shared_sparse_gemm_forward(report)
+
+    assert summary["status"] == "measured"
+    assert summary["bucket_count"] > 0
+    assert summary["sampled_qgroups"] > 0
+    assert math.isfinite(summary["dense_qk_ms"])
+    assert math.isfinite(summary["sparse_main_qk_ms"])
+    assert math.isfinite(summary["sparse_exact_qk_ms"])
+    assert math.isfinite(summary["dense_fwd_ms"])
+    assert math.isfinite(summary["sparse_main_fwd_ms"])
+    assert math.isfinite(summary["sparse_exact_fwd_ms"])
+    assert summary["exact_output_max_diff"] >= 0.0
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_benchmark_hsa_shared_sparse_gemm_summary_is_read_only(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "64")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_WARMUP_ITERS", "0")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_BENCH_ITERS", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_BUCKETS", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_QGROUPS", "16")
+
+    env_updates = {
+        "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID": "1",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q": "2",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K": "2",
+        "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K": "64",
+        "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS": "1",
+    }
+
+    out_before = benchmark_hsa._run_sparse_attention(
+        q,
+        k,
+        v,
+        keep_ids,
+        hash_ids,
+        schedule,
+        env_updates=env_updates,
+    )
+    summary = benchmark_hsa._get_shared_sparse_gemm_forward_summary(
+        schedule,
+        q,
+        k,
+        v,
+        use_synthetic_grid=True,
+    )
+    out_after = benchmark_hsa._run_sparse_attention(
+        q,
+        k,
+        v,
+        keep_ids,
+        hash_ids,
+        schedule,
+        env_updates=env_updates,
+    )
+
+    assert summary["status"] == "measured"
+    assert summary["bucket_count"] > 0
+    _assert_close(out_before.float(), out_after.float(), "benchmark_shared_sparse_gemm_summary_read_only")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse24_analysis_summary_runs_on_runtime_metadata(monkeypatch):
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "4")
+
+    report = analyze_hsa_sparse24_feasibility(schedule, q, k, use_synthetic_grid=True)
+    summary = summarize_hsa_sparse24_feasibility(report)
+
+    assert report["physical"]["summary"]["segments"] > 0
+    assert summary["physical_segments"] > 0
+    assert summary["synthetic_segments"] > 0
+    assert summary["synthetic_direct_segments"] >= 0
+    for value in summary.values():
+        if isinstance(value, float):
+            assert math.isfinite(value)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_benchmark_hsa_sparse24_summary_is_read_only(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    env_updates: dict[str, str] = {}
+    out_before = benchmark_hsa._run_sparse_attention(
+        q,
+        k,
+        v,
+        keep_ids,
+        hash_ids,
+        schedule,
+        env_updates=env_updates,
+    )
+    summary = benchmark_hsa._get_sparse24_feasibility_summary(schedule, q, k, use_synthetic_grid=False)
+    out_after = benchmark_hsa._run_sparse_attention(
+        q,
+        k,
+        v,
+        keep_ids,
+        hash_ids,
+        schedule,
+        env_updates=env_updates,
+    )
+
+    assert summary["physical_segments"] > 0
+    assert summary["synthetic_segments"] == 0
+    _assert_close(out_before.float(), out_after.float(), "benchmark_sparse24_summary_read_only")
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_sparse24_runtime_bitmap_partial_tile_is_ineligible():
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    report = analyze_hsa_sparse24_feasibility(schedule, q, k, use_synthetic_grid=False)
+    bitmap_segments = [
+        segment
+        for segment in report["physical"]["segments"]
+        if segment["segment_kind"] == "partial_tile" and segment["mask_kind"] == "bitmap"
+    ]
+
+    assert bitmap_segments
+    assert any(
+        "row_dependent_columns" in segment["failure_reasons"] and not segment["eligible"]
+        for segment in bitmap_segments
+    )
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -1752,6 +2265,55 @@ def test_hsa_synthetic_grid_2x2_builds_segmented_direct_plan(monkeypatch, batch_
     assert len(direct_plan["bucket_packed_k"]) >= 1
     assert all(1 <= num_segments <= 4 for num_segments in direct_plan["qgroup_bucket_num_segments"])
     assert any(num_segments > 1 for num_segments in direct_plan["qgroup_bucket_num_segments"])
+    assert direct_plan["row_compact_plan"] is None
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("logical_block_k", [2, 4])
+def test_hsa_synthetic_grid_segmented_sparse_parse_flag_rebuilds_row_compact_plan(monkeypatch, logical_block_k):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", str(logical_block_k))
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "4")
+    monkeypatch.delenv("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD", raising=False)
+
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+
+    metadata = runtime.forward_synthetic_grid
+    assert metadata is not None
+    direct_plan = metadata.forward_execution_plan["direct_execution_plan"]
+    assert direct_plan is not None
+    assert metadata.sparse_parse_fwd is False
+    assert direct_plan["row_compact_plan"] is None
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD", "1")
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+
+    metadata = runtime.forward_synthetic_grid
+    assert metadata is not None
+    direct_plan = metadata.forward_execution_plan["direct_execution_plan"]
+    assert direct_plan is not None
+    assert metadata.sparse_parse_fwd is True
+    row_plan = direct_plan["row_compact_plan"]
+    assert row_plan is not None
+    if logical_block_k > 2:
+        assert direct_plan["union_row_compact_plan"] is not None
+    else:
+        assert direct_plan["union_row_compact_plan"] is None
+    assert max(direct_plan["qgroup_bucket_num_segments"]) > 1
+    assert max(row_plan["bucket_row_k_cap"]) <= int(row_plan["row_k_cap_limit"])
+    assert row_plan["bucket_row_k_length"].numel() > 0
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -1826,6 +2388,163 @@ def test_hsa_synthetic_grid_matches_sparse_path(
     _assert_close(out_synth.float(), out_base.float(), f"{label}_synthetic_grid_output_vs_sparse")
     _assert_close(out_synth.float(), out_ref.float(), f"{label}_synthetic_grid_output_vs_ref")
     _assert_finite_gradients(f"{label}_synthetic_grid_grads", q_synth, k_synth, v_synth)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("logical_block_k", [2, 4])
+def test_hsa_synthetic_grid_segmented_sparse_parse_forward_matches_sparse_path(monkeypatch, logical_block_k):
+    import flash_attn.cute.hsa as hsa_module
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    label = f"mixed_small_segmented_sparse_parse_2x{logical_block_k}"
+    batch_size, seqlen, nheads, headdim, n_kv_heads = 1, 65, 4, 64, 4
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", raising=False)
+    baseline = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+    out_base, _, _, _, out_ref, _, _, _ = baseline
+
+    calls = {"row_compact": 0, "combine": 0}
+    original_row_compact = synthetic_module._run_synthetic_direct_row_micro_fwd_kernel
+    original_combine = synthetic_module._run_synthetic_direct_combine_rows_kernel
+
+    def _tracked_row_compact(*args, **kwargs):
+        calls["row_compact"] += 1
+        return original_row_compact(*args, **kwargs)
+
+    def _tracked_combine(*args, **kwargs):
+        calls["combine"] += 1
+        return original_combine(*args, **kwargs)
+
+    _tracked_row_compact.compile_cache = original_row_compact.compile_cache
+    _tracked_combine.compile_cache = original_combine.compile_cache
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_fwd_kernel", _tracked_row_compact)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_combine_rows_kernel", _tracked_combine)
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", str(logical_block_k))
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+    metadata = runtime.forward_synthetic_grid
+    assert metadata is not None
+    direct_plan = metadata.forward_execution_plan["direct_execution_plan"]
+    assert direct_plan is not None
+    out_sparse_parse, q_parse, k_parse, v_parse, _, _, _, _ = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    assert calls["row_compact"] > 0
+    if logical_block_k > 2:
+        assert direct_plan["union_row_compact_plan"] is not None
+        assert calls["combine"] == 0
+    else:
+        assert direct_plan["union_row_compact_plan"] is None
+        assert calls["combine"] > 0
+    _assert_close(out_sparse_parse.float(), out_base.float(), f"{label}_output_vs_sparse")
+    _assert_close(out_sparse_parse.float(), out_ref.float(), f"{label}_output_vs_ref")
+    _assert_finite_gradients(f"{label}_grads", q_parse, k_parse, v_parse)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_grid_segmented_sparse_parse_packed_kv_forward_matches_sparse_path(monkeypatch):
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    label = "mixed_small_segmented_sparse_parse_2x4_packed_kv"
+    batch_size, seqlen, nheads, headdim, n_kv_heads = 1, 65, 4, 64, 4
+    device = "cuda"
+    dtype = torch.bfloat16
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    q_data = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    k_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_data = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", raising=False)
+    baseline = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+    out_base, _, _, _, out_ref, _, _, _ = baseline
+
+    calls = {"packed_kv": 0, "combine": 0}
+    original_packed_kv = synthetic_module._run_synthetic_direct_row_micro_fwd_packed_kv_kernel
+    original_combine = synthetic_module._run_synthetic_direct_combine_rows_kernel
+
+    def _tracked_packed_kv(*args, **kwargs):
+        calls["packed_kv"] += 1
+        return original_packed_kv(*args, **kwargs)
+
+    def _tracked_combine(*args, **kwargs):
+        calls["combine"] += 1
+        return original_combine(*args, **kwargs)
+
+    _tracked_packed_kv.compile_cache = original_packed_kv.compile_cache
+    _tracked_combine.compile_cache = original_combine.compile_cache
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_row_micro_fwd_packed_kv_kernel", _tracked_packed_kv)
+    monkeypatch.setattr(synthetic_module, "_run_synthetic_direct_combine_rows_kernel", _tracked_combine)
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_PACKED_KV_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "1")
+    out_sparse_parse, q_parse, k_parse, v_parse, _, _, _, _ = _run_mixed_sparse_mask_case(
+        batch_size=batch_size,
+        seqlen=seqlen,
+        nheads=nheads,
+        headdim=headdim,
+        n_kv_heads=n_kv_heads,
+        keep_ids=keep_ids,
+        hash_ids=hash_ids,
+        q_data=q_data,
+        k_data=k_data,
+        v_data=v_data,
+    )
+
+    assert calls["packed_kv"] > 0
+    assert calls["combine"] == 0
+    _assert_close(out_sparse_parse.float(), out_base.float(), f"{label}_output_vs_sparse")
+    _assert_close(out_sparse_parse.float(), out_ref.float(), f"{label}_output_vs_ref")
+    _assert_finite_gradients(f"{label}_grads", q_parse, k_parse, v_parse)
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
@@ -3410,6 +4129,385 @@ def test_hsa_synthetic_grid_gqa_falls_back(monkeypatch):
     )
     _assert_close(out_sparse.float(), out_ref.float(), "train_gqa_synthetic_grid_fallback_output")
     _assert_finite_gradients("train_gqa_synthetic_grid_fallback_grads", q_grad, k_grad, v_grad)
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_unpacked_direct_fwd_flag_disables_synthetic_grid(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    assert hsa_module._can_use_hsa_synthetic_grid_for_inputs(schedule, q, k) is True
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "1")
+    assert hsa_module._can_use_hsa_synthetic_grid_for_inputs(schedule, q, k) is False
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_blocksparse_forward_unpacked_direct_flag_routes_direct_kernel(monkeypatch):
+    import flash_attn.cute.flash_hsa_fwd_sm100 as hsa_fwd_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 1, 65, 4, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    sentinel_out = torch.full_like(v, 0.25)
+    sentinel_lse = torch.full((batch_size, nheads, seqlen), -3.0, dtype=torch.float32, device=device)
+    calls = {"direct": 0}
+
+    def _tracked_direct(*args, **kwargs):
+        calls["direct"] += 1
+        return sentinel_out, sentinel_lse
+
+    monkeypatch.setattr(hsa_fwd_module, "_run_hsa_fwd_sm100_direct", _tracked_direct)
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0")
+
+    out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
+        hsa_fwd_module.run_hsa_fwd_sm100_blocksparse(q, k, v, schedule, 1.0 / math.sqrt(headdim))
+    )
+
+    assert calls["direct"] == 1
+    assert torch.equal(out, sentinel_out)
+    assert torch.equal(lse, sentinel_lse)
+    assert sentence_lse.numel() == 0
+    assert sentence_q_stream.numel() == 0
+    assert sentence_k_stream.numel() == 0
+    assert sentence_v_stream.numel() == 0
+    assert sentence_out_stream.numel() == 0
+
+
+def test_benchmark_hsa_unpacked_direct_env_sets_flag():
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "mixed-small")
+
+    env = benchmark_hsa._unpacked_direct_fwd_env(case)
+
+    assert env["FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD"] == "1"
+    assert env["FLASH_ATTN_HSA_USE_SYNTHETIC_GRID"] == "0"
+    assert env["FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD"] == "0"
+
+
+def test_benchmark_hsa_unpacked_direct_compare_mode(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "compare")
+    assert benchmark_hsa._use_unpacked_direct_compare_mode() is True
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "sweep")
+    assert benchmark_hsa._use_unpacked_direct_compare_mode() is True
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "1")
+    assert benchmark_hsa._use_unpacked_direct_compare_mode() is False
+
+
+def test_benchmark_hsa_approx_sparse_gemm_summary_helper(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+
+    captured = {}
+
+    def _fake_analyze(schedule, q, k, v, **kwargs):
+        captured["args"] = (schedule, q, k, v)
+        captured["kwargs"] = kwargs
+        return {"status": "measured", "dense_qk_ms": 1.0}
+
+    def _fake_summarize(report):
+        assert report["dense_qk_ms"] == pytest.approx(1.0)
+        return {"status": report["status"], "dense_qk_ms": report["dense_qk_ms"]}
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_MAX_BUCKETS", "7")
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_MAX_MEMBERS", "11")
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_WARMUP_ITERS", "3")
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_BENCH_ITERS", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_GROUP_SIZE", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_APPROX_SPARSE_GEMM_NNZ_PER_GROUP", "2")
+
+    import flash_attn.cute.hsa_approx_sparse_gemm_analysis as approx_module
+
+    monkeypatch.setattr(approx_module, "analyze_hsa_approx_sparse_gemm_forward", _fake_analyze)
+    monkeypatch.setattr(approx_module, "summarize_hsa_approx_sparse_gemm_forward", _fake_summarize)
+
+    q = torch.zeros(1, 1, 1, 64)
+    summary = benchmark_hsa._get_approx_sparse_gemm_forward_summary(
+        "schedule",
+        q,
+        q,
+        q,
+        use_synthetic_grid=True,
+    )
+
+    assert summary["status"] == "measured"
+    assert summary["dense_qk_ms"] == pytest.approx(1.0)
+    assert captured["kwargs"]["use_synthetic_grid"] is True
+    assert captured["kwargs"]["max_buckets"] == 7
+    assert captured["kwargs"]["max_members"] == 11
+    assert captured["kwargs"]["warmup_iters"] == 3
+    assert captured["kwargs"]["benchmark_iters"] == 4
+
+
+def test_benchmark_hsa_shared_sparse_gemm_summary_helper(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+
+    captured = {}
+
+    def _fake_analyze(schedule, q, k, v, **kwargs):
+        captured["args"] = (schedule, q, k, v)
+        captured["kwargs"] = kwargs
+        return {"status": "measured", "dense_qk_ms": 1.0}
+
+    def _fake_summarize(report):
+        assert report["dense_qk_ms"] == pytest.approx(1.0)
+        return {"status": report["status"], "dense_qk_ms": report["dense_qk_ms"]}
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_GROUP_SIZE", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_NNZ_PER_GROUP", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_BUCKETIZER", "coarse_window")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MIN_JACCARD", "0.75")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_SUPPORT_ROWS", "96")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_QGROUPS_PER_BUCKET", "9")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_BUCKETS", "7")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_MAX_QGROUPS", "11")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_WARMUP_ITERS", "3")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_BENCH_ITERS", "4")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_SEMI_STRUCTURED", "0")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_CUSTOM_MASKED", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_FA4_PACKED", "0")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_ENABLE_SHARED_CTA", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SHARED_SPARSE_GEMM_SHARED_CTA_QGROUPS_PER_CTA", "8")
+
+    import flash_attn.cute.hsa_shared_sparse_gemm_analysis as shared_module
+
+    monkeypatch.setattr(shared_module, "analyze_hsa_shared_sparse_gemm_forward", _fake_analyze)
+    monkeypatch.setattr(shared_module, "summarize_hsa_shared_sparse_gemm_forward", _fake_summarize)
+
+    q = torch.zeros(1, 1, 1, 64)
+    summary = benchmark_hsa._get_shared_sparse_gemm_forward_summary(
+        "schedule",
+        q,
+        q,
+        q,
+        use_synthetic_grid=True,
+    )
+
+    assert summary["status"] == "measured"
+    assert summary["dense_qk_ms"] == pytest.approx(1.0)
+    assert captured["kwargs"]["use_synthetic_grid"] is True
+    assert captured["kwargs"]["group_size"] == 4
+    assert captured["kwargs"]["nnz_per_group"] == 2
+    assert captured["kwargs"]["bucketizer"] == "coarse_window"
+    assert captured["kwargs"]["min_jaccard"] == pytest.approx(0.75)
+    assert captured["kwargs"]["max_support_rows"] == 96
+    assert captured["kwargs"]["max_qgroups_per_bucket"] == 9
+    assert captured["kwargs"]["max_buckets"] == 7
+    assert captured["kwargs"]["max_qgroups"] == 11
+    assert captured["kwargs"]["warmup_iters"] == 3
+    assert captured["kwargs"]["benchmark_iters"] == 4
+    assert captured["kwargs"]["enable_sparse_payload"] is False
+    assert captured["kwargs"]["enable_custom_masked"] is True
+    assert captured["kwargs"]["enable_fa4_packed"] is False
+    assert captured["kwargs"]["enable_shared_cta"] is True
+    assert captured["kwargs"]["shared_cta_qgroups_per_cta"] == 8
+
+
+def test_benchmark_hsa_unpacked_direct_correctness_policy():
+    benchmark_hsa = _load_benchmark_hsa_module()
+    mixed_small = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "mixed-small")
+    long_16k = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-16k")
+    long_32k = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-32k")
+    long_64k = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-64k")
+
+    assert benchmark_hsa._should_validate_unpacked_direct_outputs(mixed_small) is True
+    assert benchmark_hsa._should_validate_unpacked_direct_outputs(long_16k) is True
+    assert benchmark_hsa._should_validate_unpacked_direct_outputs(long_32k) is True
+    assert benchmark_hsa._should_validate_unpacked_direct_outputs(long_64k) is False
+
+
+def test_benchmark_hsa_unpacked_direct_case_summary(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "mixed-small")
+    q_data = torch.zeros(1, 1, 1, 1)
+    k_data = torch.zeros(1, 1, 1, 1)
+    v_data = torch.zeros(1, 1, 1, 1)
+
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_build_case_tensors",
+        lambda _: ("schedule", "keep_ids", "hash_ids", q_data, k_data, v_data),
+    )
+
+    def _fake_measure(_forward_fn, _q, _k, _v, _warmup_iters, _benchmark_iters, *, env_updates=None):
+        env_updates = env_updates or {}
+        if env_updates.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD") == "1":
+            return {
+                "fwd_ms": 8.0,
+                "bwd_ms": 14.0,
+                "fwd_bwd_ms": 22.0,
+                "status": "measured",
+            }
+        return {
+            "fwd_ms": 4.0,
+            "bwd_ms": 14.0,
+            "fwd_bwd_ms": 18.0,
+            "status": "measured",
+        }
+
+    monkeypatch.setattr(benchmark_hsa, "_measure_triplet_or_status", _fake_measure)
+
+    def _fake_run_sparse_attention(_q, _k, _v, _keep_ids, _hash_ids, _schedule, *, env_updates=None):
+        env_updates = env_updates or {}
+        fill_value = 2.0 if env_updates.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD") == "1" else 1.0
+        return torch.full_like(v_data, fill_value)
+
+    monkeypatch.setattr(benchmark_hsa, "_run_sparse_attention", _fake_run_sparse_attention)
+
+    result = benchmark_hsa._benchmark_unpacked_direct_case(case)
+    line = benchmark_hsa._format_unpacked_direct_case_report(result)
+
+    assert result["case"] == "mixed-small"
+    assert result["plain_sparse_fwd_ms"] == pytest.approx(4.0)
+    assert result["unpacked_direct_fwd_ms"] == pytest.approx(8.0)
+    assert result["speedup"] == pytest.approx(0.5)
+    assert result["correctness_status"] == "measured"
+    assert result["max_diff"] == pytest.approx(1.0)
+    assert result["mean_diff"] == pytest.approx(1.0)
+    assert result["status"] == "measured"
+    assert "plain_sparse_fwd_ms=4.000" in line
+    assert "unpacked_direct_fwd_ms=8.000" in line
+    assert "plain_sparse_fwd_vs_unpacked_direct=0.500x" in line
+
+
+def test_benchmark_hsa_unpacked_direct_long_case_skips_correctness(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-64k")
+    q_data = torch.zeros(1, 1, 1, 1)
+    k_data = torch.zeros(1, 1, 1, 1)
+    v_data = torch.zeros(1, 1, 1, 1)
+
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_build_case_tensors",
+        lambda _: ("schedule", "keep_ids", "hash_ids", q_data, k_data, v_data),
+    )
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_measure_triplet_or_status",
+        lambda *_args, **_kwargs: {
+            "fwd_ms": 3.0,
+            "bwd_ms": 5.0,
+            "fwd_bwd_ms": 8.0,
+            "status": "measured",
+        },
+    )
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_run_sparse_attention",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("correctness path should be skipped")),
+    )
+
+    result = benchmark_hsa._benchmark_unpacked_direct_case(case)
+
+    assert result["correctness_status"] == "skipped_long_gt_32k"
+    assert result["max_diff"] is None
+    assert result["mean_diff"] is None
+
+
+def test_benchmark_hsa_unpacked_direct_case_subprocess_success(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "mixed-small")
+
+    class _Completed:
+        returncode = 0
+        stdout = '{"case":"mixed-small","status":"measured","plain_sparse_status":"measured","unpacked_direct_status":"measured","correctness_status":"measured"}\n'
+        stderr = ""
+
+    monkeypatch.setattr(benchmark_hsa.subprocess, "run", lambda *args, **kwargs: _Completed())
+
+    result = benchmark_hsa._run_unpacked_direct_case_subprocess(case)
+
+    assert result["case"] == "mixed-small"
+    assert result["status"] == "measured"
+
+
+def test_benchmark_hsa_unpacked_direct_case_subprocess_failure(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-2M")
+
+    class _Completed:
+        returncode = 137
+        stdout = ""
+        stderr = "killed\n"
+
+    monkeypatch.setattr(benchmark_hsa.subprocess, "run", lambda *args, **kwargs: _Completed())
+
+    result = benchmark_hsa._run_unpacked_direct_case_subprocess(case)
+
+    assert result["case"] == "long-2M"
+    assert result["status"].startswith("child_exit_137")
+    assert result["plain_sparse_fwd_ms"] is None
+    assert result["unpacked_direct_fwd_ms"] is None
+
+
+def test_benchmark_hsa_unpacked_direct_case_subprocess_timeout(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-1M")
+
+    def _raise_timeout(*args, **kwargs):
+        raise benchmark_hsa.subprocess.TimeoutExpired(cmd="python", timeout=42.0)
+
+    monkeypatch.setattr(benchmark_hsa.subprocess, "run", _raise_timeout)
+    monkeypatch.setenv("FLASH_ATTN_HSA_UNPACKED_DIRECT_CHILD_TIMEOUT_S", "42")
+
+    result = benchmark_hsa._run_unpacked_direct_case_subprocess(case)
+
+    assert result["case"] == "long-1M"
+    assert result["status"] == "child_timeout_42s"
+
+
+def test_benchmark_hsa_unpacked_direct_forward_only_case_summary(monkeypatch):
+    benchmark_hsa = _load_benchmark_hsa_module()
+    case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "long-64k")
+    q_data = torch.zeros(1, 1, 1, 1)
+    k_data = torch.zeros(1, 1, 1, 1)
+    v_data = torch.zeros(1, 1, 1, 1)
+
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_build_case_tensors",
+        lambda _: ("schedule", "keep_ids", "hash_ids", q_data, k_data, v_data),
+    )
+
+    def _fake_measure_forward(_forward_fn, _q, _k, _v, _warmup_iters, _benchmark_iters, *, env_updates=None):
+        env_updates = env_updates or {}
+        if env_updates.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD") == "1":
+            return 7.5
+        return 9.0
+
+    monkeypatch.setattr(benchmark_hsa, "_measure_forward_ms", _fake_measure_forward)
+    monkeypatch.setattr(
+        benchmark_hsa,
+        "_run_sparse_attention",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("correctness should be skipped for long-64k")),
+    )
+
+    result = benchmark_hsa._benchmark_unpacked_direct_forward_only_case(case)
+
+    assert result["case"] == "long-64k"
+    assert result["plain_sparse_fwd_ms"] == pytest.approx(9.0)
+    assert result["unpacked_direct_fwd_ms"] == pytest.approx(7.5)
+    assert result["speedup"] == pytest.approx(1.2)
+    assert result["plain_sparse_bwd_ms"] is None
+    assert result["unpacked_direct_bwd_ms"] is None
+    assert result["correctness_status"] == "skipped_long_gt_32k"
+    assert result["mode"] == "forward_only"
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")

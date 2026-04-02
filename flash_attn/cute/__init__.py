@@ -30,6 +30,18 @@ from .hsa import (
     hsa_sparse_reference_attention,
     schedule_to_attend_mask,
 )
+from .hsa_sparse24_analysis import (
+    analyze_hsa_sparse24_feasibility,
+    summarize_hsa_sparse24_feasibility,
+)
+from .hsa_approx_sparse_gemm_analysis import (
+    analyze_hsa_approx_sparse_gemm_forward,
+    summarize_hsa_approx_sparse_gemm_forward,
+)
+from .hsa_shared_sparse_gemm_analysis import (
+    analyze_hsa_shared_sparse_gemm_forward,
+    summarize_hsa_shared_sparse_gemm_forward,
+)
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
 
@@ -55,4 +67,10 @@ __all__ = [
     "hsa_reference_attention",
     "hsa_sparse_reference_attention",
     "HSASchedule",
+    "analyze_hsa_sparse24_feasibility",
+    "summarize_hsa_sparse24_feasibility",
+    "analyze_hsa_approx_sparse_gemm_forward",
+    "summarize_hsa_approx_sparse_gemm_forward",
+    "analyze_hsa_shared_sparse_gemm_forward",
+    "summarize_hsa_shared_sparse_gemm_forward",
 ]

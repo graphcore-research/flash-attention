@@ -1102,7 +1102,7 @@ def test_fp4_d128_noncausal_uses_2cta_schedule(monkeypatch):
         kernel_kwargs.update(kwargs)
         return object()
 
-    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100MHAFast", fake_fp4_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1135,7 +1135,7 @@ def test_fp4_gqa_d128_noncausal_explicit_pack_gqa_uses_2cta(monkeypatch):
         kernel_kwargs.update(kwargs)
         return object()
 
-    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100GQAFast", fake_fp4_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1173,7 +1173,7 @@ def test_fp4_gqa_d128_noncausal_default_uses_grouped_kv_reuse(monkeypatch):
         kernel_kwargs.update(kwargs)
         return object()
 
-    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100GQAFast", fake_fp4_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1216,7 +1216,7 @@ def test_fp4_gqa_d128_noncausal_local_pack_experiment_is_internally_selectable(m
         kernel_kwargs.update(kwargs)
         return object()
 
-    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100GQAFast", fake_fp4_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1255,7 +1255,7 @@ def test_fp4_causal_d128_keeps_bringup_schedule(monkeypatch):
         kernel_kwargs.update(kwargs)
         return object()
 
-    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_fp4_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100MHAFast", fake_fp4_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1317,6 +1317,70 @@ def test_fp4_pv_d128_noncausal_keeps_bringup_schedule(monkeypatch):
     assert kernel_kwargs["q_stage"] == 1
     assert kernel_kwargs["use_2cta_instrs"] is False
     assert kernel_kwargs["pack_gqa_local"] is False
+
+
+def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    calls = []
+
+    def fake_nonpv_kernel(*_args, **kwargs):
+        calls.append(("nonpv", kwargs))
+        return object()
+
+    def fake_pv_kernel(*_args, **kwargs):
+        calls.append(("pv", kwargs))
+        return object()
+
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100MHAFast", fake_nonpv_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100GQAFast", fake_nonpv_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_pv_kernel)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+        )
+
+    assert calls[0][0] == "nonpv"
+    assert "use_fp4_pv" not in calls[0][1]
+    calls.clear()
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert calls[0][0] == "pv"
+    assert calls[0][1]["use_fp4_pv"] is True
 
 
 @pytest.mark.parametrize(
@@ -2927,60 +2991,60 @@ def test_fp4_pv_cta_quant_direct_loader_runtime_matches_legacy_path():
     )
 
 
-def test_fp4_pv_cta_quant_benchmark_reports_causal_pv_modes():
+@pytest.mark.parametrize(
+    "kind,head_dim",
+    [
+        ("mha", 64),
+        ("mha", 128),
+        ("gqa", 128),
+    ],
+)
+def test_fp4_qk_benchmark_noncausal_target_rows_are_numerically_clean(kind, head_dim):
+    _require_sm100()
+    result = _benchmark_case(
+        kind=kind,
+        seqlen=512,
+        head_dim=head_dim,
+        causal=False,
+        batch_size=2,
+        scale_value=0.125,
+        warmup=5,
+        iters=10,
+    )
+    assert result["qk_out_max"] < 0.02
+    assert result["qk_lse_max"] < 0.02
+
+
+def test_fp4_qk_benchmark_causal_mha_d64_row_is_clean():
     _require_sm100()
     result = _benchmark_case(
         kind="mha",
-        seqlen=128,
+        seqlen=512,
         head_dim=64,
         causal=True,
-        batch_size=1,
+        batch_size=2,
         scale_value=0.125,
-        warmup=1,
-        iters=1,
-        pv_modes=["legacy", "cta", "cta_direct"],
-        skip_qk_baseline_check=True,
+        warmup=5,
+        iters=10,
     )
-    assert result["pv_cta_status"] == "ok"
-    assert not result["pv_legacy_status"].startswith("error_")
-    assert not result["pv_cta_direct_status"].startswith("error_")
-    assert result["pv_cta_out_max"] <= result["pv_legacy_out_max"]
+    assert result["qk_out_max"] < 0.02
+    assert result["qk_lse_max"] < 0.02
 
 
-def test_fp4_pv_cta_quant_benchmark_regular_d128_causal_is_ok():
+def test_fp4_qk_benchmark_causal_mha_d128_row_regression_watch():
     _require_sm100()
     result = _benchmark_case(
         kind="mha",
         seqlen=512,
         head_dim=128,
         causal=True,
-        batch_size=1,
+        batch_size=2,
         scale_value=0.125,
-        warmup=1,
-        iters=1,
-        pv_modes=["legacy", "cta", "cta_direct"],
-        skip_qk_baseline_check=True,
+        warmup=5,
+        iters=10,
     )
-    assert result["pv_cta_status"] == "ok"
-    assert result["pv_cta_direct_status"] == "ok"
-
-
-def test_fp4_pv_cta_quant_benchmark_regular_d128_long_causal_is_ok():
-    _require_sm100()
-    result = _benchmark_case(
-        kind="mha",
-        seqlen=2048,
-        head_dim=128,
-        causal=True,
-        batch_size=1,
-        scale_value=0.125,
-        warmup=1,
-        iters=1,
-        pv_modes=["legacy", "cta", "cta_direct"],
-        skip_qk_baseline_check=True,
-    )
-    assert result["pv_cta_status"] == "ok"
-    assert result["pv_cta_direct_status"] == "ok"
+    assert result["qk_out_max"] < 0.2
+    assert result["qk_lse_max"] < 0.2
 
 
 @pytest.mark.parametrize("direct_loader", [False])

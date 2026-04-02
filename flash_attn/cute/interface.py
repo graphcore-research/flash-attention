@@ -49,21 +49,57 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_fp4_tensor, to_cute_fp4_vt_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
+    to_cute_tensor, to_cute_fp4_tensor, to_cute_fp4_tensor_qkfast, to_cute_fp4_vt_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
     get_aux_tensor_metadata, get_broadcast_dims,
+)
+from flash_attn.cute.cute_dsl_utils_qkfast import (
+    to_cute_tensor as to_cute_tensor_qkfast_legacy,
+    to_cute_fp4_tensor as to_cute_fp4_tensor_qkfast_legacy,
+    to_tvm_ffi_fp4x2_tensor as to_tvm_ffi_fp4x2_tensor_qkfast_legacy,
+    to_tvm_ffi_float8_tensor as to_tvm_ffi_float8_tensor_qkfast_legacy,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn.cute.fp4_flash_fwd_sm100 import FP4FlashAttentionForwardSm100
-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.fp4_flash_bwd_sm100 import FlashAttentionBackwardSm100 as FP4FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+try:
+    from flash_attn.cute.fp4_flash_fwd_sm100 import FP4FlashAttentionForwardSm100
+    _fp4_flash_fwd_sm100_import_error = None
+except Exception as exc:
+    FP4FlashAttentionForwardSm100 = None
+    _fp4_flash_fwd_sm100_import_error = exc
+
+try:
+    from flash_attn.cute.fp4_flash_fwd_sm100_mhafast import FP4FlashAttentionForwardSm100MHAFast
+    _fp4_flash_fwd_sm100_mhafast_import_error = None
+except Exception as exc:
+    FP4FlashAttentionForwardSm100MHAFast = None
+    _fp4_flash_fwd_sm100_mhafast_import_error = exc
+
+try:
+    from flash_attn.cute.fp4_flash_fwd_sm100_gqafast import FP4FlashAttentionForwardSm100GQAFast
+    _fp4_flash_fwd_sm100_gqafast_import_error = None
+except Exception as exc:
+    FP4FlashAttentionForwardSm100GQAFast = None
+    _fp4_flash_fwd_sm100_gqafast_import_error = exc
+try:
+    from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+    from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+    from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+    from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+    from flash_attn.cute.fp4_flash_bwd_sm100 import FlashAttentionBackwardSm100 as FP4FlashAttentionBackwardSm100
+    from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
+    from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+    _flash_bwd_import_error = None
+except Exception as exc:
+    FlashAttentionBackwardPreprocess = None
+    FlashAttentionBackwardSm80 = None
+    FlashAttentionBackwardSm90 = None
+    FlashAttentionBackwardSm100 = None
+    FP4FlashAttentionBackwardSm100 = None
+    FlashAttentionBackwardSm120 = None
+    FlashAttentionBackwardPostprocess = None
+    _flash_bwd_import_error = exc
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 from flash_attn.cute.block_sparsity import (
@@ -1479,6 +1515,20 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    is_fp4_nonpv_fast = is_fp4_qk and not is_fp4_pv
+    is_fp4_nonpv_gqa_fast = is_fp4_nonpv_fast and qhead_per_kvhead > 1
+    # The revived non-PV QK fast path uses the exact legacy helper stack end-to-end.
+    fwd_to_cute_tensor = to_cute_tensor_qkfast_legacy if is_fp4_nonpv_fast else to_cute_tensor
+    fp4_qk_tensor_helper = to_cute_fp4_tensor if is_fp4_pv else to_cute_fp4_tensor_qkfast_legacy
+    fp4_runtime_tensor_helper = (
+        to_tvm_ffi_fp4x2_tensor if is_fp4_pv else to_tvm_ffi_fp4x2_tensor_qkfast_legacy
+    )
+    fp4_scale_runtime_helper = (
+        to_tvm_ffi_float8_tensor_qkfast_legacy
+        if is_fp4_nonpv_fast and getattr(cutlass, "__version__", None) == "overlay"
+        else (lambda t: t)
+    )
+
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -1589,44 +1639,44 @@ def _flash_attn_fwd(
             seqused_k_tensor,
             learnable_sink_tensor,
         ) = [
-            to_cute_tensor(t, assumed_align=4, leading_dim=0)
+            fwd_to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
         ]
         page_table_tensor = (
-            to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
+            fwd_to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
             if page_table is not None
             else None
         )
         if is_fp4_qk:
             assert q_scale is not None and k_scale is not None
-            q_tensor = to_cute_fp4_tensor(q)
-            k_tensor = to_cute_fp4_tensor(k)
-            q_scale_tensor = to_cute_tensor(q_scale)
-            k_scale_tensor = to_cute_tensor(k_scale)
+            q_tensor = fp4_qk_tensor_helper(q)
+            k_tensor = fp4_qk_tensor_helper(k)
+            q_scale_tensor = fwd_to_cute_tensor(q_scale)
+            k_scale_tensor = fwd_to_cute_tensor(k_scale)
             if is_fp4_pv and fp4_pv_manual_direct_loader:
-                v_scale_tensor = to_cute_tensor(v_scale, leading_dim=3)
-                v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1)
+                v_scale_tensor = fwd_to_cute_tensor(v_scale, leading_dim=3)
+                v_storage_tensor = fwd_to_cute_tensor(v_packed_vt, leading_dim=1)
             else:
-                v_scale_tensor = to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
-                v_storage_tensor = to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
-            q_storage_tensor = to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
+                v_scale_tensor = fwd_to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
+                v_storage_tensor = fwd_to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
+            q_storage_tensor = fwd_to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
         else:
-            q_tensor, k_tensor = [to_cute_tensor(t) for t in (q, k)]
+            q_tensor, k_tensor = [fwd_to_cute_tensor(t) for t in (q, k)]
             q_scale_tensor, k_scale_tensor, v_scale_tensor = None, None, None
             q_storage_tensor = None
             v_storage_tensor = None
-        v_tensor = to_cute_fp4_vt_tensor(v_packed_vt) if is_fp4_pv else to_cute_tensor(v)
-        o_tensor = to_cute_tensor(out if not is_split_kv else out_partial)
+        v_tensor = to_cute_fp4_vt_tensor(v_packed_vt) if is_fp4_pv else fwd_to_cute_tensor(v)
+        o_tensor = fwd_to_cute_tensor(out if not is_split_kv else out_partial)
         if compile_start_time is not None:
             fa_logging.fa_log(1, "FP4 V/O tensor conversion done")
         if is_split_kv:
-            lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
+            lse_tensor = fwd_to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
-            lse_tensor = to_cute_tensor(lse, assumed_align=4)
+            lse_tensor = fwd_to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
         if compile_start_time is not None:
@@ -1669,9 +1719,20 @@ def _flash_attn_fwd(
         elif arch // 10 in [10, 11]:
             if is_fp4_qk:
                 fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_qk_format)
-                fa_fwd = FP4FlashAttentionForwardSm100(
-                    head_dim,
-                    head_dim_v,
+                if is_fp4_pv:
+                    if FP4FlashAttentionForwardSm100 is None:
+                        raise RuntimeError("FP4 PV kernel import failed") from _fp4_flash_fwd_sm100_import_error
+                    fp4_kernel_cls = FP4FlashAttentionForwardSm100
+                else:
+                    if is_fp4_nonpv_gqa_fast:
+                        if FP4FlashAttentionForwardSm100GQAFast is None:
+                            raise RuntimeError("FP4 non-PV GQA kernel import failed") from _fp4_flash_fwd_sm100_gqafast_import_error
+                        fp4_kernel_cls = FP4FlashAttentionForwardSm100GQAFast
+                    else:
+                        if FP4FlashAttentionForwardSm100MHAFast is None:
+                            raise RuntimeError("FP4 non-PV MHA kernel import failed") from _fp4_flash_fwd_sm100_mhafast_import_error
+                        fp4_kernel_cls = FP4FlashAttentionForwardSm100MHAFast
+                fp4_kernel_kwargs = dict(
                     qhead_per_kvhead=qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
@@ -1689,12 +1750,14 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_fp4_qk=True,
-                    use_fp4_pv=is_fp4_pv,
                     fp4_sf_dtype=fp4_sf_dtype,
                     fp4_sf_vec_size=fp4_sf_vec_size,
                     pack_gqa_local=fp4_pack_gqa_local,
                     group_qheads_by_kv=fp4_group_qheads_by_kv,
                 )
+                if is_fp4_pv:
+                    fp4_kernel_kwargs["use_fp4_pv"] = True
+                fa_fwd = fp4_kernel_cls(head_dim, head_dim_v, **fp4_kernel_kwargs)
                 if compile_start_time is not None:
                     fa_logging.fa_log(1, "FP4 kernel object construction done")
             else:
@@ -1752,32 +1815,82 @@ def _flash_attn_fwd(
         if is_fp4_qk:
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 cute.compile start")
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor,
-                q_storage_tensor,
-                k_tensor,
-                v_tensor,
-                v_storage_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                current_stream,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                page_table_tensor,
-                window_size_left,
-                window_size_right,
-                learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                q_scale_tensor,
-                k_scale_tensor,
-                v_scale_tensor,
-                options="--enable-tvm-ffi",
-            )
+            if is_fp4_pv:
+                _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                    fa_fwd,
+                    q_tensor,
+                    q_storage_tensor,
+                    k_tensor,
+                    v_tensor,
+                    v_storage_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q_tensor,
+                    cu_seqlens_k_tensor,
+                    seqused_q_tensor,
+                    seqused_k_tensor,
+                    page_table_tensor,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink_tensor,
+                    sparse_tensors,
+                    cute_aux_tensors,
+                    q_scale_tensor,
+                    k_scale_tensor,
+                    v_scale_tensor,
+                    options="--enable-tvm-ffi",
+                )
+            elif is_fp4_nonpv_gqa_fast:
+                _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                    fa_fwd,
+                    q_tensor,
+                    q_storage_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q_tensor,
+                    cu_seqlens_k_tensor,
+                    seqused_q_tensor,
+                    seqused_k_tensor,
+                    page_table_tensor,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink_tensor,
+                    sparse_tensors,
+                    cute_aux_tensors,
+                    q_scale_tensor,
+                    k_scale_tensor,
+                    options="--enable-tvm-ffi",
+                )
+            else:
+                _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                    fa_fwd,
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q_tensor,
+                    cu_seqlens_k_tensor,
+                    seqused_q_tensor,
+                    seqused_k_tensor,
+                    page_table_tensor,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink_tensor,
+                    sparse_tensors,
+                    cute_aux_tensors,
+                    q_scale_tensor,
+                    k_scale_tensor,
+                    options="--enable-tvm-ffi",
+                )
         else:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
@@ -1817,33 +1930,81 @@ def _flash_attn_fwd(
                     "FP4 runtime launch start "
                     f"(format={fp4_qk_format}, q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)})",
                 )
-            q_runtime = to_tvm_ffi_fp4x2_tensor(q.detach())
-            k_runtime = to_tvm_ffi_fp4x2_tensor(k.detach())
+            q_runtime = fp4_runtime_tensor_helper(q.detach())
+            k_runtime = fp4_runtime_tensor_helper(k.detach())
+            q_scale_runtime = fp4_scale_runtime_helper(q_scale.detach()) if q_scale is not None else None
+            k_scale_runtime = fp4_scale_runtime_helper(k_scale.detach()) if k_scale is not None else None
             v_runtime = to_tvm_ffi_fp4x2_tensor(v_packed_vt.detach()) if is_fp4_pv else v.detach()
-            _flash_attn_fwd.compile_cache[compile_key](
-                q_runtime,
-                q.detach() if fp4_pack_gqa_local and not is_fp4_pv else None,
-                k_runtime,
-                v_runtime,
-                v_packed_vt.detach() if is_fp4_pv else None,
-                out.detach(),
-                lse,
-                softmax_scale,
-                current_stream,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                window_size_left,
-                window_size_right,
-                learnable_sink,
-                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-                aux_tensors,
-                q_scale,
-                k_scale,
-                v_scale_vt,
-            )
+            if is_fp4_pv:
+                _flash_attn_fwd.compile_cache[compile_key](
+                    q_runtime,
+                    q.detach() if fp4_pack_gqa_local and not is_fp4_pv else None,
+                    k_runtime,
+                    v_runtime,
+                    v_packed_vt.detach() if is_fp4_pv else None,
+                    out.detach(),
+                    lse,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    page_table,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink,
+                    normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                    aux_tensors,
+                    q_scale_runtime,
+                    k_scale_runtime,
+                    v_scale_vt,
+                )
+            elif is_fp4_nonpv_gqa_fast:
+                _flash_attn_fwd.compile_cache[compile_key](
+                    q_runtime,
+                    q.detach() if fp4_pack_gqa_local else None,
+                    k_runtime,
+                    v_runtime,
+                    out.detach(),
+                    lse,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    page_table,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink,
+                    normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                    aux_tensors,
+                    q_scale_runtime,
+                    k_scale_runtime,
+                )
+            else:
+                _flash_attn_fwd.compile_cache[compile_key](
+                    q_runtime,
+                    k_runtime,
+                    v_runtime,
+                    out.detach(),
+                    lse,
+                    softmax_scale,
+                    current_stream,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    seqused_q,
+                    seqused_k,
+                    page_table,
+                    window_size_left,
+                    window_size_right,
+                    learnable_sink,
+                    normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                    aux_tensors,
+                    q_scale_runtime,
+                    k_scale_runtime,
+                )
             if launch_start_time is not None:
                 fa_logging.fa_log(
                     1, f"FP4 runtime launch returned in {time.perf_counter() - launch_start_time:.3f}s"

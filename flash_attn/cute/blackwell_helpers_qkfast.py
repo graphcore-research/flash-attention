@@ -93,14 +93,6 @@ def i64_to_i32x2(i: int) -> Tuple[int, int]:
 
 
 @cute.jit
-def canonicalize_mma_k_layout(layout: cute.Layout) -> cute.Layout:
-    """Drop a trailing singleton stage mode so PTX offset math can use canonical (M, N, K) coords."""
-    if const_expr(cute.rank(layout.shape) == 4 and cute.size(layout.shape[3]) == 1):
-        return cute.slice_(layout, (None, None, None, 0))
-    return layout
-
-
-@cute.jit
 def gemm_ptx(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
     acc: cute.Tensor,
@@ -442,6 +434,7 @@ def gemm_ptx_partial(
     offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
+
     if const_expr(not is_ts):
         smem_desc_start_a_lo = Int32(
             smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator)
@@ -1209,101 +1202,6 @@ def gemm_ptx_fp4_block_scaled(
 
 
 @cute.jit
-def gemm_ptx_fp4_block_scaled_partial(
-    op: cute.nvgpu.tcgen05.mma.MmaOp,
-    acc_tmem_addr: Int32,
-    tCrA: cute.Tensor,
-    tCrB: cute.Tensor,
-    sB: cute.Tensor,
-    tmem_sa_addr: Int32,
-    tmem_sb_addr: Int32,
-    scale_factor_id: int = 0,
-    scale_vec: str = "4X",
-    zero_init: bool | Boolean = False,
-    tA_addr: Optional[Int32] = None,
-    cta_group: int = 1,
-) -> None:
-    """Emit TS-style block-scaled FP4 MMA PTX for TMEM-A / SMEM-B operands."""
-    assert op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM, (
-        "gemm_ptx_fp4_block_scaled_partial only supports TMEM-A / SMEM-B MMA"
-    )
-
-    sB_layout = sB.layout
-    sB_swizzle = sB.iterator.type.swizzle_type
-    idesc: int = const_expr(sm100_desc.mma_op_to_idesc_block_scaled(op, scale_factor_id))
-    smem_desc_base_b: int = const_expr(
-        sm100_desc.make_smem_desc_base(
-            cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
-            sB_swizzle,
-            sm100_desc.Major.K
-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
-            else sm100_desc.Major.MN,
-        )
-    )
-    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
-    smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
-    smem_desc_b_hi = const_expr(smem_desc_b_hi)
-
-    tCrA_layout = canonicalize_mma_k_layout(cute.recast_layout(32, tCrA.element_type.width, tCrA.layout))
-    tCrB_layout = canonicalize_mma_k_layout(tCrB.layout)
-    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(cute.size(tCrA.shape[2]))]
-    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(cute.size(tCrB.shape[2]))]
-    smem_desc_start_b_lo = Int32(
-        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
-    )
-    tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
-    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
-    ptx_kind = f"kind::mxf4nvf4.block_scale.scale_vec::{scale_vec}"
-
-    llvm.inline_asm(
-        None,
-        [
-            Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(not zero_init).ir_value(),
-            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(tmem_sa_addr)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(tmem_sb_addr)).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .pred leader_thread;\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 idesc;\n\t"
-        ".reg .b32 tmem_acc;\n\t"
-        ".reg .b32 tmem_a;\n\t"
-        ".reg .b32 tmem_sa, tmem_sb;\n\t"
-        ".reg .b32 smem_desc_b_lo_start;\n\t"
-        ".reg .b32 smem_desc_b_lo;\n\t"
-        ".reg .b32 smem_desc_b_hi;\n\t"
-        ".reg .b64 smem_desc_b;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        f"mov.b32 idesc, {hex(idesc)};\n\t"
-        "mov.b32 tmem_a, $0;\n\t"
-        "mov.b32 smem_desc_b_lo_start, $1;\n\t"
-        "mov.b32 tmem_acc, $3;\n\t"
-        "mov.b32 tmem_sa, $4;\n\t"
-        "mov.b32 tmem_sb, $5;\n\t"
-        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-        "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
-        "setp.ne.b32 p, $2, 0;\n\t"
-        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, [tmem_sa], [tmem_sb], {pred_str};\n\t"
-        + "".join(
-            (
-                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_sa], [tmem_sb], 1;\n\t"
-            )
-            for k in range(1, cute.size(tCrA.shape[2]))
-        )
-        + "}\n",
-        "r,r,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
 def copy_scale_smem_to_tmem(
     tmem_addr: Int32,
     smem_desc: int,    # 64-bit TMA/SMEM descriptor for scale factor data
@@ -1338,3 +1236,4 @@ def copy_scale_smem_to_tmem(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+

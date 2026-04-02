@@ -39,6 +39,14 @@ _PYTHONAPI = ctypes.pythonapi
 _PYTHONAPI.PyCapsule_GetPointer.restype = ctypes.c_void_p
 _PYTHONAPI.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 _FP4X2_DLPACK_DTYPE = DLDataType(17, 4, 2)
+_FLOAT8_DLPACK_DTYPE = DLDataType(2, 8, 1)
+
+_TORCH_TO_CUTLASS_FLOAT8 = {
+    getattr(torch, "float8_e4m3fn", None): cutlass.Float8E4M3FN,
+    getattr(torch, "float8_e4m3fnuz", None): cutlass.Float8E4M3B11FNUZ,
+    getattr(torch, "float8_e5m2", None): cutlass.Float8E5M2,
+    getattr(torch, "float8_e5m2fnuz", None): cutlass.Float8E5M2,
+}
 
 
 class PackedFP4x2Tensor:
@@ -57,6 +65,30 @@ class PackedFP4x2Tensor:
         ptr = _PYTHONAPI.PyCapsule_GetPointer(capsule, b"dltensor")
         managed = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor))
         managed.contents.dl_tensor.dtype = _FP4X2_DLPACK_DTYPE
+        self._capsules.append(capsule)
+        return capsule
+
+
+class Float8Tensor:
+    """Expose float8 storage to legacy TVM-FFI stacks via a patched DLPack dtype."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self._capsules = []
+        self._views = []
+
+    def __dlpack_device__(self):
+        return self.tensor.__dlpack_device__()
+
+    def __dlpack__(self, stream=None):
+        stream_arg = -1 if stream is None else stream
+        storage = self.tensor.view(torch.uint8)
+        capsule = storage.__dlpack__(stream=stream_arg)
+        ptr = _PYTHONAPI.PyCapsule_GetPointer(capsule, b"dltensor")
+        managed = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor))
+        # Legacy CUTLASS identifies float8 tensors by kDLFloat with 8-bit elements.
+        managed.contents.dl_tensor.dtype = _FLOAT8_DLPACK_DTYPE
+        self._views.append(storage)
         self._capsules.append(capsule)
         return capsule
 
@@ -159,7 +191,32 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    tensor_arg = t.detach()
+    is_float8_tensor = isinstance(tensor_arg, torch.Tensor) and tensor_arg.dtype in {
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    }
+    use_legacy_float8_dlpack = is_float8_tensor and getattr(cutlass, "__version__", None) == "overlay"
+    if use_legacy_float8_dlpack:
+        tensor = from_dlpack(
+            tensor_arg.view(torch.uint8),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        tensor.element_type = _TORCH_TO_CUTLASS_FLOAT8[tensor_arg.dtype]
+        if fully_dynamic:
+            return tensor.mark_layout_dynamic()
+        if leading_dim == -1:
+            leading_dim = t.ndim - 1
+        return tensor.mark_layout_dynamic(leading_dim=leading_dim)
+    try:
+        tensor = from_dlpack(tensor_arg, assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    except Exception:
+        if not is_float8_tensor:
+            raise
+        tensor = from_dlpack(Float8Tensor(tensor_arg), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -184,36 +241,6 @@ def to_cute_fp4_tensor(
     del fully_dynamic, enable_tvm_ffi
     if leading_dim == -1:
         leading_dim = t.ndim - 1
-    assert t.stride(leading_dim) == 1, "Packed FP4 tensors must be contiguous in the packed dimension."
-    logical_shape = list(t.shape)
-    logical_shape[leading_dim] *= 2
-    logical_stride = []
-    for dim, stride in enumerate(t.stride()):
-        logical_stride.append(1 if dim == leading_dim else stride * 2)
-    return make_fake_tensor(
-        cutlass.Float4E2M1FN,
-        tuple(logical_shape),
-        tuple(logical_stride),
-        assumed_align=assumed_align,
-    )
-
-
-def to_cute_fp4_tensor_qkfast(
-    t,
-    assumed_align=16,
-    leading_dim=-1,
-    fully_dynamic=False,
-    enable_tvm_ffi=True,
-):
-    """Legacy FP4 tensor helper used by the revived non-PV QK fast path.
-
-    This preserves the `46b15ea` compile-time contract exactly: the packed axis
-    must remain innermost and its logical stride is inherited from the packed
-    storage instead of being generalized across arbitrary leading dimensions.
-    """
-    del fully_dynamic, enable_tvm_ffi
-    if leading_dim == -1:
-        leading_dim = t.ndim - 1
     assert leading_dim == t.ndim - 1, "Packed FP4 tensors must keep the packed dimension innermost."
     assert t.stride(leading_dim) == 1, "Packed FP4 tensors must be contiguous in the packed dimension."
 
@@ -221,35 +248,6 @@ def to_cute_fp4_tensor_qkfast(
     logical_stride = tuple(
         stride if dim == leading_dim else stride * 2
         for dim, stride in enumerate(t.stride())
-    )
-    return make_fake_tensor(
-        cutlass.Float4E2M1FN,
-        logical_shape,
-        logical_stride,
-        assumed_align=assumed_align,
-    )
-
-
-def to_cute_fp4_vt_tensor(
-    t,
-    assumed_align=16,
-):
-    """Build a logical FP4 Vt tensor spec from packed transposed storage.
-
-    FP4 PV consumes operand-B as logical ``Vt = (D, S_k, H_k, B)``. The public
-    packed runtime contract for that operand is ``(D, S_k // 2, H_k, B)``, where
-    mode ``1`` packs pairs of sequence positions after transpose. This
-    helper keeps the packed storage untouched while exposing the logical FP4 Vt
-    view expected by the PV MMA path.
-    """
-    assert t.ndim == 4, "FP4 Vt helper expects packed storage shaped (D, S/2, H, B)."
-    assert t.stride(1) == 1, "Packed FP4 Vt storage must keep the packed sequence dimension contiguous."
-    logical_shape = (t.shape[0], t.shape[1] * 2, t.shape[2], t.shape[3])
-    logical_stride = (
-        t.stride(0) * 2,
-        1,
-        t.stride(2) * 2,
-        t.stride(3) * 2,
     )
     return make_fake_tensor(
         cutlass.Float4E2M1FN,
@@ -300,3 +298,7 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
 
 def to_tvm_ffi_fp4x2_tensor(tensor: torch.Tensor) -> PackedFP4x2Tensor:
     return PackedFP4x2Tensor(tensor)
+
+
+def to_tvm_ffi_float8_tensor(tensor: torch.Tensor) -> Float8Tensor:
+    return Float8Tensor(tensor)

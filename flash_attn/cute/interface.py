@@ -83,6 +83,12 @@ except Exception as exc:
     FP4FlashAttentionForwardSm100GQAFast = None
     _fp4_flash_fwd_sm100_gqafast_import_error = exc
 try:
+    from flash_attn.cute.fp4_flash_fwd_sm100_pvfused import FP4FlashAttentionForwardSm100PVFused
+    _fp4_flash_fwd_sm100_pvfused_import_error = None
+except Exception as exc:
+    FP4FlashAttentionForwardSm100PVFused = None
+    _fp4_flash_fwd_sm100_pvfused_import_error = exc
+try:
     from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
     from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
     from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -284,9 +290,35 @@ def _validate_fp4_qk_inputs(
     arch: int,
 ) -> Tuple[int, int]:
     _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
+    _, pv_sf_vec_size, pv_sf_dtype = _get_fp4_qk_config("nvfp4")
+    head_dim = q.shape[-1] * 2
+    head_dim_v = v.shape[-2] if use_fp4_pv else v.shape[-1]
+    allow_fp4_pv_fused_lane = (
+        use_fp4_pv
+        and fp4_qk_format == "nvfp4"
+        and arch // 10 in [10, 11]
+        and head_dim == 128
+        and head_dim_v == 128
+        and q.shape[-2] == k.shape[-2]
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and page_table is None
+        and block_sparse_tensors is None
+        and window_size_left is None
+        and window_size_right is None
+        and not causal
+        and softcap in (None, 0.0)
+        and score_mod is None
+        and mask_mod is None
+        and aux_tensors is None
+        and learnable_sink is None
+        and num_splits == 1
+    )
     if fp4_qk_format != "nvfp4":
         raise NotImplementedError(
-            "FP4 QK/PV bring-up currently only supports fp4_qk_format='nvfp4'."
+            "FP4 QK/PV bring-up currently only supports fp4_qk_format='nvfp4'. The narrow PV experiment uses NVFP4 for both QK and PV."
         )
     if arch // 10 not in [10, 11]:
         raise NotImplementedError(
@@ -324,27 +356,39 @@ def _validate_fp4_qk_inputs(
         raise TypeError(f"{fp4_qk_format} expects q_scale/k_scale dtype {sf_dtype}.")
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
-    head_dim = q.shape[-1] * 2
-    head_dim_v = v.shape[-2] if use_fp4_pv else v.shape[-1]
     if use_fp4_pv:
+        if not allow_fp4_pv_fused_lane:
+            raise NotImplementedError(
+                "The exact Sage-style FP4 PV rewrite is currently scoped to dense fixed-length noncausal MHA with head_dim=head_dim_v=128 on SM100/SM110."
+            )
         seqlen_k_padded = math.ceil(k.shape[-3] / 128) * 128
         if v.dtype != torch.uint8:
             raise TypeError("FP4 PV expects packed uint8 Vt tensors.")
         if v_scale is None:
             raise ValueError("FP4 PV requires v_scale when use_fp4_pv=True.")
-        if v_scale.dtype != sf_dtype:
-            raise TypeError(f"{fp4_qk_format} expects v_scale dtype {sf_dtype}.")
+        expected_v_sf_dtype = pv_sf_dtype if allow_fp4_pv_fused_lane else sf_dtype
+        if v_scale.dtype != expected_v_sf_dtype:
+            raise TypeError(
+                f"FP4 PV expects v_scale dtype {expected_v_sf_dtype} for this lane, got {v_scale.dtype}."
+            )
     else:
         if v.dtype != torch.bfloat16:
             raise NotImplementedError("FP4 QK bring-up currently only supports BF16 V.")
         if v_scale is not None:
             raise ValueError("v_scale requires use_fp4_pv=True.")
-    if head_dim not in (64, 128) or head_dim_v != head_dim:
+    if allow_fp4_pv_fused_lane:
+        if head_dim not in (64, 128) or head_dim_v != head_dim:
+            raise NotImplementedError("FP4 PV currently only supports head_dim=head_dim_v in {64, 128}.")
+    elif head_dim not in (64, 128) or head_dim_v != head_dim:
         raise NotImplementedError(
             "FP4 QK bring-up currently only supports head_dim=head_dim_v in {64, 128}."
         )
     if head_dim % sf_vec_size != 0:
         raise ValueError(f"FP4 head_dim={head_dim} must be divisible by scale vec size {sf_vec_size}.")
+    if use_fp4_pv and allow_fp4_pv_fused_lane and head_dim_v % pv_sf_vec_size != 0:
+        raise ValueError(
+            f"FP4 PV head_dim_v={head_dim_v} must be divisible by PV scale vec size {pv_sf_vec_size}."
+        )
     expected_q_scale_shape = (*q.shape[:-1], head_dim // sf_vec_size)
     expected_k_scale_shape = (*k.shape[:-1], head_dim // sf_vec_size)
     if q_scale.shape != expected_q_scale_shape:
@@ -363,14 +407,59 @@ def _validate_fp4_qk_inputs(
             raise ValueError(
                 f"FP4 PV expects packed transposed Vt shape {expected_v_shape} (128-token padded), got {tuple(v.shape)}."
             )
-        expected_v_scale_shape = (q.shape[0], k.shape[-2], head_dim_v, seqlen_k_padded // sf_vec_size)
+        expected_v_sf_vec_size = pv_sf_vec_size if allow_fp4_pv_fused_lane else sf_vec_size
+        expected_v_scale_shape = (q.shape[0], k.shape[-2], head_dim_v, seqlen_k_padded // expected_v_sf_vec_size)
         if v_scale.shape != expected_v_scale_shape:
             raise ValueError(
-                f"v_scale shape {tuple(v_scale.shape)} != expected colwise transposed SFVt storage shape {expected_v_scale_shape} (128-token padded) for {fp4_qk_format}."
+                f"v_scale shape {tuple(v_scale.shape)} != expected colwise transposed SFVt storage shape {expected_v_scale_shape} (128-token padded) for this FP4 PV lane."
             )
     return head_dim, sf_vec_size
 
 
+def _should_enable_fp4_pv_fused_lane(
+    *,
+    fp4_qk_format: Optional[str],
+    use_fp4_pv: bool,
+    arch: int,
+    head_dim: int,
+    head_dim_v: int,
+    qhead_per_kvhead: int,
+    causal: bool,
+    local: bool,
+    num_splits: int,
+    page_size: Optional[int],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    use_block_sparsity: bool,
+    pack_gqa: bool,
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    aux_tensors: Optional[list[torch.Tensor]],
+    learnable_sink: Optional[torch.Tensor],
+) -> bool:
+    return (
+        use_fp4_pv
+        and fp4_qk_format == "nvfp4"
+        and arch // 10 in [10, 11]
+        and head_dim == 128
+        and head_dim_v == 128
+        and qhead_per_kvhead == 1
+        and not causal
+        and not local
+        and num_splits == 1
+        and page_size is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and not use_block_sparsity
+        and score_mod is None
+        and mask_mod is None
+        and aux_tensors is None
+        and learnable_sink is None
+    )
 def _should_enable_fp4_q3_local_pack_experiment(
     *,
     fp4_qk_format: Optional[str],
@@ -1368,6 +1457,7 @@ def _flash_attn_fwd(
             fp4_use_2cta_instrs = False
             fp4_q_stage = 1
             fp4_pack_gqa_local = False
+            fp4_group_qheads_by_kv = False
         if not fp4_pack_gqa_local and not fp4_group_qheads_by_kv:
             fp4_use_2cta_instrs = (
                 not is_fp4_pv
@@ -1425,15 +1515,15 @@ def _flash_attn_fwd(
             fp4_pack_gqa_local = env_pack_local
             if fp4_pack_gqa_local:
                 fp4_group_qheads_by_kv = False
-        if env_group_qheads is not None:
+        if env_group_qheads is not None and not is_fp4_pv:
             fp4_group_qheads_by_kv = env_group_qheads
             if fp4_group_qheads_by_kv:
                 fp4_pack_gqa_local = False
-        if env_use_2cta is not None and not is_fp4_pv:
+        if env_use_2cta is not None:
             fp4_use_2cta_instrs = env_use_2cta
         if env_is_persistent is not None:
             fp4_is_persistent = env_is_persistent
-        if env_q_stage is not None and not is_fp4_pv:
+        if env_q_stage is not None:
             fp4_q_stage = env_q_stage
         q_stage = fp4_q_stage
     elif arch // 10 == 10:
@@ -1517,6 +1607,28 @@ def _flash_attn_fwd(
 
     is_fp4_nonpv_fast = is_fp4_qk and not is_fp4_pv
     is_fp4_nonpv_gqa_fast = is_fp4_nonpv_fast and qhead_per_kvhead > 1
+    is_fp4_pv_fused_lane = _should_enable_fp4_pv_fused_lane(
+        fp4_qk_format=fp4_qk_format,
+        use_fp4_pv=is_fp4_pv,
+        arch=arch,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        qhead_per_kvhead=qhead_per_kvhead,
+        causal=causal,
+        local=local,
+        num_splits=num_splits,
+        page_size=page_size,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        use_block_sparsity=use_block_sparsity,
+        pack_gqa=pack_gqa,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        learnable_sink=learnable_sink,
+    )
     # The revived non-PV QK fast path uses the exact legacy helper stack end-to-end.
     fwd_to_cute_tensor = to_cute_tensor_qkfast_legacy if is_fp4_nonpv_fast else to_cute_tensor
     fp4_qk_tensor_helper = to_cute_fp4_tensor if is_fp4_pv else to_cute_fp4_tensor_qkfast_legacy
@@ -1612,6 +1724,7 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
+        is_fp4_pv_fused_lane,
         get_broadcast_dims(q_scale) if is_fp4_qk else None,
         get_broadcast_dims(k_scale) if is_fp4_qk else None,
         get_broadcast_dims(v_scale) if is_fp4_pv else None,
@@ -1655,12 +1768,21 @@ def _flash_attn_fwd(
             k_tensor = fp4_qk_tensor_helper(k)
             q_scale_tensor = fwd_to_cute_tensor(q_scale)
             k_scale_tensor = fwd_to_cute_tensor(k_scale)
-            if is_fp4_pv and fp4_pv_manual_direct_loader:
-                v_scale_tensor = fwd_to_cute_tensor(v_scale, leading_dim=3)
+            if is_fp4_pv:
+                # The isolated Sage-style PV kernel consumes swizzled SFVt in the
+                # public `(B, H_k, D_v, S_k // sf_vec)` storage contract, while
+                # V itself still uses the internal transposed logical Vt view.
+                # Keep the scale tensor on its public layout for this lane so the
+                # kernel-side scale loaders do not need to reverse the permuted
+                # view at runtime.
+                if is_fp4_pv_fused_lane or fp4_pv_manual_direct_loader:
+                    v_scale_tensor = fwd_to_cute_tensor(v_scale, leading_dim=3)
+                else:
+                    v_scale_tensor = fwd_to_cute_tensor(v_scale_vt, leading_dim=1)
                 v_storage_tensor = fwd_to_cute_tensor(v_packed_vt, leading_dim=1)
             else:
-                v_scale_tensor = fwd_to_cute_tensor(v_scale_vt, leading_dim=1) if is_fp4_pv else None
-                v_storage_tensor = fwd_to_cute_tensor(v_packed_vt, leading_dim=1) if is_fp4_pv else None
+                v_scale_tensor = None
+                v_storage_tensor = None
             q_storage_tensor = fwd_to_cute_tensor(q) if fp4_pack_gqa_local and not is_fp4_pv else None
             if compile_start_time is not None:
                 fa_logging.fa_log(1, "FP4 tensor conversion done")
@@ -1719,10 +1841,18 @@ def _flash_attn_fwd(
         elif arch // 10 in [10, 11]:
             if is_fp4_qk:
                 fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_qk_format)
+                pv_sf_dtype = None
+                pv_sf_vec_size = None
                 if is_fp4_pv:
-                    if FP4FlashAttentionForwardSm100 is None:
-                        raise RuntimeError("FP4 PV kernel import failed") from _fp4_flash_fwd_sm100_import_error
-                    fp4_kernel_cls = FP4FlashAttentionForwardSm100
+                    if is_fp4_pv_fused_lane:
+                        pv_sf_dtype, pv_sf_vec_size, _ = _get_fp4_qk_config("nvfp4")
+                        if FP4FlashAttentionForwardSm100PVFused is None:
+                            raise RuntimeError("FP4 PV fused kernel import failed") from _fp4_flash_fwd_sm100_pvfused_import_error
+                        fp4_kernel_cls = FP4FlashAttentionForwardSm100PVFused
+                    else:
+                        if FP4FlashAttentionForwardSm100 is None:
+                            raise RuntimeError("FP4 PV kernel import failed") from _fp4_flash_fwd_sm100_import_error
+                        fp4_kernel_cls = FP4FlashAttentionForwardSm100
                 else:
                     if is_fp4_nonpv_gqa_fast:
                         if FP4FlashAttentionForwardSm100GQAFast is None:
@@ -1757,6 +1887,9 @@ def _flash_attn_fwd(
                 )
                 if is_fp4_pv:
                     fp4_kernel_kwargs["use_fp4_pv"] = True
+                    if is_fp4_pv_fused_lane:
+                        fp4_kernel_kwargs["pv_sf_dtype"] = pv_sf_dtype
+                        fp4_kernel_kwargs["pv_sf_vec_size"] = pv_sf_vec_size
                 fa_fwd = fp4_kernel_cls(head_dim, head_dim_v, **fp4_kernel_kwargs)
                 if compile_start_time is not None:
                     fa_logging.fa_log(1, "FP4 kernel object construction done")
@@ -1958,7 +2091,7 @@ def _flash_attn_fwd(
                     aux_tensors,
                     q_scale_runtime,
                     k_scale_runtime,
-                    v_scale_vt,
+                    v_scale if is_fp4_pv_fused_lane else v_scale_vt,
                 )
             elif is_fp4_nonpv_gqa_fast:
                 _flash_attn_fwd.compile_cache[compile_key](

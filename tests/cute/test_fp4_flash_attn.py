@@ -19,6 +19,7 @@ from flash_attn.cute.interface import (
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from tests.cute.benchmark_fp4_qk import _benchmark_case
+from tests.cute.benchmark_fp4_pv import _aggregate_benchmark_runs
 
 
 FP4_GRID = torch.tensor(
@@ -147,6 +148,7 @@ def _make_fake_fp4_dense_inputs(
 def _make_fake_fp4_pv_dense_inputs(
     *,
     fp4_qk_format: str,
+    fp4_pv_format: str | None = None,
     head_dim: int,
     head_dim_v: int = 64,
     num_heads: int = 4,
@@ -156,8 +158,11 @@ def _make_fake_fp4_pv_dense_inputs(
     seqlen_k: int = 128,
 ):
     num_heads_kv = num_heads if num_heads_kv is None else num_heads_kv
+    fp4_pv_format = fp4_qk_format if fp4_pv_format is None else fp4_pv_format
     sf_vec = FP4_FORMAT_TO_VEC[fp4_qk_format]
     sf_dtype = FP4_FORMAT_TO_DTYPE[fp4_qk_format]
+    pv_sf_vec = FP4_FORMAT_TO_VEC[fp4_pv_format]
+    pv_sf_dtype = FP4_FORMAT_TO_DTYPE[fp4_pv_format]
     seqlen_k_padded = _fp4_pv_seqlen_k_padded(seqlen_k)
     q = torch.empty(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
     k = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim // 2, device="cuda", dtype=torch.uint8)
@@ -172,7 +177,7 @@ def _make_fake_fp4_pv_dense_inputs(
         batch_size, seqlen_k, num_heads_kv, head_dim // sf_vec, device="cuda", dtype=sf_dtype
     )
     v_scale = torch.empty(
-        batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // sf_vec, device="cuda", dtype=sf_dtype
+        batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // pv_sf_vec, device="cuda", dtype=pv_sf_dtype
     )
     return q, k, v, q_scale, k_scale, v_scale
 
@@ -452,21 +457,86 @@ def test_fp4_pv_fake_compile_dense_forward(
     monkeypatch, num_heads, num_heads_kv, head_dim, head_dim_v, causal
 ):
     compile_calls = _install_fake_cuda_runtime(monkeypatch)
+    exact_sage_lane = (
+        num_heads == num_heads_kv == 4 and head_dim == 128 and head_dim_v == 128 and not causal
+    )
+    fp4_pv_format = "nvfp4" if exact_sage_lane else None
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
             fp4_qk_format="nvfp4",
+            fp4_pv_format=fp4_pv_format,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             num_heads=num_heads,
             num_heads_kv=num_heads_kv,
         )
-        out, lse = _flash_attn_fwd(
+        if exact_sage_lane:
+            out, lse = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                causal=causal,
+                return_lse=True,
+                _arch=100,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+
+            assert out.dtype == torch.bfloat16
+            assert lse.dtype == torch.float32
+            assert len(compile_calls) == 1
+            assert len(_flash_attn_fwd.compile_cache) == 1
+        else:
+            with pytest.raises(NotImplementedError, match="exact Sage-style FP4 PV rewrite"):
+                _flash_attn_fwd(
+                    q,
+                    k,
+                    v,
+                    causal=causal,
+                    return_lse=True,
+                    _arch=100,
+                    fp4_qk_format="nvfp4",
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    use_fp4_pv=True,
+                    v_scale=v_scale,
+                )
+
+
+def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    kernel_kwargs = {}
+
+    def fake_pvfused_kernel(*_args, **kwargs):
+        kernel_kwargs.update(kwargs)
+        return object()
+
+    def fail_regular_pv_kernel(*_args, **_kwargs):
+        raise AssertionError("PV experiment should not instantiate the regular FP4 PV kernel.")
+
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused", fake_pvfused_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fail_regular_pv_kernel)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=4,
+            num_heads_kv=4,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
             q,
             k,
             v,
-            causal=causal,
-            return_lse=True,
+            causal=False,
             _arch=100,
             fp4_qk_format="nvfp4",
             q_scale=q_scale,
@@ -475,10 +545,52 @@ def test_fp4_pv_fake_compile_dense_forward(
             v_scale=v_scale,
         )
 
-    assert out.dtype == torch.bfloat16
-    assert lse.dtype == torch.float32
-    assert len(compile_calls) == 1
-    assert len(_flash_attn_fwd.compile_cache) == 1
+    assert kernel_kwargs["use_fp4_pv"] is True
+    assert kernel_kwargs["fp4_sf_dtype"] == "e4m3"
+    assert kernel_kwargs["fp4_sf_vec_size"] == 16
+    assert kernel_kwargs["pv_sf_dtype"] == "e4m3"
+    assert kernel_kwargs["pv_sf_vec_size"] == 16
+    assert kernel_kwargs["qhead_per_kvhead"] == 1
+    assert kernel_kwargs["pack_gqa"] is False
+    assert kernel_kwargs["use_2cta_instrs"] is False
+
+
+def test_fp4_pv_fused_dispatch_ignores_removed_legacy_selector(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    calls = []
+
+    def fake_fused_kernel(*_args, **kwargs):
+        calls.append(("fused", kwargs))
+        return object()
+
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused", fake_fused_kernel)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=4,
+            num_heads_kv=4,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert not hasattr(__import__("flash_attn.cute.interface", fromlist=["_get_internal_fp4_pv_impl"]), "_get_internal_fp4_pv_impl")
+    assert calls and calls[0][0] == "fused"
 
 
 @pytest.mark.parametrize(
@@ -935,7 +1047,7 @@ def test_fp4_pv_public_vt_scale_unswizzle_roundtrips():
     assert torch.equal(roundtrip.view(torch.uint8), logical.view(torch.uint8))
 
 
-def test_fp4_compile_cache_separates_pv_legacy_and_cta_quant(monkeypatch):
+def test_fp4_compile_cache_separates_pv_cta_quant_variants(monkeypatch):
     compile_calls = _install_fake_cuda_runtime(monkeypatch)
 
     with FakeTensorMode():
@@ -1331,9 +1443,14 @@ def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
         calls.append(("pv", kwargs))
         return object()
 
+    def fake_pvfused_kernel(*_args, **kwargs):
+        calls.append(("pvfused", kwargs))
+        return object()
+
     monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100MHAFast", fake_nonpv_kernel)
     monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100GQAFast", fake_nonpv_kernel)
     monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100", fake_pv_kernel)
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused", fake_pvfused_kernel)
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale = _make_fake_fp4_dense_inputs(
@@ -1361,6 +1478,31 @@ def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
     with FakeTensorMode():
         q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
             fp4_qk_format="nvfp4",
+            head_dim=64,
+            head_dim_v=64,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        with pytest.raises(NotImplementedError, match="exact Sage-style FP4 PV rewrite"):
+            _flash_attn_fwd(
+                q,
+                k,
+                v,
+                causal=False,
+                _arch=100,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+    assert not calls
+    calls.clear()
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="nvfp4",
             head_dim=128,
             head_dim_v=128,
             seqlen_q=512,
@@ -1379,8 +1521,48 @@ def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
             v_scale=v_scale,
         )
 
-    assert calls[0][0] == "pv"
+    assert calls[0][0] == "pvfused"
     assert calls[0][1]["use_fp4_pv"] is True
+    assert calls[0][1]["fp4_sf_dtype"] == "e4m3"
+    assert calls[0][1]["pv_sf_dtype"] == "e4m3"
+
+
+def test_fp4_use_fp4_pv_dispatch_supports_causal_gqa(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    calls = []
+
+    def fake_pvfused_kernel(*_args, **kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused", fake_pvfused_kernel)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=6,
+            num_heads_kv=2,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        with pytest.raises(NotImplementedError, match="exact Sage-style FP4 PV rewrite"):
+            _flash_attn_fwd(
+                q,
+                k,
+                v,
+                causal=True,
+                _arch=100,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -1498,7 +1680,9 @@ def test_fp4_qk_validation_errors(monkeypatch, kwargs, expected_error):
         ({"use_fp4_pv": True, "v_scale_dtype": torch.float16}, TypeError),
         ({"use_fp4_pv": True, "v_scale_shape_delta": 1}, ValueError),
         ({"use_fp4_pv": True, "fp4_qk_format": None}, ValueError),
-        ({"use_fp4_pv": True, "fp4_qk_format": "mxfp4"}, NotImplementedError),
+        ({"use_fp4_pv": True, "fp4_qk_format": "mxfp4", "head_dim": 64, "head_dim_v": 64}, NotImplementedError),
+        ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 128, "fp4_pv_format": "mxfp4"}, TypeError),
+        ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 128, "causal": True, "fp4_pv_format": "mxfp4"}, TypeError),
         ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 64}, NotImplementedError),
     ],
 )
@@ -1509,6 +1693,7 @@ def test_fp4_pv_validation_errors(monkeypatch, kwargs, expected_error):
         if kwargs.get("use_fp4_pv"):
             q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
                 fp4_qk_format=kwargs.get("fp4_qk_format", "nvfp4") or "nvfp4",
+                fp4_pv_format=kwargs.get("fp4_pv_format"),
                 head_dim=kwargs.get("head_dim", 64),
                 head_dim_v=kwargs.get("head_dim_v", 64),
             )
@@ -1547,7 +1732,7 @@ def test_fp4_pv_validation_errors(monkeypatch, kwargs, expected_error):
                 q,
                 k,
                 v,
-                causal=False,
+                causal=kwargs.get("causal", False),
                 _arch=100,
                 fp4_qk_format=kwargs.get("fp4_qk_format", "nvfp4"),
                 q_scale=q_scale,
@@ -3045,6 +3230,102 @@ def test_fp4_qk_benchmark_causal_mha_d128_row_regression_watch():
     )
     assert result["qk_out_max"] < 0.2
     assert result["qk_lse_max"] < 0.2
+
+
+def test_fp4_pv_benchmark_controller_aggregates_medians_and_failures():
+    samples = [
+        {
+            "kind": "mha",
+            "hq": 4,
+            "hkv": 4,
+            "d": 128,
+            "causal": False,
+            "seqlen": 512,
+            "qkfast_ms": 10.0,
+            "pv_fused_ms": 9.5,
+            "bf16_ms": 11.0,
+            "qkfast_out_max": 0.01,
+            "qkfast_lse_max": 0.02,
+            "pv_fused_out_max": 0.03,
+            "pv_fused_lse_max": 0.04,
+        },
+        {
+            "kind": "mha",
+            "hq": 4,
+            "hkv": 4,
+            "d": 128,
+            "causal": False,
+            "seqlen": 512,
+            "qkfast_ms": 12.0,
+            "pv_fused_ms": 10.5,
+            "bf16_ms": 12.0,
+            "qkfast_out_max": 0.02,
+            "qkfast_lse_max": 0.01,
+            "pv_fused_out_max": 0.04,
+            "pv_fused_lse_max": 0.02,
+        },
+        {
+            "kind": "mha",
+            "hq": 4,
+            "hkv": 4,
+            "d": 128,
+            "causal": False,
+            "seqlen": 512,
+            "qkfast_ms": 11.0,
+            "pv_fused_ms": 10.0,
+            "bf16_ms": 10.0,
+            "qkfast_out_max": 0.03,
+            "qkfast_lse_max": 0.03,
+            "pv_fused_out_max": 0.01,
+            "pv_fused_lse_max": 0.03,
+        },
+        {
+            "kind": "mha",
+            "hq": 4,
+            "hkv": 4,
+            "d": 128,
+            "causal": False,
+            "seqlen": 512,
+            "qkfast_ms": 9.0,
+            "pv_fused_ms": 8.5,
+            "bf16_ms": 9.0,
+            "qkfast_out_max": 0.02,
+            "qkfast_lse_max": 0.05,
+            "pv_fused_out_max": 0.05,
+            "pv_fused_lse_max": 0.01,
+        },
+        {
+            "kind": "mha",
+            "hq": 4,
+            "hkv": 4,
+            "d": 128,
+            "causal": False,
+            "seqlen": 512,
+            "qkfast_ms": 13.0,
+            "pv_fused_ms": 11.5,
+            "bf16_ms": 13.0,
+            "qkfast_out_max": 0.01,
+            "qkfast_lse_max": 0.02,
+            "pv_fused_out_max": 0.02,
+            "pv_fused_lse_max": 0.05,
+        },
+    ]
+    failures = [{"returncode": 1}, {"returncode": 1}]
+
+    aggregated = _aggregate_benchmark_runs(samples, failures)
+
+    assert aggregated["success_count"] == 5
+    assert aggregated["failure_count"] == 2
+    assert aggregated["qkfast_ms"] == 11.0
+    assert aggregated["pv_fused_ms"] == 10.0
+    assert aggregated["bf16_ms"] == 11.0
+    assert aggregated["qkfast_over_bf16"] == pytest.approx(1.0)
+    assert aggregated["pv_fused_over_qkfast"] == pytest.approx(10.0 / 11.0)
+    assert aggregated["pv_fused_over_bf16"] == pytest.approx(10.0 / 11.0)
+    assert aggregated["qkfast_out_max"] == 0.03
+    assert aggregated["qkfast_lse_max"] == 0.05
+    assert aggregated["pv_fused_out_max"] == 0.05
+    assert aggregated["pv_fused_lse_max"] == 0.05
 
 
 @pytest.mark.parametrize("direct_loader", [False])

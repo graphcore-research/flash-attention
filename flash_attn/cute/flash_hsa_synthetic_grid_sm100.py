@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -137,8 +138,11 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
     forward = _summarize_one_grid(runtime.forward_synthetic_grid)
     reference = runtime.forward_synthetic_grid if runtime.forward_synthetic_grid is not None else runtime.backward_synthetic_grid
     direct_plan = None
+    hybrid_selected_qgroups = 0
     if runtime.forward_synthetic_grid is not None and runtime.forward_synthetic_grid.forward_execution_plan is not None:
-        direct_plan = runtime.forward_synthetic_grid.forward_execution_plan.get("direct_execution_plan")
+        execution_plan = runtime.forward_synthetic_grid.forward_execution_plan
+        direct_plan = execution_plan.get("direct_execution_plan")
+        hybrid_selected_qgroups = len(execution_plan.get("hybrid_selected_qgroup_idx", []))
     if reference is None:
         return {
             "logical_block_q": 0,
@@ -170,6 +174,9 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
             "forward_avg_num_splits": 0.0,
             "backward_avg_num_splits": 0.0,
             "forward_avg_direct_segments": 0.0,
+            "forward_direct_segments_p50": 0.0,
+            "forward_direct_segments_p90": 0.0,
+            "forward_max_direct_segments_per_qgroup": 0,
             "forward_avg_segment_k_length": 0.0,
             "forward_avg_segment_fill": 0.0,
             "forward_segment_fill_p50": 0.0,
@@ -178,6 +185,7 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
             "forward_row_k_p50": 0.0,
             "forward_row_k_p90": 0.0,
             "forward_avg_union_k": 0.0,
+            "forward_hybrid_selected_qgroups": 0,
         }
 
     if direct_plan is not None and len(direct_plan["bucket_packed_k"]) > 0:
@@ -203,7 +211,9 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
         "logical_block_q": reference.logical_block_q,
         "logical_block_k": reference.logical_block_k,
         "max_packed_k": 0 if reference.max_packed_k is None else reference.max_packed_k,
-        "max_direct_segments": max_direct_segments if reference.max_direct_segments is None else reference.max_direct_segments,
+        "max_direct_segments": (
+            max_direct_segments if max_direct_segments > 0 else 0 if reference.max_direct_segments is None else reference.max_direct_segments
+        ),
         "physical_block_q": reference.physical_block_q,
         "physical_block_k": reference.physical_block_k,
         "num_tiles": forward["num_tiles"],
@@ -231,6 +241,11 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
         "forward_dense_tiles": forward["dense_tiles"],
         "backward_dense_tiles": backward["dense_tiles"],
         "forward_avg_direct_segments": _mean_or_zero(qgroup_num_segments),
+        "forward_direct_segments_p50": _quantile_or_zero(qgroup_num_segments, 0.5),
+        "forward_direct_segments_p90": _quantile_or_zero(qgroup_num_segments, 0.9),
+        "forward_max_direct_segments_per_qgroup": (
+            int(qgroup_num_segments.max().item()) if qgroup_num_segments.numel() > 0 else 0
+        ),
         "forward_avg_segment_k_length": _mean_or_zero(segment_k),
         "forward_avg_segment_fill": _mean_or_zero(segment_fill),
         "forward_segment_fill_p50": _quantile_or_zero(segment_fill, 0.5),
@@ -239,6 +254,7 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
         "forward_row_k_p50": _quantile_or_zero(row_k, 0.5),
         "forward_row_k_p90": _quantile_or_zero(row_k, 0.9),
         "forward_avg_union_k": _mean_or_zero(union_k),
+        "forward_hybrid_selected_qgroups": hybrid_selected_qgroups,
     }
 
 
@@ -1297,6 +1313,186 @@ class FlashHSASharedSupportBucketFwdWide64Sm100:
                     mOutPacked[qgroup_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
                 if dim1 < mOutPacked.shape[3]:
                     mOutPacked[qgroup_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+
+
+class FlashHSASynthetic2DMaskedFwdSm100:
+    """Benchmark-only masked packed forward over a Qtile x Ktile bucket."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQPacked.shape[0]
+        grid_y = mQPacked.shape[2]
+        self.kernel(
+            mQPacked,
+            mKPacked,
+            mVPacked,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQPacked.element_type,
+            cute.make_layout((self.rows_per_cta, 64)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKPacked.element_type,
+            cute.make_layout((self.tile_k, 64)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVPacked.element_type,
+            cute.make_layout((self.tile_k, 64)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(64), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(64)
+            dim_idx = elem_idx - row_idx * Int32(64)
+            if row_idx < q_length:
+                sQ[row_idx, dim_idx] = mQPacked[bucket_idx, row_idx, head_idx, dim_idx]
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            active_row = row_idx < q_length
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+
+            for tile_start in range(0, mKPacked.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(64), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(64)
+                    dim_idx = elem_idx - tile_row * Int32(64)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        sK[tile_row, dim_idx] = mKPacked[bucket_idx, global_key, head_idx, dim_idx]
+                        sV[tile_row, dim_idx] = mVPacked[bucket_idx, global_key, head_idx, dim_idx]
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 64, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutPacked.shape[3]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutPacked.shape[3]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                if row_max == -Float32.inf or row_sum == Float32(0.0):
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                else:
+                    inv_row_sum = Float32(1.0) / row_sum
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = (out0 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = (out1 * inv_row_sum).to(mOutPacked.element_type)
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSEPacked.element_type)
+            else:
+                if lane == Int32(0):
+                    mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                if dim0 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                if dim1 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
 
 
 def _run_synthetic_pack_rows_kernel(
@@ -14433,6 +14629,99 @@ def _run_shared_support_bucket_fwd_kernel(
 _run_shared_support_bucket_fwd_kernel.compile_cache = get_jit_cache("hsa_shared_support_bucket_fwd")
 
 
+def _can_use_synthetic_2d_masked_fwd(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    *,
+    packed_q: int,
+    packed_k: int,
+) -> bool:
+    return (
+        0 < packed_q <= 16
+        and 0 < packed_k <= 128
+        and q_rows.dtype in (torch.float16, torch.bfloat16)
+        and k_rows.dtype == q_rows.dtype
+        and v_rows.dtype == q_rows.dtype
+        and q_rows.shape[-1] == 64
+        and k_rows.shape[-1] == 64
+        and v_rows.shape[-1] == 64
+        and q_rows.is_cuda
+        and k_rows.is_cuda
+        and v_rows.is_cuda
+    )
+
+
+def _run_synthetic_2d_masked_fwd_kernel(
+    q_packed: torch.Tensor,
+    k_packed: torch.Tensor,
+    v_packed: torch.Tensor,
+    q_length: torch.Tensor,
+    k_length: torch.Tensor,
+    mask_words: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute_runtime()
+    rows_per_cta = int(q_packed.shape[1])
+    compile_key = (
+        "synthetic_2d_masked_fwd_v1",
+        q_packed.dtype,
+        k_packed.dtype,
+        v_packed.dtype,
+        q_packed.shape[0],
+        q_packed.shape[1],
+        k_packed.shape[1],
+        q_packed.shape[2],
+        q_packed.shape[3],
+        v_packed.shape[3],
+        mask_words.shape[2],
+        torch.cuda.get_device_capability(q_packed.device),
+    )
+    out = torch.empty(
+        (q_packed.shape[0], q_packed.shape[1], q_packed.shape[2], v_packed.shape[3]),
+        dtype=torch.float32,
+        device=q_packed.device,
+    )
+    lse = torch.empty(
+        (q_packed.shape[0], q_packed.shape[1], q_packed.shape[2]),
+        dtype=torch.float32,
+        device=q_packed.device,
+    )
+    if compile_key not in _run_synthetic_2d_masked_fwd_kernel.compile_cache:
+        kernel = FlashHSASynthetic2DMaskedFwdSm100(rows_per_cta=rows_per_cta)
+        _run_synthetic_2d_masked_fwd_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_packed),
+            to_cute_tensor(k_packed),
+            to_cute_tensor(v_packed),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(k_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(mask_words, assumed_align=4, leading_dim=2),
+            Float32(softmax_scale),
+            to_cute_tensor(out, assumed_align=4),
+            to_cute_tensor(lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_2d_masked_fwd_kernel.compile_cache[compile_key](
+        q_packed,
+        k_packed,
+        v_packed,
+        q_length,
+        k_length,
+        mask_words,
+        Float32(softmax_scale),
+        out,
+        lse,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return out, lse
+
+
+_run_synthetic_2d_masked_fwd_kernel.compile_cache = get_jit_cache("hsa_synth_2d_masked_fwd")
+
+
 def _slice_bucket_flat_rows(
     metadata,
     bucket_idx: int,
@@ -15234,6 +15523,46 @@ def _run_bucketed_forward(
             lse = total_lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
             return out, lse
 
+    hybrid_direct_plan = execution_plan.get("hybrid_direct_execution_plan")
+    hybrid_regular_execution_plan = execution_plan.get("hybrid_regular_execution_plan")
+    if (
+        _synthetic_micro_fwd_enabled()
+        and hybrid_direct_plan is not None
+        and hybrid_regular_execution_plan is not None
+        and _can_use_direct_forward_micro_plan_runtime(hybrid_direct_plan, q_flat, k_flat, v_flat)
+    ):
+        hybrid_plan = {"direct_execution_plan": hybrid_direct_plan}
+        if _can_use_direct_row_compact_plan_runtime(
+            hybrid_direct_plan,
+            q_flat,
+            k_flat,
+            v_flat,
+            enforce_segment_limits=False,
+        ) and _run_direct_row_compact_forward(
+            q_flat,
+            k_flat,
+            v_flat,
+            total_out,
+            total_lse,
+            metadata,
+            hybrid_plan,
+            softmax_scale=softmax_scale,
+            runtime=runtime,
+        ):
+            execution_plan = hybrid_regular_execution_plan
+        elif _run_direct_segmented_forward(
+            q_flat,
+            k_flat,
+            v_flat,
+            total_out,
+            total_lse,
+            metadata,
+            hybrid_plan,
+            softmax_scale=softmax_scale,
+            runtime=runtime,
+        ):
+            execution_plan = hybrid_regular_execution_plan
+
     workspace = runtime.synthetic_forward_workspace
     if workspace is None:
         workspace = {
@@ -15286,6 +15615,32 @@ def _run_bucketed_forward(
     bucket_mask_word_range = execution_plan["bucket_mask_word_range"]
     bucket_use_qgroup_q = execution_plan.get("bucket_use_qgroup_q")
     bucket_scatter_only = execution_plan.get("bucket_scatter_only")
+    save_packed_qkv = runtime is not None and _should_save_synthetic_bucket_dense_packed_qkv(q_flat, k_flat, v_flat)
+    packed_saved_q = None
+    packed_saved_k = None
+    packed_saved_v = None
+    packed_q_offsets = None
+    packed_kv_offsets = None
+    if save_packed_qkv:
+        (
+            packed_saved_q,
+            packed_saved_k,
+            packed_saved_v,
+            packed_q_offsets,
+            packed_kv_offsets,
+        ) = _get_bucket_dense_saved_packed_qkv_forward_buffers(
+            runtime,
+            device=q.device,
+            direct_bucket_size=bucket_size_plan,
+            direct_bucket_packed_q=bucket_packed_q,
+            direct_bucket_packed_k=bucket_packed_k,
+            num_q_heads=q.shape[2],
+            head_dim_q=q.shape[3],
+            num_k_heads=k.shape[2],
+            head_dim_k=k.shape[3],
+            num_v_heads=v.shape[2],
+            head_dim_v=v.shape[3],
+        )
 
     for qgroup_bucket_idx, packed_q in enumerate(qgroup_bucket_packed_q):
         qgroup_bucket_size_value = qgroup_bucket_size[qgroup_bucket_idx]
@@ -15293,6 +15648,8 @@ def _run_bucketed_forward(
             continue
         exec_bucket_start, exec_bucket_end = qgroup_bucket_execution_bucket_range[qgroup_bucket_idx]
         split_bucket_ids = qgroup_bucket_execution_bucket_idx[exec_bucket_start:exec_bucket_end]
+        if not split_bucket_ids:
+            continue
         if len(split_bucket_ids) == 1:
             split_bucket_idx = int(split_bucket_ids[0])
             bucket_size = bucket_size_plan[split_bucket_idx]
@@ -15528,33 +15885,70 @@ def _can_use_direct_synthetic_micro_runtime(metadata, q: torch.Tensor, k: torch.
     return _can_use_synthetic_micro_fwd(q, k, v, packed_q=packed_q, packed_k=packed_k)
 
 
-def _can_use_direct_forward_micro_runtime(metadata, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    if metadata is None or metadata.forward_execution_plan is None:
-        return False
-    plan = metadata.forward_execution_plan
-    direct_plan = plan.get("direct_execution_plan")
-    if metadata.logical_block_q != 2 or direct_plan is None or len(direct_plan["bucket_packed_k"]) <= 0:
+def _can_use_direct_forward_micro_plan_runtime(direct_plan, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    if direct_plan is None or len(direct_plan["bucket_packed_k"]) <= 0:
         return False
     packed_q = 2
     packed_k = max(int(packed_k) for packed_k in direct_plan["bucket_packed_k"])
     return _can_use_synthetic_micro_fwd(q, k, v, packed_q=packed_q, packed_k=packed_k)
 
 
-def _can_use_direct_row_compact_runtime(metadata, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    if metadata is None or metadata.forward_execution_plan is None:
+def _can_use_direct_forward_micro_runtime(metadata, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    if metadata is None or metadata.forward_execution_plan is None or metadata.logical_block_q != 2:
         return False
     plan = metadata.forward_execution_plan
-    direct_plan = plan.get("direct_execution_plan")
-    if metadata.logical_block_q != 2 or direct_plan is None:
+    return _can_use_direct_forward_micro_plan_runtime(plan.get("direct_execution_plan"), q, k, v)
+
+
+def _can_use_direct_row_compact_plan_runtime(
+    direct_plan,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    enforce_segment_limits: bool,
+) -> bool:
+    if direct_plan is None:
         return False
     row_plan = direct_plan.get("row_compact_plan")
     if row_plan is None or len(row_plan["bucket_row_k_cap"]) <= 0:
         return False
+    if enforce_segment_limits:
+        max_runtime_qgroup_segments = int(os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MAX_RUNTIME_QGROUP_SEGMENTS", "0"))
+        max_runtime_qgroup_segments_p90 = int(
+            os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MAX_RUNTIME_QGROUP_SEGMENTS_P90", "0")
+        )
+        if max_runtime_qgroup_segments > 0 or max_runtime_qgroup_segments_p90 > 0:
+            qgroup_num_segments = direct_plan.get("qgroup_num_segments")
+            if qgroup_num_segments is None or len(qgroup_num_segments) <= 0:
+                return False
+            qgroup_num_segments = sorted(int(num_segments) for num_segments in qgroup_num_segments if int(num_segments) > 0)
+            if not qgroup_num_segments:
+                return False
+            if max_runtime_qgroup_segments > 0 and qgroup_num_segments[-1] > max_runtime_qgroup_segments:
+                return False
+            if max_runtime_qgroup_segments_p90 > 0:
+                p90_idx = max(0, min(len(qgroup_num_segments) - 1, math.ceil(len(qgroup_num_segments) * 0.9) - 1))
+                if qgroup_num_segments[p90_idx] > max_runtime_qgroup_segments_p90:
+                    return False
     if q.shape[-1] != 64 or v.shape[-1] != 64:
         return False
     max_row_k = max(int(row_k_cap) for row_k_cap in row_plan["bucket_row_k_cap"])
     return max_row_k <= int(row_plan["row_k_cap_limit"]) and _can_use_synthetic_micro_fwd(
         q, k, v, packed_q=2, packed_k=max_row_k
+    )
+
+
+def _can_use_direct_row_compact_runtime(metadata, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    if metadata is None or metadata.forward_execution_plan is None or metadata.logical_block_q != 2:
+        return False
+    plan = metadata.forward_execution_plan
+    return _can_use_direct_row_compact_plan_runtime(
+        plan.get("direct_execution_plan"),
+        q,
+        k,
+        v,
+        enforce_segment_limits=True,
     )
 
 

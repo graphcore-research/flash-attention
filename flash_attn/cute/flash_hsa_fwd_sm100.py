@@ -875,12 +875,14 @@ def run_hsa_fwd_sm100_blocksparse(
     v: torch.Tensor,
     schedule,
     softmax_scale: float,
+    *,
+    allow_true_fused_bwd: bool = True,
 ):
     sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
         _empty_sentence_cache_tensors(q, k, v)
     )
     use_monolithic_bwd = os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
-    use_true_fused_bwd = _use_hsa_true_fused_bwd()
+    use_true_fused_bwd = allow_true_fused_bwd and _use_hsa_true_fused_bwd()
     runtime_state = _materialize_runtime_state(schedule) if use_monolithic_bwd else None
     only_sentence_family = runtime_state is not None and _runtime_state_has_only_sentence_family(runtime_state)
     use_true_fused_forward = only_sentence_family and _should_use_hsa_true_fused_forward(

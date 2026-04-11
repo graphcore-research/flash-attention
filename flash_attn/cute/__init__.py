@@ -42,6 +42,12 @@ from .hsa_shared_sparse_gemm_analysis import (
     analyze_hsa_shared_sparse_gemm_forward,
     summarize_hsa_shared_sparse_gemm_forward,
 )
+from .hsa_explicit_2d_sparse_analysis import (
+    analyze_explicit_2d_sparse_forward,
+    build_explicit_2d_sparse_case,
+    scatter_explicit_packed_rows,
+    summarize_explicit_2d_sparse_forward,
+)
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
 
@@ -73,4 +79,8 @@ __all__ = [
     "summarize_hsa_approx_sparse_gemm_forward",
     "analyze_hsa_shared_sparse_gemm_forward",
     "summarize_hsa_shared_sparse_gemm_forward",
+    "analyze_explicit_2d_sparse_forward",
+    "build_explicit_2d_sparse_case",
+    "scatter_explicit_packed_rows",
+    "summarize_explicit_2d_sparse_forward",
 ]

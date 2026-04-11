@@ -5094,13 +5094,14 @@ def run_hsa_bwd_sm100_monolithic(
     sentence_k_stream: Optional[torch.Tensor] = None,
     sentence_v_stream: Optional[torch.Tensor] = None,
     sentence_out_stream: Optional[torch.Tensor] = None,
+    allow_true_fused: bool = True,
 ):
     if not _is_supported_packed_bwd(q, k, v):
         raise NotImplementedError("Monolithic HSA backward scaffold requires CUDA SM100+/fp16 or bf16 tensors")
 
     hsa_mod = _load_hsa_module()
     monolithic_schedule = hsa_mod._get_hsa_monolithic_backward_schedule(schedule)
-    use_true_fused = _use_hsa_true_fused_bwd()
+    use_true_fused = allow_true_fused and _use_hsa_true_fused_bwd()
     sentence_lse_override = _normalize_sentence_lse_override(sentence_lse)
 
     # Stage 1: if sentence descriptors are the whole workload, stay on the

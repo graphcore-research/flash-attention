@@ -17,9 +17,11 @@ def _safe_cuda_capability():
 
 try:
     from flash_attn.cute import (
+        analyze_explicit_2d_sparse_forward,
         analyze_hsa_approx_sparse_gemm_forward,
         analyze_hsa_shared_sparse_gemm_forward,
         analyze_hsa_sparse24_feasibility,
+        build_explicit_2d_sparse_case,
         hybrid_backward_to_attend_mask,
         backward_packed_masks_to_attend_mask,
         backward_descriptors_to_attend_mask,
@@ -41,9 +43,11 @@ try:
     _IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - import guard for unsupported envs
     analyze_hsa_approx_sparse_gemm_forward = None
+    analyze_explicit_2d_sparse_forward = None
     analyze_hsa_shared_sparse_gemm_forward = None
     analyze_hsa_sparse24_feasibility = None
     build_hsa_schedule = None
+    build_explicit_2d_sparse_case = None
     backward_descriptors_to_attend_mask = None
     backward_packed_masks_to_attend_mask = None
     compute_hsa_mask = None
@@ -4150,6 +4154,35 @@ def test_hsa_unpacked_direct_fwd_flag_disables_synthetic_grid(monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_grid_row_compact_guard_rejects_segmented_direct_plan(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+
+    device = "cuda"
+    batch_size, seqlen, nheads, headdim = 2, 1024, 8, 64
+    keep_ids, hash_ids = _make_hsa_metadata(batch_size, seqlen, device)
+    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_USE_SYNTHETIC_GRID", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_REQUIRE_ROW_COMPACT", "1")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K", "2")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K", "128")
+    monkeypatch.setenv("FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS", "4")
+
+    runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q, k)
+    hsa_module._ensure_hsa_synthetic_grid_metadata(schedule, runtime)
+
+    metadata = runtime.forward_synthetic_grid
+    assert metadata is not None
+    direct_plan = metadata.forward_execution_plan["direct_execution_plan"]
+    assert direct_plan is not None
+    assert direct_plan["row_compact_plan"] is None
+    assert hsa_module._can_use_hsa_synthetic_grid_for_inputs(schedule, q, k, runtime=runtime) is False
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 def test_hsa_blocksparse_forward_unpacked_direct_flag_routes_direct_kernel(monkeypatch):
     import flash_attn.cute.flash_hsa_fwd_sm100 as hsa_fwd_module
 
@@ -4518,3 +4551,67 @@ def test_external_hdt_benchmark_subprocess_smoke(case_name):
     result = benchmark_hsa._run_external_hdt_case_subprocess(case)
     status = str(result["status"])
     assert not status.startswith("child_"), status
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_synthetic_2d_masked_fwd_kernel_smoke():
+    import flash_attn.cute.flash_hsa_synthetic_grid_sm100 as synthetic_module
+
+    case = build_explicit_2d_sparse_case(
+        case_family="disjoint_confetti",
+        seqlen=16,
+        heads=4,
+        head_dim=64,
+        packed_q=8,
+        support_k=32,
+        islands_per_row=2,
+        island_width=2,
+        row_shift=5,
+        device="cuda",
+        dtype=torch.bfloat16,
+        seed=0,
+    )
+    bucket = case["full_bucket"]
+    out, lse = synthetic_module._run_synthetic_2d_masked_fwd_kernel(
+        bucket["custom_q_buf"],
+        bucket["custom_k_buf"],
+        bucket["custom_v_buf"],
+        bucket["custom_q_length"],
+        bucket["custom_k_length"],
+        bucket["custom_mask_words"],
+        softmax_scale=1.0 / math.sqrt(64.0),
+    )
+
+    assert out.shape == (2, 8, 4, 64)
+    assert lse.shape == (2, 8, 4)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(lse).logical_or(torch.isneginf(lse)).all()
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("case_family", ["disjoint_confetti", "compact_control"])
+def test_hsa_explicit_2d_sparse_variants_match_dense_oracle(case_family):
+    report = analyze_explicit_2d_sparse_forward(
+        case_family=case_family,
+        seqlen=16,
+        heads=4,
+        head_dim=64,
+        packed_q=8,
+        support_k=32,
+        islands_per_row=2,
+        island_width=2,
+        row_shift=5,
+        warmup_iters=0,
+        benchmark_iters=1,
+        variants=("dense", "custom_masked", "fa4_packed", "direct_2d"),
+        device="cuda",
+        dtype=torch.bfloat16,
+        seed=0,
+    )
+
+    assert report["results"]["custom_masked"]["status"] == "measured"
+    assert report["results"]["fa4_packed"]["status"] == "measured"
+    assert report["results"]["direct_2d"]["status"] == "measured"
+    assert report["results"]["custom_masked"]["output_max_diff"] < 0.1
+    assert report["results"]["fa4_packed"]["output_max_diff"] < 0.1
+    assert report["results"]["direct_2d"]["output_max_diff"] < 0.1

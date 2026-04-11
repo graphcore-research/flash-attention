@@ -555,6 +555,76 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
     assert kernel_kwargs["use_2cta_instrs"] is False
 
 
+def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch):
+    _install_fake_cuda_runtime(monkeypatch)
+    kernel_call = {}
+    from flash_attn.cute.fp4_flash_fwd_sm100_pvfused import FP4FlashAttentionForwardSm100PVFused
+
+    def capture_pvfused_kernel(*args, **kwargs):
+        kernel_call["args"] = args
+        kernel_call["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        "flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused",
+        capture_pvfused_kernel,
+    )
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            num_heads=4,
+            num_heads_kv=4,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    return FP4FlashAttentionForwardSm100PVFused(
+        *kernel_call["args"],
+        **kernel_call["kwargs"],
+    )
+
+
+def test_fp4_pv_fused_exact_lane_uses_compact_warp_map(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+    assert kernel.threads_per_cta == 288
+    assert kernel.softmax0_warp_ids == (0, 1, 2, 3)
+    assert kernel.softmax1_warp_ids == ()
+    assert kernel.correction_warp_ids == (4, 5)
+    assert kernel.mma_warp_id == 6
+    assert kernel.epilogue_warp_ids == (7,)
+    assert kernel.load_warp_ids == (8,)
+    assert kernel.empty_warp_ids == ()
+
+
+def test_fp4_pv_fused_exact_lane_uses_split_handoffs(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+    assert kernel.use_exact_fp4_pv_lane is True
+    assert kernel.use_exact_fp4_pv_s_ready_handoff is True
+    assert kernel.use_exact_fp4_pv_p_ready_handoff is True
+
+
+def test_fp4_pv_fused_exact_lane_skips_legacy_stats_pipeline(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+    assert kernel.use_exact_fp4_pv_lane is True
+    assert kernel.use_exact_fp4_pv_legacy_stats_pipeline is False
+
+
 def test_fp4_pv_fused_dispatch_ignores_removed_legacy_selector(monkeypatch):
     _install_fake_cuda_runtime(monkeypatch)
     calls = []

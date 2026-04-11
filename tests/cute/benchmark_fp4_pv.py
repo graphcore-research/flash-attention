@@ -7,6 +7,12 @@ import statistics
 import subprocess
 import sys
 
+try:
+    import cuda.bindings.driver as _pre_torch_cuda_driver
+    _pre_torch_cuda_driver.cuInit(0)
+except Exception:
+    _pre_torch_cuda_driver = None
+
 import torch
 
 if __package__ in (None, ""):
@@ -38,9 +44,24 @@ FP4_GRID = torch.tensor(
 DEFAULT_NUM_HEADS = 4
 DEFAULT_NUM_HEADS_KV = 4
 NVFP4_VEC_SIZE = 16
+BOGUS_FAST_QKFAST_MS = 0.05
 _FLASH_ATTN_FWD = None
 _BENCH_DEVICE = None
 _CUDA_DRIVER = False
+EXACT_PROFILE_ROW = {
+    "kind": "mha",
+    "head_dim": 128,
+    "seqlen": 512,
+    "batch_size": 2,
+    "causal": False,
+}
+EXACT_PROFILE_NCU_KERNEL_NAME_BASE = "demangled"
+EXACT_PROFILE_NCU_KERNEL_REGEX = r"regex:.*FP4FlashAttentionForwardSm100PVFused.*"
+EXACT_PROFILE_LAUNCH_SKIP = 1
+EXACT_PROFILE_LAUNCH_COUNT = 1
+EXACT_PROFILE_QKFAST_WARMUP = 2
+EXACT_PROFILE_QKFAST_ITERS = 5
+EXACT_PROFILE_SKIP_QKFAST_ENV = "FLASH_ATTN_FP4_PROFILE_EXACT_SKIP_QKFAST"
 
 
 def _get_cuda_driver():
@@ -209,6 +230,40 @@ def _get_benchmark_device() -> int:
     raise RuntimeError("No usable CUDA device found for benchmark_fp4_pv.py.") from last_exc
 
 
+def _enumerate_usable_devices() -> list[int]:
+    devices = []
+    last_exc = None
+    _maybe_cuinit()
+    for device_idx in range(8):
+        try:
+            torch.cuda.set_device(device_idx)
+            torch.empty(1, device="cuda")
+            devices.append(device_idx)
+        except Exception as exc:
+            last_exc = exc
+    if devices:
+        return devices
+    raise RuntimeError("No usable CUDA device found for benchmark_fp4_pv.py.") from last_exc
+
+
+def _is_known_bogus_fast_qkfast(
+    *,
+    qkfast_ms: float,
+    seqlen: int,
+    head_dim: int,
+    causal: bool,
+    num_heads: int,
+    num_heads_kv: int,
+) -> bool:
+    return (
+        not causal
+        and head_dim == 128
+        and seqlen == 512
+        and num_heads == num_heads_kv
+        and qkfast_ms < BOGUS_FAST_QKFAST_MS
+    )
+
+
 def _make_inputs(*, seqlen: int, head_dim: int, batch_size: int, num_heads: int, num_heads_kv: int):
     seed = 31_000 + seqlen * 13 + head_dim * 101 + batch_size * 17
     generator = torch.Generator(device="cpu")
@@ -316,6 +371,21 @@ def _max_metric(samples: list[dict], key: str) -> float:
     return max(values) if values else math.nan
 
 
+def _exact_profile_metadata(*, device_idx: int) -> dict:
+    return {
+        "profile_mode": "exact-lane",
+        "profile_row": "mha_d128_s512_b2_noncausal",
+        "profile_device": device_idx,
+        "ncu_kernel_name_base": EXACT_PROFILE_NCU_KERNEL_NAME_BASE,
+        "ncu_kernel_regex": EXACT_PROFILE_NCU_KERNEL_REGEX,
+        "profile_launch_skip": EXACT_PROFILE_LAUNCH_SKIP,
+        "profile_launch_count": EXACT_PROFILE_LAUNCH_COUNT,
+        "profile_qkfast_warmup": EXACT_PROFILE_QKFAST_WARMUP,
+        "profile_qkfast_iters": EXACT_PROFILE_QKFAST_ITERS,
+        "profile_skip_qkfast_env": EXACT_PROFILE_SKIP_QKFAST_ENV,
+    }
+
+
 def _benchmark_case(
     *,
     seqlen: int,
@@ -328,7 +398,27 @@ def _benchmark_case(
     iters: int,
     skip_baseline_check: bool = False,
     compare_mode: str = "full",
+    device_idx: int | None = None,
+    pv_tile_mn: tuple[int, int] | None = None,
 ):
+    global _BENCH_DEVICE
+    if device_idx is not None:
+        _BENCH_DEVICE = device_idx
+    profile_exact = compare_mode == "profile-exact"
+    skip_qkfast_profile_baseline = (
+        profile_exact and os.environ.get(EXACT_PROFILE_SKIP_QKFAST_ENV) == "1"
+    )
+    if profile_exact:
+        if device_idx is None:
+            raise RuntimeError("profile-exact mode requires an explicit device_idx.")
+        if (
+            head_dim != EXACT_PROFILE_ROW["head_dim"]
+            or seqlen != EXACT_PROFILE_ROW["seqlen"]
+            or batch_size != EXACT_PROFILE_ROW["batch_size"]
+            or causal != EXACT_PROFILE_ROW["causal"]
+            or num_heads != num_heads_kv
+        ):
+            raise RuntimeError("profile-exact mode is only supported on the must-win exact row.")
     tensors = _make_inputs(
         seqlen=seqlen,
         head_dim=head_dim,
@@ -358,6 +448,7 @@ def _benchmark_case(
             tensors["v_pv_packed"],
             causal=causal,
             return_lse=True,
+            tile_mn=pv_tile_mn,
             fp4_qk_format="nvfp4",
             q_scale=tensors["q_qkfast_scale"],
             k_scale=tensors["k_qkfast_scale"],
@@ -402,14 +493,39 @@ def _benchmark_case(
         torch.testing.assert_close(out_fp4.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
         torch.testing.assert_close(lse_fp4.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
 
-    qkfast_ms = _time_ms(run_qkfast, warmup=warmup, iters=iters)
-    fp4_ms = _time_ms(run_pv_fp4, warmup=warmup, iters=iters)
+    if profile_exact and not skip_qkfast_profile_baseline:
+        qkfast_ms = _time_ms(
+            run_qkfast,
+            warmup=EXACT_PROFILE_QKFAST_WARMUP,
+            iters=EXACT_PROFILE_QKFAST_ITERS,
+        )
+        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1)
+    elif profile_exact:
+        qkfast_ms = math.nan
+        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1)
+    else:
+        qkfast_ms = _time_ms(run_qkfast, warmup=warmup, iters=iters)
+        fp4_ms = _time_ms(run_pv_fp4, warmup=warmup, iters=iters)
     bf16_ms = math.nan
     if include_bf16:
         bf16_ms = _time_ms(run_bf16_direct, warmup=warmup, iters=iters)
+    if not skip_qkfast_profile_baseline:
+        if _is_known_bogus_fast_qkfast(
+            qkfast_ms=qkfast_ms,
+            seqlen=seqlen,
+            head_dim=head_dim,
+            causal=causal,
+            num_heads=num_heads,
+            num_heads_kv=num_heads_kv,
+        ):
+            raise RuntimeError(
+                f"QK-fast baseline looks bogus-fast on device {_get_benchmark_device()} "
+                f"(qkfast_ms={qkfast_ms:.5f}) for d={head_dim}, s={seqlen}, causal={causal}."
+            )
 
-    return {
+    result = {
         "kind": "mha" if num_heads == num_heads_kv else "gqa",
+        "device": _get_benchmark_device(),
         "hq": num_heads,
         "hkv": num_heads_kv,
         "d": head_dim,
@@ -418,8 +534,8 @@ def _benchmark_case(
         "qkfast_ms": qkfast_ms,
         "pv_fused_ms": fp4_ms,
         "bf16_ms": bf16_ms,
-        "qkfast_over_bf16": qkfast_ms / bf16_ms if math.isfinite(bf16_ms) else math.nan,
-        "pv_fused_over_qkfast": fp4_ms / qkfast_ms,
+        "qkfast_over_bf16": qkfast_ms / bf16_ms if math.isfinite(qkfast_ms) and math.isfinite(bf16_ms) else math.nan,
+        "pv_fused_over_qkfast": fp4_ms / qkfast_ms if math.isfinite(qkfast_ms) else math.nan,
         "pv_fused_over_bf16": fp4_ms / bf16_ms if math.isfinite(bf16_ms) else math.nan,
         "qkfast_out_max": (out_qkfast.float() - out_bf16.float()).abs().max().item() if out_bf16 is not None else math.nan,
         "qkfast_lse_max": (lse_qkfast.float() - lse_bf16.float()).abs().max().item() if lse_bf16 is not None else math.nan,
@@ -428,6 +544,10 @@ def _benchmark_case(
         "pv_fused_impl": "cute",
         "compare_mode": compare_mode,
     }
+    if profile_exact:
+        result.update(_exact_profile_metadata(device_idx=_get_benchmark_device()))
+        result["profile_skip_qkfast"] = skip_qkfast_profile_baseline
+    return result
 
 
 def _aggregate_benchmark_runs(samples: list[dict], failures: list[dict] | None = None) -> dict:
@@ -437,6 +557,7 @@ def _aggregate_benchmark_runs(samples: list[dict], failures: list[dict] | None =
     first = samples[0]
     aggregated = {
         "kind": first["kind"],
+        "device": first.get("device", -1),
         "hq": first["hq"],
         "hkv": first["hkv"],
         "d": first["d"],
@@ -469,13 +590,17 @@ def _run_row_fresh_processes(
     batch_size: int,
     num_heads: int,
     num_heads_kv: int,
+    device_idx: int,
     warmup: int,
     iters: int,
     skip_baseline_check: bool,
     fresh_runs: int,
     max_attempts: int,
     compare_mode: str,
+    pv_tile_mn: tuple[int, int] | None = None,
 ) -> dict:
+    if compare_mode == "profile-exact":
+        raise RuntimeError("profile-exact mode does not use the fresh-process row aggregator.")
     successes = []
     failures = []
     while len(successes) < fresh_runs and len(successes) + len(failures) < max_attempts:
@@ -490,6 +615,8 @@ def _run_row_fresh_processes(
             "true" if causal else "false",
             "--batch-size",
             str(batch_size),
+            "--device",
+            str(device_idx),
             "--num-heads",
             str(num_heads),
             "--num-heads-kv",
@@ -502,6 +629,15 @@ def _run_row_fresh_processes(
             "--compare-mode",
             compare_mode,
         ]
+        if pv_tile_mn is not None:
+            cmd.extend(
+                [
+                    "--pv-tile-m",
+                    str(pv_tile_mn[0]),
+                    "--pv-tile-n",
+                    str(pv_tile_mn[1]),
+                ]
+            )
         if skip_baseline_check:
             cmd.append("--skip-baseline-check")
         child = subprocess.run(
@@ -540,6 +676,9 @@ def main():
     parser.add_argument("--seqlens", default="512", help="Comma-separated sequence lengths.")
     parser.add_argument("--causal-values", default="false", help="Comma-separated causal flags.")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--device", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--pv-tile-m", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--pv-tile-n", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--num-heads", type=int, default=DEFAULT_NUM_HEADS)
     parser.add_argument("--num-heads-kv", type=int, default=DEFAULT_NUM_HEADS_KV)
     parser.add_argument("--warmup", type=int, default=15)
@@ -548,7 +687,7 @@ def main():
     parser.add_argument("--max-attempts", type=int, default=10, help="Maximum subprocess attempts per row before failing.")
     parser.add_argument(
         "--compare-mode",
-        choices=("full", "fused-only"),
+        choices=("full", "fused-only", "profile-exact"),
         default="full",
         help="Use 'fused-only' for primary perf work so only qkfast vs fused PV are measured in each subprocess.",
     )
@@ -565,6 +704,10 @@ def main():
     args = parser.parse_args()
 
     try:
+        _maybe_cuinit()
+        if args.device is not None:
+            global _BENCH_DEVICE
+            _BENCH_DEVICE = args.device
         torch.cuda.set_device(_get_benchmark_device())
         torch.empty(1, device="cuda")
     except Exception as exc:
@@ -576,6 +719,13 @@ def main():
     head_dims = _parse_csv_ints(args.head_dims)
     seqlens = _parse_csv_ints(args.seqlens)
     causal_values = _parse_csv_bools(args.causal_values)
+    if (args.pv_tile_m is None) ^ (args.pv_tile_n is None):
+        raise SystemExit("Pass both --pv-tile-m and --pv-tile-n together.")
+    pv_tile_mn = (
+        (args.pv_tile_m, args.pv_tile_n)
+        if args.pv_tile_m is not None and args.pv_tile_n is not None
+        else None
+    )
     rows = [
         (head_dim, causal, seqlen)
         for head_dim in head_dims
@@ -583,7 +733,7 @@ def main():
         for seqlen in seqlens
     ]
 
-    if args.emit_json:
+    if args.emit_json or args.compare_mode == "profile-exact":
         if len(rows) != 1:
             raise SystemExit("--emit-json expects exactly one benchmark row.")
         head_dim, causal, seqlen = rows[0]
@@ -596,44 +746,64 @@ def main():
                     batch_size=args.batch_size,
                     num_heads=args.num_heads,
                     num_heads_kv=args.num_heads_kv,
+                    device_idx=args.device,
                     warmup=args.warmup,
                     iters=args.iters,
                     skip_baseline_check=args.skip_baseline_check,
                     compare_mode=args.compare_mode,
+                    pv_tile_mn=pv_tile_mn,
                 )
             )
         )
         return
 
     script_path = pathlib.Path(__file__).resolve()
+    candidate_devices = [args.device] if args.device is not None else _enumerate_usable_devices()
     print(
-        "kind,hq,hkv,d,causal,seqlen,pv_fused_impl,success_count,failure_count,"
+        "device,kind,hq,hkv,d,causal,seqlen,pv_fused_impl,success_count,failure_count,"
         "qkfast_ms,pv_fused_ms,bf16_ms,qkfast_over_bf16,pv_fused_over_qkfast,pv_fused_over_bf16,"
         "qkfast_out_max,qkfast_lse_max,pv_fused_out_max,pv_fused_lse_max"
     )
+    saw_clean_device = False
+    failed_clean_device = False
     for head_dim, causal, seqlen in rows:
-        result = _run_row_fresh_processes(
-            script_path=script_path,
-            head_dim=head_dim,
-            causal=causal,
-            seqlen=seqlen,
-            batch_size=args.batch_size,
-            num_heads=args.num_heads,
-            num_heads_kv=args.num_heads_kv,
-            warmup=args.warmup,
-            iters=args.iters,
-            skip_baseline_check=args.skip_baseline_check,
-            fresh_runs=args.fresh_runs,
-            max_attempts=args.max_attempts,
-            compare_mode=args.compare_mode,
-        )
-        print(
-            f"{result['kind']},{result['hq']},{result['hkv']},{result['d']},"
-            f"{result['causal']},{result['seqlen']},{result['pv_fused_impl']},{result['success_count']},{result['failure_count']},"
-            f"{result['qkfast_ms']:.5f},{result['pv_fused_ms']:.5f},{result['bf16_ms']:.5f},"
-            f"{result['qkfast_over_bf16']:.3f},{result['pv_fused_over_qkfast']:.3f},{result['pv_fused_over_bf16']:.3f},"
-            f"{result['qkfast_out_max']:.6f},{result['qkfast_lse_max']:.6f},{result['pv_fused_out_max']:.6f},{result['pv_fused_lse_max']:.6f}"
-        )
+        for device_idx in candidate_devices:
+            try:
+                result = _run_row_fresh_processes(
+                    script_path=script_path,
+                    head_dim=head_dim,
+                    causal=causal,
+                    seqlen=seqlen,
+                    batch_size=args.batch_size,
+                    num_heads=args.num_heads,
+                    num_heads_kv=args.num_heads_kv,
+                    device_idx=device_idx,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    skip_baseline_check=args.skip_baseline_check,
+                    fresh_runs=args.fresh_runs,
+                    max_attempts=args.max_attempts,
+                    compare_mode=args.compare_mode,
+                    pv_tile_mn=pv_tile_mn,
+                )
+            except RuntimeError as exc:
+                if "bogus-fast" in str(exc):
+                    continue
+                raise
+            saw_clean_device = True
+            if result["pv_fused_over_qkfast"] >= 1.0:
+                failed_clean_device = True
+            print(
+                f"{result['device']},{result['kind']},{result['hq']},{result['hkv']},{result['d']},"
+                f"{result['causal']},{result['seqlen']},{result['pv_fused_impl']},{result['success_count']},{result['failure_count']},"
+                f"{result['qkfast_ms']:.5f},{result['pv_fused_ms']:.5f},{result['bf16_ms']:.5f},"
+                f"{result['qkfast_over_bf16']:.3f},{result['pv_fused_over_qkfast']:.3f},{result['pv_fused_over_bf16']:.3f},"
+                f"{result['qkfast_out_max']:.6f},{result['qkfast_lse_max']:.6f},{result['pv_fused_out_max']:.6f},{result['pv_fused_lse_max']:.6f}"
+            )
+    if not saw_clean_device:
+        raise SystemExit("benchmark_fp4_pv.py did not find any clean GPU for this row.")
+    if failed_clean_device:
+        raise SystemExit("At least one clean GPU failed the pv_fused_over_qkfast < 1.0 gate.")
 
 
 if __name__ == "__main__":

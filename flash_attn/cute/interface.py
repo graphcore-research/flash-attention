@@ -297,8 +297,8 @@ def _validate_fp4_qk_inputs(
         use_fp4_pv
         and fp4_qk_format == "nvfp4"
         and arch // 10 in [10, 11]
-        and head_dim == 128
-        and head_dim_v == 128
+        and head_dim in (64, 128)
+        and head_dim_v == head_dim
         and q.shape[-2] == k.shape[-2]
         and cu_seqlens_q is None
         and cu_seqlens_k is None
@@ -359,7 +359,7 @@ def _validate_fp4_qk_inputs(
     if use_fp4_pv:
         if not allow_fp4_pv_fused_lane:
             raise NotImplementedError(
-                "The exact Sage-style FP4 PV rewrite is currently scoped to dense fixed-length noncausal MHA with head_dim=head_dim_v=128 on SM100/SM110."
+                "The exact Sage-style FP4 PV rewrite is currently scoped to dense fixed-length noncausal MHA with head_dim=head_dim_v in {64, 128} on SM100/SM110."
             )
         seqlen_k_padded = math.ceil(k.shape[-3] / 128) * 128
         if v.dtype != torch.uint8:
@@ -443,8 +443,8 @@ def _should_enable_fp4_pv_fused_lane(
         use_fp4_pv
         and fp4_qk_format == "nvfp4"
         and arch // 10 in [10, 11]
-        and head_dim == 128
-        and head_dim_v == 128
+        and head_dim in (64, 128)
+        and head_dim_v == head_dim
         and qhead_per_kvhead == 1
         and not causal
         and not local

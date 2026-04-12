@@ -641,26 +641,7 @@ class FP4FlashAttentionForwardSm100PVFused:
             else max(smem_size_k_per_stage, smem_size_v_per_stage)
         ) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
-        if (
-            os.getenv("FLASH_ATTN_FP4_CAP_D128_KV_STAGE", "0") == "1"
-            and self.use_fp4_qk
-            and not self.use_2cta_instrs
-            and self.head_dim_padded == 128
-            and self.head_dim_v_padded == 128
-            and kv_stage > 3
-        ):
-            # The first PV-era shared-forward merge hard-capped FP4 d128 at 3 KV stages.
-            # The pre-PV fast path did not impose that cap, and that older schedule is the
-            # performance reference we are restoring by default. Keep the cap as an internal
-            # escape hatch while we revalidate the repaired non-PV path.
-            kv_stage = 3
-        forced_kv_stage = os.environ.get("FLASH_ATTN_FP4_FORCE_KV_STAGE")
-        if forced_kv_stage is not None:
-            kv_stage = min(kv_stage, int(forced_kv_stage))
-        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
-            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
-             kv_stage = 3
-        self.kv_stage = kv_stage
+        self.kv_stage = self._finalize_kv_stage(kv_stage)
         # print("kv_stage", self.kv_stage)
         self.s_stage = 2
         assert self.s_stage >= self.q_stage
@@ -680,6 +661,37 @@ class FP4FlashAttentionForwardSm100PVFused:
             else 0
         )
         assert self.uneven_kv_smem_offset % 1024 == 0
+
+    def _finalize_kv_stage(self, kv_stage: int) -> int:
+        if (
+            os.getenv("FLASH_ATTN_FP4_CAP_D128_KV_STAGE", "0") == "1"
+            and self.use_fp4_qk
+            and not self.use_2cta_instrs
+            and self.head_dim_padded == 128
+            and self.head_dim_v_padded == 128
+            and kv_stage > 3
+        ):
+            # The first PV-era shared-forward merge hard-capped FP4 d128 at 3 KV stages.
+            # The pre-PV fast path did not impose that cap, and that older schedule is the
+            # performance reference we are restoring by default. Keep the cap as an internal
+            # escape hatch while we revalidate the repaired non-PV path.
+            kv_stage = 3
+        if (
+            self.use_exact_fp4_pv_lane
+            and self.head_dim_padded == 64
+            and self.head_dim_v_padded == 64
+            and kv_stage > 21
+        ):
+            # The exact fused d64 lane's raw byte heuristic ignores layout and barrier
+            # overhead. Stage 22 overshoots the 224 KiB launch budget; 21 still fits.
+            kv_stage = 21
+        forced_kv_stage = os.environ.get("FLASH_ATTN_FP4_FORCE_KV_STAGE")
+        if forced_kv_stage is not None:
+            kv_stage = min(kv_stage, int(forced_kv_stage))
+        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
+            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
+            kv_stage = 3
+        return kv_stage
 
     @cute.jit
     def __call__(

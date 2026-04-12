@@ -10,12 +10,18 @@ Current scope of the active FP4 PV path:
 - attention shape: dense fixed-length
 - mode: noncausal
 - topology: `MHA`
-- dimensions: `head_dim=head_dim_v=128`
+- dimensions:
+  - dispatch-enabled: `head_dim=head_dim_v in {64, 128}`
+  - stable smoke coverage:
+    - `d64`: `S=512` and `S=1024`
+    - `d128`: `S=512`
+- known unstable row:
+  - `d128`, `S=1024` still produces `NaN/Inf` in the fused PV path
 - public API remains:
   - `fp4_qk_format="nvfp4"`
   - `use_fp4_pv=True`
 
-Everything else is intentionally still out of scope for the active exact lane until the must-win row beats `qkfast` robustly on clean devices.
+Everything beyond dense fixed-length noncausal `MHA` in `{64, 128}` remains intentionally out of scope for the active exact lane until the must-win row beats `qkfast` robustly on clean devices.
 
 ## Relevant Files
 
@@ -78,6 +84,30 @@ Current honest must-win-row anchor on the restored stable line:
 This number is still above `1.0`, so the exact FP4 PV lane is not yet at the required win condition.
 
 Historically during this push sequence, the stable line has also been observed in better states around the `~1.05x-1.09x` band on clean runs, but it has not held below `1.0` robustly across devices `1` and `2`.
+
+## General-Shape Extension
+
+Recent widening work re-enabled the exact fused lane for dense noncausal `d64` `MHA`.
+
+The key runtime fix was not a new math path. The launch heuristic was overestimating how many KV stages fit in shared memory for the exact `d64` lane:
+
+- raw heuristic result: `kv_stage=22`
+- actual launchable cap for the current fused layout: `kv_stage=21`
+- measured reason:
+  - `kv_stage=21` gives `shared_storage.size_in_bytes() = 228352`
+  - `kv_stage=22` gives `shared_storage.size_in_bytes() = 238592`
+  - the fused kernel targets a `224 KiB = 229376` shared-memory budget
+
+Current short-smoke data after the d64 cap:
+
+- `d64`, `S=512`, device `2`, default path:
+  - `pv_fused_over_qkfast = 0.9884854211718744`
+- `d64`, `S=512`, device `1`, `FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT=1`:
+  - `pv_fused_over_qkfast = 0.9793912401494516`
+- `d64`, `S=1024`, device `2`, default path:
+  - `pv_fused_over_qkfast = 0.8320691502132515`
+
+This widening does not make the broader exact lane generally stable yet. In particular, `d128`, `S=1024` still fails with `NaN/Inf` in the fused PV output and needs separate debugging.
 
 ## Validation Commands
 
@@ -312,7 +342,7 @@ Right now the best evidence says:
    - avoid direct reuse of the current generic swizzled shared-scale contract if possible
    - preserve blockscaled legality
 4. Re-profile after each structural `SFV` change using the exact profiling mode and imported `ncu` reports.
-5. Only widen back to `d64`, `GQA`, or causal once the must-win row is robustly `< 1.0` on devices `1` and `2`.
+5. Keep `d64` dense `MHA` enabled, but do not widen further to `GQA` or causal until the `d128`, `S=512` must-win row is robustly `< 1.0` on devices `1` and `2`, and `d128`, `S=1024` no longer produces `NaN/Inf`.
 
 ## New Experimental Knob
 

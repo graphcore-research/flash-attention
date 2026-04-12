@@ -457,8 +457,9 @@ def test_fp4_pv_fake_compile_dense_forward(
     monkeypatch, num_heads, num_heads_kv, head_dim, head_dim_v, causal
 ):
     compile_calls = _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
     exact_sage_lane = (
-        num_heads == num_heads_kv == 4 and head_dim == 128 and head_dim_v == 128 and not causal
+        num_heads == num_heads_kv == 4 and head_dim in (64, 128) and head_dim_v == head_dim and not causal
     )
     fp4_pv_format = "nvfp4" if exact_sage_lane else None
 
@@ -507,8 +508,10 @@ def test_fp4_pv_fake_compile_dense_forward(
                 )
 
 
-def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch, head_dim):
     _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
     kernel_kwargs = {}
 
     def fake_pvfused_kernel(*_args, **kwargs):
@@ -525,8 +528,8 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
         q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
             fp4_qk_format="nvfp4",
             fp4_pv_format="nvfp4",
-            head_dim=128,
-            head_dim_v=128,
+            head_dim=head_dim,
+            head_dim_v=head_dim,
             num_heads=4,
             num_heads_kv=4,
             seqlen_q=512,
@@ -555,13 +558,13 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
     assert kernel_kwargs["use_2cta_instrs"] is False
 
 
-def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch):
+def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, *, head_dim=128):
     _install_fake_cuda_runtime(monkeypatch)
     from flash_attn.cute.fp4_flash_fwd_sm100_pvfused import FP4FlashAttentionForwardSm100PVFused
 
     return FP4FlashAttentionForwardSm100PVFused(
-        head_dim=128,
-        head_dim_v=128,
+        head_dim=head_dim,
+        head_dim_v=head_dim,
         qhead_per_kvhead=1,
         is_causal=False,
         is_local=False,
@@ -620,6 +623,19 @@ def test_fp4_pv_fused_exact_lane_supports_exact_sfv_direct_opt_in(monkeypatch):
     kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
     assert kernel.use_exact_fp4_pv_lane is True
     assert kernel.fp4_pv_exact_sfv_direct is True
+
+
+def test_fp4_pv_fused_exact_lane_caps_d64_kv_stage(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=64)
+    assert kernel._finalize_kv_stage(20) == 20
+    assert kernel._finalize_kv_stage(21) == 21
+    assert kernel._finalize_kv_stage(22) == 21
+
+
+def test_fp4_pv_fused_exact_lane_respects_forced_kv_stage(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTN_FP4_FORCE_KV_STAGE", "8")
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=64)
+    assert kernel._finalize_kv_stage(22) == 8
 
 
 def test_fp4_pv_fused_dispatch_ignores_removed_legacy_selector(monkeypatch):
@@ -1585,15 +1601,16 @@ def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
     assert "use_fp4_pv" not in calls[0][1]
     calls.clear()
 
-    with FakeTensorMode():
-        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
-            fp4_qk_format="nvfp4",
-            head_dim=64,
-            head_dim_v=64,
-            seqlen_q=512,
-            seqlen_k=512,
-        )
-        with pytest.raises(NotImplementedError, match="exact Sage-style FP4 PV rewrite"):
+    for head_dim in (64, 128):
+        with FakeTensorMode():
+            q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+                fp4_qk_format="nvfp4",
+                fp4_pv_format="nvfp4",
+                head_dim=head_dim,
+                head_dim_v=head_dim,
+                seqlen_q=512,
+                seqlen_k=512,
+            )
             _flash_attn_fwd(
                 q,
                 k,
@@ -1606,35 +1623,12 @@ def test_fp4_use_fp4_pv_dispatch_selects_split_kernel(monkeypatch):
                 use_fp4_pv=True,
                 v_scale=v_scale,
             )
-    assert not calls
-    calls.clear()
 
-    with FakeTensorMode():
-        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
-            fp4_qk_format="nvfp4",
-            fp4_pv_format="nvfp4",
-            head_dim=128,
-            head_dim_v=128,
-            seqlen_q=512,
-            seqlen_k=512,
-        )
-        _flash_attn_fwd(
-            q,
-            k,
-            v,
-            causal=False,
-            _arch=100,
-            fp4_qk_format="nvfp4",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            use_fp4_pv=True,
-            v_scale=v_scale,
-        )
-
-    assert calls[0][0] == "pvfused"
-    assert calls[0][1]["use_fp4_pv"] is True
-    assert calls[0][1]["fp4_sf_dtype"] == "e4m3"
-    assert calls[0][1]["pv_sf_dtype"] == "e4m3"
+        assert calls[0][0] == "pvfused"
+        assert calls[0][1]["use_fp4_pv"] is True
+        assert calls[0][1]["fp4_sf_dtype"] == "e4m3"
+        assert calls[0][1]["pv_sf_dtype"] == "e4m3"
+        calls.clear()
 
 
 def test_fp4_use_fp4_pv_dispatch_supports_causal_gqa(monkeypatch):

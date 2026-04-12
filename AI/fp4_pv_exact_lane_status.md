@@ -109,6 +109,24 @@ Current short-smoke data after the d64 cap:
 
 This widening does not make the broader exact lane generally stable yet. In particular, `d128`, `S=1024` still fails with `NaN/Inf` in the fused PV output and needs separate debugging.
 
+Another general-shape issue was fixed after the d64 widening:
+
+- same-process mixed-seqlen exact-lane calls were reusing stale compile-cache entries
+- concrete repro before the fix:
+  - call exact FP4 PV once at `S=64`
+  - call it again at `S=1024` in the same process
+  - CuTe raised a shape mismatch on `mK.shape[1]`
+- current fix:
+  - the fused-lane compile cache key now includes dense `seqlen_q` and `seqlen_k`
+  - a runtime probe now verifies exact-lane recompilation across `S=64 -> 1024` for both default and `FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT=1`
+
+There is still a deeper runtime correctness question in the exact FP4 PV path:
+
+- the long-standing constant-`V` oracle probes do not currently match the expected all-ones output
+- the packed `V`/`SFV` fixture itself dequantizes correctly in Python
+- that points at the fused runtime path rather than the test encoding
+- this has not been fixed in the current push and should be treated as active follow-up work before using those probes as gating correctness checks
+
 ## Validation Commands
 
 ### 1. Python compile sanity

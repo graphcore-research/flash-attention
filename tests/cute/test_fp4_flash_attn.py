@@ -19,7 +19,7 @@ from flash_attn.cute.interface import (
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from tests.cute.benchmark_fp4_qk import _benchmark_case
-from tests.cute.benchmark_fp4_pv import _aggregate_benchmark_runs
+from tests.cute.benchmark_fp4_pv import _aggregate_benchmark_runs, _get_benchmark_device
 
 
 FP4_GRID = torch.tensor(
@@ -2838,8 +2838,19 @@ def _run_fp4_runtime_case(
         )
 
 
-def _run_fp4_pv_probe(script: str, *, direct_loader: bool, timeout_s: int = 180) -> None:
-    extra_env = {"FLASH_ATTN_FP4_PV_DIRECT_LOADER": "1"} if direct_loader else {}
+def _run_fp4_pv_probe(
+    script: str,
+    *,
+    direct_loader: bool,
+    timeout_s: int = 180,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    env = {}
+    if direct_loader:
+        env["FLASH_ATTN_FP4_PV_DIRECT_LOADER"] = "1"
+    if extra_env is not None:
+        env.update(extra_env)
+    env.setdefault("CUDA_VISIBLE_DEVICES", str(_get_benchmark_device()))
     try:
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(script)],
@@ -2847,7 +2858,7 @@ def _run_fp4_pv_probe(script: str, *, direct_loader: bool, timeout_s: int = 180)
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            env={**os.environ, **extra_env},
+            env={**os.environ, **env},
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -3615,4 +3626,72 @@ def test_fp4_pv_probe_v_scale_axis_is_colwise(direct_loader):
         assert torch.isfinite(lse.float()).all().item()
         """,
         direct_loader=direct_loader,
+    )
+
+
+@pytest.mark.parametrize("exact_sfv_direct", [False, True])
+def test_fp4_pv_probe_exact_lane_recompiles_across_seqlens(exact_sfv_direct):
+    _require_sm100()
+    extra_env = (
+        {"FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT": "1"}
+        if exact_sfv_direct
+        else None
+    )
+    _run_fp4_pv_probe(
+        """
+        import torch
+        from flash_attn.cute.interface import _flash_attn_fwd
+
+        def _swizzle_fp4_vt_scale(scale_vt):
+            batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+            out = torch.empty_like(scale_vt)
+            flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+            flat_out = out.view(batch_size, num_heads, -1)
+            for d in range(head_dim):
+                tile_m, row_in_tile = divmod(d, 64)
+                quad, row_mod16 = divmod(row_in_tile, 16)
+                for seq_group in range(seqlen_groups):
+                    offset = (
+                        tile_m * 64 * seqlen_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+            return out
+
+        def _run_case(seqlen_k):
+            batch_size, seqlen_q, num_heads, head_dim = 1, 64, 4, 128
+            seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
+            q = torch.zeros(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
+            k = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
+            v = torch.zeros((batch_size, num_heads, head_dim, seqlen_k_padded // 2), device="cuda", dtype=torch.uint8)
+            q_scale = torch.ones(batch_size, seqlen_q, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+            k_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+            v_scale = torch.ones(batch_size, num_heads, head_dim, seqlen_k_padded // 16, device="cuda", dtype=torch.float8_e4m3fn)
+            v_scale = _swizzle_fp4_vt_scale(v_scale)
+
+            out, lse = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                causal=False,
+                return_lse=True,
+                fp4_qk_format="nvfp4",
+                q_scale=q_scale,
+                k_scale=k_scale,
+                use_fp4_pv=True,
+                v_scale=v_scale,
+            )
+            torch.cuda.synchronize()
+            assert torch.isfinite(out.float()).all().item()
+            assert torch.isfinite(lse.float()).all().item()
+
+        _run_case(64)
+        _run_case(1024)
+        """,
+        direct_loader=False,
+        timeout_s=300,
+        extra_env=extra_env,
     )

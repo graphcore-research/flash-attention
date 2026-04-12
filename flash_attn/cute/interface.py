@@ -1669,6 +1669,7 @@ def _flash_attn_fwd(
     v_scale_vt = None
     fp4_pv_direct_loader = _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None
     fp4_pv_force_cta_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT") if is_fp4_pv else None
+    fp4_pv_exact_sfv_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT") if is_fp4_pv_fused_lane else None
     fp4_pv_encode_centric = _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC") if is_fp4_pv else None
     fp4_pv_manual_direct_loader = bool(fp4_pv_direct_loader and fp4_pv_force_cta_direct) if is_fp4_pv else None
     if is_fp4_pv:
@@ -1730,6 +1731,7 @@ def _flash_attn_fwd(
         get_broadcast_dims(v_scale) if is_fp4_pv else None,
         "vt_packed_seq" if is_fp4_pv else None,
         fp4_pv_direct_loader,
+        fp4_pv_exact_sfv_direct,
         _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE") if is_fp4_pv else None,
         fp4_pv_encode_centric,
         fp4_pv_force_cta_direct,

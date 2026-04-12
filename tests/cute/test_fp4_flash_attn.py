@@ -557,46 +557,36 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch):
 
 def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch):
     _install_fake_cuda_runtime(monkeypatch)
-    kernel_call = {}
     from flash_attn.cute.fp4_flash_fwd_sm100_pvfused import FP4FlashAttentionForwardSm100PVFused
 
-    def capture_pvfused_kernel(*args, **kwargs):
-        kernel_call["args"] = args
-        kernel_call["kwargs"] = kwargs
-        return object()
-
-    monkeypatch.setattr(
-        "flash_attn.cute.interface.FP4FlashAttentionForwardSm100PVFused",
-        capture_pvfused_kernel,
-    )
-
-    with FakeTensorMode():
-        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
-            fp4_qk_format="nvfp4",
-            fp4_pv_format="nvfp4",
-            head_dim=128,
-            head_dim_v=128,
-            num_heads=4,
-            num_heads_kv=4,
-            seqlen_q=512,
-            seqlen_k=512,
-        )
-        _flash_attn_fwd(
-            q,
-            k,
-            v,
-            causal=False,
-            _arch=100,
-            fp4_qk_format="nvfp4",
-            q_scale=q_scale,
-            k_scale=k_scale,
-            use_fp4_pv=True,
-            v_scale=v_scale,
-        )
-
     return FP4FlashAttentionForwardSm100PVFused(
-        *kernel_call["args"],
-        **kernel_call["kwargs"],
+        head_dim=128,
+        head_dim_v=128,
+        qhead_per_kvhead=1,
+        is_causal=False,
+        is_local=False,
+        is_split_kv=False,
+        pack_gqa=False,
+        q_subtile_factor=None,
+        m_block_size=128,
+        n_block_size=128,
+        q_stage=1,
+        is_persistent=True,
+        score_mod=None,
+        mask_mod=None,
+        has_aux_tensors=False,
+        paged_kv_non_tma=False,
+        is_varlen_q=False,
+        use_2cta_instrs=False,
+        use_fp4_qk=True,
+        use_fp4_pv=True,
+        fp4_sf_dtype="e4m3",
+        fp4_sf_vec_size=16,
+        pv_sf_dtype="e4m3",
+        pv_sf_vec_size=16,
+        pack_gqa_local=False,
+        group_qheads_by_kv=False,
+        fp4_pv_fp32_online_rescale=False,
     )
 
 
@@ -623,6 +613,13 @@ def test_fp4_pv_fused_exact_lane_skips_legacy_stats_pipeline(monkeypatch):
     kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
     assert kernel.use_exact_fp4_pv_lane is True
     assert kernel.use_exact_fp4_pv_legacy_stats_pipeline is False
+
+
+def test_fp4_pv_fused_exact_lane_supports_exact_sfv_direct_opt_in(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "1")
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+    assert kernel.use_exact_fp4_pv_lane is True
+    assert kernel.fp4_pv_exact_sfv_direct is True
 
 
 def test_fp4_pv_fused_dispatch_ignores_removed_legacy_selector(monkeypatch):
@@ -1181,6 +1178,49 @@ def test_fp4_compile_cache_separates_pv_cta_decode_and_encode_centric(monkeypatc
             v_scale=v_scale,
         )
         monkeypatch.setenv("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC", "1")
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert len(compile_calls) == 2
+    assert len(_flash_attn_fwd.compile_cache) == 2
+
+
+def test_fp4_compile_cache_separates_exact_sfv_direct_variants(monkeypatch):
+    compile_calls = _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
+
+    with FakeTensorMode():
+        q, k, v_packed, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            head_dim=128,
+            head_dim_v=128,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        monkeypatch.delenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", raising=False)
+        _flash_attn_fwd(
+            q,
+            k,
+            v_packed,
+            causal=False,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+        monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "1")
         _flash_attn_fwd(
             q,
             k,

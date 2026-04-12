@@ -314,6 +314,39 @@ Right now the best evidence says:
 4. Re-profile after each structural `SFV` change using the exact profiling mode and imported `ncu` reports.
 5. Only widen back to `d64`, `GQA`, or causal once the must-win row is robustly `< 1.0` on devices `1` and `2`.
 
+## New Experimental Knob
+
+A new exact-lane-only experiment is now available behind:
+
+- `FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT=1`
+
+What it does:
+
+- keeps the current exact-lane `TMA V` path intact
+- bypasses the generic public `SFV` staging copy in `load_v_scale_stage_public()`
+- uses the manual public-SFV byte loader directly into the exact-lane shared `SFV` stage
+- keeps the default stable path unchanged when the env var is unset
+- is compile-cache separated from the default path
+
+Validation coverage added for this knob:
+
+- exact-lane fake-runtime property coverage
+- compile-cache separation coverage for the exact fused lane
+
+Short smoke results from the first shortened fused-only pass (`--warmup 1 --iters 1`):
+
+- device `2`: `pv_fused_over_qkfast = 0.9918`
+- device `1`: `pv_fused_over_qkfast = 1.0298`
+
+These numbers are directionally positive, but they are not yet acceptance-quality because they do not use the full multi-run median workflow.
+
+Recommended measurement workflow for the new experiment:
+
+```bash
+cd /workspace/codebases/fp4_matmul/flash-attention
+FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT=1   timeout 120s env FLASH_ATTN_FP4_PROFILE_EXACT_SKIP_QKFAST=1   /workspace/codebases/fp4_matmul/.venv/bin/python   tests/cute/benchmark_fp4_pv.py   --compare-mode profile-exact   --device 2   --head-dims 128   --seqlens 512   --causal-values false   --batch-size 2   --num-heads 4   --num-heads-kv 4
+```
+
 ## Acceptance Target That Is Still Outstanding
 
 Must-win row:

@@ -324,6 +324,7 @@ class FP4FlashAttentionForwardSm100PVFused:
         self.fp4_pv_direct_loader = os.getenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "0") == "1"
         self.fp4_pv_force_cta_direct = os.getenv("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT", "0") == "1"
         self.fp4_pv_manual_direct_loader = self.fp4_pv_direct_loader and self.fp4_pv_force_cta_direct
+        self.fp4_pv_exact_sfv_direct_requested = os.getenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "0") == "1"
         # Keep the legacy env var name for the optional CTA-local P amax path.
         self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
         self.fp4_pv_encode_centric_requested = (
@@ -439,6 +440,9 @@ class FP4FlashAttentionForwardSm100PVFused:
         self.load_warp_ids = (14,)
         self.empty_warp_ids = (15,)
         self.use_exact_fp4_pv_lane = self.use_fp4_pv and self.use_tma_KV and self.q_stage == 1 and not self.is_varlen_q
+        # Optional experiment: keep the stable exact-lane TMA V path but bypass
+        # the generic public SFV staging copy with a direct byte loader.
+        self.fp4_pv_exact_sfv_direct = self.fp4_pv_exact_sfv_direct_requested and self.use_exact_fp4_pv_lane
         self.use_exact_fp4_pv_s_ready_handoff = self.use_exact_fp4_pv_lane
         self.use_exact_fp4_pv_p_ready_handoff = self.use_exact_fp4_pv_lane
         self.use_exact_fp4_pv_legacy_stats_pipeline = not self.use_exact_fp4_pv_lane
@@ -5389,6 +5393,73 @@ class FP4FlashAttentionForwardSm100PVFused:
         )
 
     @cute.jit
+    def load_v_scale_stage_public_direct(
+        self,
+        mV_scale: cute.Tensor,  # public swizzled SFVt storage: (b, h_k, d, s_k // sf_vec)
+        batch_idx: Int32,
+        kv_head_idx: Int32,
+        sSFV_stage: cute.Tensor,
+        block: Int32,
+        seqlen_k: Int32,
+    ):
+        num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
+        tidx = cute.arch.thread_idx()[0] % num_load_threads
+        sSFV_logical = cute.make_tensor(
+            sSFV_stage.iterator,
+            tile_atom_to_shape_sfv_vt(
+                (self.head_dim_v_padded, self.n_block_size, 1, 1),
+                self.pv_sf_vec_size,
+            ),
+        )
+        sSFV_logical_u8 = cute.make_tensor(
+            cute.recast_ptr(utils.elem_pointer(sSFV_logical, (0, 0, 0, 0)), dtype=cutlass.Uint8),
+            sSFV_logical.layout,
+        )
+        sSFV_logical_u8_flat = cute.group_modes(
+            cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
+        )
+        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
+        for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
+            sSFV_logical_u8_flat[idx] = one_scale_u8
+
+        num_d_groups = self.head_dim_v_padded // self.pv_sf_vec_size
+        num_seq_groups = mV_scale.shape[3]
+        num_heads_kv = mV_scale.shape[1]
+        raw_scale_u8 = cute.make_tensor(
+            cute.recast_ptr(
+                utils.elem_pointer(mV_scale, (0,) * cute.rank(mV_scale)),
+                dtype=cutlass.Uint8,
+            ),
+            (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
+        )
+        slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
+        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
+            row = idx // num_d_groups
+            d_group = idx - row * num_d_groups
+            seqlen_idx = block * self.n_block_size + row
+            if seqlen_idx < seqlen_k:
+                d_idx = d_group * self.pv_sf_vec_size
+                seq_group = seqlen_idx // self.pv_sf_vec_size
+                tile_m = d_idx // 64
+                row_in_tile = d_idx - tile_m * 64
+                quad = row_in_tile // 16
+                row_mod16 = row_in_tile - quad * 16
+                raw_offset = (
+                    tile_m * 64 * num_seq_groups
+                    + (seq_group // 4) * 256
+                    + (seq_group % 4)
+                    + quad * 4
+                    + row_mod16 * 16
+                )
+                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
+
+        cute.arch.sync_warp()
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
+
+    @cute.jit
     def load_v_scale_stage_public(
         self,
         mV_scale: cute.Tensor,  # public colwise-SFVt storage: (b, h_k, d, s_k // sf_vec)
@@ -5489,58 +5560,13 @@ class FP4FlashAttentionForwardSm100PVFused:
                         batch_idx,
                     ]
 
-        sSFV_logical = cute.make_tensor(
-            sSFV_stage.iterator,
-            tile_atom_to_shape_sfv_vt(
-                (self.head_dim_v_padded, self.n_block_size, 1, 1),
-                self.pv_sf_vec_size,
-            ),
-        )
-        sSFV_logical_u8 = cute.make_tensor(
-            cute.recast_ptr(utils.elem_pointer(sSFV_logical, (0, 0, 0, 0)), dtype=cutlass.Uint8),
-            sSFV_logical.layout,
-        )
-        sSFV_logical_u8_flat = cute.group_modes(
-            cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
-        )
-        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
-        for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
-            sSFV_logical_u8_flat[idx] = one_scale_u8
-
-        num_d_groups = self.head_dim_v_padded // self.pv_sf_vec_size
-        num_seq_groups = mV_scale.shape[3]
-        num_heads_kv = mV_scale.shape[1]
-        raw_scale_u8 = cute.make_tensor(
-            cute.recast_ptr(
-                utils.elem_pointer(mV_scale, (0,) * cute.rank(mV_scale)),
-                dtype=cutlass.Uint8,
-            ),
-            (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
-        )
-        slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
-        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
-            row = idx // num_d_groups
-            d_group = idx - row * num_d_groups
-            seqlen_idx = block * self.n_block_size + row
-            if seqlen_idx < seqlen_k:
-                d_idx = d_group * self.pv_sf_vec_size
-                seq_group = seqlen_idx // self.pv_sf_vec_size
-                tile_m = d_idx // 64
-                row_in_tile = d_idx - tile_m * 64
-                quad = row_in_tile // 16
-                row_mod16 = row_in_tile - quad * 16
-                raw_offset = (
-                    tile_m * 64 * num_seq_groups
-                    + (seq_group // 4) * 256
-                    + (seq_group % 4)
-                    + quad * 4
-                    + row_mod16 * 16
-                )
-                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
-
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+        self.load_v_scale_stage_public_direct(
+            mV_scale,
+            batch_idx,
+            kv_head_idx,
+            sSFV_stage,
+            block,
+            seqlen_k,
         )
 
     @cute.jit
@@ -5566,14 +5592,24 @@ class FP4FlashAttentionForwardSm100PVFused:
         extra_kwargs = {"extra_tx_count": extra_tx_count_kv} if const_expr(self.use_tma_KV) else {}
         pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
 
-        self.load_v_scale_stage_public(
-            mV_scale,
-            batch_idx,
-            kv_head_idx,
-            sSFV[None, None, None, stage],
-            block,
-            seqlen_k,
-        )
+        if const_expr(self.fp4_pv_exact_sfv_direct):
+            self.load_v_scale_stage_public_direct(
+                mV_scale,
+                batch_idx,
+                kv_head_idx,
+                sSFV[None, None, None, stage],
+                block,
+                seqlen_k,
+            )
+        else:
+            self.load_v_scale_stage_public(
+                mV_scale,
+                batch_idx,
+                kv_head_idx,
+                sSFV[None, None, None, stage],
+                block,
+                seqlen_k,
+            )
 
         if const_expr(self.use_tma_KV):
             assert tma_atom is not None and tVgV is not None and tVsV is not None
@@ -5671,20 +5707,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         if const_expr(self.uneven_kv_smem):
             sV_stage = self.offset_kv_smem(sV_stage, stage, phase ^ 1)
         sSFV_stage = sSFV[None, None, None, stage]
-        sSFV_logical = cute.make_tensor(
-            sSFV_stage.iterator,
-            tile_atom_to_shape_sfv_vt(
-                (self.head_dim_v_padded, self.n_block_size, 1, 1),
-                self.pv_sf_vec_size,
-            ),
-        )
-        sSFV_logical_u8 = cute.make_tensor(
-            cute.recast_ptr(utils.elem_pointer(sSFV_logical, (0, 0, 0, 0)), dtype=cutlass.Uint8),
-            sSFV_logical.layout,
-        )
-        sSFV_logical_u8_flat = cute.group_modes(
-            cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
-        )
         valid_packed_cols = self.head_dim_v_padded * self.v_dtype.width // self.v_storage_dtype.width
         sV_stage_packed = self.as_packed_byte_tensor(
             sV_stage,
@@ -5694,7 +5716,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         low_nibble_mask = Int32(0x0F)
         shift_bits = Int32(4)
 
-        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
         del thr_mma_pv
         for idx in cutlass.range(
             tidx,
@@ -5720,44 +5741,13 @@ class FP4FlashAttentionForwardSm100PVFused:
             else:
                 sV_stage_packed[(row_pair, packed_col), Int32(0), row_parity] = zero_v
 
-        for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
-            sSFV_logical_u8_flat[idx] = one_scale_u8
-
-        num_d_groups = self.head_dim_v_padded // self.pv_sf_vec_size
-        num_seq_groups = mV_scale.shape[3]
-        num_heads_kv = mV_scale.shape[1]
-        raw_scale_u8 = cute.make_tensor(
-            cute.recast_ptr(
-                utils.elem_pointer(mV_scale, (0,) * cute.rank(mV_scale)),
-                dtype=cutlass.Uint8,
-            ),
-            (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
-        )
-        slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
-        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
-            row = idx // num_d_groups
-            d_group = idx - row * num_d_groups
-            seqlen_idx = block * self.n_block_size + row
-            if seqlen_idx < seqlen_k:
-                d_idx = d_group * self.pv_sf_vec_size
-                seq_group = seqlen_idx // self.pv_sf_vec_size
-                tile_m = d_idx // 64
-                row_in_tile = d_idx - tile_m * 64
-                quad = row_in_tile // 16
-                row_mod16 = row_in_tile - quad * 16
-                raw_offset = (
-                    tile_m * 64 * num_seq_groups
-                    + (seq_group // 4) * 256
-                    + (seq_group % 4)
-                    + quad * 4
-                    + row_mod16 * 16
-                )
-                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
-
-        cute.arch.sync_warp()
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
+        self.load_v_scale_stage_public_direct(
+            mV_scale,
+            batch_idx,
+            kv_head_idx,
+            sSFV_stage,
+            block,
+            seqlen_k,
         )
         pipeline_kv.producer_commit(producer_state)
 

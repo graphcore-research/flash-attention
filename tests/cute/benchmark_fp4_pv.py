@@ -62,6 +62,7 @@ EXACT_PROFILE_LAUNCH_COUNT = 1
 EXACT_PROFILE_QKFAST_WARMUP = 2
 EXACT_PROFILE_QKFAST_ITERS = 5
 EXACT_PROFILE_SKIP_QKFAST_ENV = "FLASH_ATTN_FP4_PROFILE_EXACT_SKIP_QKFAST"
+EXACT_SFV_DIRECT_ENV = "FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT"
 
 
 def _get_cuda_driver():
@@ -543,6 +544,7 @@ def _benchmark_case(
         "pv_fused_lse_max": (lse_fp4.float() - lse_bf16.float()).abs().max().item() if lse_bf16 is not None else math.nan,
         "pv_fused_impl": "cute",
         "compare_mode": compare_mode,
+        "exact_sfv_direct": os.environ.get(EXACT_SFV_DIRECT_ENV) == "1",
     }
     if profile_exact:
         result.update(_exact_profile_metadata(device_idx=_get_benchmark_device()))
@@ -574,6 +576,7 @@ def _aggregate_benchmark_runs(samples: list[dict], failures: list[dict] | None =
         "pv_fused_lse_max": _max_metric(samples, "pv_fused_lse_max"),
         "pv_fused_impl": first.get("pv_fused_impl", "cute"),
         "compare_mode": first.get("compare_mode", "full"),
+        "exact_sfv_direct": bool(first.get("exact_sfv_direct", False)),
     }
     aggregated["qkfast_over_bf16"] = aggregated["qkfast_ms"] / aggregated["bf16_ms"] if math.isfinite(aggregated["bf16_ms"]) else math.nan
     aggregated["pv_fused_over_qkfast"] = aggregated["pv_fused_ms"] / aggregated["qkfast_ms"]
@@ -760,7 +763,7 @@ def main():
     script_path = pathlib.Path(__file__).resolve()
     candidate_devices = [args.device] if args.device is not None else _enumerate_usable_devices()
     print(
-        "device,kind,hq,hkv,d,causal,seqlen,pv_fused_impl,success_count,failure_count,"
+        "device,kind,hq,hkv,d,causal,seqlen,pv_fused_impl,exact_sfv_direct,success_count,failure_count,"
         "qkfast_ms,pv_fused_ms,bf16_ms,qkfast_over_bf16,pv_fused_over_qkfast,pv_fused_over_bf16,"
         "qkfast_out_max,qkfast_lse_max,pv_fused_out_max,pv_fused_lse_max"
     )
@@ -795,7 +798,7 @@ def main():
                 failed_clean_device = True
             print(
                 f"{result['device']},{result['kind']},{result['hq']},{result['hkv']},{result['d']},"
-                f"{result['causal']},{result['seqlen']},{result['pv_fused_impl']},{result['success_count']},{result['failure_count']},"
+                f"{result['causal']},{result['seqlen']},{result['pv_fused_impl']},{result['exact_sfv_direct']},{result['success_count']},{result['failure_count']},"
                 f"{result['qkfast_ms']:.5f},{result['pv_fused_ms']:.5f},{result['bf16_ms']:.5f},"
                 f"{result['qkfast_over_bf16']:.3f},{result['pv_fused_over_qkfast']:.3f},{result['pv_fused_over_bf16']:.3f},"
                 f"{result['qkfast_out_max']:.6f},{result['qkfast_lse_max']:.6f},{result['pv_fused_out_max']:.6f},{result['pv_fused_lse_max']:.6f}"

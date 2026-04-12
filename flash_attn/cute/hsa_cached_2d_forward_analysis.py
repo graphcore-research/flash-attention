@@ -9,6 +9,7 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_synthetic_combine_scatter_rows_kernel,
     _run_synthetic_2d_masked_fwd_kernel,
     _run_synthetic_2d_masked_gather_fwd_kernel,
+    _run_synthetic_2d_masked_gather_scatter_fwd_kernel,
     _run_synthetic_pack_kv_rows_kernel,
     _run_synthetic_pack_rows_kernel,
 )
@@ -226,13 +227,45 @@ def _append_group_entries(
         group_fill.append(float(mask.sum().item()) / max(1, len(row_group) * union_k))
 
 
+def _build_range_execution_metadata(
+    group_q_rows: list[torch.Tensor],
+    combine_group_ranges: list[tuple[int, int]],
+) -> list[dict[str, int | bool]]:
+    row_counts: dict[int, int] = {}
+    for q_rows in group_q_rows:
+        for q_row in q_rows.detach().cpu().tolist():
+            q_row_int = int(q_row)
+            if q_row_int < 0:
+                continue
+            row_counts[q_row_int] = row_counts.get(q_row_int, 0) + 1
+
+    range_execution: list[dict[str, int | bool]] = []
+    for group_start, group_end in combine_group_ranges:
+        range_rows: list[int] = []
+        for group_idx in range(int(group_start), int(group_end)):
+            range_rows.extend(
+                int(q_row)
+                for q_row in group_q_rows[group_idx].detach().cpu().tolist()
+                if int(q_row) >= 0
+            )
+        scatter_only = bool(range_rows) and all(row_counts.get(q_row, 0) == 1 for q_row in range_rows)
+        range_execution.append(
+            {
+                "group_start": int(group_start),
+                "group_end": int(group_end),
+                "scatter_only": scatter_only,
+            }
+        )
+    return range_execution
+
+
 def build_cached_direct_2d_forward_payload(
     runtime,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    max_rows_per_group: int = 8,
+    max_rows_per_group: int = 16,
     max_merged_support_rows: int = 128,
     max_merged_support_growth_ratio: float = 999.0,
     max_merged_support_increase: int = 1_000_000,
@@ -429,6 +462,16 @@ def build_cached_direct_2d_forward_payload(
         rows_per_group,
         -1,
     )
+    range_execution = _build_range_execution_metadata(group_q_rows, combine_group_ranges)
+    scatter_only_ranges = sum(1 for entry in range_execution if bool(entry["scatter_only"]))
+    scatter_only_rows = sum(
+        int(payload_q_rows.numel())
+        for group_idx, payload_q_rows in enumerate(group_q_rows)
+        if any(
+            int(entry["group_start"]) <= group_idx < int(entry["group_end"]) and bool(entry["scatter_only"])
+            for entry in range_execution
+        )
+    )
     avg_union_k = float(k_length.float().mean().item()) if group_count > 0 else 0.0
     avg_baseline_k = float(baseline_packed_k_sum / baseline_live_row_count) if baseline_live_row_count > 0 else 0.0
     total_group_area = sum(
@@ -450,6 +493,8 @@ def build_cached_direct_2d_forward_payload(
         "cached_direct_2d_cross_bucket_merged_rows": merged_row_count,
         "cached_direct_2d_cross_bucket_fallback_rows": fallback_row_count,
         "cached_direct_2d_cross_bucket_merged_qgroup_buckets": merged_qgroup_bucket_count,
+        "cached_direct_2d_scatter_only_ranges": scatter_only_ranges,
+        "cached_direct_2d_scatter_only_rows": scatter_only_rows,
     }
     return {
         "status": "ready",
@@ -464,6 +509,7 @@ def build_cached_direct_2d_forward_payload(
         "k_length": k_length.contiguous(),
         "total_rows": int(q_flat.shape[0]),
         "combine_group_ranges": combine_group_ranges,
+        "range_execution": range_execution,
         "geometry": geometry,
         "_workspace": {},
     }
@@ -534,55 +580,91 @@ def run_cached_direct_2d_forward(
     out_flat.zero_()
     lse_flat.fill_(float("-inf"))
     group_count = int(payload["q_row_idx"].shape[0])
-    try:
-        packed_out, packed_lse = _run_synthetic_2d_masked_gather_fwd_kernel(
-            q_flat,
-            k_flat,
-            v_flat,
-            payload["q_row_idx"],
-            payload["k_row_idx"],
-            payload["q_length"],
-            payload["k_length"],
-            payload["mask_words"],
-            softmax_scale=float(softmax_scale),
-        )
-    except Exception:
-        q_buf_flat = q_buf_flat[: group_count * packed_q]
-        k_buf_flat = k_buf_flat[: group_count * packed_k]
-        v_buf_flat = v_buf_flat[: group_count * packed_k]
-        _run_synthetic_pack_rows_kernel(q_flat, payload["q_row_idx"].reshape(-1).contiguous(), q_buf_flat)
-        _run_synthetic_pack_kv_rows_kernel(
-            k_flat,
-            v_flat,
-            payload["k_row_idx"].reshape(-1).contiguous(),
-            k_buf_flat,
-            v_buf_flat,
-        )
-        q_buf = q_buf_flat.view(group_count, packed_q, q_flat.shape[1], q_flat.shape[2])
-        k_buf = k_buf_flat.view(group_count, packed_k, k_flat.shape[1], k_flat.shape[2])
-        v_buf = v_buf_flat.view(group_count, packed_k, v_flat.shape[1], v_flat.shape[2])
-        packed_out, packed_lse = _run_synthetic_2d_masked_fwd_kernel(
-            q_buf,
-            k_buf,
-            v_buf,
-            payload["q_length"],
-            payload["k_length"],
-            payload["mask_words"],
-            softmax_scale=float(softmax_scale),
-        )
-    packed_out_flat = packed_out.view(group_count * packed_q, packed_out.shape[2], packed_out.shape[3]).contiguous()
-    packed_lse_flat = packed_lse.view(group_count * packed_q, packed_lse.shape[2]).contiguous()
-    combine_group_ranges = payload.get("combine_group_ranges") or [(0, group_count)]
-    for group_start, group_end in combine_group_ranges:
+    range_execution = payload.get("range_execution")
+    if not range_execution:
+        range_execution = [
+            {
+                "group_start": 0,
+                "group_end": group_count,
+                "scatter_only": False,
+            }
+        ]
+
+    def _run_range_packed(group_start: int, group_end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        range_group_count = group_end - group_start
+        try:
+            return _run_synthetic_2d_masked_gather_fwd_kernel(
+                q_flat,
+                k_flat,
+                v_flat,
+                payload["q_row_idx"][group_start:group_end],
+                payload["k_row_idx"][group_start:group_end],
+                payload["q_length"][group_start:group_end],
+                payload["k_length"][group_start:group_end],
+                payload["mask_words"][group_start:group_end],
+                softmax_scale=float(softmax_scale),
+            )
+        except Exception:
+            q_buf_range = q_buf_flat[: range_group_count * packed_q]
+            k_buf_range = k_buf_flat[: range_group_count * packed_k]
+            v_buf_range = v_buf_flat[: range_group_count * packed_k]
+            _run_synthetic_pack_rows_kernel(
+                q_flat,
+                payload["q_row_idx"][group_start:group_end].reshape(-1).contiguous(),
+                q_buf_range,
+            )
+            _run_synthetic_pack_kv_rows_kernel(
+                k_flat,
+                v_flat,
+                payload["k_row_idx"][group_start:group_end].reshape(-1).contiguous(),
+                k_buf_range,
+                v_buf_range,
+            )
+            q_buf = q_buf_range.view(range_group_count, packed_q, q_flat.shape[1], q_flat.shape[2])
+            k_buf = k_buf_range.view(range_group_count, packed_k, k_flat.shape[1], k_flat.shape[2])
+            v_buf = v_buf_range.view(range_group_count, packed_k, v_flat.shape[1], v_flat.shape[2])
+            return _run_synthetic_2d_masked_fwd_kernel(
+                q_buf,
+                k_buf,
+                v_buf,
+                payload["q_length"][group_start:group_end],
+                payload["k_length"][group_start:group_end],
+                payload["mask_words"][group_start:group_end],
+                softmax_scale=float(softmax_scale),
+            )
+
+    for range_entry in range_execution:
+        group_start = int(range_entry["group_start"])
+        group_end = int(range_entry["group_end"])
         group_start = int(group_start)
         group_end = int(group_end)
         if group_end <= group_start:
             continue
-        row_start = group_start * packed_q
-        row_end = group_end * packed_q
+        if bool(range_entry.get("scatter_only")):
+            try:
+                _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    payload["q_row_idx"][group_start:group_end],
+                    payload["k_row_idx"][group_start:group_end],
+                    payload["q_length"][group_start:group_end],
+                    payload["k_length"][group_start:group_end],
+                    payload["mask_words"][group_start:group_end],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                )
+                continue
+            except Exception:
+                pass
+        packed_out, packed_lse = _run_range_packed(group_start, group_end)
+        range_group_count = group_end - group_start
+        packed_out_flat = packed_out.view(range_group_count * packed_q, packed_out.shape[2], packed_out.shape[3]).contiguous()
+        packed_lse_flat = packed_lse.view(range_group_count * packed_q, packed_lse.shape[2]).contiguous()
         _run_synthetic_combine_scatter_rows_kernel(
-            packed_out_flat[row_start:row_end].contiguous(),
-            packed_lse_flat[row_start:row_end].contiguous(),
+            packed_out_flat,
+            packed_lse_flat,
             payload["q_row_idx"][group_start:group_end].reshape(-1).contiguous(),
             out_flat,
             lse_flat,

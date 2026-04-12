@@ -67,6 +67,319 @@ def _quantile_or_zero(tensor: torch.Tensor, quantile: float) -> float:
     return float(torch.quantile(tensor.float(), quantile).item())
 
 
+def _tile_span_or_zero(lengths: torch.Tensor, *, tile_k: int = 32) -> torch.Tensor:
+    if lengths.numel() <= 0:
+        return torch.empty(0, dtype=torch.float32)
+    return torch.ceil(lengths.float() / float(tile_k))
+
+
+def _count_between(
+    tensor: torch.Tensor,
+    *,
+    lower_exclusive: float | None = None,
+    upper_inclusive: float | None = None,
+) -> int:
+    if tensor.numel() <= 0:
+        return 0
+    mask = torch.ones_like(tensor, dtype=torch.bool)
+    if lower_exclusive is not None:
+        mask &= tensor > float(lower_exclusive)
+    if upper_inclusive is not None:
+        mask &= tensor <= float(upper_inclusive)
+    return int(mask.sum().item())
+
+
+def _summarize_direct_qgroup_segments(
+    qgroup_num_segments: torch.Tensor,
+    qgroup_length: torch.Tensor | None,
+) -> dict[str, float | int]:
+    zero_summary = {
+        "forward_direct_qgroup_segments_1_count": 0,
+        "forward_direct_qgroup_segments_2_count": 0,
+        "forward_direct_qgroup_segments_3_4_count": 0,
+        "forward_direct_qgroup_segments_5_8_count": 0,
+        "forward_direct_qgroup_segments_gt8_count": 0,
+        "forward_direct_q_rows_count": 0,
+        "forward_direct_q_rows_segments_le2_count": 0,
+        "forward_direct_q_rows_segments_le4_count": 0,
+        "forward_direct_q_rows_segments_gt4_count": 0,
+        "forward_direct_q_rows_segments_le2_frac": 0.0,
+        "forward_direct_q_rows_segments_le4_frac": 0.0,
+        "forward_direct_q_rows_segments_gt4_frac": 0.0,
+    }
+    if qgroup_num_segments.numel() <= 0:
+        return zero_summary
+
+    direct_mask = qgroup_num_segments > 0
+    direct_segments = qgroup_num_segments[direct_mask]
+    if direct_segments.numel() <= 0:
+        return zero_summary
+
+    summary = {
+        "forward_direct_qgroup_segments_1_count": _count_between(direct_segments, upper_inclusive=1),
+        "forward_direct_qgroup_segments_2_count": _count_between(
+            direct_segments, lower_exclusive=1, upper_inclusive=2
+        ),
+        "forward_direct_qgroup_segments_3_4_count": _count_between(
+            direct_segments, lower_exclusive=2, upper_inclusive=4
+        ),
+        "forward_direct_qgroup_segments_5_8_count": _count_between(
+            direct_segments, lower_exclusive=4, upper_inclusive=8
+        ),
+        "forward_direct_qgroup_segments_gt8_count": _count_between(direct_segments, lower_exclusive=8),
+        "forward_direct_q_rows_count": 0,
+        "forward_direct_q_rows_segments_le2_count": 0,
+        "forward_direct_q_rows_segments_le4_count": 0,
+        "forward_direct_q_rows_segments_gt4_count": 0,
+        "forward_direct_q_rows_segments_le2_frac": 0.0,
+        "forward_direct_q_rows_segments_le4_frac": 0.0,
+        "forward_direct_q_rows_segments_gt4_frac": 0.0,
+    }
+    if qgroup_length is None or qgroup_length.numel() != qgroup_num_segments.numel():
+        return summary
+
+    direct_q_rows = qgroup_length.detach().cpu().float()[direct_mask.detach().cpu()]
+    total_direct_q_rows = int(direct_q_rows.sum().item())
+    q_rows_segments_le2_count = int(direct_q_rows[direct_segments.detach().cpu() <= 2].sum().item())
+    q_rows_segments_le4_count = int(direct_q_rows[direct_segments.detach().cpu() <= 4].sum().item())
+    q_rows_segments_gt4_count = int(direct_q_rows[direct_segments.detach().cpu() > 4].sum().item())
+    summary.update(
+        {
+            "forward_direct_q_rows_count": total_direct_q_rows,
+            "forward_direct_q_rows_segments_le2_count": q_rows_segments_le2_count,
+            "forward_direct_q_rows_segments_le4_count": q_rows_segments_le4_count,
+            "forward_direct_q_rows_segments_gt4_count": q_rows_segments_gt4_count,
+            "forward_direct_q_rows_segments_le2_frac": (
+                q_rows_segments_le2_count / total_direct_q_rows if total_direct_q_rows > 0 else 0.0
+            ),
+            "forward_direct_q_rows_segments_le4_frac": (
+                q_rows_segments_le4_count / total_direct_q_rows if total_direct_q_rows > 0 else 0.0
+            ),
+            "forward_direct_q_rows_segments_gt4_frac": (
+                q_rows_segments_gt4_count / total_direct_q_rows if total_direct_q_rows > 0 else 0.0
+            ),
+        }
+    )
+    return summary
+
+
+def _summarize_direct_bucket_costs(
+    direct_plan: dict[str, object] | None,
+    *,
+    qgroup_bucket_row_ptr: torch.Tensor | None = None,
+    qgroup_bucket_idx: torch.Tensor | None = None,
+    qgroup_length: torch.Tensor | None = None,
+) -> dict[str, float | int]:
+    zero_summary = {
+        "forward_direct_bucket_count": 0,
+        "forward_avg_direct_bucket_size": 0.0,
+        "forward_direct_bucket_size_p50": 0.0,
+        "forward_direct_bucket_size_p90": 0.0,
+        "forward_direct_bucket_size_1_count": 0,
+        "forward_direct_bucket_size_2_count": 0,
+        "forward_direct_bucket_size_3_4_count": 0,
+        "forward_direct_bucket_size_5_8_count": 0,
+        "forward_direct_bucket_size_gt8_count": 0,
+        "forward_avg_direct_bucket_union_k": 0.0,
+        "forward_direct_bucket_union_k_p50": 0.0,
+        "forward_direct_bucket_union_k_p90": 0.0,
+        "forward_avg_direct_bucket_tile_span": 0.0,
+        "forward_direct_bucket_tile_span_p50": 0.0,
+        "forward_direct_bucket_tile_span_p90": 0.0,
+        "forward_direct_bucket_union_k_le16_count": 0,
+        "forward_direct_bucket_union_k_17_32_count": 0,
+        "forward_direct_bucket_union_k_33_64_count": 0,
+        "forward_direct_bucket_union_k_65_96_count": 0,
+        "forward_direct_bucket_union_k_97_128_count": 0,
+        "forward_direct_bucket_union_k_gt128_count": 0,
+        "forward_direct_bucket_tile_span_1_count": 0,
+        "forward_direct_bucket_tile_span_2_count": 0,
+        "forward_direct_bucket_tile_span_3_count": 0,
+        "forward_direct_bucket_tile_span_4_count": 0,
+        "forward_direct_bucket_tile_span_gt4_count": 0,
+        "forward_direct_bucket_member_count": 0,
+        "forward_direct_member_tile_reduction_bucket_count": 0,
+        "forward_direct_member_tile_reduction_member_count": 0,
+        "forward_direct_member_tile_reduction_bucket_frac": 0.0,
+        "forward_direct_member_tile_reduction_member_frac": 0.0,
+        "forward_direct_qgroup_bucket_count": 0,
+        "forward_avg_direct_segments_per_qgroup_bucket": 0.0,
+        "forward_direct_segments_per_qgroup_bucket_p50": 0.0,
+        "forward_direct_segments_per_qgroup_bucket_p90": 0.0,
+        "forward_direct_multi_segment_qgroup_bucket_count": 0,
+        "forward_direct_multi_segment_qgroup_bucket_frac": 0.0,
+        "forward_avg_direct_qgroup_bucket_member_visit_factor": 0.0,
+        "forward_direct_qgroup_bucket_member_visit_factor_p50": 0.0,
+        "forward_direct_qgroup_bucket_member_visit_factor_p90": 0.0,
+        "forward_avg_direct_qgroup_bucket_q_row_visit_factor": 0.0,
+        "forward_direct_qgroup_bucket_q_row_visit_factor_p50": 0.0,
+        "forward_direct_qgroup_bucket_q_row_visit_factor_p90": 0.0,
+        "forward_avg_direct_qgroup_bucket_segment_member_utilization": 0.0,
+        "forward_direct_qgroup_bucket_segment_member_utilization_p50": 0.0,
+        "forward_direct_qgroup_bucket_segment_member_utilization_p90": 0.0,
+    }
+    if direct_plan is None or len(direct_plan.get("bucket_packed_k", [])) <= 0:
+        return zero_summary
+
+    def _int_list(values) -> list[int]:
+        if values is None:
+            return []
+        if isinstance(values, torch.Tensor):
+            return [int(value) for value in values.detach().cpu().tolist()]
+        return [int(value) for value in values]
+
+    bucket_size = torch.tensor(direct_plan["bucket_size"], dtype=torch.float32)
+    bucket_union_k = torch.tensor(direct_plan["bucket_packed_k"], dtype=torch.float32)
+    bucket_tile_span = _tile_span_or_zero(bucket_union_k)
+    qgroup_bucket_num_segments = (
+        torch.tensor(direct_plan["qgroup_bucket_num_segments"], dtype=torch.float32)
+        if len(direct_plan.get("qgroup_bucket_num_segments", [])) > 0
+        else torch.empty(0, dtype=torch.float32)
+    )
+    member_union_k = direct_plan["bucket_k_length"].detach().cpu().float() if len(direct_plan["bucket_k_length"]) > 0 else torch.empty(0, dtype=torch.float32)
+    member_tile_span = _tile_span_or_zero(member_union_k)
+    member_tile_reduction_bucket_count = 0
+    member_tile_reduction_member_count = 0
+    member_ranges = direct_plan.get("bucket_k_length_range", [])
+    if member_tile_span.numel() > 0 and len(member_ranges) == int(bucket_union_k.numel()):
+        for bucket_idx, (start, end) in enumerate(member_ranges):
+            if end <= start:
+                continue
+            bucket_span = float(bucket_tile_span[bucket_idx].item())
+            member_reductions = int((member_tile_span[start:end] < bucket_span).sum().item())
+            member_tile_reduction_member_count += member_reductions
+            member_tile_reduction_bucket_count += int(member_reductions > 0)
+
+    bucket_count = int(bucket_union_k.numel())
+    member_count = int(member_union_k.numel())
+    qgroup_bucket_count = int(qgroup_bucket_num_segments.numel())
+    multi_segment_qgroup_bucket_count = int((qgroup_bucket_num_segments > 1).sum().item()) if qgroup_bucket_count > 0 else 0
+    qgroup_bucket_member_visit_factor = torch.empty(0, dtype=torch.float32)
+    qgroup_bucket_q_row_visit_factor = torch.empty(0, dtype=torch.float32)
+    qgroup_bucket_segment_member_utilization = torch.empty(0, dtype=torch.float32)
+    qgroup_bucket_segment_range = direct_plan.get("qgroup_bucket_segment_range", [])
+    qgroup_bucket_segment_idx = _int_list(direct_plan.get("qgroup_bucket_segment_idx"))
+    bucket_size_values = _int_list(direct_plan.get("bucket_size"))
+    qgroup_bucket_row_ptr_values = _int_list(qgroup_bucket_row_ptr)
+    qgroup_bucket_idx_values = _int_list(qgroup_bucket_idx)
+    qgroup_length_values = _int_list(qgroup_length)
+    bucket_q_length = direct_plan.get("bucket_q_length")
+    bucket_q_length_range = direct_plan.get("bucket_q_length_range", [])
+    if (
+        qgroup_bucket_count > 0
+        and len(qgroup_bucket_segment_range) == qgroup_bucket_count
+        and len(qgroup_bucket_row_ptr_values) == qgroup_bucket_count + 1
+        and len(qgroup_bucket_idx_values) == qgroup_bucket_row_ptr_values[-1]
+        and bucket_q_length is not None
+        and len(bucket_q_length_range) == len(bucket_size_values)
+    ):
+        member_visit_factors: list[float] = []
+        q_row_visit_factors: list[float] = []
+        segment_member_utilizations: list[float] = []
+        bucket_q_length_tensor = bucket_q_length.detach().cpu().int() if isinstance(bucket_q_length, torch.Tensor) else None
+        bucket_q_length_values = None if bucket_q_length_tensor is not None else _int_list(bucket_q_length)
+        for qgroup_bucket_id, (segment_start, segment_end) in enumerate(qgroup_bucket_segment_range):
+            qgroup_start = qgroup_bucket_row_ptr_values[qgroup_bucket_id]
+            qgroup_end = qgroup_bucket_row_ptr_values[qgroup_bucket_id + 1]
+            qgroup_bucket_size_value = qgroup_end - qgroup_start
+            if qgroup_bucket_size_value <= 0:
+                continue
+            qgroup_ids = qgroup_bucket_idx_values[qgroup_start:qgroup_end]
+            unique_q_rows = sum(
+                qgroup_length_values[qgroup_idx]
+                for qgroup_idx in qgroup_ids
+                if 0 <= qgroup_idx < len(qgroup_length_values)
+            )
+            direct_bucket_ids = qgroup_bucket_segment_idx[int(segment_start) : int(segment_end)]
+            if not direct_bucket_ids:
+                continue
+            member_visits = 0
+            q_row_visits = 0
+            segment_utilization_values: list[float] = []
+            for bucket_idx in direct_bucket_ids:
+                if not (0 <= bucket_idx < len(bucket_size_values)):
+                    continue
+                member_count_value = bucket_size_values[bucket_idx]
+                member_visits += member_count_value
+                segment_utilization_values.append(member_count_value / qgroup_bucket_size_value)
+                q_length_start, q_length_end = bucket_q_length_range[bucket_idx]
+                if bucket_q_length_tensor is not None:
+                    q_row_visits += int(bucket_q_length_tensor[int(q_length_start) : int(q_length_end)].sum().item())
+                elif bucket_q_length_values is not None:
+                    q_row_visits += sum(bucket_q_length_values[int(q_length_start) : int(q_length_end)])
+            member_visit_factors.append(member_visits / qgroup_bucket_size_value)
+            if unique_q_rows > 0:
+                q_row_visit_factors.append(q_row_visits / unique_q_rows)
+            if segment_utilization_values:
+                segment_member_utilizations.append(sum(segment_utilization_values) / len(segment_utilization_values))
+        if member_visit_factors:
+            qgroup_bucket_member_visit_factor = torch.tensor(member_visit_factors, dtype=torch.float32)
+        if q_row_visit_factors:
+            qgroup_bucket_q_row_visit_factor = torch.tensor(q_row_visit_factors, dtype=torch.float32)
+        if segment_member_utilizations:
+            qgroup_bucket_segment_member_utilization = torch.tensor(segment_member_utilizations, dtype=torch.float32)
+    return {
+        "forward_direct_bucket_count": bucket_count,
+        "forward_avg_direct_bucket_size": _mean_or_zero(bucket_size),
+        "forward_direct_bucket_size_p50": _quantile_or_zero(bucket_size, 0.5),
+        "forward_direct_bucket_size_p90": _quantile_or_zero(bucket_size, 0.9),
+        "forward_direct_bucket_size_1_count": _count_between(bucket_size, upper_inclusive=1),
+        "forward_direct_bucket_size_2_count": _count_between(bucket_size, lower_exclusive=1, upper_inclusive=2),
+        "forward_direct_bucket_size_3_4_count": _count_between(bucket_size, lower_exclusive=2, upper_inclusive=4),
+        "forward_direct_bucket_size_5_8_count": _count_between(bucket_size, lower_exclusive=4, upper_inclusive=8),
+        "forward_direct_bucket_size_gt8_count": _count_between(bucket_size, lower_exclusive=8),
+        "forward_avg_direct_bucket_union_k": _mean_or_zero(bucket_union_k),
+        "forward_direct_bucket_union_k_p50": _quantile_or_zero(bucket_union_k, 0.5),
+        "forward_direct_bucket_union_k_p90": _quantile_or_zero(bucket_union_k, 0.9),
+        "forward_avg_direct_bucket_tile_span": _mean_or_zero(bucket_tile_span),
+        "forward_direct_bucket_tile_span_p50": _quantile_or_zero(bucket_tile_span, 0.5),
+        "forward_direct_bucket_tile_span_p90": _quantile_or_zero(bucket_tile_span, 0.9),
+        "forward_direct_bucket_union_k_le16_count": _count_between(bucket_union_k, upper_inclusive=16),
+        "forward_direct_bucket_union_k_17_32_count": _count_between(bucket_union_k, lower_exclusive=16, upper_inclusive=32),
+        "forward_direct_bucket_union_k_33_64_count": _count_between(bucket_union_k, lower_exclusive=32, upper_inclusive=64),
+        "forward_direct_bucket_union_k_65_96_count": _count_between(bucket_union_k, lower_exclusive=64, upper_inclusive=96),
+        "forward_direct_bucket_union_k_97_128_count": _count_between(bucket_union_k, lower_exclusive=96, upper_inclusive=128),
+        "forward_direct_bucket_union_k_gt128_count": _count_between(bucket_union_k, lower_exclusive=128),
+        "forward_direct_bucket_tile_span_1_count": _count_between(bucket_tile_span, upper_inclusive=1),
+        "forward_direct_bucket_tile_span_2_count": _count_between(bucket_tile_span, lower_exclusive=1, upper_inclusive=2),
+        "forward_direct_bucket_tile_span_3_count": _count_between(bucket_tile_span, lower_exclusive=2, upper_inclusive=3),
+        "forward_direct_bucket_tile_span_4_count": _count_between(bucket_tile_span, lower_exclusive=3, upper_inclusive=4),
+        "forward_direct_bucket_tile_span_gt4_count": _count_between(bucket_tile_span, lower_exclusive=4),
+        "forward_direct_bucket_member_count": member_count,
+        "forward_direct_member_tile_reduction_bucket_count": member_tile_reduction_bucket_count,
+        "forward_direct_member_tile_reduction_member_count": member_tile_reduction_member_count,
+        "forward_direct_member_tile_reduction_bucket_frac": (
+            member_tile_reduction_bucket_count / bucket_count if bucket_count > 0 else 0.0
+        ),
+        "forward_direct_member_tile_reduction_member_frac": (
+            member_tile_reduction_member_count / member_count if member_count > 0 else 0.0
+        ),
+        "forward_direct_qgroup_bucket_count": qgroup_bucket_count,
+        "forward_avg_direct_segments_per_qgroup_bucket": _mean_or_zero(qgroup_bucket_num_segments),
+        "forward_direct_segments_per_qgroup_bucket_p50": _quantile_or_zero(qgroup_bucket_num_segments, 0.5),
+        "forward_direct_segments_per_qgroup_bucket_p90": _quantile_or_zero(qgroup_bucket_num_segments, 0.9),
+        "forward_direct_multi_segment_qgroup_bucket_count": multi_segment_qgroup_bucket_count,
+        "forward_direct_multi_segment_qgroup_bucket_frac": (
+            multi_segment_qgroup_bucket_count / qgroup_bucket_count if qgroup_bucket_count > 0 else 0.0
+        ),
+        "forward_avg_direct_qgroup_bucket_member_visit_factor": _mean_or_zero(qgroup_bucket_member_visit_factor),
+        "forward_direct_qgroup_bucket_member_visit_factor_p50": _quantile_or_zero(qgroup_bucket_member_visit_factor, 0.5),
+        "forward_direct_qgroup_bucket_member_visit_factor_p90": _quantile_or_zero(qgroup_bucket_member_visit_factor, 0.9),
+        "forward_avg_direct_qgroup_bucket_q_row_visit_factor": _mean_or_zero(qgroup_bucket_q_row_visit_factor),
+        "forward_direct_qgroup_bucket_q_row_visit_factor_p50": _quantile_or_zero(qgroup_bucket_q_row_visit_factor, 0.5),
+        "forward_direct_qgroup_bucket_q_row_visit_factor_p90": _quantile_or_zero(qgroup_bucket_q_row_visit_factor, 0.9),
+        "forward_avg_direct_qgroup_bucket_segment_member_utilization": _mean_or_zero(
+            qgroup_bucket_segment_member_utilization
+        ),
+        "forward_direct_qgroup_bucket_segment_member_utilization_p50": _quantile_or_zero(
+            qgroup_bucket_segment_member_utilization, 0.5
+        ),
+        "forward_direct_qgroup_bucket_segment_member_utilization_p90": _quantile_or_zero(
+            qgroup_bucket_segment_member_utilization, 0.9
+        ),
+    }
+
+
 def _summarize_one_grid(metadata) -> dict[str, float | int]:
     if metadata is None:
         return {
@@ -185,6 +498,64 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
             "forward_row_k_p50": 0.0,
             "forward_row_k_p90": 0.0,
             "forward_avg_union_k": 0.0,
+            "forward_direct_bucket_count": 0,
+            "forward_avg_direct_bucket_size": 0.0,
+            "forward_direct_bucket_size_p50": 0.0,
+            "forward_direct_bucket_size_p90": 0.0,
+            "forward_direct_bucket_size_1_count": 0,
+            "forward_direct_bucket_size_2_count": 0,
+            "forward_direct_bucket_size_3_4_count": 0,
+            "forward_direct_bucket_size_5_8_count": 0,
+            "forward_direct_bucket_size_gt8_count": 0,
+            "forward_avg_direct_bucket_union_k": 0.0,
+            "forward_direct_bucket_union_k_p50": 0.0,
+            "forward_direct_bucket_union_k_p90": 0.0,
+            "forward_avg_direct_bucket_tile_span": 0.0,
+            "forward_direct_bucket_tile_span_p50": 0.0,
+            "forward_direct_bucket_tile_span_p90": 0.0,
+            "forward_direct_bucket_union_k_le16_count": 0,
+            "forward_direct_bucket_union_k_17_32_count": 0,
+            "forward_direct_bucket_union_k_33_64_count": 0,
+            "forward_direct_bucket_union_k_65_96_count": 0,
+            "forward_direct_bucket_union_k_97_128_count": 0,
+            "forward_direct_bucket_union_k_gt128_count": 0,
+            "forward_direct_bucket_tile_span_1_count": 0,
+            "forward_direct_bucket_tile_span_2_count": 0,
+            "forward_direct_bucket_tile_span_3_count": 0,
+            "forward_direct_bucket_tile_span_4_count": 0,
+            "forward_direct_bucket_tile_span_gt4_count": 0,
+            "forward_direct_bucket_member_count": 0,
+            "forward_direct_member_tile_reduction_bucket_count": 0,
+            "forward_direct_member_tile_reduction_member_count": 0,
+            "forward_direct_member_tile_reduction_bucket_frac": 0.0,
+            "forward_direct_member_tile_reduction_member_frac": 0.0,
+            "forward_direct_qgroup_bucket_count": 0,
+            "forward_avg_direct_segments_per_qgroup_bucket": 0.0,
+            "forward_direct_segments_per_qgroup_bucket_p50": 0.0,
+            "forward_direct_segments_per_qgroup_bucket_p90": 0.0,
+            "forward_direct_qgroup_segments_1_count": 0,
+            "forward_direct_qgroup_segments_2_count": 0,
+            "forward_direct_qgroup_segments_3_4_count": 0,
+            "forward_direct_qgroup_segments_5_8_count": 0,
+            "forward_direct_qgroup_segments_gt8_count": 0,
+            "forward_direct_q_rows_count": 0,
+            "forward_direct_q_rows_segments_le2_count": 0,
+            "forward_direct_q_rows_segments_le4_count": 0,
+            "forward_direct_q_rows_segments_gt4_count": 0,
+            "forward_direct_q_rows_segments_le2_frac": 0.0,
+            "forward_direct_q_rows_segments_le4_frac": 0.0,
+            "forward_direct_q_rows_segments_gt4_frac": 0.0,
+            "forward_direct_multi_segment_qgroup_bucket_count": 0,
+            "forward_direct_multi_segment_qgroup_bucket_frac": 0.0,
+            "forward_avg_direct_qgroup_bucket_member_visit_factor": 0.0,
+            "forward_direct_qgroup_bucket_member_visit_factor_p50": 0.0,
+            "forward_direct_qgroup_bucket_member_visit_factor_p90": 0.0,
+            "forward_avg_direct_qgroup_bucket_q_row_visit_factor": 0.0,
+            "forward_direct_qgroup_bucket_q_row_visit_factor_p50": 0.0,
+            "forward_direct_qgroup_bucket_q_row_visit_factor_p90": 0.0,
+            "forward_avg_direct_qgroup_bucket_segment_member_utilization": 0.0,
+            "forward_direct_qgroup_bucket_segment_member_utilization_p50": 0.0,
+            "forward_direct_qgroup_bucket_segment_member_utilization_p90": 0.0,
             "forward_hybrid_selected_qgroups": 0,
         }
 
@@ -207,7 +578,7 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
         union_k = torch.empty(0, dtype=torch.float32)
         max_direct_segments = 0
 
-    return {
+    summary = {
         "logical_block_q": reference.logical_block_q,
         "logical_block_k": reference.logical_block_k,
         "max_packed_k": 0 if reference.max_packed_k is None else reference.max_packed_k,
@@ -256,6 +627,16 @@ def summarize_synthetic_grid(runtime) -> dict[str, float | int]:
         "forward_avg_union_k": _mean_or_zero(union_k),
         "forward_hybrid_selected_qgroups": hybrid_selected_qgroups,
     }
+    summary.update(_summarize_direct_qgroup_segments(qgroup_num_segments, getattr(reference, "qgroup_length", None)))
+    summary.update(
+        _summarize_direct_bucket_costs(
+            direct_plan,
+            qgroup_bucket_row_ptr=getattr(reference, "qgroup_bucket_row_ptr", None),
+            qgroup_bucket_idx=getattr(reference, "qgroup_bucket_idx", None),
+            qgroup_length=getattr(reference, "qgroup_length", None),
+        )
+    )
+    return summary
 
 
 def _empty_sentence_cache(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -1495,6 +1876,201 @@ class FlashHSASynthetic2DMaskedFwdSm100:
                     mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
 
 
+class FlashHSASynthetic2DMaskedGatherFwdSm100:
+    """Benchmark-only masked forward that gathers Q/K/V rows in-kernel."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQRowIdx.shape[0]
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQRows.element_type,
+            cute.make_layout((self.rows_per_cta, 64)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type,
+            cute.make_layout((self.tile_k, 64)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type,
+            cute.make_layout((self.tile_k, 64)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(64), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(64)
+            dim_idx = elem_idx - row_idx * Int32(64)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    sQ[row_idx, dim_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            active_row = row_idx < q_length
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+
+            for tile_start in range(0, mKRowIdx.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(64), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(64)
+                    dim_idx = elem_idx - tile_row * Int32(64)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        global_k_row = Int32(mKRowIdx[bucket_idx, global_key])
+                        if global_k_row >= Int32(0):
+                            sK[tile_row, dim_idx] = mKRows[global_k_row, head_idx, dim_idx]
+                            sV[tile_row, dim_idx] = mVRows[global_k_row, head_idx, dim_idx]
+                        else:
+                            sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                            sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 64, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutPacked.shape[3]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutPacked.shape[3]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                if row_max == -Float32.inf or row_sum == Float32(0.0):
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                else:
+                    inv_row_sum = Float32(1.0) / row_sum
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = (out0 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = (out1 * inv_row_sum).to(mOutPacked.element_type)
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSEPacked.element_type)
+            else:
+                if lane == Int32(0):
+                    mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                if dim0 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                if dim1 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+
+
 def _run_synthetic_pack_rows_kernel(
     src_rows: torch.Tensor,
     row_idx: torch.Tensor,
@@ -1877,6 +2453,17 @@ def _synthetic_micro_fwd_enabled() -> bool:
     import os
 
     return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _prefer_hybrid_direct_fwd_enabled() -> bool:
+    import os
+
+    return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PREFER_HYBRID_DIRECT", "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -14722,6 +15309,82 @@ def _run_synthetic_2d_masked_fwd_kernel(
 _run_synthetic_2d_masked_fwd_kernel.compile_cache = get_jit_cache("hsa_synth_2d_masked_fwd")
 
 
+def _run_synthetic_2d_masked_gather_fwd_kernel(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    k_row_idx: torch.Tensor,
+    q_length: torch.Tensor,
+    k_length: torch.Tensor,
+    mask_words: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_cute_runtime()
+    rows_per_cta = int(q_row_idx.shape[1])
+    compile_key = (
+        "synthetic_2d_masked_gather_fwd_v1",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        q_row_idx.shape[0],
+        q_row_idx.shape[1],
+        k_row_idx.shape[1],
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        mask_words.shape[2],
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    out = torch.empty(
+        (q_row_idx.shape[0], q_row_idx.shape[1], q_rows.shape[1], v_rows.shape[2]),
+        dtype=torch.float32,
+        device=q_rows.device,
+    )
+    lse = torch.empty(
+        (q_row_idx.shape[0], q_row_idx.shape[1], q_rows.shape[1]),
+        dtype=torch.float32,
+        device=q_rows.device,
+    )
+    if compile_key not in _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache:
+        kernel = FlashHSASynthetic2DMaskedGatherFwdSm100(rows_per_cta=rows_per_cta)
+        _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(k_row_idx, assumed_align=4),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(k_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(mask_words, assumed_align=4, leading_dim=2),
+            Float32(softmax_scale),
+            to_cute_tensor(out, assumed_align=4),
+            to_cute_tensor(lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        Float32(softmax_scale),
+        out,
+        lse,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    return out, lse
+
+
+_run_synthetic_2d_masked_gather_fwd_kernel.compile_cache = get_jit_cache("hsa_synth_2d_masked_gather_fwd")
+
+
 def _slice_bucket_flat_rows(
     metadata,
     bucket_idx: int,
@@ -15488,6 +16151,55 @@ def _run_bucketed_forward(
     if execution_plan is None:
         raise RuntimeError("Synthetic packed metadata is missing the cached forward execution plan")
 
+    def _try_hybrid_direct_forward(plan_to_run) -> tuple[bool, dict[str, object] | None]:
+        hybrid_direct_plan = plan_to_run.get("hybrid_direct_execution_plan")
+        hybrid_regular_execution_plan = plan_to_run.get("hybrid_regular_execution_plan")
+        if (
+            not _synthetic_micro_fwd_enabled()
+            or hybrid_direct_plan is None
+            or hybrid_regular_execution_plan is None
+            or not _can_use_direct_forward_micro_plan_runtime(hybrid_direct_plan, q_flat, k_flat, v_flat)
+        ):
+            return False, None
+
+        hybrid_plan = {"direct_execution_plan": hybrid_direct_plan}
+        if _can_use_direct_row_compact_plan_runtime(
+            hybrid_direct_plan,
+            q_flat,
+            k_flat,
+            v_flat,
+            enforce_segment_limits=False,
+        ) and _run_direct_row_compact_forward(
+            q_flat,
+            k_flat,
+            v_flat,
+            total_out,
+            total_lse,
+            metadata,
+            hybrid_plan,
+            softmax_scale=softmax_scale,
+            runtime=runtime,
+        ):
+            return True, hybrid_regular_execution_plan
+        if _run_direct_segmented_forward(
+            q_flat,
+            k_flat,
+            v_flat,
+            total_out,
+            total_lse,
+            metadata,
+            hybrid_plan,
+            softmax_scale=softmax_scale,
+            runtime=runtime,
+        ):
+            return True, hybrid_regular_execution_plan
+        return False, None
+
+    if _prefer_hybrid_direct_fwd_enabled():
+        hybrid_ran, hybrid_regular_execution_plan = _try_hybrid_direct_forward(execution_plan)
+        if hybrid_ran:
+            execution_plan = hybrid_regular_execution_plan
+
     direct_plan = execution_plan.get("direct_execution_plan")
     if (
         _synthetic_micro_fwd_enabled()
@@ -15523,44 +16235,9 @@ def _run_bucketed_forward(
             lse = total_lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
             return out, lse
 
-    hybrid_direct_plan = execution_plan.get("hybrid_direct_execution_plan")
-    hybrid_regular_execution_plan = execution_plan.get("hybrid_regular_execution_plan")
-    if (
-        _synthetic_micro_fwd_enabled()
-        and hybrid_direct_plan is not None
-        and hybrid_regular_execution_plan is not None
-        and _can_use_direct_forward_micro_plan_runtime(hybrid_direct_plan, q_flat, k_flat, v_flat)
-    ):
-        hybrid_plan = {"direct_execution_plan": hybrid_direct_plan}
-        if _can_use_direct_row_compact_plan_runtime(
-            hybrid_direct_plan,
-            q_flat,
-            k_flat,
-            v_flat,
-            enforce_segment_limits=False,
-        ) and _run_direct_row_compact_forward(
-            q_flat,
-            k_flat,
-            v_flat,
-            total_out,
-            total_lse,
-            metadata,
-            hybrid_plan,
-            softmax_scale=softmax_scale,
-            runtime=runtime,
-        ):
-            execution_plan = hybrid_regular_execution_plan
-        elif _run_direct_segmented_forward(
-            q_flat,
-            k_flat,
-            v_flat,
-            total_out,
-            total_lse,
-            metadata,
-            hybrid_plan,
-            softmax_scale=softmax_scale,
-            runtime=runtime,
-        ):
+    if not _prefer_hybrid_direct_fwd_enabled():
+        hybrid_ran, hybrid_regular_execution_plan = _try_hybrid_direct_forward(execution_plan)
+        if hybrid_ran:
             execution_plan = hybrid_regular_execution_plan
 
     workspace = runtime.synthetic_forward_workspace

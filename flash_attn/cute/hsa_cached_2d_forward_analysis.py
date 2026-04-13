@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 import torch
@@ -10,11 +11,24 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_synthetic_2d_masked_fwd_kernel,
     _run_synthetic_2d_masked_gather_fwd_kernel,
     _run_synthetic_2d_masked_gather_scatter_fwd_kernel,
+    _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel,
     _run_synthetic_pack_kv_rows_kernel,
     _run_synthetic_pack_rows_kernel,
 )
 from flash_attn.cute.hsa_explicit_2d_sparse_analysis import _partition_packed_rows_by_support
 from flash_attn.cute.hsa_shared_sparse_gemm_analysis import _encode_mask_rows_to_words
+
+
+@dataclass(frozen=True)
+class CachedPackingPolicy:
+    direct_density_threshold: float = 0.85
+    window_density_threshold: float = 0.60
+    k_gap_threshold: float = 1.25
+    max_rows_per_group: int = 16
+    tile_k: int = 32
+    max_union_k_direct: int = 64
+    max_union_k_2d: int = 128
+    union_kernel: str = "tc16x32"
 
 
 def _flatten_row_tensor(rows: torch.Tensor) -> torch.Tensor:
@@ -206,6 +220,8 @@ def _append_group_entries(
     group_k_rows: list[torch.Tensor],
     group_masks: list[torch.Tensor],
     group_fill: list[float],
+    group_families: list[str] | None = None,
+    family: str | None = None,
 ):
     for row_group in row_groups:
         if not row_group:
@@ -225,12 +241,16 @@ def _append_group_entries(
         group_k_rows.append(k_tensor.contiguous())
         group_masks.append(mask.contiguous())
         group_fill.append(float(mask.sum().item()) / max(1, len(row_group) * union_k))
+        if group_families is not None and family is not None:
+            group_families.append(family)
 
 
 def _build_range_execution_metadata(
     group_q_rows: list[torch.Tensor],
     combine_group_ranges: list[tuple[int, int]],
-) -> list[dict[str, int | bool]]:
+    *,
+    group_families: list[str] | None = None,
+) -> list[dict[str, int | bool | str]]:
     row_counts: dict[int, int] = {}
     for q_rows in group_q_rows:
         for q_row in q_rows.detach().cpu().tolist():
@@ -254,9 +274,579 @@ def _build_range_execution_metadata(
                 "group_start": int(group_start),
                 "group_end": int(group_end),
                 "scatter_only": scatter_only,
+                **(
+                    {}
+                    if group_families is None or int(group_start) >= len(group_families)
+                    else {"family": str(group_families[int(group_start)])}
+                ),
             }
         )
     return range_execution
+
+
+def _coerce_cached_packing_policy(
+    policy: CachedPackingPolicy | None = None,
+    *,
+    overrides: dict[str, Any] | None = None,
+) -> CachedPackingPolicy:
+    resolved = CachedPackingPolicy() if policy is None else policy
+    if overrides:
+        resolved = replace(resolved, **overrides)
+    if not (0.0 < float(resolved.direct_density_threshold) <= 1.0):
+        raise ValueError("direct_density_threshold must be in (0, 1]")
+    if not (0.0 < float(resolved.window_density_threshold) <= 1.0):
+        raise ValueError("window_density_threshold must be in (0, 1]")
+    if float(resolved.window_density_threshold) > float(resolved.direct_density_threshold):
+        raise ValueError("window_density_threshold must be <= direct_density_threshold")
+    if float(resolved.k_gap_threshold) <= 0.0:
+        raise ValueError("k_gap_threshold must be positive")
+    if int(resolved.max_rows_per_group) <= 0 or int(resolved.max_rows_per_group) > 16:
+        raise ValueError("max_rows_per_group must be between 1 and 16")
+    if int(resolved.tile_k) not in {16, 32}:
+        raise ValueError("tile_k must be one of 16 or 32")
+    if int(resolved.max_union_k_direct) <= 0 or int(resolved.max_union_k_direct) > 128:
+        raise ValueError("max_union_k_direct must be between 1 and 128")
+    if int(resolved.max_union_k_2d) <= 0 or int(resolved.max_union_k_2d) > 128:
+        raise ValueError("max_union_k_2d must be between 1 and 128")
+    if int(resolved.max_union_k_direct) > int(resolved.max_union_k_2d):
+        raise ValueError("max_union_k_direct must be <= max_union_k_2d")
+    if str(resolved.union_kernel) not in {"tc16x32", "scalar"}:
+        raise ValueError("union_kernel must be one of tc16x32 or scalar")
+    return resolved
+
+
+def _summarize_bucket_support_geometry(
+    q_rows: list[int],
+    support_lists: list[list[int]],
+) -> dict[str, float | int]:
+    live_pairs = sum(len(support_list) for support_list in support_lists)
+    live_k_rows = sorted({support_row for support_list in support_lists for support_row in support_list})
+    num_live_rows = len(q_rows)
+    num_live_k = len(live_k_rows)
+    k_extent = live_k_rows[-1] - live_k_rows[0] + 1 if live_k_rows else 0
+    q_extent = max(q_rows) - min(q_rows) + 1 if q_rows else 0
+    max_row_support = max((len(support_list) for support_list in support_lists), default=0)
+    active_density = live_pairs / max(1, num_live_rows * max(1, num_live_k)) if num_live_rows > 0 else 0.0
+    return {
+        "num_live_rows": num_live_rows,
+        "num_live_k": num_live_k,
+        "live_pairs": live_pairs,
+        "k_extent": k_extent,
+        "q_extent": q_extent,
+        "active_density": active_density,
+        "k_gap_ratio": (k_extent / max(1, num_live_k)) if num_live_k > 0 else 0.0,
+        "q_gap_ratio": (q_extent / max(1, num_live_rows)) if num_live_rows > 0 else 0.0,
+        "max_row_support": max_row_support,
+    }
+
+
+def _choose_cached_packing_family(
+    bucket_stats: dict[str, float | int],
+    policy: CachedPackingPolicy,
+) -> str:
+    num_live_k = int(bucket_stats["num_live_k"])
+    active_density = float(bucket_stats["active_density"])
+    k_gap_ratio = float(bucket_stats["k_gap_ratio"])
+    if (
+        num_live_k > 0
+        and num_live_k <= int(policy.max_union_k_direct)
+        and active_density >= float(policy.direct_density_threshold)
+        and k_gap_ratio <= float(policy.k_gap_threshold)
+    ):
+        return "direct_passthrough"
+    if active_density >= float(policy.window_density_threshold) and k_gap_ratio > float(policy.k_gap_threshold):
+        return "k_window"
+    return "union_2d"
+
+
+def _build_bucket_mask_from_support_lists(
+    support_lists: list[list[int]],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    union_rows = sorted({support_row for support_list in support_lists for support_row in support_list})
+    if not union_rows:
+        return torch.zeros((len(support_lists), 0), dtype=torch.bool, device=device)
+    union_pos = {support_row: pos for pos, support_row in enumerate(union_rows)}
+    mask = torch.zeros((len(support_lists), len(union_rows)), dtype=torch.bool, device=device)
+    for row_idx, support_list in enumerate(support_lists):
+        for support_row in support_list:
+            mask[row_idx, union_pos[int(support_row)]] = True
+    return mask
+
+
+def _append_group_range(
+    *,
+    group_start: int,
+    family: str,
+    group_q_rows: list[torch.Tensor],
+    combine_group_ranges: list[tuple[int, int]],
+    group_families: list[str],
+):
+    if len(group_q_rows) <= group_start:
+        return
+    group_end = len(group_q_rows)
+    combine_group_ranges.append((group_start, group_end))
+    group_families.extend([family] * (group_end - group_start))
+
+
+def _append_direct_passthrough_groups(
+    *,
+    device: torch.device,
+    q_rows: list[int],
+    support_lists: list[list[int]],
+    policy: CachedPackingPolicy,
+    group_q_rows: list[torch.Tensor],
+    group_k_rows: list[torch.Tensor],
+    group_masks: list[torch.Tensor],
+    group_fill: list[float],
+    combine_group_ranges: list[tuple[int, int]],
+    group_families: list[str],
+) -> int:
+    bucket_mask = _build_bucket_mask_from_support_lists(support_lists, device=device)
+    row_groups = _group_rows_by_support_patterns(
+        bucket_mask,
+        max_rows_per_group=min(int(policy.max_rows_per_group), len(q_rows)),
+    )
+    group_start = len(group_q_rows)
+    _append_group_entries(
+        device=device,
+        q_rows=q_rows,
+        support_lists=support_lists,
+        row_groups=row_groups,
+        group_q_rows=group_q_rows,
+        group_k_rows=group_k_rows,
+        group_masks=group_masks,
+        group_fill=group_fill,
+    )
+    _append_group_range(
+        group_start=group_start,
+        family="direct_passthrough",
+        group_q_rows=group_q_rows,
+        combine_group_ranges=combine_group_ranges,
+        group_families=group_families,
+    )
+    return len(group_q_rows) - group_start
+
+
+def _append_k_window_groups(
+    *,
+    device: torch.device,
+    q_rows: list[int],
+    support_lists: list[list[int]],
+    policy: CachedPackingPolicy,
+    group_q_rows: list[torch.Tensor],
+    group_k_rows: list[torch.Tensor],
+    group_masks: list[torch.Tensor],
+    group_fill: list[float],
+    combine_group_ranges: list[tuple[int, int]],
+    group_families: list[str],
+) -> int:
+    max_union_k = max(
+        int(policy.max_union_k_direct),
+        max((len(support_list) for support_list in support_lists), default=0),
+    )
+    row_groups = _group_support_lists_by_span(
+        support_lists,
+        max_rows_per_group=min(int(policy.max_rows_per_group), len(q_rows)),
+        max_union_k=max_union_k,
+    )
+    group_start = len(group_q_rows)
+    _append_group_entries(
+        device=device,
+        q_rows=q_rows,
+        support_lists=support_lists,
+        row_groups=row_groups,
+        group_q_rows=group_q_rows,
+        group_k_rows=group_k_rows,
+        group_masks=group_masks,
+        group_fill=group_fill,
+    )
+    _append_group_range(
+        group_start=group_start,
+        family="k_window",
+        group_q_rows=group_q_rows,
+        combine_group_ranges=combine_group_ranges,
+        group_families=group_families,
+    )
+    return len(group_q_rows) - group_start
+
+
+def _finalize_generalized_cached_forward_payload(
+    *,
+    device: torch.device,
+    q_flat: torch.Tensor,
+    group_q_rows: list[torch.Tensor],
+    group_k_rows: list[torch.Tensor],
+    group_masks: list[torch.Tensor],
+    group_fill: list[float],
+    combine_group_ranges: list[tuple[int, int]],
+    group_families: list[str],
+    tile_k: int,
+    geometry_base: dict[str, Any],
+    reason: str,
+    union_kernel: str = "scalar",
+) -> dict[str, Any]:
+    group_count = len(group_q_rows)
+    if group_count <= 0:
+        return {"status": "not_applicable", "reason": "cached generalized packing did not yield any forward groups"}
+
+    rows_per_group = max(int(group_q_rows[group_idx].numel()) for group_idx in range(group_count))
+    max_union_k = max(int(group_k_rows[group_idx].numel()) for group_idx in range(group_count))
+    q_row_idx = torch.full((group_count, rows_per_group), -1, dtype=torch.int32, device=device)
+    k_row_idx = torch.full((group_count, max_union_k), -1, dtype=torch.int32, device=device)
+    mask_bool = torch.zeros((group_count, rows_per_group, max_union_k), dtype=torch.bool, device=device)
+    q_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
+    k_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
+    for group_idx in range(group_count):
+        row_count = int(group_q_rows[group_idx].numel())
+        union_k = int(group_k_rows[group_idx].numel())
+        q_row_idx[group_idx, :row_count] = group_q_rows[group_idx]
+        k_row_idx[group_idx, :union_k] = group_k_rows[group_idx]
+        mask_bool[group_idx, :row_count, :union_k] = group_masks[group_idx]
+        q_length[group_idx] = row_count
+        k_length[group_idx] = union_k
+
+    mask_words = _encode_mask_rows_to_words(mask_bool.view(group_count * rows_per_group, max_union_k)).view(
+        group_count,
+        rows_per_group,
+        -1,
+    )
+    range_execution = _build_range_execution_metadata(
+        group_q_rows,
+        combine_group_ranges,
+        group_families=group_families,
+    )
+    scatter_only_ranges = sum(1 for entry in range_execution if bool(entry["scatter_only"]))
+    scatter_only_rows = 0
+    family_group_counts = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_union_k_sums = {family: 0.0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_scatter_only_rows = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    for group_idx, family in enumerate(group_families):
+        q_count = int(q_length[group_idx].item())
+        family_group_counts[family] = family_group_counts.get(family, 0) + 1
+        family_union_k_sums[family] = family_union_k_sums.get(family, 0.0) + float(k_length[group_idx].item())
+        is_scatter_only = any(
+            int(entry["group_start"]) <= group_idx < int(entry["group_end"]) and bool(entry["scatter_only"])
+            for entry in range_execution
+        )
+        if is_scatter_only:
+            scatter_only_rows += q_count
+            family_scatter_only_rows[family] = family_scatter_only_rows.get(family, 0) + q_count
+    geometry = dict(geometry_base)
+    geometry.update(
+        {
+            "cached_generalized_groups": group_count,
+            "cached_generalized_rows_per_group": rows_per_group,
+            "cached_generalized_avg_union_k": float(k_length.float().mean().item()) if group_count > 0 else 0.0,
+            "cached_generalized_max_union_k": max_union_k,
+            "cached_generalized_avg_group_fill": float(sum(group_fill) / len(group_fill)) if group_fill else 0.0,
+            "cached_generalized_scatter_only_ranges": scatter_only_ranges,
+            "cached_generalized_scatter_only_rows": scatter_only_rows,
+            "family_group_counts": family_group_counts,
+            "family_avg_union_k": {
+                family: (
+                    family_union_k_sums[family] / family_group_counts[family]
+                    if family_group_counts[family] > 0
+                    else 0.0
+                )
+                for family in family_group_counts
+            },
+            "family_scatter_only_rows": family_scatter_only_rows,
+            "union_kernel": str(union_kernel),
+            "union_tc_group_count": 0,
+            "union_tc_row_count": 0,
+            "union_scalar_fallback_group_count": 0,
+            "union_scalar_fallback_row_count": 0,
+        }
+    )
+    return {
+        "status": "ready",
+        "reason": reason,
+        "packed_q": rows_per_group,
+        "support_rows": max_union_k,
+        "tile_k": int(tile_k),
+        "q_row_idx": q_row_idx.contiguous(),
+        "k_row_idx": k_row_idx.contiguous(),
+        "mask_words": mask_words.contiguous(),
+        "mask_bool": mask_bool.contiguous(),
+        "q_length": q_length.contiguous(),
+        "k_length": k_length.contiguous(),
+        "total_rows": int(q_flat.shape[0]),
+        "combine_group_ranges": combine_group_ranges,
+        "range_execution": range_execution,
+        "union_kernel": str(union_kernel),
+        "geometry": geometry,
+        "_workspace": {},
+    }
+
+
+def build_cached_generalized_packed_forward_payload(
+    runtime,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    policy: CachedPackingPolicy | None = None,
+    policy_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    del k, v
+    q_flat = _flatten_row_tensor(q)
+    resolved_policy = _coerce_cached_packing_policy(policy, overrides=policy_overrides)
+    metadata = None if runtime is None else getattr(runtime, "forward_synthetic_grid", None)
+    if metadata is None or getattr(metadata, "forward_execution_plan", None) is None:
+        return {"status": "not_applicable", "reason": "cached schedule is missing synthetic-grid forward metadata"}
+    direct_plan = metadata.forward_execution_plan.get("direct_execution_plan")
+    if direct_plan is None:
+        return {"status": "not_applicable", "reason": "cached schedule does not expose a direct execution plan"}
+    row_plan = direct_plan.get("row_compact_plan")
+    if row_plan is None:
+        return {"status": "not_applicable", "reason": "cached direct execution plan is missing a row-compact plan"}
+
+    device = q_flat.device
+    group_q_rows: list[torch.Tensor] = []
+    group_k_rows: list[torch.Tensor] = []
+    group_masks: list[torch.Tensor] = []
+    group_fill: list[float] = []
+    group_families: list[str] = []
+    combine_group_ranges: list[tuple[int, int]] = []
+    bucket_qgroup_bucket_idx = direct_plan.get("bucket_qgroup_bucket_idx")
+    family_counts = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_live_pairs = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_bucket_stats = {
+        family: {"active_density": 0.0, "k_gap_ratio": 0.0, "q_gap_ratio": 0.0, "count": 0}
+        for family in ("direct_passthrough", "k_window", "union_2d")
+    }
+    union_bucket_entries: list[dict[str, Any]] = []
+    baseline_live_row_count = 0
+    baseline_packed_k_sum = 0
+    zero_support_rows_count = 0
+    total_live_pairs = 0
+    total_group_area = 0
+
+    for bucket_idx in range(len(direct_plan["bucket_size"])):
+        live_q_rows, live_support_rows, live_support_valid, zero_support_rows, packed_k = _extract_bucket_live_row_supports(
+            direct_plan,
+            row_plan,
+            bucket_idx,
+        )
+        zero_support_rows_count += int(zero_support_rows)
+        live_row_count = int(live_q_rows.numel())
+        if live_row_count <= 0:
+            continue
+        baseline_live_row_count += live_row_count
+        baseline_packed_k_sum += int(packed_k) * live_row_count
+        live_q_rows_cpu = [int(value) for value in live_q_rows.detach().cpu().tolist()]
+        live_support_rows_cpu = live_support_rows.detach().cpu().tolist()
+        live_support_valid_cpu = live_support_valid.detach().cpu().tolist()
+        support_lists = [
+            [int(support_row) for support_row, valid in zip(row_supports, row_valid, strict=True) if valid and int(support_row) >= 0]
+            for row_supports, row_valid in zip(live_support_rows_cpu, live_support_valid_cpu, strict=True)
+        ]
+        q_rows = [int(q_row) for q_row in live_q_rows_cpu]
+        if not q_rows:
+            continue
+        bucket_stats = _summarize_bucket_support_geometry(q_rows, support_lists)
+        family = _choose_cached_packing_family(bucket_stats, resolved_policy)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        family_live_pairs[family] = family_live_pairs.get(family, 0) + int(bucket_stats["live_pairs"])
+        total_live_pairs += int(bucket_stats["live_pairs"])
+        family_bucket_stats[family]["active_density"] += float(bucket_stats["active_density"])
+        family_bucket_stats[family]["k_gap_ratio"] += float(bucket_stats["k_gap_ratio"])
+        family_bucket_stats[family]["q_gap_ratio"] += float(bucket_stats["q_gap_ratio"])
+        family_bucket_stats[family]["count"] += 1
+        qgroup_bucket_idx = bucket_idx if bucket_qgroup_bucket_idx is None else int(bucket_qgroup_bucket_idx[bucket_idx])
+        if family == "direct_passthrough":
+            _append_direct_passthrough_groups(
+                device=device,
+                q_rows=q_rows,
+                support_lists=support_lists,
+                policy=resolved_policy,
+                group_q_rows=group_q_rows,
+                group_k_rows=group_k_rows,
+                group_masks=group_masks,
+                group_fill=group_fill,
+                combine_group_ranges=combine_group_ranges,
+                group_families=group_families,
+            )
+            continue
+        if family == "k_window":
+            _append_k_window_groups(
+                device=device,
+                q_rows=q_rows,
+                support_lists=support_lists,
+                policy=resolved_policy,
+                group_q_rows=group_q_rows,
+                group_k_rows=group_k_rows,
+                group_masks=group_masks,
+                group_fill=group_fill,
+                combine_group_ranges=combine_group_ranges,
+                group_families=group_families,
+            )
+            continue
+        union_bucket_entries.append(
+            {
+                "bucket_idx": bucket_idx,
+                "qgroup_bucket_idx": qgroup_bucket_idx,
+                "q_rows": q_rows,
+                "support_lists": support_lists,
+            }
+        )
+
+    union_entries_by_qgroup: dict[int, list[tuple[int, list[int]]]] = {}
+    for bucket_entry in union_bucket_entries:
+        qgroup_entries = union_entries_by_qgroup.setdefault(int(bucket_entry["qgroup_bucket_idx"]), [])
+        qgroup_entries.extend(zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True))
+
+    fallback_rows_by_qgroup: dict[int, set[int]] = {}
+    for qgroup_bucket_idx in sorted(union_entries_by_qgroup):
+        row_support_map: dict[int, set[int]] = {}
+        for q_row, support_list in union_entries_by_qgroup[qgroup_bucket_idx]:
+            if not support_list:
+                continue
+            row_support_map.setdefault(int(q_row), set()).update(int(support_row) for support_row in support_list)
+        merged_q_rows: list[int] = []
+        merged_support_lists: list[list[int]] = []
+        fallback_rows: set[int] = set()
+        for q_row in sorted(row_support_map):
+            support_list = sorted(row_support_map[q_row])
+            if len(support_list) > int(resolved_policy.max_union_k_2d):
+                fallback_rows.add(int(q_row))
+                continue
+            merged_q_rows.append(int(q_row))
+            merged_support_lists.append(support_list)
+        if merged_q_rows:
+            row_groups = _group_support_lists_by_span(
+                merged_support_lists,
+                max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(merged_q_rows)),
+                max_union_k=max(
+                    int(resolved_policy.max_union_k_2d),
+                    max((len(support_list) for support_list in merged_support_lists), default=0),
+                ),
+            )
+            group_start = len(group_q_rows)
+            _append_group_entries(
+                device=device,
+                q_rows=merged_q_rows,
+                support_lists=merged_support_lists,
+                row_groups=row_groups,
+                group_q_rows=group_q_rows,
+                group_k_rows=group_k_rows,
+                group_masks=group_masks,
+                group_fill=group_fill,
+            )
+            _append_group_range(
+                group_start=group_start,
+                family="union_2d",
+                group_q_rows=group_q_rows,
+                combine_group_ranges=combine_group_ranges,
+                group_families=group_families,
+            )
+        if fallback_rows:
+            fallback_rows_by_qgroup[qgroup_bucket_idx] = fallback_rows
+
+    for bucket_entry in union_bucket_entries:
+        fallback_rows = fallback_rows_by_qgroup.get(int(bucket_entry["qgroup_bucket_idx"]))
+        if not fallback_rows:
+            continue
+        fallback_q_rows = [
+            q_row
+            for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True)
+            if q_row in fallback_rows and support_list
+        ]
+        fallback_support_lists = [
+            support_list
+            for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True)
+            if q_row in fallback_rows and support_list
+        ]
+        if not fallback_q_rows:
+            continue
+        row_groups = _group_support_lists_by_span(
+            fallback_support_lists,
+            max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(fallback_q_rows)),
+            max_union_k=max(
+                int(resolved_policy.max_union_k_2d),
+                max((len(support_list) for support_list in fallback_support_lists), default=0),
+            ),
+        )
+        group_start = len(group_q_rows)
+        _append_group_entries(
+            device=device,
+            q_rows=fallback_q_rows,
+            support_lists=fallback_support_lists,
+            row_groups=row_groups,
+            group_q_rows=group_q_rows,
+            group_k_rows=group_k_rows,
+            group_masks=group_masks,
+            group_fill=group_fill,
+        )
+        _append_group_range(
+            group_start=group_start,
+            family="union_2d",
+            group_q_rows=group_q_rows,
+            combine_group_ranges=combine_group_ranges,
+            group_families=group_families,
+        )
+
+    for group_idx in range(len(group_q_rows)):
+        total_group_area += int(group_q_rows[group_idx].numel()) * int(group_k_rows[group_idx].numel())
+
+    geometry_base = {
+        "cached_generalized_buckets": sum(family_counts.values()),
+        "cached_generalized_zero_support_rows": zero_support_rows_count,
+        "cached_generalized_live_pairs": total_live_pairs,
+        "cached_generalized_case_fill_rate": total_live_pairs / max(1, total_group_area),
+        "cached_generalized_support_reduction": (
+            0.0
+            if baseline_live_row_count <= 0
+            else 1.0
+            - (
+                sum(int(group_k_rows[group_idx].numel()) * int(group_q_rows[group_idx].numel()) for group_idx in range(len(group_q_rows)))
+                / max(1, baseline_packed_k_sum)
+            )
+        ),
+        "family_counts": family_counts,
+        "family_live_pairs": family_live_pairs,
+        "family_avg_active_density": {
+            family: (
+                family_bucket_stats[family]["active_density"] / family_bucket_stats[family]["count"]
+                if family_bucket_stats[family]["count"] > 0
+                else 0.0
+            )
+            for family in family_bucket_stats
+        },
+        "family_avg_k_gap_ratio": {
+            family: (
+                family_bucket_stats[family]["k_gap_ratio"] / family_bucket_stats[family]["count"]
+                if family_bucket_stats[family]["count"] > 0
+                else 0.0
+            )
+            for family in family_bucket_stats
+        },
+        "family_avg_q_gap_ratio": {
+            family: (
+                family_bucket_stats[family]["q_gap_ratio"] / family_bucket_stats[family]["count"]
+                if family_bucket_stats[family]["count"] > 0
+                else 0.0
+            )
+            for family in family_bucket_stats
+        },
+        "cached_pack_policy": asdict(resolved_policy),
+    }
+    return _finalize_generalized_cached_forward_payload(
+        device=device,
+        q_flat=q_flat,
+        group_q_rows=group_q_rows,
+        group_k_rows=group_k_rows,
+        group_masks=group_masks,
+        group_fill=group_fill,
+        combine_group_ranges=combine_group_ranges,
+        group_families=group_families,
+        tile_k=int(resolved_policy.tile_k),
+        geometry_base=geometry_base,
+        reason="cached direct buckets were packed by a policy-selected family mix",
+        union_kernel=str(resolved_policy.union_kernel),
+    )
 
 
 def build_cached_direct_2d_forward_payload(
@@ -501,6 +1091,7 @@ def build_cached_direct_2d_forward_payload(
         "reason": "cached direct buckets were repacked into 2D forward groups",
         "packed_q": rows_per_group,
         "support_rows": max_union_k,
+        "tile_k": 32,
         "q_row_idx": q_row_idx.contiguous(),
         "k_row_idx": k_row_idx.contiguous(),
         "mask_words": mask_words.contiguous(),
@@ -554,6 +1145,68 @@ def _get_cached_direct_2d_buffers(
     return buffers
 
 
+def _cached_union_range_counts(
+    payload: dict[str, Any],
+    *,
+    group_start: int,
+    group_end: int,
+) -> tuple[int, int]:
+    row_count = int(payload["q_length"][group_start:group_end].sum().item())
+    return int(group_end - group_start), row_count
+
+
+def _can_use_cached_union_tc(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    *,
+    group_start: int,
+    group_end: int,
+    range_entry: dict[str, Any],
+) -> bool:
+    if str(payload.get("union_kernel", "scalar")) != "tc16x32":
+        return False
+    if str(range_entry.get("family", "union_2d")) != "union_2d":
+        return False
+    if not bool(range_entry.get("scatter_only")):
+        return False
+    if int(payload["packed_q"]) != 16 or int(payload.get("tile_k", 32)) != 32:
+        return False
+    if int(payload["support_rows"]) <= 0 or int(payload["support_rows"]) > 128:
+        return False
+    if not _can_use_synthetic_2d_masked_fwd(
+        q_flat,
+        k_flat,
+        v_flat,
+        packed_q=int(payload["packed_q"]),
+        packed_k=int(payload["support_rows"]),
+    ):
+        return False
+    range_q_lengths = payload["q_length"][group_start:group_end]
+    if int(range_q_lengths.numel()) <= 0 or int(range_q_lengths.max().item()) > 16:
+        return False
+    return True
+
+
+def _record_union_runtime_geometry(
+    payload: dict[str, Any],
+    *,
+    tc_group_count: int,
+    tc_row_count: int,
+    scalar_group_count: int,
+    scalar_row_count: int,
+) -> None:
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    geometry["union_kernel"] = str(payload.get("union_kernel", geometry.get("union_kernel", "scalar")))
+    geometry["union_tc_group_count"] = int(tc_group_count)
+    geometry["union_tc_row_count"] = int(tc_row_count)
+    geometry["union_scalar_fallback_group_count"] = int(scalar_group_count)
+    geometry["union_scalar_fallback_row_count"] = int(scalar_row_count)
+
+
 def run_cached_direct_2d_forward(
     payload: dict[str, Any],
     q: torch.Tensor,
@@ -571,6 +1224,7 @@ def run_cached_direct_2d_forward(
     v_flat = _flatten_row_tensor(v)
     packed_q = int(payload["packed_q"])
     packed_k = int(payload["support_rows"])
+    tile_k = int(payload.get("tile_k", 32))
     if softmax_scale is None:
         softmax_scale = q_flat.shape[-1] ** (-0.5)
     if not _can_use_synthetic_2d_masked_fwd(q_flat, k_flat, v_flat, packed_q=packed_q, packed_k=packed_k):
@@ -589,6 +1243,10 @@ def run_cached_direct_2d_forward(
                 "scatter_only": False,
             }
         ]
+    union_tc_group_count = 0
+    union_tc_row_count = 0
+    union_scalar_group_count = 0
+    union_scalar_row_count = 0
 
     def _run_range_packed(group_start: int, group_end: int) -> tuple[torch.Tensor, torch.Tensor]:
         range_group_count = group_end - group_start
@@ -603,6 +1261,7 @@ def run_cached_direct_2d_forward(
                 payload["k_length"][group_start:group_end],
                 payload["mask_words"][group_start:group_end],
                 softmax_scale=float(softmax_scale),
+                tile_k=tile_k,
             )
         except Exception:
             q_buf_range = q_buf_flat[: range_group_count * packed_q]
@@ -631,6 +1290,7 @@ def run_cached_direct_2d_forward(
                 payload["k_length"][group_start:group_end],
                 payload["mask_words"][group_start:group_end],
                 softmax_scale=float(softmax_scale),
+                tile_k=tile_k,
             )
 
     for range_entry in range_execution:
@@ -640,7 +1300,45 @@ def run_cached_direct_2d_forward(
         group_end = int(group_end)
         if group_end <= group_start:
             continue
+        if _can_use_cached_union_tc(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            group_start=group_start,
+            group_end=group_end,
+            range_entry=range_entry,
+        ):
+            try:
+                _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    payload["q_row_idx"][group_start:group_end],
+                    payload["k_row_idx"][group_start:group_end],
+                    payload["q_length"][group_start:group_end],
+                    payload["k_length"][group_start:group_end],
+                    payload["mask_words"][group_start:group_end],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
+                tc_groups, tc_rows = _cached_union_range_counts(payload, group_start=group_start, group_end=group_end)
+                union_tc_group_count += tc_groups
+                union_tc_row_count += tc_rows
+                continue
+            except Exception:
+                pass
         if bool(range_entry.get("scatter_only")):
+            if str(range_entry.get("family", "union_2d")) == "union_2d":
+                scalar_groups, scalar_rows = _cached_union_range_counts(
+                    payload,
+                    group_start=group_start,
+                    group_end=group_end,
+                )
+                union_scalar_group_count += scalar_groups
+                union_scalar_row_count += scalar_rows
             try:
                 _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
                     q_flat,
@@ -654,6 +1352,7 @@ def run_cached_direct_2d_forward(
                     out_flat,
                     lse_flat,
                     softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
                 )
                 continue
             except Exception:
@@ -669,6 +1368,30 @@ def run_cached_direct_2d_forward(
             out_flat,
             lse_flat,
         )
+    _record_union_runtime_geometry(
+        payload,
+        tc_group_count=union_tc_group_count,
+        tc_row_count=union_tc_row_count,
+        scalar_group_count=union_scalar_group_count,
+        scalar_row_count=union_scalar_row_count,
+    )
     if q.ndim == 4:
         return out_flat.to(dtype=v.dtype).view(q.shape[0], q.shape[1], q.shape[2], v.shape[3]).contiguous()
     return out_flat.to(dtype=v.dtype).contiguous()
+
+
+def run_cached_generalized_packed_forward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    return run_cached_direct_2d_forward(
+        payload,
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+    )

@@ -2263,6 +2263,298 @@ class FlashHSASynthetic2DMaskedGatherScatterFwdSm100:
                         ).to(mLSERows.element_type)
 
 
+class FlashHSASynthetic2DMaskedGatherScatterTCFwdSm100:
+    """Benchmark-only gather+scatter forward with TC score tiles for 16x32 union buckets."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int = 16, tile_k: int = 32):
+        if rows_per_cta != 16:
+            raise ValueError("FlashHSASynthetic2DMaskedGatherScatterTCFwdSm100 requires rows_per_cta=16")
+        if tile_k != 32:
+            raise ValueError("FlashHSASynthetic2DMaskedGatherScatterTCFwdSm100 requires tile_k=32")
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQRowIdx.shape[0]
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutRows,
+            mLSERows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        tile64_layout = cute.tile_to_shape(
+            sm80_utils.get_smem_layout_atom(mQRows.element_type, 64),
+            (16, 64),
+            (0, 1),
+        )
+        tile32x64_layout = cute.tile_to_shape(
+            sm80_utils.get_smem_layout_atom(mVRows.element_type, 64),
+            (32, 64),
+            (0, 1),
+        )
+        sQ = smem.allocate_tensor(
+            mQRows.element_type,
+            tile64_layout,
+            byte_alignment=16,
+        )
+        sK0 = smem.allocate_tensor(
+            mKRows.element_type,
+            tile64_layout,
+            byte_alignment=16,
+        )
+        sK1 = smem.allocate_tensor(
+            mKRows.element_type,
+            tile64_layout,
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type,
+            tile32x64_layout,
+            byte_alignment=16,
+        )
+        sScore = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((16, 32)),
+            byte_alignment=16,
+        )
+        sProb = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((16, 32)),
+            byte_alignment=16,
+        )
+        sOut = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((16, 64)),
+            byte_alignment=16,
+        )
+        sRowMax = smem.allocate_tensor(cutlass.Float32, cute.make_layout((16,)), byte_alignment=16)
+        sRowSum = smem.allocate_tensor(cutlass.Float32, cute.make_layout((16,)), byte_alignment=16)
+
+        q_length = Int32(mQLength[bucket_idx])
+        k_length = Int32(mKLength[bucket_idx])
+
+        for elem_idx in cutlass.range(lane, Int32(16) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            row_idx = elem_idx // Int32(64)
+            dim_idx = elem_idx - row_idx * Int32(64)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    sQ[row_idx, dim_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            sOut[row_idx, dim_idx] = Float32(0.0)
+        if lane < Int32(16):
+            sRowMax[lane] = -Float32.inf
+            sRowSum[lane] = Float32(0.0)
+        cute.arch.barrier()
+
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(mQRows.element_type, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+        thr_mma = tiled_mma.get_slice(lane)
+        smem_copy_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            mQRows.element_type,
+        )
+        smem_thr_copy_q = utils.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(lane)
+        smem_thr_copy_k = utils.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(lane)
+        tSrQ = utils.mma_make_fragment_A(sQ, thr_mma)
+        tSrK0 = utils.mma_make_fragment_B(sK0, thr_mma)
+        tSrK1 = utils.mma_make_fragment_B(sK1, thr_mma)
+        tSsQ = smem_thr_copy_q.partition_S(sQ)
+        tSsK0 = smem_thr_copy_k.partition_S(sK0)
+        tSsK1 = smem_thr_copy_k.partition_S(sK1)
+        acc_shape_16 = thr_mma.partition_shape_C((16, 16))
+        c16 = cute.make_identity_tensor((16, 16))
+        tCc16 = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(c16))
+
+        for tile_start in range(0, mKRowIdx.shape[1], 32):
+            for elem_idx in cutlass.range(lane, Int32(32) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+                tile_row = elem_idx // Int32(64)
+                dim_idx = elem_idx - tile_row * Int32(64)
+                global_key = Int32(tile_start) + tile_row
+                k_val = Float32(0.0).to(sK0.element_type)
+                v_val = Float32(0.0).to(sV.element_type)
+                if global_key < k_length:
+                    global_k_row = Int32(mKRowIdx[bucket_idx, global_key])
+                    if global_k_row >= Int32(0):
+                        k_val = mKRows[global_k_row, head_idx, dim_idx]
+                        v_val = mVRows[global_k_row, head_idx, dim_idx]
+                if tile_row < Int32(16):
+                    sK0[tile_row, dim_idx] = k_val
+                else:
+                    sK1[tile_row - Int32(16), dim_idx] = k_val
+                sV[tile_row, dim_idx] = v_val
+            cute.arch.barrier()
+
+            acc_S0 = cute.make_fragment(acc_shape_16, Float32)
+            acc_S1 = cute.make_fragment(acc_shape_16, Float32)
+            acc_S0.fill(0.0)
+            acc_S1.fill(0.0)
+            sm80_utils.gemm(
+                thr_mma,
+                acc_S0,
+                tSrQ,
+                tSrK0,
+                tSsQ,
+                tSsK0,
+                smem_thr_copy_q,
+                smem_thr_copy_k,
+            )
+            sm80_utils.gemm(
+                thr_mma,
+                acc_S1,
+                tSrQ,
+                tSrK1,
+                tSsQ,
+                tSsK1,
+                smem_thr_copy_q,
+                smem_thr_copy_k,
+            )
+
+            acc_S0_mn = layout_utils.reshape_acc_to_mn(acc_S0)
+            acc_S1_mn = layout_utils.reshape_acc_to_mn(acc_S1)
+            for mi in cutlass.range_constexpr(cute.size(tCc16.shape[0])):
+                for ni in cutlass.range_constexpr(cute.size(tCc16.shape[1])):
+                    row_idx = tCc16[mi, ni][0]
+                    col_idx = tCc16[mi, ni][1]
+                    for half_idx in cutlass.range_constexpr(2):
+                        tile_col = col_idx + Int32(half_idx) * Int32(16)
+                        global_key = Int32(tile_start) + tile_col
+                        score = -Float32.inf
+                        if row_idx < q_length and global_key < k_length:
+                            word_idx = global_key // Int32(32)
+                            bit_idx = global_key % Int32(32)
+                            mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                            bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                            if bit != cutlass.Uint32(0):
+                                score_acc = acc_S0_mn[mi, ni] if half_idx == 0 else acc_S1_mn[mi, ni]
+                                score = score_acc * softmax_scale
+                        sScore[row_idx, tile_col] = score
+            cute.arch.barrier()
+
+            if lane < Int32(16):
+                row_idx = lane
+                global_q_row = Int32(-1)
+                active_row = Boolean(False)
+                if row_idx < q_length:
+                    global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                    active_row = global_q_row >= Int32(0)
+                if active_row:
+                    chunk_max = -Float32.inf
+                    for tile_col in range(32):
+                        score = Float32(sScore[row_idx, tile_col])
+                        if score > chunk_max:
+                            chunk_max = score
+                    if chunk_max != -Float32.inf:
+                        chunk_sum = Float32(0.0)
+                        for tile_col in range(32):
+                            prob = Float32(0.0)
+                            score = Float32(sScore[row_idx, tile_col])
+                            if score != -Float32.inf:
+                                prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                            sProb[row_idx, tile_col] = prob
+                            chunk_sum += prob
+                        if chunk_sum != Float32(0.0):
+                            prev_row_max = Float32(sRowMax[row_idx])
+                            prev_row_sum = Float32(sRowSum[row_idx])
+                            next_max = prev_row_max if prev_row_max > chunk_max else chunk_max
+                            prev_scale = Float32(0.0) if prev_row_max == -Float32.inf else cute.math.exp2(
+                                (prev_row_max - next_max) * Float32(_LOG2_E),
+                                fastmath=True,
+                            )
+                            chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                            for dim_idx in range(64):
+                                chunk_out = Float32(0.0)
+                                for tile_col in range(32):
+                                    chunk_out += Float32(sProb[row_idx, tile_col]) * Float32(sV[tile_col, dim_idx])
+                                sOut[row_idx, dim_idx] = Float32(sOut[row_idx, dim_idx]) * prev_scale + chunk_out * chunk_scale
+                            sRowSum[row_idx] = prev_row_sum * prev_scale + chunk_sum * chunk_scale
+                            sRowMax[row_idx] = next_max
+                        else:
+                            for tile_col in range(32):
+                                sProb[row_idx, tile_col] = Float32(0.0)
+                    else:
+                        for tile_col in range(32):
+                            sProb[row_idx, tile_col] = Float32(0.0)
+            cute.arch.barrier()
+
+        if lane < Int32(16):
+            row_idx = lane
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    row_max = Float32(sRowMax[row_idx])
+                    row_sum = Float32(sRowSum[row_idx])
+                    if row_max == -Float32.inf or row_sum == Float32(0.0):
+                        mLSERows[global_q_row, head_idx] = -Float32.inf
+                        for dim_idx in range(64):
+                            mOutRows[global_q_row, head_idx, dim_idx] = Float32(0.0).to(mOutRows.element_type)
+                    else:
+                        inv_row_sum = Float32(1.0) / row_sum
+                        for dim_idx in range(64):
+                            mOutRows[global_q_row, head_idx, dim_idx] = (
+                                Float32(sOut[row_idx, dim_idx]) * inv_row_sum
+                            ).to(mOutRows.element_type)
+                        mLSERows[global_q_row, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSERows.element_type)
+
+
 def _run_synthetic_pack_rows_kernel(
     src_rows: torch.Tensor,
     row_idx: torch.Tensor,
@@ -15440,6 +15732,7 @@ def _run_synthetic_2d_masked_fwd_kernel(
     mask_words: torch.Tensor,
     *,
     softmax_scale: float,
+    tile_k: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cute_runtime()
     rows_per_cta = int(q_packed.shape[1])
@@ -15451,6 +15744,7 @@ def _run_synthetic_2d_masked_fwd_kernel(
         q_packed.shape[0],
         q_packed.shape[1],
         k_packed.shape[1],
+        tile_k,
         q_packed.shape[2],
         q_packed.shape[3],
         v_packed.shape[3],
@@ -15468,7 +15762,7 @@ def _run_synthetic_2d_masked_fwd_kernel(
         device=q_packed.device,
     )
     if compile_key not in _run_synthetic_2d_masked_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedFwdSm100(rows_per_cta=rows_per_cta)
+        kernel = FlashHSASynthetic2DMaskedFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_packed),
@@ -15512,6 +15806,7 @@ def _run_synthetic_2d_masked_gather_fwd_kernel(
     mask_words: torch.Tensor,
     *,
     softmax_scale: float,
+    tile_k: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cute_runtime()
     rows_per_cta = int(q_row_idx.shape[1])
@@ -15523,6 +15818,7 @@ def _run_synthetic_2d_masked_gather_fwd_kernel(
         q_row_idx.shape[0],
         q_row_idx.shape[1],
         k_row_idx.shape[1],
+        tile_k,
         q_rows.shape[1],
         q_rows.shape[2],
         v_rows.shape[2],
@@ -15540,7 +15836,7 @@ def _run_synthetic_2d_masked_gather_fwd_kernel(
         device=q_rows.device,
     )
     if compile_key not in _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedGatherFwdSm100(rows_per_cta=rows_per_cta)
+        kernel = FlashHSASynthetic2DMaskedGatherFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -15590,6 +15886,7 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
     lse_rows: torch.Tensor,
     *,
     softmax_scale: float,
+    tile_k: int = 32,
 ) -> None:
     _require_cute_runtime()
     rows_per_cta = int(q_row_idx.shape[1])
@@ -15603,6 +15900,7 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
         q_row_idx.shape[0],
         q_row_idx.shape[1],
         k_row_idx.shape[1],
+        tile_k,
         q_rows.shape[1],
         q_rows.shape[2],
         v_rows.shape[2],
@@ -15610,7 +15908,7 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
         torch.cuda.get_device_capability(q_rows.device),
     )
     if compile_key not in _run_synthetic_2d_masked_gather_scatter_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedGatherScatterFwdSm100(rows_per_cta=rows_per_cta)
+        kernel = FlashHSASynthetic2DMaskedGatherScatterFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_gather_scatter_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -15645,6 +15943,81 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
 
 _run_synthetic_2d_masked_gather_scatter_fwd_kernel.compile_cache = get_jit_cache(
     "hsa_synth_2d_masked_gather_scatter_fwd"
+)
+
+
+def _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
+    q_rows: torch.Tensor,
+    k_rows: torch.Tensor,
+    v_rows: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    k_row_idx: torch.Tensor,
+    q_length: torch.Tensor,
+    k_length: torch.Tensor,
+    mask_words: torch.Tensor,
+    out_rows: torch.Tensor,
+    lse_rows: torch.Tensor,
+    *,
+    softmax_scale: float,
+    tile_k: int = 32,
+) -> None:
+    _require_cute_runtime()
+    rows_per_cta = int(q_row_idx.shape[1])
+    if rows_per_cta != 16 or int(tile_k) != 32:
+        raise RuntimeError("synthetic_2d_masked_gather_scatter_tc_fwd_unsupported_shape")
+    compile_key = (
+        "synthetic_2d_masked_gather_scatter_tc_fwd_v1",
+        q_rows.dtype,
+        k_rows.dtype,
+        v_rows.dtype,
+        out_rows.dtype,
+        lse_rows.dtype,
+        q_row_idx.shape[0],
+        q_row_idx.shape[1],
+        k_row_idx.shape[1],
+        tile_k,
+        q_rows.shape[1],
+        q_rows.shape[2],
+        v_rows.shape[2],
+        mask_words.shape[2],
+        torch.cuda.get_device_capability(q_rows.device),
+    )
+    if compile_key not in _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel.compile_cache:
+        kernel = FlashHSASynthetic2DMaskedGatherScatterTCFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
+        _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(q_rows),
+            to_cute_tensor(k_rows),
+            to_cute_tensor(v_rows),
+            to_cute_tensor(q_row_idx, assumed_align=4),
+            to_cute_tensor(k_row_idx, assumed_align=4),
+            to_cute_tensor(q_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(k_length, assumed_align=4, leading_dim=0),
+            to_cute_tensor(mask_words, assumed_align=4, leading_dim=2),
+            Float32(softmax_scale),
+            to_cute_tensor(out_rows, assumed_align=4),
+            to_cute_tensor(lse_rows, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel.compile_cache[compile_key](
+        q_rows,
+        k_rows,
+        v_rows,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        Float32(softmax_scale),
+        out_rows,
+        lse_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel.compile_cache = get_jit_cache(
+    "hsa_synth_2d_masked_gather_scatter_tc_fwd"
 )
 
 

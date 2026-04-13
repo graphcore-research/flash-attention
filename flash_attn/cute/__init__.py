@@ -50,8 +50,11 @@ from .hsa_explicit_2d_sparse_analysis import (
     summarize_explicit_2d_sparse_suite,
 )
 from .hsa_cached_2d_forward_analysis import (
+    CachedPackingPolicy,
     build_cached_direct_2d_forward_payload,
+    build_cached_generalized_packed_forward_payload,
     run_cached_direct_2d_forward,
+    run_cached_generalized_packed_forward,
 )
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
@@ -86,9 +89,12 @@ __all__ = [
     "summarize_hsa_shared_sparse_gemm_forward",
     "analyze_explicit_2d_sparse_forward",
     "build_explicit_2d_sparse_case",
+    "CachedPackingPolicy",
     "build_cached_direct_2d_forward_payload",
+    "build_cached_generalized_packed_forward_payload",
     "scatter_explicit_packed_rows",
     "run_cached_direct_2d_forward",
+    "run_cached_generalized_packed_forward",
     "summarize_explicit_2d_sparse_forward",
     "summarize_explicit_2d_sparse_suite",
 ]

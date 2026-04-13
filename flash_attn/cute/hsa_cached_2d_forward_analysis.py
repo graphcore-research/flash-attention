@@ -7,6 +7,8 @@ import torch
 
 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _can_use_synthetic_2d_masked_fwd,
+    _run_synthetic_2d_exact_gather_scatter_tc_fwd_kernel,
+    _run_synthetic_2d_exact_tail_gather_scatter_tc_fwd_kernel,
     _run_synthetic_combine_scatter_rows_kernel,
     _run_synthetic_2d_masked_fwd_kernel,
     _run_synthetic_2d_masked_gather_fwd_kernel,
@@ -16,7 +18,6 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_synthetic_pack_rows_kernel,
 )
 from flash_attn.cute.hsa_explicit_2d_sparse_analysis import _partition_packed_rows_by_support
-from flash_attn.cute.hsa_shared_sparse_gemm_analysis import _encode_mask_rows_to_words
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,43 @@ class CachedPackingPolicy:
     max_union_k_direct: int = 64
     max_union_k_2d: int = 128
     union_kernel: str = "tc16x32"
+    exact_kernel_family: str = "tc8x8"
+    exact_min_rows: int = 6
+    residual_mode: str = "fused_tail"
+
+
+_EXACT_KERNEL_SPECS = {
+    "tc16x16": {
+        "rows_per_range": 16,
+        "keys_per_tile": 16,
+        "default_min_rows": 8,
+    },
+    "tc8x8": {
+        "rows_per_range": 8,
+        "keys_per_tile": 8,
+        "default_min_rows": 6,
+    },
+}
+
+
+def _resolve_exact_kernel_spec(
+    family: str,
+    *,
+    min_rows: int | None = None,
+) -> dict[str, int | str]:
+    family_name = str(family)
+    if family_name not in _EXACT_KERNEL_SPECS:
+        raise ValueError(f"unsupported exact_kernel_family {family_name!r}")
+    base = dict(_EXACT_KERNEL_SPECS[family_name])
+    resolved_min_rows = int(base["default_min_rows"] if min_rows is None else min_rows)
+    rows_per_range = int(base["rows_per_range"])
+    if resolved_min_rows <= 0 or resolved_min_rows > rows_per_range:
+        raise ValueError(
+            f"exact_min_rows must be between 1 and {rows_per_range} for {family_name}"
+        )
+    base["family"] = family_name
+    base["min_rows"] = resolved_min_rows
+    return base
 
 
 def _flatten_row_tensor(rows: torch.Tensor) -> torch.Tensor:
@@ -210,15 +248,435 @@ def _group_support_lists_by_span(
     return row_groups
 
 
-def _append_group_entries(
+def _build_group_mask_words(
+    support_lists: list[list[int]],
+    row_group: list[int],
+    union_rows: list[int],
+) -> tuple[torch.Tensor, float]:
+    union_pos = {row_idx: pos for pos, row_idx in enumerate(union_rows)}
+    word_count = max(1, (len(union_rows) + 31) // 32)
+    row_word_values: list[list[int]] = []
+    live_pairs = 0
+    for entry_idx in row_group:
+        row_words = [0] * word_count
+        row_live_pairs = 0
+        for support_row in support_lists[entry_idx]:
+            support_pos = union_pos[int(support_row)]
+            row_words[support_pos // 32] |= 1 << (support_pos % 32)
+            row_live_pairs += 1
+        row_word_values.append(row_words)
+        live_pairs += row_live_pairs
+    mask_words = torch.tensor(row_word_values, dtype=torch.int64).to(dtype=torch.int32)
+    fill = float(live_pairs) / max(1, len(row_group) * len(union_rows))
+    return mask_words, fill
+
+
+def _decode_mask_words_to_bool(mask_words: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= 0:
+        return torch.zeros((int(mask_words.shape[0]), 0), dtype=torch.bool)
+    bit_offsets = torch.arange(32, dtype=torch.int64).view(1, 1, 32)
+    mask_words_u32 = mask_words.to(dtype=torch.int64) & ((1 << 32) - 1)
+    unpacked = ((mask_words_u32.unsqueeze(-1) >> bit_offsets) & 1).to(dtype=torch.bool)
+    return unpacked.view(int(mask_words.shape[0]), -1)[:, :width].contiguous()
+
+
+def _extract_exact_dense_tile_ranges(
+    q_rows: list[int],
+    support_lists: list[list[int]],
+    *,
+    rows_per_range: int,
+    keys_per_tile: int,
+    min_rows: int,
+) -> tuple[list[dict[str, Any]], list[list[int]], int]:
+    if rows_per_range <= 0 or keys_per_tile <= 0 or min_rows <= 0:
+        raise ValueError("exact dense extractor parameters must be positive")
+    residual_sets = [set(int(value) for value in support_list) for support_list in support_lists]
+    exact_ranges: list[dict[str, Any]] = []
+    exact_live_pairs = 0
+
+    while True:
+        active_rows = [row_idx for row_idx, support in enumerate(residual_sets) if len(support) >= keys_per_tile]
+        if len(active_rows) < min_rows:
+            break
+
+        best_group: list[int] | None = None
+        best_common: set[int] | None = None
+        best_score: tuple[int, int, int, int] | None = None
+
+        for seed_idx in active_rows:
+            seed_support = residual_sets[seed_idx]
+            candidate_rows = sorted(
+                (row_idx for row_idx in active_rows if row_idx != seed_idx),
+                key=lambda row_idx: (
+                    len(seed_support.intersection(residual_sets[row_idx])),
+                    len(residual_sets[row_idx]),
+                    -row_idx,
+                ),
+                reverse=True,
+            )
+            subgroup = [seed_idx]
+            common_support = set(seed_support)
+            for row_idx in candidate_rows:
+                if len(subgroup) >= rows_per_range:
+                    break
+                candidate_common = common_support.intersection(residual_sets[row_idx])
+                if len(candidate_common) < keys_per_tile:
+                    continue
+                subgroup.append(row_idx)
+                common_support = candidate_common
+            if len(subgroup) < min_rows:
+                continue
+            tile_count = len(common_support) // keys_per_tile
+            if tile_count <= 0:
+                continue
+            score = (
+                len(subgroup) * tile_count * keys_per_tile,
+                len(subgroup),
+                tile_count,
+                len(common_support),
+            )
+            if best_score is None or score > best_score:
+                best_group = subgroup
+                best_common = common_support
+                best_score = score
+
+        if best_group is None or best_common is None or best_score is None:
+            break
+
+        sorted_common = sorted(best_common)
+        tile_count = best_score[2]
+        tiles = [
+            sorted_common[tile_idx * keys_per_tile : (tile_idx + 1) * keys_per_tile]
+            for tile_idx in range(tile_count)
+        ]
+        covered_keys = set(key for tile in tiles for key in tile)
+        exact_ranges.append(
+            {
+                "q_rows": [int(q_rows[row_idx]) for row_idx in best_group],
+                "tiles": tiles,
+            }
+        )
+        exact_live_pairs += len(best_group) * len(covered_keys)
+        for row_idx in best_group:
+            residual_sets[row_idx].difference_update(covered_keys)
+
+    residual_support_lists = [sorted(support_set) for support_set in residual_sets]
+    return exact_ranges, residual_support_lists, exact_live_pairs
+
+
+def _build_masked_tail_tiles(
+    tail_support_lists: list[list[int]],
+    *,
+    rows_per_range: int,
+    keys_per_tile: int,
+) -> tuple[list[list[int]], list[list[int]], int]:
+    if rows_per_range <= 0 or keys_per_tile <= 0:
+        raise ValueError("tail tile builder parameters must be positive")
+    key_row_masks: dict[int, int] = {}
+    for row_idx, support_list in enumerate(tail_support_lists):
+        if row_idx >= rows_per_range:
+            break
+        for support_row in support_list:
+            key_row_masks[int(support_row)] = key_row_masks.get(int(support_row), 0) | (1 << row_idx)
+    if not key_row_masks:
+        return [], [], 0
+
+    key_entries = sorted(
+        key_row_masks.items(),
+        key=lambda item: (-int(item[1]).bit_count(), int(item[1]), int(item[0])),
+    )
+    tail_tiles: list[list[int]] = []
+    tail_mask_rows: list[list[int]] = []
+    tail_live_pairs = 0
+    for chunk_start in range(0, len(key_entries), keys_per_tile):
+        chunk = key_entries[chunk_start : chunk_start + keys_per_tile]
+        tile_rows = [-1] * keys_per_tile
+        row_masks = [0] * rows_per_range
+        for col_idx, (support_row, row_mask) in enumerate(chunk):
+            tile_rows[col_idx] = int(support_row)
+            tail_live_pairs += int(row_mask).bit_count()
+            for row_idx in range(rows_per_range):
+                if (int(row_mask) >> row_idx) & 1:
+                    row_masks[row_idx] |= 1 << col_idx
+        tail_tiles.append(tile_rows)
+        tail_mask_rows.append(row_masks)
+    return tail_tiles, tail_mask_rows, tail_live_pairs
+
+
+def _extract_fused_exact_tail_ranges(
+    q_rows: list[int],
+    support_lists: list[list[int]],
+    *,
+    rows_per_range: int,
+    keys_per_tile: int,
+    min_rows: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    if rows_per_range <= 0 or keys_per_tile <= 0 or min_rows <= 0:
+        raise ValueError("fused exact/tail extractor parameters must be positive")
+    support_sets = [set(int(value) for value in support_list) for support_list in support_lists]
+    remaining_rows = [row_idx for row_idx, support_set in enumerate(support_sets) if support_set]
+    fused_ranges: list[dict[str, Any]] = []
+    exact_live_pairs = 0
+    tail_live_pairs = 0
+
+    def _ordered_rows(row_indices: list[int]) -> list[int]:
+        return sorted(
+            row_indices,
+            key=lambda idx: (
+                support_lists[idx][0] if support_lists[idx] else -1,
+                support_lists[idx][-1] if support_lists[idx] else -1,
+                len(support_lists[idx]),
+                idx,
+            ),
+        )
+
+    while remaining_rows:
+        active_rows = [row_idx for row_idx in remaining_rows if len(support_sets[row_idx]) >= keys_per_tile]
+        best_group: list[int] | None = None
+        best_common: set[int] | None = None
+        best_score: tuple[int, int, int, int] | None = None
+
+        for seed_idx in active_rows:
+            seed_support = support_sets[seed_idx]
+            candidate_rows = sorted(
+                (row_idx for row_idx in active_rows if row_idx != seed_idx),
+                key=lambda row_idx: (
+                    len(seed_support.intersection(support_sets[row_idx])),
+                    len(support_sets[row_idx]),
+                    -row_idx,
+                ),
+                reverse=True,
+            )
+            subgroup = [seed_idx]
+            common_support = set(seed_support)
+            for row_idx in candidate_rows:
+                if len(subgroup) >= rows_per_range:
+                    break
+                candidate_common = common_support.intersection(support_sets[row_idx])
+                if len(candidate_common) < keys_per_tile:
+                    continue
+                subgroup.append(row_idx)
+                common_support = candidate_common
+            if len(subgroup) < min_rows:
+                continue
+            tile_count = len(common_support) // keys_per_tile
+            if tile_count <= 0:
+                continue
+            score = (
+                len(subgroup) * tile_count * keys_per_tile,
+                len(subgroup),
+                tile_count,
+                len(common_support),
+            )
+            if best_score is None or score > best_score:
+                best_group = subgroup
+                best_common = common_support
+                best_score = score
+
+        if best_group is None or best_common is None or best_score is None:
+            tail_group = _ordered_rows(remaining_rows[:rows_per_range] if len(remaining_rows) <= rows_per_range else _ordered_rows(remaining_rows)[:rows_per_range])
+            tail_support_lists = [sorted(support_sets[row_idx]) for row_idx in tail_group]
+            tail_tiles, tail_mask_rows, group_tail_live_pairs = _build_masked_tail_tiles(
+                tail_support_lists,
+                rows_per_range=rows_per_range,
+                keys_per_tile=keys_per_tile,
+            )
+            fused_ranges.append(
+                {
+                    "q_rows": [int(q_rows[row_idx]) for row_idx in tail_group],
+                    "exact_tiles": [],
+                    "tail_tiles": tail_tiles,
+                    "tail_mask_rows": tail_mask_rows,
+                }
+            )
+            tail_live_pairs += int(group_tail_live_pairs)
+            remaining_set = set(tail_group)
+            remaining_rows = [row_idx for row_idx in remaining_rows if row_idx not in remaining_set]
+            continue
+
+        ordered_group = _ordered_rows(best_group)
+        sorted_common = sorted(best_common)
+        tile_count = best_score[2]
+        exact_tiles = [
+            sorted_common[tile_idx * keys_per_tile : (tile_idx + 1) * keys_per_tile]
+            for tile_idx in range(tile_count)
+        ]
+        covered_keys = set(key for tile in exact_tiles for key in tile)
+        tail_support_lists = [
+            sorted(support_sets[row_idx].difference(covered_keys))
+            for row_idx in ordered_group
+        ]
+        tail_tiles, tail_mask_rows, group_tail_live_pairs = _build_masked_tail_tiles(
+            tail_support_lists,
+            rows_per_range=rows_per_range,
+            keys_per_tile=keys_per_tile,
+        )
+        fused_ranges.append(
+            {
+                "q_rows": [int(q_rows[row_idx]) for row_idx in ordered_group],
+                "exact_tiles": exact_tiles,
+                "tail_tiles": tail_tiles,
+                "tail_mask_rows": tail_mask_rows,
+            }
+        )
+        exact_live_pairs += len(ordered_group) * len(covered_keys)
+        tail_live_pairs += int(group_tail_live_pairs)
+        remaining_set = set(best_group)
+        remaining_rows = [row_idx for row_idx in remaining_rows if row_idx not in remaining_set]
+
+    return fused_ranges, exact_live_pairs, tail_live_pairs
+
+
+def _materialize_exact_dense_range_tensors(
     *,
     device: torch.device,
+    exact_ranges: list[dict[str, Any]],
+    rows_per_range: int,
+    keys_per_tile: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    range_count = len(exact_ranges)
+    q_row_idx = torch.full((range_count, rows_per_range), -1, dtype=torch.int32, device=device)
+    q_length = torch.zeros((range_count,), dtype=torch.int32, device=device)
+    tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
+    tile_count = sum(len(range_entry["tiles"]) for range_entry in exact_ranges)
+    tile_k_row_idx = torch.full((tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
+
+    tile_offset = 0
+    for range_idx, range_entry in enumerate(exact_ranges):
+        q_rows = [int(value) for value in range_entry["q_rows"]]
+        tiles = range_entry["tiles"]
+        q_length[range_idx] = len(q_rows)
+        q_row_idx[range_idx, : len(q_rows)] = torch.tensor(q_rows, dtype=torch.int32, device=device)
+        for tile in tiles:
+            tile_k_row_idx[tile_offset] = torch.tensor(tile, dtype=torch.int32, device=device)
+            tile_offset += 1
+        tile_ptr[range_idx + 1] = tile_offset
+    return q_row_idx, q_length, tile_ptr, tile_k_row_idx
+
+
+def _materialize_fused_exact_tail_range_tensors(
+    *,
+    device: torch.device,
+    fused_ranges: list[dict[str, Any]],
+    rows_per_range: int,
+    keys_per_tile: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    range_count = len(fused_ranges)
+    q_row_idx = torch.full((range_count, rows_per_range), -1, dtype=torch.int32, device=device)
+    q_length = torch.zeros((range_count,), dtype=torch.int32, device=device)
+    exact_tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
+    exact_tile_count = sum(len(range_entry.get("exact_tiles", ())) for range_entry in fused_ranges)
+    exact_k_row_idx = torch.full((exact_tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
+    tail_tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
+    tail_tile_count = sum(len(range_entry.get("tail_tiles", ())) for range_entry in fused_ranges)
+    tail_k_row_idx = torch.full((tail_tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
+    tail_mask_words = torch.zeros((tail_tile_count, rows_per_range, 1), dtype=torch.int32, device=device)
+
+    exact_tile_offset = 0
+    tail_tile_offset = 0
+    for range_idx, range_entry in enumerate(fused_ranges):
+        q_rows = [int(value) for value in range_entry["q_rows"]]
+        exact_tiles = [[int(value) for value in tile] for tile in range_entry.get("exact_tiles", ())]
+        tail_tiles = [
+            [int(value) for value in tail_tile]
+            for tail_tile in range_entry.get("tail_tiles", ())
+        ]
+        tail_mask_rows = [
+            [int(value) for value in row_masks]
+            for row_masks in range_entry.get("tail_mask_rows", ())
+        ]
+        q_length[range_idx] = len(q_rows)
+        if q_rows:
+            q_row_idx[range_idx, : len(q_rows)] = torch.tensor(q_rows, dtype=torch.int32, device=device)
+        for tile in exact_tiles:
+            exact_k_row_idx[exact_tile_offset, : len(tile)] = torch.tensor(tile, dtype=torch.int32, device=device)
+            exact_tile_offset += 1
+        exact_tile_ptr[range_idx + 1] = exact_tile_offset
+        for tile_rows, row_masks in zip(tail_tiles, tail_mask_rows, strict=True):
+            tail_k_row_idx[tail_tile_offset, : len(tile_rows)] = torch.tensor(
+                tile_rows,
+                dtype=torch.int32,
+                device=device,
+            )
+            tail_mask_words[tail_tile_offset, : len(row_masks), 0] = torch.tensor(
+                row_masks,
+                dtype=torch.int32,
+                device=device,
+            )
+            tail_tile_offset += 1
+        tail_tile_ptr[range_idx + 1] = tail_tile_offset
+    return (
+        q_row_idx,
+        q_length,
+        exact_tile_ptr,
+        exact_k_row_idx,
+        tail_tile_ptr,
+        tail_k_row_idx,
+        tail_mask_words,
+    )
+
+
+def _materialize_cached_group_tensors(
+    *,
+    device: torch.device,
+    group_q_rows: list[list[int]],
+    group_k_rows: list[list[int]],
+    group_mask_words: list[torch.Tensor],
+    include_mask_bool: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, int, int]:
+    group_count = len(group_q_rows)
+    if group_count <= 0:
+        raise ValueError("group_count must be positive")
+    rows_per_group = max(len(group_q_rows[group_idx]) for group_idx in range(group_count))
+    max_union_k = max(len(group_k_rows[group_idx]) for group_idx in range(group_count))
+    max_mask_words = max(int(group_mask_words[group_idx].shape[1]) for group_idx in range(group_count))
+
+    q_row_idx_cpu = torch.full((group_count, rows_per_group), -1, dtype=torch.int32)
+    k_row_idx_cpu = torch.full((group_count, max_union_k), -1, dtype=torch.int32)
+    mask_words_cpu = torch.zeros((group_count, rows_per_group, max_mask_words), dtype=torch.int32)
+    q_length_cpu = torch.zeros((group_count,), dtype=torch.int32)
+    k_length_cpu = torch.zeros((group_count,), dtype=torch.int32)
+    mask_bool_cpu = (
+        torch.zeros((group_count, rows_per_group, max_union_k), dtype=torch.bool)
+        if include_mask_bool
+        else None
+    )
+
+    for group_idx in range(group_count):
+        row_count = len(group_q_rows[group_idx])
+        union_k = len(group_k_rows[group_idx])
+        word_count = int(group_mask_words[group_idx].shape[1])
+        q_row_idx_cpu[group_idx, :row_count] = torch.tensor(group_q_rows[group_idx], dtype=torch.int32)
+        k_row_idx_cpu[group_idx, :union_k] = torch.tensor(group_k_rows[group_idx], dtype=torch.int32)
+        mask_words_cpu[group_idx, :row_count, :word_count] = group_mask_words[group_idx]
+        q_length_cpu[group_idx] = row_count
+        k_length_cpu[group_idx] = union_k
+        if mask_bool_cpu is not None:
+            mask_bool_cpu[group_idx, :row_count, :union_k] = _decode_mask_words_to_bool(
+                group_mask_words[group_idx],
+                union_k,
+            )
+
+    return (
+        q_row_idx_cpu.to(device=device).contiguous(),
+        k_row_idx_cpu.to(device=device).contiguous(),
+        mask_words_cpu.to(device=device).contiguous(),
+        None if mask_bool_cpu is None else mask_bool_cpu.to(device=device).contiguous(),
+        q_length_cpu.to(device=device).contiguous(),
+        k_length_cpu.to(device=device).contiguous(),
+        rows_per_group,
+        max_union_k,
+    )
+
+
+def _append_group_entries(
+    *,
     q_rows: list[int],
     support_lists: list[list[int]],
     row_groups: list[list[int]],
-    group_q_rows: list[torch.Tensor],
-    group_k_rows: list[torch.Tensor],
-    group_masks: list[torch.Tensor],
+    group_q_rows: list[list[int]],
+    group_k_rows: list[list[int]],
+    group_mask_words: list[torch.Tensor],
     group_fill: list[float],
     group_families: list[str] | None = None,
     family: str | None = None,
@@ -230,30 +688,25 @@ def _append_group_entries(
         union_k = len(union_rows)
         if union_k <= 0:
             continue
-        union_pos = {row_idx: pos for pos, row_idx in enumerate(union_rows)}
-        mask = torch.zeros((len(row_group), union_k), dtype=torch.bool, device=device)
-        for row_pos, entry_idx in enumerate(row_group):
-            for support_row in support_lists[entry_idx]:
-                mask[row_pos, union_pos[support_row]] = True
-        q_tensor = torch.tensor([q_rows[entry_idx] for entry_idx in row_group], dtype=torch.int32, device=device)
-        k_tensor = torch.tensor(union_rows, dtype=torch.int32, device=device)
-        group_q_rows.append(q_tensor.contiguous())
-        group_k_rows.append(k_tensor.contiguous())
-        group_masks.append(mask.contiguous())
-        group_fill.append(float(mask.sum().item()) / max(1, len(row_group) * union_k))
+        mask_words, fill = _build_group_mask_words(support_lists, row_group, union_rows)
+        group_q_rows.append([q_rows[entry_idx] for entry_idx in row_group])
+        group_k_rows.append(union_rows)
+        group_mask_words.append(mask_words.contiguous())
+        group_fill.append(fill)
         if group_families is not None and family is not None:
             group_families.append(family)
 
 
 def _build_range_execution_metadata(
-    group_q_rows: list[torch.Tensor],
+    group_q_rows: list[list[int]],
     combine_group_ranges: list[tuple[int, int]],
     *,
     group_families: list[str] | None = None,
+    additional_row_counts: dict[int, int] | None = None,
 ) -> list[dict[str, int | bool | str]]:
-    row_counts: dict[int, int] = {}
+    row_counts: dict[int, int] = {} if additional_row_counts is None else dict(additional_row_counts)
     for q_rows in group_q_rows:
-        for q_row in q_rows.detach().cpu().tolist():
+        for q_row in q_rows:
             q_row_int = int(q_row)
             if q_row_int < 0:
                 continue
@@ -264,9 +717,7 @@ def _build_range_execution_metadata(
         range_rows: list[int] = []
         for group_idx in range(int(group_start), int(group_end)):
             range_rows.extend(
-                int(q_row)
-                for q_row in group_q_rows[group_idx].detach().cpu().tolist()
-                if int(q_row) >= 0
+                int(q_row) for q_row in group_q_rows[group_idx] if int(q_row) >= 0
             )
         scatter_only = bool(range_rows) and all(row_counts.get(q_row, 0) == 1 for q_row in range_rows)
         range_execution.append(
@@ -312,6 +763,12 @@ def _coerce_cached_packing_policy(
         raise ValueError("max_union_k_direct must be <= max_union_k_2d")
     if str(resolved.union_kernel) not in {"tc16x32", "scalar"}:
         raise ValueError("union_kernel must be one of tc16x32 or scalar")
+    _resolve_exact_kernel_spec(
+        str(resolved.exact_kernel_family),
+        min_rows=int(resolved.exact_min_rows),
+    )
+    if str(resolved.residual_mode) not in {"fused_tail", "masked_union"}:
+        raise ValueError("residual_mode must be one of fused_tail or masked_union")
     return resolved
 
 
@@ -392,17 +849,17 @@ def _append_group_range(
 
 def _append_direct_passthrough_groups(
     *,
-    device: torch.device,
     q_rows: list[int],
     support_lists: list[list[int]],
     policy: CachedPackingPolicy,
-    group_q_rows: list[torch.Tensor],
-    group_k_rows: list[torch.Tensor],
-    group_masks: list[torch.Tensor],
+    group_q_rows: list[list[int]],
+    group_k_rows: list[list[int]],
+    group_mask_words: list[torch.Tensor],
     group_fill: list[float],
     combine_group_ranges: list[tuple[int, int]],
     group_families: list[str],
 ) -> int:
+    device = torch.device("cpu")
     bucket_mask = _build_bucket_mask_from_support_lists(support_lists, device=device)
     row_groups = _group_rows_by_support_patterns(
         bucket_mask,
@@ -410,13 +867,12 @@ def _append_direct_passthrough_groups(
     )
     group_start = len(group_q_rows)
     _append_group_entries(
-        device=device,
         q_rows=q_rows,
         support_lists=support_lists,
         row_groups=row_groups,
         group_q_rows=group_q_rows,
         group_k_rows=group_k_rows,
-        group_masks=group_masks,
+        group_mask_words=group_mask_words,
         group_fill=group_fill,
     )
     _append_group_range(
@@ -431,13 +887,12 @@ def _append_direct_passthrough_groups(
 
 def _append_k_window_groups(
     *,
-    device: torch.device,
     q_rows: list[int],
     support_lists: list[list[int]],
     policy: CachedPackingPolicy,
-    group_q_rows: list[torch.Tensor],
-    group_k_rows: list[torch.Tensor],
-    group_masks: list[torch.Tensor],
+    group_q_rows: list[list[int]],
+    group_k_rows: list[list[int]],
+    group_mask_words: list[torch.Tensor],
     group_fill: list[float],
     combine_group_ranges: list[tuple[int, int]],
     group_families: list[str],
@@ -453,13 +908,12 @@ def _append_k_window_groups(
     )
     group_start = len(group_q_rows)
     _append_group_entries(
-        device=device,
         q_rows=q_rows,
         support_lists=support_lists,
         row_groups=row_groups,
         group_q_rows=group_q_rows,
         group_k_rows=group_k_rows,
-        group_masks=group_masks,
+        group_mask_words=group_mask_words,
         group_fill=group_fill,
     )
     _append_group_range(
@@ -476,56 +930,78 @@ def _finalize_generalized_cached_forward_payload(
     *,
     device: torch.device,
     q_flat: torch.Tensor,
-    group_q_rows: list[torch.Tensor],
-    group_k_rows: list[torch.Tensor],
-    group_masks: list[torch.Tensor],
+    group_q_rows: list[list[int]],
+    group_k_rows: list[list[int]],
+    group_mask_words: list[torch.Tensor],
     group_fill: list[float],
     combine_group_ranges: list[tuple[int, int]],
     group_families: list[str],
     tile_k: int,
     geometry_base: dict[str, Any],
     reason: str,
+    exact_ranges: list[dict[str, Any]] | None = None,
+    exact_live_pairs: int = 0,
+    fused_ranges: list[dict[str, Any]] | None = None,
+    fused_exact_live_pairs: int = 0,
+    fused_tail_live_pairs: int = 0,
     union_kernel: str = "scalar",
+    exact_kernel_family: str = "tc16x16",
+    exact_rows_per_range: int = 16,
+    exact_keys_per_tile: int = 16,
+    exact_min_rows: int = 8,
+    residual_mode: str = "masked_union",
+    include_mask_bool: bool = True,
 ) -> dict[str, Any]:
     group_count = len(group_q_rows)
-    if group_count <= 0:
+    exact_ranges = [] if exact_ranges is None else exact_ranges
+    fused_ranges = [] if fused_ranges is None else fused_ranges
+    exact_range_count = len(exact_ranges)
+    fused_range_count = len(fused_ranges)
+    if group_count <= 0 and exact_range_count <= 0 and fused_range_count <= 0:
         return {"status": "not_applicable", "reason": "cached generalized packing did not yield any forward groups"}
 
-    rows_per_group = max(int(group_q_rows[group_idx].numel()) for group_idx in range(group_count))
-    max_union_k = max(int(group_k_rows[group_idx].numel()) for group_idx in range(group_count))
-    q_row_idx = torch.full((group_count, rows_per_group), -1, dtype=torch.int32, device=device)
-    k_row_idx = torch.full((group_count, max_union_k), -1, dtype=torch.int32, device=device)
-    mask_bool = torch.zeros((group_count, rows_per_group, max_union_k), dtype=torch.bool, device=device)
-    q_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
-    k_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
-    for group_idx in range(group_count):
-        row_count = int(group_q_rows[group_idx].numel())
-        union_k = int(group_k_rows[group_idx].numel())
-        q_row_idx[group_idx, :row_count] = group_q_rows[group_idx]
-        k_row_idx[group_idx, :union_k] = group_k_rows[group_idx]
-        mask_bool[group_idx, :row_count, :union_k] = group_masks[group_idx]
-        q_length[group_idx] = row_count
-        k_length[group_idx] = union_k
-
-    mask_words = _encode_mask_rows_to_words(mask_bool.view(group_count * rows_per_group, max_union_k)).view(
-        group_count,
-        rows_per_group,
-        -1,
-    )
-    range_execution = _build_range_execution_metadata(
-        group_q_rows,
-        combine_group_ranges,
-        group_families=group_families,
-    )
+    if group_count > 0:
+        exact_row_counts: dict[int, int] = {}
+        for range_entry in exact_ranges:
+            for q_row in range_entry["q_rows"]:
+                q_row_int = int(q_row)
+                if q_row_int < 0:
+                    continue
+                exact_row_counts[q_row_int] = exact_row_counts.get(q_row_int, 0) + 1
+        q_row_idx, k_row_idx, mask_words, mask_bool, q_length, k_length, rows_per_group, max_union_k = (
+            _materialize_cached_group_tensors(
+                device=device,
+                group_q_rows=group_q_rows,
+                group_k_rows=group_k_rows,
+                group_mask_words=group_mask_words,
+                include_mask_bool=include_mask_bool,
+            )
+        )
+        range_execution = _build_range_execution_metadata(
+            group_q_rows,
+            combine_group_ranges,
+            group_families=group_families,
+            additional_row_counts=exact_row_counts,
+        )
+    else:
+        q_row_idx = torch.empty((0, int(geometry_base.get("cached_pack_policy", {}).get("max_rows_per_group", 16))), dtype=torch.int32, device=device)
+        k_row_idx = torch.empty((0, 0), dtype=torch.int32, device=device)
+        mask_words = torch.empty((0, 0, 0), dtype=torch.int32, device=device)
+        mask_bool = None
+        q_length = torch.empty((0,), dtype=torch.int32, device=device)
+        k_length = torch.empty((0,), dtype=torch.int32, device=device)
+        rows_per_group = int(geometry_base.get("cached_pack_policy", {}).get("max_rows_per_group", 16))
+        max_union_k = 0
+        range_execution = []
     scatter_only_ranges = sum(1 for entry in range_execution if bool(entry["scatter_only"]))
     scatter_only_rows = 0
     family_group_counts = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
     family_union_k_sums = {family: 0.0 for family in ("direct_passthrough", "k_window", "union_2d")}
     family_scatter_only_rows = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
     for group_idx, family in enumerate(group_families):
-        q_count = int(q_length[group_idx].item())
+        q_count = len(group_q_rows[group_idx])
         family_group_counts[family] = family_group_counts.get(family, 0) + 1
-        family_union_k_sums[family] = family_union_k_sums.get(family, 0.0) + float(k_length[group_idx].item())
+        family_union_k_sums[family] = family_union_k_sums.get(family, 0.0) + float(len(group_k_rows[group_idx]))
         is_scatter_only = any(
             int(entry["group_start"]) <= group_idx < int(entry["group_end"]) and bool(entry["scatter_only"])
             for entry in range_execution
@@ -533,6 +1009,63 @@ def _finalize_generalized_cached_forward_payload(
         if is_scatter_only:
             scatter_only_rows += q_count
             family_scatter_only_rows[family] = family_scatter_only_rows.get(family, 0) + q_count
+
+    if exact_range_count > 0:
+        exact_q_row_idx, exact_q_length, exact_tile_ptr, exact_k_row_idx = _materialize_exact_dense_range_tensors(
+            device=device,
+            exact_ranges=exact_ranges,
+            rows_per_range=int(exact_rows_per_range),
+            keys_per_tile=int(exact_keys_per_tile),
+        )
+        exact_tile_count = int(exact_k_row_idx.shape[0])
+        exact_hardware_slots = exact_tile_count * int(exact_rows_per_range) * int(exact_keys_per_tile)
+        exact_coverage_frac = float(exact_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0)))
+        residual_live_pairs = max(0, int(geometry_base.get("cached_generalized_live_pairs", 0)) - int(exact_live_pairs))
+    else:
+        exact_q_row_idx = torch.empty((0, int(exact_rows_per_range)), dtype=torch.int32, device=device)
+        exact_q_length = torch.empty((0,), dtype=torch.int32, device=device)
+        exact_tile_ptr = torch.zeros((1,), dtype=torch.int32, device=device)
+        exact_k_row_idx = torch.empty((0, int(exact_keys_per_tile)), dtype=torch.int32, device=device)
+        exact_tile_count = 0
+        exact_hardware_slots = 0
+        exact_coverage_frac = 0.0
+        residual_live_pairs = int(geometry_base.get("cached_generalized_live_pairs", 0))
+    if fused_range_count > 0:
+        (
+            fused_q_row_idx,
+            fused_q_length,
+            fused_exact_tile_ptr,
+            fused_exact_k_row_idx,
+            fused_tail_tile_ptr,
+            fused_tail_k_row_idx,
+            fused_tail_mask_words,
+        ) = _materialize_fused_exact_tail_range_tensors(
+            device=device,
+            fused_ranges=fused_ranges,
+            rows_per_range=int(exact_rows_per_range),
+            keys_per_tile=int(exact_keys_per_tile),
+        )
+        tail_only_range_count = sum(1 for range_entry in fused_ranges if not range_entry.get("exact_tiles"))
+        fused_total_live_pairs = int(fused_exact_live_pairs) + int(fused_tail_live_pairs)
+        residual_live_pairs = max(
+            0,
+            int(geometry_base.get("cached_generalized_live_pairs", 0)) - fused_total_live_pairs,
+        )
+        fused_tail_tile_count = int(fused_tail_k_row_idx.shape[0])
+        fused_tail_slots = fused_tail_tile_count * int(exact_rows_per_range) * int(exact_keys_per_tile)
+    else:
+        fused_q_row_idx = torch.empty((0, int(exact_rows_per_range)), dtype=torch.int32, device=device)
+        fused_q_length = torch.empty((0,), dtype=torch.int32, device=device)
+        fused_exact_tile_ptr = torch.zeros((1,), dtype=torch.int32, device=device)
+        fused_exact_k_row_idx = torch.empty((0, int(exact_keys_per_tile)), dtype=torch.int32, device=device)
+        fused_tail_tile_ptr = torch.zeros((1,), dtype=torch.int32, device=device)
+        fused_tail_k_row_idx = torch.empty((0, int(exact_keys_per_tile)), dtype=torch.int32, device=device)
+        fused_tail_mask_words = torch.empty((0, int(exact_rows_per_range), 1), dtype=torch.int32, device=device)
+        tail_only_range_count = 0
+        fused_total_live_pairs = int(exact_live_pairs) + int(residual_live_pairs)
+        fused_tail_tile_count = 0
+        fused_tail_slots = 0
+    legacy_union_group_count = sum(1 for family in group_families if family == "union_2d")
     geometry = dict(geometry_base)
     geometry.update(
         {
@@ -558,9 +1091,30 @@ def _finalize_generalized_cached_forward_payload(
             "union_tc_row_count": 0,
             "union_scalar_fallback_group_count": 0,
             "union_scalar_fallback_row_count": 0,
+            "exact_dense_range_count": exact_range_count,
+            "exact_dense_tile_count": exact_tile_count,
+            "exact_dense_live_pairs": int(exact_live_pairs),
+            "exact_dense_slots": int(exact_hardware_slots),
+            "exact_dense_hardware_fill": float(exact_live_pairs) / max(1, exact_hardware_slots),
+            "exact_dense_coverage_frac": exact_coverage_frac,
+            "residual_live_pairs": int(residual_live_pairs),
+            "residual_coverage_frac": float(residual_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0))),
+            "exact_kernel_family": str(exact_kernel_family),
+            "residual_mode": str(residual_mode),
+            "fused_range_count": int(fused_range_count),
+            "fused_exact_live_pairs": int(fused_exact_live_pairs),
+            "fused_tail_live_pairs": int(fused_tail_live_pairs),
+            "fused_exact_coverage_frac": float(fused_exact_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0))),
+            "fused_tail_coverage_frac": float(fused_tail_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0))),
+            "fused_total_coverage_frac": float(fused_total_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0))),
+            "fused_tail_tile_count": int(fused_tail_tile_count),
+            "fused_tail_slots": int(fused_tail_slots),
+            "fused_tail_hardware_fill": float(fused_tail_live_pairs) / max(1, fused_tail_slots),
+            "tail_only_range_count": int(tail_only_range_count),
+            "legacy_residual_fallback_range_count": int(legacy_union_group_count),
         }
     )
-    return {
+    payload = {
         "status": "ready",
         "reason": reason,
         "packed_q": rows_per_group,
@@ -569,7 +1123,6 @@ def _finalize_generalized_cached_forward_payload(
         "q_row_idx": q_row_idx.contiguous(),
         "k_row_idx": k_row_idx.contiguous(),
         "mask_words": mask_words.contiguous(),
-        "mask_bool": mask_bool.contiguous(),
         "q_length": q_length.contiguous(),
         "k_length": k_length.contiguous(),
         "total_rows": int(q_flat.shape[0]),
@@ -578,7 +1131,26 @@ def _finalize_generalized_cached_forward_payload(
         "union_kernel": str(union_kernel),
         "geometry": geometry,
         "_workspace": {},
+        "exact_dense_q_row_idx": exact_q_row_idx.contiguous(),
+        "exact_dense_q_length": exact_q_length.contiguous(),
+        "exact_dense_tile_ptr": exact_tile_ptr.contiguous(),
+        "exact_dense_k_row_idx": exact_k_row_idx.contiguous(),
+        "exact_dense_rows_per_range": int(exact_rows_per_range),
+        "exact_dense_keys_per_tile": int(exact_keys_per_tile),
+        "exact_dense_min_rows": int(exact_min_rows),
+        "exact_kernel_family": str(exact_kernel_family),
+        "residual_mode": str(residual_mode),
+        "fused_q_row_idx": fused_q_row_idx.contiguous(),
+        "fused_q_length": fused_q_length.contiguous(),
+        "fused_exact_tile_ptr": fused_exact_tile_ptr.contiguous(),
+        "fused_exact_k_row_idx": fused_exact_k_row_idx.contiguous(),
+        "fused_tail_tile_ptr": fused_tail_tile_ptr.contiguous(),
+        "fused_tail_k_row_idx": fused_tail_k_row_idx.contiguous(),
+        "fused_tail_mask_words": fused_tail_mask_words.contiguous(),
     }
+    if mask_bool is not None:
+        payload["mask_bool"] = mask_bool.contiguous()
+    return payload
 
 
 def build_cached_generalized_packed_forward_payload(
@@ -589,10 +1161,15 @@ def build_cached_generalized_packed_forward_payload(
     *,
     policy: CachedPackingPolicy | None = None,
     policy_overrides: dict[str, Any] | None = None,
+    include_mask_bool: bool = True,
 ) -> dict[str, Any]:
     del k, v
     q_flat = _flatten_row_tensor(q)
     resolved_policy = _coerce_cached_packing_policy(policy, overrides=policy_overrides)
+    exact_spec = _resolve_exact_kernel_spec(
+        str(resolved_policy.exact_kernel_family),
+        min_rows=int(resolved_policy.exact_min_rows),
+    )
     metadata = None if runtime is None else getattr(runtime, "forward_synthetic_grid", None)
     if metadata is None or getattr(metadata, "forward_execution_plan", None) is None:
         return {"status": "not_applicable", "reason": "cached schedule is missing synthetic-grid forward metadata"}
@@ -604,9 +1181,9 @@ def build_cached_generalized_packed_forward_payload(
         return {"status": "not_applicable", "reason": "cached direct execution plan is missing a row-compact plan"}
 
     device = q_flat.device
-    group_q_rows: list[torch.Tensor] = []
-    group_k_rows: list[torch.Tensor] = []
-    group_masks: list[torch.Tensor] = []
+    group_q_rows: list[list[int]] = []
+    group_k_rows: list[list[int]] = []
+    group_mask_words: list[torch.Tensor] = []
     group_fill: list[float] = []
     group_families: list[str] = []
     combine_group_ranges: list[tuple[int, int]] = []
@@ -623,6 +1200,17 @@ def build_cached_generalized_packed_forward_payload(
     zero_support_rows_count = 0
     total_live_pairs = 0
     total_group_area = 0
+    exact_ranges: list[dict[str, Any]] = []
+    exact_live_pairs = 0
+    fused_ranges: list[dict[str, Any]] = []
+    fused_exact_live_pairs = 0
+    fused_tail_live_pairs = 0
+    use_fused_tail = (
+        str(resolved_policy.residual_mode) == "fused_tail"
+        and str(exact_spec["family"]) == "tc8x8"
+        and q_flat.shape[-1] == 64
+        and q_flat.dtype in {torch.bfloat16, torch.float16}
+    )
 
     for bucket_idx in range(len(direct_plan["bucket_size"])):
         live_q_rows, live_support_rows, live_support_valid, zero_support_rows, packed_k = _extract_bucket_live_row_supports(
@@ -658,13 +1246,12 @@ def build_cached_generalized_packed_forward_payload(
         qgroup_bucket_idx = bucket_idx if bucket_qgroup_bucket_idx is None else int(bucket_qgroup_bucket_idx[bucket_idx])
         if family == "direct_passthrough":
             _append_direct_passthrough_groups(
-                device=device,
                 q_rows=q_rows,
                 support_lists=support_lists,
                 policy=resolved_policy,
                 group_q_rows=group_q_rows,
                 group_k_rows=group_k_rows,
-                group_masks=group_masks,
+                group_mask_words=group_mask_words,
                 group_fill=group_fill,
                 combine_group_ranges=combine_group_ranges,
                 group_families=group_families,
@@ -672,13 +1259,12 @@ def build_cached_generalized_packed_forward_payload(
             continue
         if family == "k_window":
             _append_k_window_groups(
-                device=device,
                 q_rows=q_rows,
                 support_lists=support_lists,
                 policy=resolved_policy,
                 group_q_rows=group_q_rows,
                 group_k_rows=group_k_rows,
-                group_masks=group_masks,
+                group_mask_words=group_mask_words,
                 group_fill=group_fill,
                 combine_group_ranges=combine_group_ranges,
                 group_families=group_families,
@@ -698,24 +1284,17 @@ def build_cached_generalized_packed_forward_payload(
         qgroup_entries = union_entries_by_qgroup.setdefault(int(bucket_entry["qgroup_bucket_idx"]), [])
         qgroup_entries.extend(zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True))
 
-    fallback_rows_by_qgroup: dict[int, set[int]] = {}
     for qgroup_bucket_idx in sorted(union_entries_by_qgroup):
         row_support_map: dict[int, set[int]] = {}
         for q_row, support_list in union_entries_by_qgroup[qgroup_bucket_idx]:
             if not support_list:
                 continue
             row_support_map.setdefault(int(q_row), set()).update(int(support_row) for support_row in support_list)
-        merged_q_rows: list[int] = []
-        merged_support_lists: list[list[int]] = []
-        fallback_rows: set[int] = set()
-        for q_row in sorted(row_support_map):
-            support_list = sorted(row_support_map[q_row])
-            if len(support_list) > int(resolved_policy.max_union_k_2d):
-                fallback_rows.add(int(q_row))
+        merged_q_rows = [int(q_row) for q_row in sorted(row_support_map)]
+        merged_support_lists = [sorted(row_support_map[q_row]) for q_row in sorted(row_support_map)]
+        if use_fused_tail:
+            if not merged_q_rows:
                 continue
-            merged_q_rows.append(int(q_row))
-            merged_support_lists.append(support_list)
-        if merged_q_rows:
             row_groups = _group_support_lists_by_span(
                 merged_support_lists,
                 max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(merged_q_rows)),
@@ -724,15 +1303,79 @@ def build_cached_generalized_packed_forward_payload(
                     max((len(support_list) for support_list in merged_support_lists), default=0),
                 ),
             )
+            for row_group in row_groups:
+                if not row_group:
+                    continue
+                grouped_q_rows = [merged_q_rows[row_idx] for row_idx in row_group]
+                grouped_support_lists = [merged_support_lists[row_idx] for row_idx in row_group]
+                group_fused_ranges, group_exact_live_pairs, group_tail_live_pairs = _extract_fused_exact_tail_ranges(
+                    grouped_q_rows,
+                    grouped_support_lists,
+                    rows_per_range=int(exact_spec["rows_per_range"]),
+                    keys_per_tile=int(exact_spec["keys_per_tile"]),
+                    min_rows=int(exact_spec["min_rows"]),
+                )
+                fused_ranges.extend(group_fused_ranges)
+                fused_exact_live_pairs += int(group_exact_live_pairs)
+                fused_tail_live_pairs += int(group_tail_live_pairs)
+            continue
+
+        fallback_rows: set[int] = set()
+        filtered_q_rows: list[int] = []
+        filtered_support_lists: list[list[int]] = []
+        for q_row, support_list in zip(merged_q_rows, merged_support_lists, strict=True):
+            if len(support_list) > int(resolved_policy.max_union_k_2d):
+                fallback_rows.add(int(q_row))
+                continue
+            filtered_q_rows.append(int(q_row))
+            filtered_support_lists.append(support_list)
+        residual_q_rows: list[int] = []
+        residual_support_lists: list[list[int]] = []
+        if filtered_q_rows:
+            row_groups = _group_support_lists_by_span(
+                filtered_support_lists,
+                max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(filtered_q_rows)),
+                max_union_k=max(
+                    int(resolved_policy.max_union_k_2d),
+                    max((len(support_list) for support_list in filtered_support_lists), default=0),
+                ),
+            )
+            for row_group in row_groups:
+                if not row_group:
+                    continue
+                grouped_q_rows = [filtered_q_rows[row_idx] for row_idx in row_group]
+                grouped_support_lists = [filtered_support_lists[row_idx] for row_idx in row_group]
+                group_exact_ranges, group_residual_support_lists, group_exact_live_pairs = _extract_exact_dense_tile_ranges(
+                    grouped_q_rows,
+                    grouped_support_lists,
+                    rows_per_range=int(exact_spec["rows_per_range"]),
+                    keys_per_tile=int(exact_spec["keys_per_tile"]),
+                    min_rows=int(exact_spec["min_rows"]),
+                )
+                exact_ranges.extend(group_exact_ranges)
+                exact_live_pairs += int(group_exact_live_pairs)
+                for q_row, support_list in zip(grouped_q_rows, group_residual_support_lists, strict=True):
+                    if not support_list:
+                        continue
+                    residual_q_rows.append(int(q_row))
+                    residual_support_lists.append(support_list)
+        if residual_q_rows:
+            row_groups = _group_support_lists_by_span(
+                residual_support_lists,
+                max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(residual_q_rows)),
+                max_union_k=max(
+                    int(resolved_policy.max_union_k_2d),
+                    max((len(support_list) for support_list in residual_support_lists), default=0),
+                ),
+            )
             group_start = len(group_q_rows)
             _append_group_entries(
-                device=device,
-                q_rows=merged_q_rows,
-                support_lists=merged_support_lists,
+                q_rows=residual_q_rows,
+                support_lists=residual_support_lists,
                 row_groups=row_groups,
                 group_q_rows=group_q_rows,
                 group_k_rows=group_k_rows,
-                group_masks=group_masks,
+                group_mask_words=group_mask_words,
                 group_fill=group_fill,
             )
             _append_group_range(
@@ -742,54 +1385,27 @@ def build_cached_generalized_packed_forward_payload(
                 combine_group_ranges=combine_group_ranges,
                 group_families=group_families,
             )
-        if fallback_rows:
-            fallback_rows_by_qgroup[qgroup_bucket_idx] = fallback_rows
 
-    for bucket_entry in union_bucket_entries:
-        fallback_rows = fallback_rows_by_qgroup.get(int(bucket_entry["qgroup_bucket_idx"]))
-        if not fallback_rows:
-            continue
-        fallback_q_rows = [
-            q_row
-            for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True)
-            if q_row in fallback_rows and support_list
+    if use_fused_tail:
+        exact_ranges = [
+            {
+                "q_rows": [int(q_row) for q_row in range_entry["q_rows"]],
+                "tiles": [[int(value) for value in tile] for tile in range_entry.get("exact_tiles", ())],
+            }
+            for range_entry in fused_ranges
+            if range_entry.get("exact_tiles")
         ]
-        fallback_support_lists = [
-            support_list
-            for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True)
-            if q_row in fallback_rows and support_list
-        ]
-        if not fallback_q_rows:
-            continue
-        row_groups = _group_support_lists_by_span(
-            fallback_support_lists,
-            max_rows_per_group=min(int(resolved_policy.max_rows_per_group), len(fallback_q_rows)),
-            max_union_k=max(
-                int(resolved_policy.max_union_k_2d),
-                max((len(support_list) for support_list in fallback_support_lists), default=0),
-            ),
-        )
-        group_start = len(group_q_rows)
-        _append_group_entries(
-            device=device,
-            q_rows=fallback_q_rows,
-            support_lists=fallback_support_lists,
-            row_groups=row_groups,
-            group_q_rows=group_q_rows,
-            group_k_rows=group_k_rows,
-            group_masks=group_masks,
-            group_fill=group_fill,
-        )
-        _append_group_range(
-            group_start=group_start,
-            family="union_2d",
-            group_q_rows=group_q_rows,
-            combine_group_ranges=combine_group_ranges,
-            group_families=group_families,
-        )
+        exact_live_pairs = int(fused_exact_live_pairs)
 
     for group_idx in range(len(group_q_rows)):
-        total_group_area += int(group_q_rows[group_idx].numel()) * int(group_k_rows[group_idx].numel())
+        total_group_area += len(group_q_rows[group_idx]) * len(group_k_rows[group_idx])
+    if fused_ranges:
+        total_group_area += (
+            sum(len(range_entry.get("exact_tiles", ())) for range_entry in fused_ranges)
+            * int(exact_spec["rows_per_range"])
+            * int(exact_spec["keys_per_tile"])
+        )
+        total_group_area += int(fused_tail_live_pairs)
 
     geometry_base = {
         "cached_generalized_buckets": sum(family_counts.values()),
@@ -801,7 +1417,7 @@ def build_cached_generalized_packed_forward_payload(
             if baseline_live_row_count <= 0
             else 1.0
             - (
-                sum(int(group_k_rows[group_idx].numel()) * int(group_q_rows[group_idx].numel()) for group_idx in range(len(group_q_rows)))
+                sum(len(group_k_rows[group_idx]) * len(group_q_rows[group_idx]) for group_idx in range(len(group_q_rows)))
                 / max(1, baseline_packed_k_sum)
             )
         ),
@@ -838,14 +1454,25 @@ def build_cached_generalized_packed_forward_payload(
         q_flat=q_flat,
         group_q_rows=group_q_rows,
         group_k_rows=group_k_rows,
-        group_masks=group_masks,
+        group_mask_words=group_mask_words,
         group_fill=group_fill,
         combine_group_ranges=combine_group_ranges,
         group_families=group_families,
         tile_k=int(resolved_policy.tile_k),
         geometry_base=geometry_base,
         reason="cached direct buckets were packed by a policy-selected family mix",
+        exact_ranges=exact_ranges,
+        exact_live_pairs=exact_live_pairs,
+        fused_ranges=fused_ranges,
+        fused_exact_live_pairs=int(fused_exact_live_pairs),
+        fused_tail_live_pairs=int(fused_tail_live_pairs),
         union_kernel=str(resolved_policy.union_kernel),
+        exact_kernel_family=str(exact_spec["family"]),
+        exact_rows_per_range=int(exact_spec["rows_per_range"]),
+        exact_keys_per_tile=int(exact_spec["keys_per_tile"]),
+        exact_min_rows=int(exact_spec["min_rows"]),
+        residual_mode=str(resolved_policy.residual_mode),
+        include_mask_bool=include_mask_bool,
     )
 
 
@@ -859,6 +1486,7 @@ def build_cached_direct_2d_forward_payload(
     max_merged_support_rows: int = 128,
     max_merged_support_growth_ratio: float = 999.0,
     max_merged_support_increase: int = 1_000_000,
+    include_mask_bool: bool = True,
 ) -> dict[str, Any]:
     q_flat = _flatten_row_tensor(q)
     k_flat = _flatten_row_tensor(k)
@@ -876,9 +1504,9 @@ def build_cached_direct_2d_forward_payload(
         raise ValueError("max_rows_per_group must be positive")
 
     device = q_flat.device
-    group_q_rows: list[torch.Tensor] = []
-    group_k_rows: list[torch.Tensor] = []
-    group_masks: list[torch.Tensor] = []
+    group_q_rows: list[list[int]] = []
+    group_k_rows: list[list[int]] = []
+    group_mask_words: list[torch.Tensor] = []
     group_fill: list[float] = []
     combine_group_ranges: list[tuple[int, int]] = []
     bucket_entries: list[dict[str, Any]] = []
@@ -967,13 +1595,12 @@ def build_cached_direct_2d_forward_payload(
                 max_union_k=max_merged_support_rows,
             )
             _append_group_entries(
-                device=device,
                 q_rows=merged_q_rows,
                 support_lists=merged_support_lists,
                 row_groups=row_groups,
                 group_q_rows=group_q_rows,
                 group_k_rows=group_k_rows,
-                group_masks=group_masks,
+                group_mask_words=group_mask_words,
                 group_fill=group_fill,
             )
             if len(group_q_rows) > group_start:
@@ -1013,13 +1640,12 @@ def build_cached_direct_2d_forward_payload(
             max_union_k=max_merged_support_rows,
         )
         _append_group_entries(
-            device=device,
             q_rows=fallback_q_rows,
             support_lists=fallback_support_lists,
             row_groups=row_groups,
             group_q_rows=group_q_rows,
             group_k_rows=group_k_rows,
-            group_masks=group_masks,
+            group_mask_words=group_mask_words,
             group_fill=group_fill,
         )
         if len(group_q_rows) > group_start:
@@ -1030,32 +1656,19 @@ def build_cached_direct_2d_forward_payload(
     if group_count <= 0:
         return {"status": "not_applicable", "reason": "cached direct buckets did not yield any live 2D forward groups"}
 
-    rows_per_group = max(int(group_q_rows[group_idx].numel()) for group_idx in range(group_count))
-    max_union_k = max(int(group_k_rows[group_idx].numel()) for group_idx in range(group_count))
-    q_row_idx = torch.full((group_count, rows_per_group), -1, dtype=torch.int32, device=device)
-    k_row_idx = torch.full((group_count, max_union_k), -1, dtype=torch.int32, device=device)
-    mask_bool = torch.zeros((group_count, rows_per_group, max_union_k), dtype=torch.bool, device=device)
-    q_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
-    k_length = torch.zeros((group_count,), dtype=torch.int32, device=device)
-
-    for group_idx in range(group_count):
-        row_count = int(group_q_rows[group_idx].numel())
-        union_k = int(group_k_rows[group_idx].numel())
-        q_row_idx[group_idx, :row_count] = group_q_rows[group_idx]
-        k_row_idx[group_idx, :union_k] = group_k_rows[group_idx]
-        mask_bool[group_idx, :row_count, :union_k] = group_masks[group_idx]
-        q_length[group_idx] = row_count
-        k_length[group_idx] = union_k
-
-    mask_words = _encode_mask_rows_to_words(mask_bool.view(group_count * rows_per_group, max_union_k)).view(
-        group_count,
-        rows_per_group,
-        -1,
+    q_row_idx, k_row_idx, mask_words, mask_bool, q_length, k_length, rows_per_group, max_union_k = (
+        _materialize_cached_group_tensors(
+            device=device,
+            group_q_rows=group_q_rows,
+            group_k_rows=group_k_rows,
+            group_mask_words=group_mask_words,
+            include_mask_bool=include_mask_bool,
+        )
     )
     range_execution = _build_range_execution_metadata(group_q_rows, combine_group_ranges)
     scatter_only_ranges = sum(1 for entry in range_execution if bool(entry["scatter_only"]))
     scatter_only_rows = sum(
-        int(payload_q_rows.numel())
+        len(payload_q_rows)
         for group_idx, payload_q_rows in enumerate(group_q_rows)
         if any(
             int(entry["group_start"]) <= group_idx < int(entry["group_end"]) and bool(entry["scatter_only"])
@@ -1086,7 +1699,7 @@ def build_cached_direct_2d_forward_payload(
         "cached_direct_2d_scatter_only_ranges": scatter_only_ranges,
         "cached_direct_2d_scatter_only_rows": scatter_only_rows,
     }
-    return {
+    payload = {
         "status": "ready",
         "reason": "cached direct buckets were repacked into 2D forward groups",
         "packed_q": rows_per_group,
@@ -1104,6 +1717,9 @@ def build_cached_direct_2d_forward_payload(
         "geometry": geometry,
         "_workspace": {},
     }
+    if mask_bool is not None:
+        payload["mask_bool"] = mask_bool.contiguous()
+    return payload
 
 
 def _get_cached_direct_2d_buffers(
@@ -1207,33 +1823,150 @@ def _record_union_runtime_geometry(
     geometry["union_scalar_fallback_row_count"] = int(scalar_row_count)
 
 
-def run_cached_direct_2d_forward(
+def _record_exact_dense_runtime_geometry(
     payload: dict[str, Any],
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
     *,
-    softmax_scale: float | None = None,
-) -> torch.Tensor:
-    if payload.get("status") != "ready":
-        reason = str(payload.get("reason", "cached direct 2D payload is unavailable"))
-        raise RuntimeError(reason)
+    exact_range_count: int,
+    exact_row_count: int,
+) -> None:
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    geometry["exact_dense_runtime_range_count"] = int(exact_range_count)
+    geometry["exact_dense_runtime_row_count"] = int(exact_row_count)
 
-    q_flat = _flatten_row_tensor(q)
-    k_flat = _flatten_row_tensor(k)
-    v_flat = _flatten_row_tensor(v)
+
+def _record_fused_runtime_geometry(
+    payload: dict[str, Any],
+    *,
+    fused_range_count: int,
+    fused_row_count: int,
+) -> None:
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    geometry["fused_runtime_range_count"] = int(fused_range_count)
+    geometry["fused_runtime_row_count"] = int(fused_row_count)
+
+
+def _run_cached_fused_exact_tail_ranges(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[int, int]:
+    fused_q_row_idx = payload.get("fused_q_row_idx")
+    fused_q_length = payload.get("fused_q_length")
+    fused_exact_tile_ptr = payload.get("fused_exact_tile_ptr")
+    fused_exact_k_row_idx = payload.get("fused_exact_k_row_idx")
+    fused_tail_tile_ptr = payload.get("fused_tail_tile_ptr")
+    fused_tail_k_row_idx = payload.get("fused_tail_k_row_idx")
+    fused_tail_mask_words = payload.get("fused_tail_mask_words")
+    if not isinstance(fused_q_row_idx, torch.Tensor) or int(fused_q_row_idx.shape[0]) <= 0:
+        return 0, 0
+    if not all(
+        isinstance(tensor, torch.Tensor)
+        for tensor in (
+            fused_q_length,
+            fused_exact_tile_ptr,
+            fused_exact_k_row_idx,
+            fused_tail_tile_ptr,
+            fused_tail_k_row_idx,
+            fused_tail_mask_words,
+        )
+    ):
+        return 0, 0
+    if str(payload.get("exact_kernel_family", "")) != "tc8x8":
+        return 0, 0
+    if int(payload.get("exact_dense_rows_per_range", 0)) != 8 or int(payload.get("exact_dense_keys_per_tile", 0)) != 8:
+        return 0, 0
+    if str(payload.get("residual_mode", "masked_union")) != "fused_tail":
+        return 0, 0
+    _run_synthetic_2d_exact_tail_gather_scatter_tc_fwd_kernel(
+        q_flat,
+        k_flat,
+        v_flat,
+        fused_q_row_idx,
+        fused_q_length,
+        fused_exact_tile_ptr,
+        fused_exact_k_row_idx,
+        fused_tail_tile_ptr,
+        fused_tail_k_row_idx,
+        fused_tail_mask_words,
+        out_flat,
+        lse_flat,
+        softmax_scale=float(softmax_scale),
+    )
+    return int(fused_q_row_idx.shape[0]), int(fused_q_length.sum().item())
+
+
+def _run_cached_exact_dense_ranges(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[int, int]:
+    exact_q_row_idx = payload.get("exact_dense_q_row_idx")
+    exact_q_length = payload.get("exact_dense_q_length")
+    exact_tile_ptr = payload.get("exact_dense_tile_ptr")
+    exact_k_row_idx = payload.get("exact_dense_k_row_idx")
+    if not isinstance(exact_q_row_idx, torch.Tensor) or int(exact_q_row_idx.shape[0]) <= 0:
+        return 0, 0
+    if not isinstance(exact_q_length, torch.Tensor) or not isinstance(exact_tile_ptr, torch.Tensor):
+        return 0, 0
+    if not isinstance(exact_k_row_idx, torch.Tensor):
+        return 0, 0
+    exact_family = str(payload.get("exact_kernel_family", "tc16x16"))
+    exact_rows_per_range = int(payload.get("exact_dense_rows_per_range", 0))
+    exact_keys_per_tile = int(payload.get("exact_dense_keys_per_tile", 0))
+    exact_spec = _resolve_exact_kernel_spec(exact_family)
+    if (
+        exact_rows_per_range != int(exact_spec["rows_per_range"])
+        or exact_keys_per_tile != int(exact_spec["keys_per_tile"])
+    ):
+        return 0, 0
+    _run_synthetic_2d_exact_gather_scatter_tc_fwd_kernel(
+        q_flat,
+        k_flat,
+        v_flat,
+        exact_q_row_idx,
+        exact_q_length,
+        exact_tile_ptr,
+        exact_k_row_idx,
+        out_flat,
+        lse_flat,
+        softmax_scale=float(softmax_scale),
+        kernel_family=exact_family,
+    )
+    return int(exact_q_row_idx.shape[0]), int(exact_q_length.sum().item())
+
+
+def _run_cached_masked_payload_forward(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> tuple[int, int, int, int]:
     packed_q = int(payload["packed_q"])
     packed_k = int(payload["support_rows"])
     tile_k = int(payload.get("tile_k", 32))
-    if softmax_scale is None:
-        softmax_scale = q_flat.shape[-1] ** (-0.5)
-    if not _can_use_synthetic_2d_masked_fwd(q_flat, k_flat, v_flat, packed_q=packed_q, packed_k=packed_k):
-        raise RuntimeError("cached_direct_2d_forward_unsupported")
-
-    q_buf_flat, k_buf_flat, v_buf_flat, out_flat, lse_flat = _get_cached_direct_2d_buffers(payload, q_flat, k_flat, v_flat)
-    out_flat.zero_()
-    lse_flat.fill_(float("-inf"))
     group_count = int(payload["q_row_idx"].shape[0])
+    if group_count <= 0:
+        return 0, 0, 0, 0
+
+    q_buf_flat, k_buf_flat, v_buf_flat, _, _ = _get_cached_direct_2d_buffers(payload, q_flat, k_flat, v_flat)
     range_execution = payload.get("range_execution")
     if not range_execution:
         range_execution = [
@@ -1296,8 +2029,6 @@ def run_cached_direct_2d_forward(
     for range_entry in range_execution:
         group_start = int(range_entry["group_start"])
         group_end = int(range_entry["group_end"])
-        group_start = int(group_start)
-        group_end = int(group_end)
         if group_end <= group_start:
             continue
         if _can_use_cached_union_tc(
@@ -1368,6 +2099,72 @@ def run_cached_direct_2d_forward(
             out_flat,
             lse_flat,
         )
+    return union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
+
+
+def run_cached_direct_2d_forward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if payload.get("status") != "ready":
+        reason = str(payload.get("reason", "cached direct 2D payload is unavailable"))
+        raise RuntimeError(reason)
+
+    q_flat = _flatten_row_tensor(q)
+    k_flat = _flatten_row_tensor(k)
+    v_flat = _flatten_row_tensor(v)
+    packed_q = int(payload["packed_q"])
+    packed_k = int(payload["support_rows"])
+    if softmax_scale is None:
+        softmax_scale = q_flat.shape[-1] ** (-0.5)
+    has_exact_dense = int(getattr(payload.get("exact_dense_q_row_idx"), "shape", [0])[0]) > 0
+    has_fused_ranges = int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
+    if packed_k > 0 and not _can_use_synthetic_2d_masked_fwd(q_flat, k_flat, v_flat, packed_q=packed_q, packed_k=packed_k):
+        raise RuntimeError("cached_direct_2d_forward_unsupported")
+    if not has_exact_dense and not has_fused_ranges and int(payload["q_row_idx"].shape[0]) <= 0:
+        raise RuntimeError("cached_direct_2d_forward_empty")
+
+    q_buf_flat, k_buf_flat, v_buf_flat, out_flat, lse_flat = _get_cached_direct_2d_buffers(payload, q_flat, k_flat, v_flat)
+    del q_buf_flat, k_buf_flat, v_buf_flat
+    out_flat.zero_()
+    lse_flat.fill_(float("-inf"))
+    fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(
+        payload,
+        q_flat,
+        k_flat,
+        v_flat,
+        out_flat,
+        lse_flat,
+        softmax_scale=float(softmax_scale),
+    )
+    exact_range_count = 0
+    exact_row_count = 0
+    if fused_range_count <= 0:
+        exact_range_count, exact_row_count = _run_cached_exact_dense_ranges(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            out_flat,
+            lse_flat,
+            softmax_scale=float(softmax_scale),
+        )
+    union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count = (
+        _run_cached_masked_payload_forward(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            out_flat,
+            lse_flat,
+            softmax_scale=float(softmax_scale),
+        )
+    )
     _record_union_runtime_geometry(
         payload,
         tc_group_count=union_tc_group_count,
@@ -1375,9 +2172,26 @@ def run_cached_direct_2d_forward(
         scalar_group_count=union_scalar_group_count,
         scalar_row_count=union_scalar_row_count,
     )
+    _record_exact_dense_runtime_geometry(
+        payload,
+        exact_range_count=exact_range_count,
+        exact_row_count=exact_row_count,
+    )
+    _record_fused_runtime_geometry(
+        payload,
+        fused_range_count=fused_range_count,
+        fused_row_count=fused_row_count,
+    )
     if q.ndim == 4:
-        return out_flat.to(dtype=v.dtype).view(q.shape[0], q.shape[1], q.shape[2], v.shape[3]).contiguous()
-    return out_flat.to(dtype=v.dtype).contiguous()
+        out = out_flat.to(dtype=v.dtype).view(q.shape[0], q.shape[1], q.shape[2], v.shape[3]).contiguous()
+        if not return_lse:
+            return out
+        lse = lse_flat.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+        return out, lse
+    out = out_flat.to(dtype=v.dtype).contiguous()
+    if not return_lse:
+        return out
+    return out, lse_flat.transpose(0, 1).contiguous()
 
 
 def run_cached_generalized_packed_forward(
@@ -1387,11 +2201,13 @@ def run_cached_generalized_packed_forward(
     v: torch.Tensor,
     *,
     softmax_scale: float | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return run_cached_direct_2d_forward(
         payload,
         q,
         k,
         v,
         softmax_scale=softmax_scale,
+        return_lse=return_lse,
     )

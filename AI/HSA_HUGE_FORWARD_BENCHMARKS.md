@@ -85,3 +85,27 @@ Interpretation:
   benchmark harness.
 - The full harness still pays large backward-runtime construction costs even for
   forward-only sweeps, which makes it impractical for `5M+` interactive runs.
+
+## Downstream Training Caveat
+
+Huge forward wins do not automatically translate into large end-to-end training
+speedups.
+
+On the current downstream `NanoGPT`-style cached-HSA fixture (`depth=1`,
+`aspect_ratio=64`, `head_dim=64`):
+
+- `legacy_packed` is much worse than `sparse_mask`
+- cached generalized fused forward + `sparse_mask` backward is only slightly
+  ahead of `sparse_mask` at `4K`
+- the same path is effectively flat at `256K`
+
+The practical reason is that this fixture is logits/loss dominated rather than
+attention dominated. A profiled `256K` fwdbwd step spent more CUDA time in
+`copy_`, elementwise ops, `log_softmax`, `log_softmax_backward`, and GEMMs than
+in attention forward/backward.
+
+Interpretation:
+
+- use the huge-length forward results to reason about attention scalability
+- use a more attention-heavy downstream fixture before expecting matching
+  `tok/sec` gains

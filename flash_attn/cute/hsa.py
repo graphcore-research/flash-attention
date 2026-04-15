@@ -22,6 +22,18 @@ def _lazy_cute_imports():
     return cutlass, cute, utils, fast_sampling, flash_attn_func, _flash_attn_fwd, _flash_attn_bwd
 
 
+def _move_nested_tensors(value, *, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _move_nested_tensors(item, device=device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_nested_tensors(item, device=device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_nested_tensors(item, device=device) for item in value)
+    return value
+
+
 @dataclass
 class HSAStreamPack:
     """Dense FA4 substream metadata for one exact HSA component."""
@@ -314,8 +326,8 @@ class HSABlockSparseRuntime:
 
     forward_sparse: HSABlockSparseTensors
     forward_tile_masks: HSAForwardTileMasks
-    backward_sparse: HSABlockSparseTensors
-    backward_packed_masks: "HSABwdPackedMasks"
+    backward_sparse: Optional[HSABlockSparseTensors]
+    backward_packed_masks: Optional["HSABwdPackedMasks"]
     forward_aux_tensors: list[torch.Tensor]
     backward_aux_tensors: list[torch.Tensor]
     forward_block_q: int
@@ -342,16 +354,19 @@ class HSABlockSparseRuntime:
             return moved
 
         forward_sparse = self.forward_sparse.to(device=device)
-        backward_sparse = self.backward_sparse.to(device=device)
+        backward_sparse = None if self.backward_sparse is None else self.backward_sparse.to(device=device)
+        backward_packed_masks = (
+            None if self.backward_packed_masks is None else self.backward_packed_masks.to(device=device)
+        )
         return HSABlockSparseRuntime(
             forward_sparse=forward_sparse,
             forward_tile_masks=self.forward_tile_masks.to(device=device),
             backward_sparse=backward_sparse,
-            backward_packed_masks=self.backward_packed_masks.to(device=device),
+            backward_packed_masks=backward_packed_masks,
             forward_aux_tensors=[_move_aux(tensor) for tensor in self.forward_aux_tensors],
             backward_aux_tensors=[_move_aux(tensor) for tensor in self.backward_aux_tensors],
             forward_sparse_torch=_to_block_sparse_tensors_torch(forward_sparse),
-            backward_sparse_torch=_to_block_sparse_tensors_torch(backward_sparse),
+            backward_sparse_torch=None if backward_sparse is None else _to_block_sparse_tensors_torch(backward_sparse),
             forward_block_q=self.forward_block_q,
             forward_block_k=self.forward_block_k,
             backward_block_q=self.backward_block_q,
@@ -1038,8 +1053,6 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
     document_segments_flat: list[list[int]] = []
     section_self_indices: list[int] = []
     document_self_indices: list[int] = []
-    section_self_allowed = [False] * total_rows
-    document_self_allowed = [False] * total_rows
 
     keep_cpu = keep_ids.detach().cpu()
     hash_cpu = hash_ids.detach().cpu()
@@ -1078,7 +1091,6 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
                     section_rows[flat_row].extend(seg[:prefix_end])
                 if ki1[pos] and not ki0[pos]:
                     section_self_indices.append(flat_row)
-                    section_self_allowed[flat_row] = True
             for idx, pos in enumerate(seg):
                 flat_row = row_base + pos
                 query_start = idx + 1 if ki0[pos] else idx
@@ -1098,12 +1110,26 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
                     document_rows[flat_row].extend(seg[:prefix_end])
                 if ki2[pos] and not ki1[pos] and not ki0[pos]:
                     document_self_indices.append(flat_row)
-                    document_self_allowed[flat_row] = True
             for idx, pos in enumerate(seg):
                 flat_row = row_base + pos
                 query_start = idx + 1 if (ki0[pos] or ki1[pos]) else idx
                 if query_start < seg_len:
                     document_t_rows[flat_row].extend(seg[query_start:])
+
+    section_self_indices_tensor = (
+        torch.tensor(section_self_indices, dtype=torch.int32, device=device) if section_self_indices else _empty_int32(device)
+    )
+    document_self_indices_tensor = (
+        torch.tensor(document_self_indices, dtype=torch.int32, device=device)
+        if document_self_indices
+        else _empty_int32(device)
+    )
+    section_self_allowed_tensor = torch.zeros(total_rows, dtype=torch.bool, device=device)
+    if section_self_indices:
+        section_self_allowed_tensor[section_self_indices_tensor.to(dtype=torch.long)] = True
+    document_self_allowed_tensor = torch.zeros(total_rows, dtype=torch.bool, device=device)
+    if document_self_indices:
+        document_self_allowed_tensor[document_self_indices_tensor.to(dtype=torch.long)] = True
 
     sentence_query_indices: list[int] = []
     sentence_cu = [0]
@@ -1198,15 +1224,18 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
         document_segments_flat=document_segments_flat,
         device=device,
     )
-    backward_descriptors = _build_block_descriptors(
-        batch_size=bsz,
-        seqlen=seqlen,
-        block_size=block_size,
-        sentence_segments_flat=sentence_segments_flat,
-        section_segments_flat=section_segments_flat,
-        document_segments_flat=document_segments_flat,
-        device=device,
-    )
+    if _use_hsa_runtime_forward_only():
+        backward_descriptors = forward_descriptors
+    else:
+        backward_descriptors = _build_block_descriptors(
+            batch_size=bsz,
+            seqlen=seqlen,
+            block_size=block_size,
+            sentence_segments_flat=sentence_segments_flat,
+            section_segments_flat=section_segments_flat,
+            document_segments_flat=document_segments_flat,
+            device=device,
+        )
 
     return HSASchedule(
         batch_size_value=bsz,
@@ -1232,27 +1261,19 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
         section_segment_pos=section_segment_pos,
         section_segment_id=section_segment_id,
         section_segment_offset=section_segment_offset,
-        section_self_allowed=torch.tensor(section_self_allowed, dtype=torch.bool, device=device),
+        section_self_allowed=section_self_allowed_tensor,
         document_segment_ptr=document_segment_ptr,
         document_segment_pos=document_segment_pos,
         document_segment_id=document_segment_id,
         document_segment_offset=document_segment_offset,
-        document_self_allowed=torch.tensor(document_self_allowed, dtype=torch.bool, device=device),
+        document_self_allowed=document_self_allowed_tensor,
         forward_descriptors=forward_descriptors,
         backward_descriptors=backward_descriptors,
         sentence_stream=sentence_stream,
         section_prefix_stream=section_prefix_stream,
         document_prefix_stream=document_prefix_stream,
-        section_self_indices=(
-            torch.tensor(section_self_indices, dtype=torch.int32, device=device)
-            if section_self_indices
-            else _empty_int32(device)
-        ),
-        document_self_indices=(
-            torch.tensor(document_self_indices, dtype=torch.int32, device=device)
-            if document_self_indices
-            else _empty_int32(device)
-        ),
+        section_self_indices=section_self_indices_tensor,
+        document_self_indices=document_self_indices_tensor,
     )
 
 
@@ -1713,6 +1734,32 @@ def _classify_forward_partial_block(
     return _HSA_FWD_TILE_ROW_PREFIX, 0, prefix_lengths, []
 
 
+def _classify_forward_partial_row_masks(
+    row_masks: list[int],
+    *,
+    q_len: int,
+    k_len: int,
+    words_per_row: int,
+) -> tuple[int, int, list[int], list[int]]:
+    valid_mask = (1 << k_len) - 1 if k_len > 0 else 0
+    prefix_lengths: list[int] = []
+    for row_idx in range(q_len):
+        row_mask = row_masks[row_idx] & valid_mask
+        if row_mask & (row_mask + 1):
+            bitmap_words = [
+                _as_signed_int32(((row_masks[bitmap_row] & valid_mask) >> (32 * word_idx)) & 0xFFFFFFFF)
+                for bitmap_row in range(q_len)
+                for word_idx in range(words_per_row)
+            ]
+            return _HSA_FWD_TILE_BITMAP, 0, [], bitmap_words
+        prefix_lengths.append(row_mask.bit_length())
+
+    affine = _find_affine_prefix_base(prefix_lengths, k_len=k_len)
+    if affine is not None:
+        return _HSA_FWD_TILE_AFFINE_PREFIX, affine, [], []
+    return _HSA_FWD_TILE_ROW_PREFIX, 0, prefix_lengths, []
+
+
 def _build_forward_hsa_tile_masks(
     schedule: HSASchedule,
     *,
@@ -1723,7 +1770,6 @@ def _build_forward_hsa_tile_masks(
     num_q_blocks = (seqlen + q_block_size - 1) // q_block_size
     num_k_blocks = (seqlen + k_block_size - 1) // k_block_size
     words_per_row = (k_block_size + 31) // 32
-    block_masks: dict[tuple[int, int, int], list[list[int]]] = {}
 
     sentence_start = schedule.sentence_start.detach().cpu().tolist()
     sentence_len = schedule.sentence_len.detach().cpu().tolist()
@@ -1731,48 +1777,6 @@ def _build_forward_hsa_tile_masks(
     section_col_idx = schedule.section_col_idx.detach().cpu().tolist()
     document_row_ptr = schedule.document_row_ptr.detach().cpu().tolist()
     document_col_idx = schedule.document_col_idx.detach().cpu().tolist()
-
-    for flat_row in range(schedule.num_rows):
-        batch_idx, q_idx = divmod(flat_row, seqlen)
-
-        sent_len = sentence_len[flat_row]
-        if sent_len > 0:
-            sent_start = sentence_start[flat_row]
-            _set_interval_block_mask_bits(
-                block_masks,
-                batch_idx=batch_idx,
-                q_idx=q_idx,
-                start=sent_start,
-                end=sent_start + sent_len,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                words_per_row=words_per_row,
-            )
-
-        for offset in range(section_row_ptr[flat_row], section_row_ptr[flat_row + 1]):
-            key_idx = section_col_idx[offset]
-            _set_interval_block_mask_bits(
-                block_masks,
-                batch_idx=batch_idx,
-                q_idx=q_idx,
-                start=key_idx,
-                end=key_idx + 1,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                words_per_row=words_per_row,
-            )
-        for offset in range(document_row_ptr[flat_row], document_row_ptr[flat_row + 1]):
-            key_idx = document_col_idx[offset]
-            _set_interval_block_mask_bits(
-                block_masks,
-                batch_idx=batch_idx,
-                q_idx=q_idx,
-                start=key_idx,
-                end=key_idx + 1,
-                q_block_size=q_block_size,
-                k_block_size=k_block_size,
-                words_per_row=words_per_row,
-            )
 
     mask_block_cnt = torch.zeros((bsz, 1, num_q_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
     mask_block_idx = torch.zeros(
@@ -1800,31 +1804,62 @@ def _build_forward_hsa_tile_masks(
     bitmap_words: list[int] = [0 for _ in range(q_block_size * words_per_row)]
 
     for batch_idx in range(bsz):
+        batch_row_base = batch_idx * seqlen
         for q_block in range(num_q_blocks):
             mask_indices: list[int] = []
             full_indices: list[int] = []
-            k_blocks = sorted(
-                k_block
-                for (batch, query_block, k_block) in block_masks.keys()
-                if batch == batch_idx and query_block == q_block
-            )
             q_len = min(q_block_size, seqlen - q_block * q_block_size)
-            for k_block in k_blocks:
-                block_words = block_masks[(batch_idx, q_block, k_block)]
+            q_row_start = batch_row_base + q_block * q_block_size
+            local_block_masks: dict[int, list[int]] = {}
+
+            for q_local in range(q_len):
+                flat_row = q_row_start + q_local
+                sent_start = sentence_start[flat_row]
+                sent_end = sent_start + sentence_len[flat_row]
+                cursor = sent_start
+                while cursor < sent_end:
+                    k_block = cursor // k_block_size
+                    row_masks = local_block_masks.get(k_block)
+                    if row_masks is None:
+                        row_masks = [0] * q_len
+                        local_block_masks[k_block] = row_masks
+                    block_end = min(sent_end, (k_block + 1) * k_block_size)
+                    start_local = cursor - k_block * k_block_size
+                    row_masks[q_local] |= ((1 << (block_end - cursor)) - 1) << start_local
+                    cursor = block_end
+
+                for offset in range(section_row_ptr[flat_row], section_row_ptr[flat_row + 1]):
+                    key_idx = section_col_idx[offset]
+                    k_block = key_idx // k_block_size
+                    row_masks = local_block_masks.get(k_block)
+                    if row_masks is None:
+                        row_masks = [0] * q_len
+                        local_block_masks[k_block] = row_masks
+                    row_masks[q_local] |= 1 << (key_idx - k_block * k_block_size)
+
+                for offset in range(document_row_ptr[flat_row], document_row_ptr[flat_row + 1]):
+                    key_idx = document_col_idx[offset]
+                    k_block = key_idx // k_block_size
+                    row_masks = local_block_masks.get(k_block)
+                    if row_masks is None:
+                        row_masks = [0] * q_len
+                        local_block_masks[k_block] = row_masks
+                    row_masks[q_local] |= 1 << (key_idx - k_block * k_block_size)
+
+            for k_block in sorted(local_block_masks):
+                row_masks = local_block_masks[k_block]
                 k_len = min(k_block_size, seqlen - k_block * k_block_size)
                 valid_count = q_len * k_len
-                allowed_count = 0
-                for row_idx in range(q_len):
-                    for word_idx, word in enumerate(block_words[row_idx][: (k_len + 31) // 32]):
-                        allowed_count += int(word & 0xFFFFFFFF).bit_count()
+                valid_mask = (1 << k_len) - 1 if k_len > 0 else 0
+                allowed_count = sum((row_mask & valid_mask).bit_count() for row_mask in row_masks)
 
                 if allowed_count == valid_count:
                     full_indices.append(k_block)
                     continue
 
                 mask_indices.append(k_block)
-                kind, affine, prefix_vals, bitmap_vals = _classify_forward_partial_block(
-                    block_words,
+                kind, affine, prefix_vals, bitmap_vals = _classify_forward_partial_row_masks(
+                    row_masks,
                     q_len=q_len,
                     k_len=k_len,
                     words_per_row=words_per_row,
@@ -3466,8 +3501,15 @@ def _get_hsa_fused_forward_batches(
     return sentence_batches, anchor_batches
 
 
-def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: torch.Tensor) -> HSABlockSparseRuntime:
+def _get_hsa_block_sparse_runtime(
+    schedule: HSASchedule,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    require_backward: Optional[bool] = None,
+) -> HSABlockSparseRuntime:
     cache = getattr(schedule, "_hsa_block_sparse_runtime_cache", None)
+    require_backward = not _use_hsa_runtime_forward_only() if require_backward is None else require_backward
     forward_block_q = _get_hsa_forward_q_block_size(q, k)
     backward_block_q = _get_hsa_backward_block_q()
     forward_block_k = 128
@@ -3482,6 +3524,7 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         backward_block_q,
         backward_block_k,
         backward_subtile_factor,
+        require_backward,
     )
     if cache is not None and cache_key in cache:
         return cache[cache_key]
@@ -3492,11 +3535,23 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         k_block_size=forward_block_k,
     )
 
-    backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
-        schedule,
-        q_block_size=backward_sparse_block_q,
-        k_block_size=backward_block_k,
-    )
+    if require_backward:
+        backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
+            schedule,
+            q_block_size=backward_sparse_block_q,
+            k_block_size=backward_block_k,
+        )
+        backward_aux_tensors = [
+            _tag_aux_tensor(backward_packed_masks.block_id_table),
+            _tag_aux_tensor(backward_packed_masks.mask_words),
+            _tag_aux_tensor(backward_packed_masks.row_group_nonempty),
+        ]
+        backward_sparse_torch = _to_block_sparse_tensors_torch(backward_sparse)
+    else:
+        backward_sparse = None
+        backward_packed_masks = None
+        backward_aux_tensors = []
+        backward_sparse_torch = None
 
     runtime = HSABlockSparseRuntime(
         forward_sparse=forward_sparse,
@@ -3504,13 +3559,9 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         backward_sparse=backward_sparse,
         backward_packed_masks=backward_packed_masks,
         forward_aux_tensors=_build_hsa_forward_tile_mask_aux_tensors(forward_tile_masks),
-        backward_aux_tensors=[
-            _tag_aux_tensor(backward_packed_masks.block_id_table),
-            _tag_aux_tensor(backward_packed_masks.mask_words),
-            _tag_aux_tensor(backward_packed_masks.row_group_nonempty),
-        ],
+        backward_aux_tensors=backward_aux_tensors,
         forward_sparse_torch=_to_block_sparse_tensors_torch(forward_sparse),
-        backward_sparse_torch=_to_block_sparse_tensors_torch(backward_sparse),
+        backward_sparse_torch=backward_sparse_torch,
         forward_block_q=forward_block_q,
         forward_block_k=forward_block_k,
         backward_block_q=backward_block_q,
@@ -3518,14 +3569,12 @@ def _get_hsa_block_sparse_runtime(schedule: HSASchedule, q: torch.Tensor, k: tor
         backward_subtile_factor=backward_subtile_factor,
     )
     if _use_hsa_synthetic_grid():
-        runtime.forward_synthetic_grid = _build_hsa_forward_synthetic_grid_metadata(
+        runtime.forward_synthetic_grid = _ensure_hsa_synthetic_grid_metadata(
             schedule,
             runtime,
-            logical_block_q=_get_hsa_synthetic_logical_block_size("q"),
-            logical_block_k=_get_hsa_synthetic_logical_block_size("k"),
-            max_packed_k=_get_hsa_synthetic_max_packed_k(_get_hsa_synthetic_logical_block_size("k")),
+            require_full_forward_plan=False,
+            require_backward=False,
         )
-        runtime.backward_synthetic_grid = _build_hsa_backward_synthetic_grid_metadata(schedule, runtime)
         runtime.synthetic_grid = runtime.forward_synthetic_grid
     if cache is None:
         cache = {}
@@ -3620,8 +3669,296 @@ def _use_hsa_synthetic_sparse_parse_fwd() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PARSE_SPARSE_FWD", "0") == "1"
 
 
+def _use_hsa_synthetic_fast_partition() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_FAST_PARTITION", "0") == "1"
+
+
+def _use_hsa_synthetic_forward_plan_only() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_FORWARD_PLAN_ONLY", "0") == "1"
+
+
+def _forward_execution_plan_has_bucket_execution(plan: Optional[dict]) -> bool:
+    if not isinstance(plan, dict):
+        return False
+    required_keys = (
+        "qgroup_bucket_packed_q",
+        "qgroup_bucket_execution_bucket_range",
+        "qgroup_bucket_execution_bucket_idx",
+        "bucket_size",
+        "bucket_packed_q",
+        "bucket_packed_k",
+        "bucket_q_row_range",
+        "bucket_q_src_row_range",
+        "bucket_k_row_range",
+    )
+    return all(key in plan for key in required_keys)
+
+
+def _get_precomputed_forward_direct_plan(
+    schedule: HSASchedule,
+    *,
+    forward_block_q: int,
+    logical_block_q: int,
+    logical_block_k: int,
+    max_packed_k: int,
+    max_direct_segments: int,
+    device: Optional[torch.device | str] = None,
+) -> Optional[dict]:
+    payload = getattr(schedule, "_precomputed_forward_direct_plan_payload", None)
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if int(entry.get("forward_block_q", -1)) != int(forward_block_q):
+            continue
+        if int(entry.get("logical_block_q", -1)) != int(logical_block_q):
+            continue
+        if int(entry.get("logical_block_k", -1)) != int(logical_block_k):
+            continue
+        if int(entry.get("max_packed_k", -1)) != int(max_packed_k):
+            continue
+        if int(entry.get("max_direct_segments", -1)) != int(max_direct_segments):
+            continue
+        direct_execution_plan = entry.get("direct_execution_plan")
+        if isinstance(direct_execution_plan, dict):
+            if device is None:
+                return direct_execution_plan
+            cache = getattr(schedule, "_precomputed_forward_direct_plan_device_cache", None)
+            cache_key = (
+                int(forward_block_q),
+                int(logical_block_q),
+                int(logical_block_k),
+                int(max_packed_k),
+                int(max_direct_segments),
+                str(torch.device(device)),
+            )
+            if cache is not None and cache_key in cache:
+                return cache[cache_key]
+            moved_direct_execution_plan = _move_nested_tensors(direct_execution_plan, device=device)
+            if cache is None:
+                cache = {}
+                setattr(schedule, "_precomputed_forward_direct_plan_device_cache", cache)
+            cache[cache_key] = moved_direct_execution_plan
+            return moved_direct_execution_plan
+    return None
+
+
+def _get_precomputed_cached_generalized_forward_payload(
+    schedule: HSASchedule,
+    *,
+    forward_block_q: int,
+    logical_block_q: int,
+    logical_block_k: int,
+    max_packed_k: int,
+    max_direct_segments: int,
+    device: Optional[torch.device | str] = None,
+    allow_same_forward_block_fallback: bool = False,
+) -> Optional[dict]:
+    def _move_cached_generalized_payload(entry: dict[str, Any]) -> Optional[dict]:
+        cached_payload = entry.get("cached_generalized_forward_payload")
+        if not isinstance(cached_payload, dict):
+            return None
+        if device is None:
+            return cached_payload
+        cache = getattr(schedule, "_precomputed_cached_generalized_forward_payload_device_cache", None)
+        cache_key = (
+            int(entry.get("forward_block_q", -1)),
+            int(entry.get("logical_block_q", -1)),
+            int(entry.get("logical_block_k", -1)),
+            int(entry.get("max_packed_k", -1)),
+            int(entry.get("max_direct_segments", -1)),
+            str(torch.device(device)),
+        )
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+        moved_payload = _move_nested_tensors(cached_payload, device=device)
+        if cache is None:
+            cache = {}
+            setattr(schedule, "_precomputed_cached_generalized_forward_payload_device_cache", cache)
+        cache[cache_key] = moved_payload
+        return moved_payload
+
+    payload = getattr(schedule, "_precomputed_forward_direct_plan_payload", None)
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return None
+    fallback_entry = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if int(entry.get("forward_block_q", -1)) != int(forward_block_q):
+            continue
+        cached_payload = entry.get("cached_generalized_forward_payload")
+        if not isinstance(cached_payload, dict):
+            continue
+        if int(entry.get("logical_block_q", -1)) != int(logical_block_q):
+            if allow_same_forward_block_fallback and fallback_entry is None:
+                fallback_entry = entry
+            continue
+        if int(entry.get("logical_block_k", -1)) != int(logical_block_k):
+            if allow_same_forward_block_fallback and fallback_entry is None:
+                fallback_entry = entry
+            continue
+        if int(entry.get("max_packed_k", -1)) != int(max_packed_k):
+            if allow_same_forward_block_fallback and fallback_entry is None:
+                fallback_entry = entry
+            continue
+        if int(entry.get("max_direct_segments", -1)) != int(max_direct_segments):
+            if allow_same_forward_block_fallback and fallback_entry is None:
+                fallback_entry = entry
+            continue
+        return _move_cached_generalized_payload(entry)
+    if allow_same_forward_block_fallback and fallback_entry is not None:
+        return _move_cached_generalized_payload(fallback_entry)
+    return None
+
+
+def _resolve_precomputed_cached_generalized_forward_payload(
+    schedule: HSASchedule,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> Optional[dict]:
+    if not _use_hsa_synthetic_grid():
+        return None
+    if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") != "1":
+        return None
+    if _get_hsa_blocksparse_backward_mode(schedule) != "sparse_mask":
+        return None
+    logical_block_q = _get_hsa_synthetic_logical_block_size("q")
+    logical_block_k = _get_hsa_synthetic_logical_block_size("k")
+    max_packed_k = _get_hsa_synthetic_max_packed_k(logical_block_k)
+    max_direct_segments = _get_hsa_synthetic_max_direct_segments()
+    forward_block_q = _get_hsa_forward_q_block_size(q, k)
+    allow_forward_block_fallback = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+    return _get_precomputed_cached_generalized_forward_payload(
+        schedule,
+        forward_block_q=forward_block_q,
+        logical_block_q=logical_block_q,
+        logical_block_k=logical_block_k,
+        max_packed_k=max_packed_k,
+        max_direct_segments=max_direct_segments,
+        device=q.device,
+        allow_same_forward_block_fallback=allow_forward_block_fallback,
+    )
+
+
+def _can_use_cached_generalized_synthetic_micro_bwd(
+    schedule: HSASchedule,
+    runtime: HSABlockSparseRuntime,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") != "1":
+        return False
+    if not _can_use_hsa_synthetic_grid_for_inputs(schedule, q, k, runtime=runtime):
+        return False
+    from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import _can_use_direct_synthetic_micro_runtime
+
+    metadata = _ensure_hsa_synthetic_grid_metadata(schedule, runtime, require_backward=True)
+    q_flat = q.reshape(-1, q.shape[2], q.shape[3]).contiguous()
+    k_flat = k.reshape(-1, k.shape[2], k.shape[3]).contiguous()
+    v_flat = v.reshape(-1, v.shape[2], v.shape[3]).contiguous()
+    return _can_use_direct_synthetic_micro_runtime(metadata, q_flat, k_flat, v_flat)
+
+
+def _build_precomputed_direct_only_synthetic_grid_metadata(
+    *,
+    device,
+    logical_block_q: int,
+    logical_block_k: int,
+    physical_block_q: int,
+    physical_block_k: int,
+    max_packed_k: int,
+    max_direct_segments: int,
+    sparse_parse_fwd: bool,
+    direct_execution_plan: dict,
+) -> HSASyntheticGridMetadata:
+    empty_i32 = _empty_int32(device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+    empty_bool = torch.empty(0, dtype=torch.bool, device=device)
+    zero_ptr = torch.tensor([0], dtype=torch.int32, device=device)
+    forward_execution_plan = {
+        "direct_execution_plan": direct_execution_plan,
+        "hybrid_direct_execution_plan": None,
+        "hybrid_regular_execution_plan": None,
+        "hybrid_selected_qgroup_idx": [],
+    }
+    return HSASyntheticGridMetadata(
+        logical_block_q=logical_block_q,
+        logical_block_k=logical_block_k,
+        physical_block_q=physical_block_q,
+        physical_block_k=physical_block_k,
+        tile_batch_idx=empty_i32,
+        tile_q_block_idx=empty_i32,
+        tile_k_block_idx=empty_i32,
+        tile_q_subgroup_idx=empty_i32,
+        tile_q_row_ptr=zero_ptr,
+        tile_q_rows=empty_i32,
+        tile_k_row_ptr=zero_ptr,
+        tile_k_rows=empty_i32,
+        tile_logical_pair_row_ptr=zero_ptr,
+        tile_logical_pairs=empty_i32,
+        compact_mask_row_ptr=zero_ptr,
+        compact_mask_col_idx=empty_i32,
+        tile_allowed_pairs=empty_i32,
+        tile_packed_q=empty_i32,
+        tile_packed_k=empty_i32,
+        tile_dense=empty_bool,
+        bucket_row_ptr=zero_ptr,
+        bucket_tile_idx=empty_i32,
+        bucket_packed_q=empty_i32,
+        bucket_packed_k=empty_i32,
+        bucket_dense=empty_bool,
+        bucket_allowed_pairs=empty_i32,
+        bucket_fill=empty_f32,
+        max_packed_k=max_packed_k,
+        max_direct_segments=max_direct_segments,
+        sparse_parse_fwd=sparse_parse_fwd,
+        tile_fill=empty_f32,
+        tile_q_length=empty_i32,
+        tile_k_length=empty_i32,
+        bucket_q_row_idx_row_ptr=zero_ptr,
+        bucket_q_row_idx=empty_i32,
+        bucket_q_src_row_idx=empty_i32,
+        bucket_k_row_idx_row_ptr=zero_ptr,
+        bucket_k_row_idx=empty_i32,
+        bucket_q_length=empty_i32,
+        bucket_k_length=empty_i32,
+        bucket_split_slot=empty_i32,
+        bucket_qgroup_bucket_idx=empty_i32,
+        bucket_mask_word_row_ptr=zero_ptr,
+        bucket_mask_words=empty_i32,
+        bucket_words_per_row=empty_i32,
+        qgroup_row_ptr=zero_ptr,
+        qgroup_rows=empty_i32,
+        qgroup_length=empty_i32,
+        qgroup_packed_q=empty_i32,
+        qgroup_num_splits=empty_i32,
+        qgroup_bucket_row_ptr=zero_ptr,
+        qgroup_bucket_idx=empty_i32,
+        qgroup_bucket_packed_q=empty_i32,
+        qgroup_bucket_q_row_idx_row_ptr=zero_ptr,
+        qgroup_bucket_q_row_idx=empty_i32,
+        qgroup_bucket_split_bucket_row_ptr=zero_ptr,
+        qgroup_bucket_split_bucket_idx=empty_i32,
+        forward_execution_plan=forward_execution_plan,
+        host_index_view=None,
+    )
+
+
 def _use_hsa_unpacked_direct_fwd() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_UNPACKED_DIRECT_FWD", "0") == "1"
+
+
+def _use_hsa_runtime_forward_only() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_RUNTIME_FORWARD_ONLY", "0") == "1"
 
 
 def _require_hsa_synthetic_row_compact() -> bool:
@@ -4037,7 +4374,9 @@ def _build_hsa_forward_synthetic_grid_metadata(
     max_blocks_per_split = max(1, max_packed_k // logical_block_k)
     max_direct_segments = _get_hsa_synthetic_max_direct_segments()
     sparse_parse_fwd = _use_hsa_synthetic_sparse_parse_fwd()
+    forward_plan_only = _use_hsa_synthetic_forward_plan_only()
     pack_k_bin = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_PACKED_K_BIN", "0") == "1"
+    bitmap_block_support_cache: dict[int, list[list[int]]] = {}
 
     def _bin_packed_k(packed_k_native: int) -> int:
         if not pack_k_bin or logical_block_q != 2 or logical_block_k != 2:
@@ -4077,71 +4416,130 @@ def _build_hsa_forward_synthetic_grid_metadata(
         logical_blocks: dict[int, dict[str, object]],
         packed_q: int,
     ) -> list[list[dict[str, object]]]:
+        def _pack_key(
+            *,
+            allowed_pairs: int,
+            num_blocks: int,
+            min_logical_k_idx: int,
+        ) -> tuple[float, int, int, int]:
+            packed_k = logical_block_k * num_blocks
+            return (
+                allowed_pairs / max(packed_q * packed_k, 1),
+                allowed_pairs,
+                -packed_k,
+                -min_logical_k_idx,
+            )
+
         remaining = sorted(logical_blocks.values(), key=lambda block: int(block["logical_k_idx"]))
+        if _use_hsa_synthetic_fast_partition():
+            ranked = sorted(
+                remaining,
+                key=lambda block: (
+                    int(block["allowed_pairs"]),
+                    -int(block["logical_k_idx"]),
+                ),
+                reverse=True,
+            )
+            splits: list[list[dict[str, object]]] = []
+            for split_start in range(0, len(ranked), max_blocks_per_split):
+                current = ranked[split_start : split_start + max_blocks_per_split]
+                current.sort(key=lambda block: int(block["logical_k_idx"]))
+                splits.append(current)
+            return splits
         splits: list[list[dict[str, object]]] = []
         while remaining:
-            seed_idx = max(range(len(remaining)), key=lambda idx: _candidate_pack_key([remaining[idx]], packed_q))
+            seed_idx = max(
+                range(len(remaining)),
+                key=lambda idx: _pack_key(
+                    allowed_pairs=int(remaining[idx]["allowed_pairs"]),
+                    num_blocks=1,
+                    min_logical_k_idx=int(remaining[idx]["logical_k_idx"]),
+                ),
+            )
             current = [remaining.pop(seed_idx)]
-            current_key = _candidate_pack_key(current, packed_q)
+            current_allowed_pairs = int(current[0]["allowed_pairs"])
+            current_num_blocks = 1
+            current_min_logical_k_idx = int(current[0]["logical_k_idx"])
+            current_key = _pack_key(
+                allowed_pairs=current_allowed_pairs,
+                num_blocks=current_num_blocks,
+                min_logical_k_idx=current_min_logical_k_idx,
+            )
             while remaining and len(current) < max_blocks_per_split:
                 best_add_idx: int | None = None
                 best_add_key = current_key
                 for candidate_idx, candidate in enumerate(remaining):
-                    candidate_blocks = current + [candidate]
-                    candidate_key = _candidate_pack_key(candidate_blocks, packed_q)
+                    candidate_key = _pack_key(
+                        allowed_pairs=current_allowed_pairs + int(candidate["allowed_pairs"]),
+                        num_blocks=current_num_blocks + 1,
+                        min_logical_k_idx=min(
+                            current_min_logical_k_idx,
+                            int(candidate["logical_k_idx"]),
+                        ),
+                    )
                     if candidate_key > best_add_key:
                         best_add_idx = candidate_idx
                         best_add_key = candidate_key
                 if best_add_idx is None:
                     break
-                current.append(remaining.pop(best_add_idx))
+                next_block = remaining.pop(best_add_idx)
+                current.append(next_block)
+                current_allowed_pairs += int(next_block["allowed_pairs"])
+                current_num_blocks += 1
+                current_min_logical_k_idx = min(current_min_logical_k_idx, int(next_block["logical_k_idx"]))
                 current_key = best_add_key
             current.sort(key=lambda block: int(block["logical_k_idx"]))
             splits.append(current)
         return splits
 
+    def _accumulate_forward_qgroup_logical_block(
+        logical_blocks: dict[int, dict[str, object]],
+        *,
+        q_local: int,
+        global_k_row: int,
+    ) -> None:
+        logical_k_idx = global_k_row // logical_block_k
+        local_k = global_k_row % logical_block_k
+        block = logical_blocks.setdefault(
+            logical_k_idx,
+            {
+                "logical_k_idx": logical_k_idx,
+                "allowed_pairs": 0,
+                "active_local_cols": set(),
+                "cols_by_q_local": {},
+            },
+        )
+        block["allowed_pairs"] = int(block["allowed_pairs"]) + 1
+        active_local_cols = block["active_local_cols"]
+        assert isinstance(active_local_cols, set)
+        active_local_cols.add(local_k)
+        cols_by_q_local = block["cols_by_q_local"]
+        assert isinstance(cols_by_q_local, dict)
+        cols_for_q = cols_by_q_local.setdefault(q_local, set())
+        assert isinstance(cols_for_q, set)
+        cols_for_q.add(local_k)
+
     def _append_forward_qgroup(
         batch_idx: int,
         q_block_idx: int,
         q_subgroup_idx: int,
-        row_cols_global: dict[int, set[int]],
+        q_rows_local: list[int],
+        logical_blocks: dict[int, dict[str, object]],
     ) -> None:
-        if not row_cols_global:
-            return
-        q_rows_local = sorted(row_cols_global.keys())
-        if not q_rows_local:
+        if not q_rows_local or not logical_blocks:
             return
 
         q_count = len(q_rows_local)
         packed_q = _align_up(q_count, logical_block_q)
         q_slot_for_local = {q_local: q_slot for q_slot, q_local in enumerate(q_rows_local)}
-        logical_blocks: dict[int, dict[str, object]] = {}
-        for q_local in q_rows_local:
-            q_slot = q_slot_for_local[q_local]
-            for global_k_row in row_cols_global[q_local]:
-                logical_k_idx = global_k_row // logical_block_k
-                local_k = global_k_row % logical_block_k
-                block = logical_blocks.setdefault(
-                    logical_k_idx,
-                    {
-                        "logical_k_idx": logical_k_idx,
-                        "allowed_pairs": 0,
-                        "active_local_cols": set(),
-                        "cols_by_qslot": {},
-                    },
-                )
-                block["allowed_pairs"] = int(block["allowed_pairs"]) + 1
-                active_local_cols = block["active_local_cols"]
-                assert isinstance(active_local_cols, set)
-                active_local_cols.add(local_k)
-                cols_by_qslot = block["cols_by_qslot"]
-                assert isinstance(cols_by_qslot, dict)
-                cols_for_q = cols_by_qslot.setdefault(q_slot, set())
-                assert isinstance(cols_for_q, set)
-                cols_for_q.add(local_k)
-
-        if not logical_blocks:
-            return
+        for block in logical_blocks.values():
+            cols_by_q_local = block.pop("cols_by_q_local")
+            assert isinstance(cols_by_q_local, dict)
+            cols_by_qslot = {}
+            for q_local, cols in cols_by_q_local.items():
+                q_slot = q_slot_for_local[int(q_local)]
+                cols_by_qslot[q_slot] = cols
+            block["cols_by_qslot"] = cols_by_qslot
 
         qgroup_idx = len(qgroup_length)
         batch_base = batch_idx * seqlen
@@ -4157,11 +4555,12 @@ def _build_hsa_forward_synthetic_grid_metadata(
         for split_slot, split_blocks in enumerate(splits):
             packed_k_native = logical_block_k * len(split_blocks)
             packed_k = _bin_packed_k(packed_k_native)
-            split_packed_cols = [set() for _ in range(q_count)]
-            split_global_rows = [set() for _ in range(q_count)]
-            active_k_rows: set[int] = set()
+            split_packed_cols = [[] for _ in range(q_count)]
             padded_k_rows: list[int] = []
-            logical_pairs_local: set[tuple[int, int]] = set()
+            active_rows_dense = True
+            active_k_rows_sorted: list[int] = []
+            split_global_rows = [[] for _ in range(q_count)] if not forward_plan_only else None
+            logical_pairs_local: list[tuple[int, int]] = [] if not forward_plan_only else []
 
             for block_pos, block in enumerate(split_blocks):
                 logical_k_idx = int(block["logical_k_idx"])
@@ -4175,19 +4574,24 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     global_row = block_base + local_k
                     if global_row < seqlen and local_k in active_local_cols:
                         padded_k_rows.append(batch_base + global_row)
-                        active_k_rows.add(global_row)
+                        if not forward_plan_only:
+                            active_k_rows_sorted.append(global_row)
                     else:
                         padded_k_rows.append(-1)
-                for q_slot, cols in cols_by_qslot.items():
+                        active_rows_dense = False
+                for q_slot in sorted(cols_by_qslot):
+                    cols = cols_by_qslot[q_slot]
                     assert isinstance(cols, set)
-                    for local_k in cols:
-                        split_packed_cols[q_slot].add(packed_col_base + local_k)
-                        split_global_rows[q_slot].add(block_base + local_k)
-                        logical_pairs_local.add((q_slot // logical_block_q, block_pos))
+                    if cols and not forward_plan_only:
+                        logical_pairs_local.append((q_slot // logical_block_q, block_pos))
+                    for local_k in sorted(cols):
+                        split_packed_cols[q_slot].append(packed_col_base + local_k)
+                        if split_global_rows is not None:
+                            split_global_rows[q_slot].append(block_base + local_k)
 
             allowed_pairs = sum(len(cols) for cols in split_packed_cols)
             split_fill = allowed_pairs / max(packed_q * packed_k, 1)
-            dense = allowed_pairs == q_count * packed_k and len(active_k_rows) == packed_k
+            dense = allowed_pairs == q_count * packed_k and active_rows_dense
             words_per_row_split = (packed_k + 31) // 32
             mask_words = [0] * (packed_q * words_per_row_split)
             for q_slot, cols in enumerate(split_packed_cols):
@@ -4198,33 +4602,35 @@ def _build_hsa_forward_synthetic_grid_metadata(
 
             if packed_k > packed_k_native:
                 padded_k_rows.extend([-1] * (packed_k - packed_k_native))
+                active_rows_dense = False
 
-            active_k_rows_sorted = sorted(active_k_rows)
-            k_compact = {k_row: idx for idx, k_row in enumerate(active_k_rows_sorted)}
-            compact_cols_per_row: list[list[int]] = []
-            for q_slot in range(q_count):
-                compact_cols_per_row.append(sorted(k_compact[k_row] for k_row in split_global_rows[q_slot]))
+            if not forward_plan_only:
+                k_compact = {k_row: idx for idx, k_row in enumerate(active_k_rows_sorted)}
+                compact_cols_per_row: list[list[int]] = []
+                assert split_global_rows is not None
+                for q_slot in range(q_count):
+                    compact_cols_per_row.append([k_compact[k_row] for k_row in split_global_rows[q_slot]])
 
-            tile_batch_idx.append(batch_idx)
-            tile_q_block_idx.append(q_block_idx)
-            tile_q_subgroup_idx.append(q_subgroup_idx)
-            tile_k_block_idx.append(-1)
-            tile_q_rows.extend(batch_base + q_base + q_local for q_local in q_rows_local)
-            tile_k_rows.extend(batch_base + k_row for k_row in active_k_rows_sorted)
-            tile_logical_pairs.extend([[q_sub, k_sub] for q_sub, k_sub in sorted(logical_pairs_local)])
-            tile_q_row_ptr.append(len(tile_q_rows))
-            tile_k_row_ptr.append(len(tile_k_rows))
-            tile_logical_pair_row_ptr.append(len(tile_logical_pairs))
-            for compact_cols in compact_cols_per_row:
-                compact_mask_col_idx.extend(compact_cols)
-                compact_mask_row_ptr.append(len(compact_mask_col_idx))
-            tile_allowed_pairs.append(allowed_pairs)
-            tile_packed_q.append(packed_q)
-            tile_packed_k.append(packed_k)
-            tile_dense.append(dense)
-            tile_fill.append(split_fill)
-            tile_q_length.append(q_count)
-            tile_k_length.append(len(active_k_rows_sorted))
+                tile_batch_idx.append(batch_idx)
+                tile_q_block_idx.append(q_block_idx)
+                tile_q_subgroup_idx.append(q_subgroup_idx)
+                tile_k_block_idx.append(-1)
+                tile_q_rows.extend(batch_base + q_base + q_local for q_local in q_rows_local)
+                tile_k_rows.extend(batch_base + k_row for k_row in active_k_rows_sorted)
+                tile_logical_pairs.extend([[q_sub, k_sub] for q_sub, k_sub in logical_pairs_local])
+                tile_q_row_ptr.append(len(tile_q_rows))
+                tile_k_row_ptr.append(len(tile_k_rows))
+                tile_logical_pair_row_ptr.append(len(tile_logical_pairs))
+                for compact_cols in compact_cols_per_row:
+                    compact_mask_col_idx.extend(compact_cols)
+                    compact_mask_row_ptr.append(len(compact_mask_col_idx))
+                tile_allowed_pairs.append(allowed_pairs)
+                tile_packed_q.append(packed_q)
+                tile_packed_k.append(packed_k)
+                tile_dense.append(dense)
+                tile_fill.append(split_fill)
+                tile_q_length.append(q_count)
+                tile_k_length.append(len(active_k_rows_sorted))
 
             split_entry = {
                 "qgroup_idx": qgroup_idx,
@@ -4251,7 +4657,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
             for q_subgroup_idx in range(num_q_subgroups):
                 subgroup_q_start = q_subgroup_idx * logical_block_q
                 subgroup_q_end = min(q_len, subgroup_q_start + logical_block_q)
-                row_cols_global: dict[int, set[int]] = {}
+                q_rows_local: set[int] = set()
+                logical_blocks: dict[int, dict[str, object]] = {}
 
                 full_cnt = 0 if full_block_cnt is None else int(full_block_cnt[batch_idx, 0, q_block_idx].item())
                 for offset in range(full_cnt):
@@ -4260,9 +4667,14 @@ def _build_hsa_forward_synthetic_grid_metadata(
                     k_len = min(k_block_size, seqlen - k_start)
                     if k_len <= 0:
                         continue
-                    global_k_rows = set(range(k_start, k_start + k_len))
                     for q_local in range(subgroup_q_start, subgroup_q_end):
-                        row_cols_global.setdefault(q_local, set()).update(global_k_rows)
+                        q_rows_local.add(q_local)
+                        for global_k_row in range(k_start, k_start + k_len):
+                            _accumulate_forward_qgroup_logical_block(
+                                logical_blocks,
+                                q_local=q_local,
+                                global_k_row=global_k_row,
+                            )
 
                 partial_cnt = int(mask_block_cnt[batch_idx, 0, q_block_idx].item())
                 for offset in range(partial_cnt):
@@ -4283,20 +4695,52 @@ def _build_hsa_forward_synthetic_grid_metadata(
                                 prefix = max(0, min(k_len, int(row_prefix_len[prefix_start + q_local].item())))
                             if prefix <= 0:
                                 continue
-                            row_cols_global.setdefault(q_local, set()).update(range(k_start, k_start + prefix))
+                            q_rows_local.add(q_local)
+                            for global_k_row in range(k_start, k_start + prefix):
+                                _accumulate_forward_qgroup_logical_block(
+                                    logical_blocks,
+                                    q_local=q_local,
+                                    global_k_row=global_k_row,
+                                )
                     else:
-                        word_start = int(bitmap_word_row_ptr[block_id].item())
+                        block_support_rows = bitmap_block_support_cache.get(block_id)
+                        if block_support_rows is None:
+                            word_start = int(bitmap_word_row_ptr[block_id].item())
+                            block_support_rows = [[] for _ in range(q_block_size)]
+                            for bitmap_q_local in range(q_block_size):
+                                row_support_rows: list[int] = []
+                                for word_idx in range(words_per_row):
+                                    word = (
+                                        int(bitmap_words[word_start + bitmap_q_local * words_per_row + word_idx].item())
+                                        & 0xFFFFFFFF
+                                    )
+                                    while word:
+                                        bit = word & -word
+                                        bit_idx = bit.bit_length() - 1
+                                        k_local = word_idx * 32 + bit_idx
+                                        if k_local < k_len:
+                                            row_support_rows.append(k_start + k_local)
+                                        word ^= bit
+                                block_support_rows[bitmap_q_local] = row_support_rows
+                            bitmap_block_support_cache[block_id] = block_support_rows
                         for q_local in range(subgroup_q_start, subgroup_q_end):
-                            for word_idx in range(words_per_row):
-                                word = int(bitmap_words[word_start + q_local * words_per_row + word_idx].item()) & 0xFFFFFFFF
-                                while word:
-                                    bit = word & -word
-                                    bit_idx = bit.bit_length() - 1
-                                    k_local = word_idx * 32 + bit_idx
-                                    if k_local < k_len:
-                                        row_cols_global.setdefault(q_local, set()).add(k_start + k_local)
-                                    word ^= bit
-                _append_forward_qgroup(batch_idx, q_block_idx, q_subgroup_idx, row_cols_global)
+                            support_rows = block_support_rows[q_local]
+                            if not support_rows:
+                                continue
+                            q_rows_local.add(q_local)
+                            for global_k_row in support_rows:
+                                _accumulate_forward_qgroup_logical_block(
+                                    logical_blocks,
+                                    q_local=q_local,
+                                    global_k_row=global_k_row,
+                                )
+                _append_forward_qgroup(
+                    batch_idx,
+                    q_block_idx,
+                    q_subgroup_idx,
+                    sorted(q_rows_local),
+                    logical_blocks,
+                )
 
     qgroup_union_support_plan = _build_hsa_qgroup_union_support_plan(
         device=device,
@@ -4419,25 +4863,98 @@ def _build_hsa_forward_synthetic_grid_metadata(
     def _build_direct_sharded_split_entries(
         shard_k_cap: int,
     ) -> tuple[list[dict[str, object]], dict[int, list[int]]]:
+        def _build_compact_direct_split_entry(
+            split_entry: dict[str, object],
+            *,
+            qgroup_idx: int,
+            packed_q: int,
+            q_count: int,
+            slot: int,
+        ) -> dict[str, object] | None:
+            split_k_length = int(split_entry["k_length"])
+            split_rows = [int(row_idx) for row_idx in split_entry["padded_k_rows"][:split_k_length]]
+            split_mask_words = split_entry["mask_words"]
+            split_words_per_row = 0 if packed_q <= 0 else len(split_mask_words) // packed_q
+            compact_rows: list[int] = []
+            split_slot_to_compact: dict[int, int] = {}
+            compact_cols_by_qslot: list[list[int]] = [[] for _ in range(packed_q)]
+            compact_allowed_pairs = 0
+
+            for split_slot_idx, row_idx in enumerate(split_rows):
+                if row_idx < 0:
+                    continue
+                split_slot_to_compact[split_slot_idx] = len(compact_rows)
+                compact_rows.append(row_idx)
+
+            if not compact_rows:
+                return None
+
+            for q_slot in range(packed_q):
+                row_base = q_slot * split_words_per_row
+                for word_idx in range(split_words_per_row):
+                    word = int(split_mask_words[row_base + word_idx]) & 0xFFFFFFFF
+                    while word:
+                        bit = word & -word
+                        bit_idx = bit.bit_length() - 1
+                        split_local_k = word_idx * 32 + bit_idx
+                        if split_local_k < split_k_length:
+                            compact_local_k = split_slot_to_compact.get(split_local_k)
+                            if compact_local_k is not None:
+                                compact_cols_by_qslot[q_slot].append(compact_local_k)
+                                compact_allowed_pairs += 1
+                        word ^= bit
+
+            compact_k_length = len(compact_rows)
+            compact_words_per_row = (compact_k_length + 31) // 32
+            compact_mask_words = [0] * (packed_q * compact_words_per_row)
+            for q_slot, compact_cols in enumerate(compact_cols_by_qslot):
+                for compact_local_k in compact_cols:
+                    compact_word_idx = compact_local_k // 32
+                    compact_bit_idx = compact_local_k % 32
+                    compact_mask_words[q_slot * compact_words_per_row + compact_word_idx] |= 1 << compact_bit_idx
+
+            return {
+                "qgroup_idx": qgroup_idx,
+                "slot": slot,
+                "packed_k": compact_k_length,
+                "dense": compact_allowed_pairs == q_count * compact_k_length,
+                "padded_k_rows": compact_rows,
+                "q_length": q_count,
+                "k_length": compact_k_length,
+                "mask_words": compact_mask_words,
+                "split_fill": compact_allowed_pairs / max(packed_q * compact_k_length, 1),
+                "allowed_pairs": compact_allowed_pairs,
+            }
+
         direct_split_entries: list[dict[str, object]] = []
         direct_split_indices_by_qgroup: dict[int, list[int]] = {}
 
         for qgroup_idx in range(len(qgroup_length)):
             packed_q = int(qgroup_packed_q[qgroup_idx])
+            q_count = int(qgroup_length[qgroup_idx])
             next_slot = 0
             split_ids = sorted(split_indices_by_qgroup.get(qgroup_idx, []), key=lambda idx: int(split_entries[idx]["slot"]))
             for split_idx in split_ids:
-                split_entry = split_entries[split_idx]
-                split_k_length = int(split_entry["k_length"])
-                split_mask_words = split_entry["mask_words"]
+                compact_split_entry = _build_compact_direct_split_entry(
+                    split_entries[split_idx],
+                    qgroup_idx=qgroup_idx,
+                    packed_q=packed_q,
+                    q_count=q_count,
+                    slot=next_slot,
+                )
+                if compact_split_entry is None:
+                    continue
+
+                split_k_length = int(compact_split_entry["k_length"])
+                split_mask_words = compact_split_entry["mask_words"]
                 split_words_per_row = 0 if packed_q <= 0 else len(split_mask_words) // packed_q
-                q_count = int(split_entry["q_length"])
+                split_padded_k_rows = compact_split_entry["padded_k_rows"]
                 for shard_start in range(0, split_k_length, shard_k_cap):
                     shard_end = min(split_k_length, shard_start + shard_k_cap)
                     shard_k_length = shard_end - shard_start
                     shard_words_per_row = (shard_k_length + 31) // 32
                     shard_mask_words = [0] * (packed_q * shard_words_per_row)
-                    shard_padded_k_rows = [int(row_idx) for row_idx in split_entry["padded_k_rows"][shard_start:shard_end]]
+                    shard_padded_k_rows = [int(row_idx) for row_idx in split_padded_k_rows[shard_start:shard_end]]
                     shard_allowed_pairs = 0
                     for q_slot in range(packed_q):
                         row_base = q_slot * split_words_per_row
@@ -4452,10 +4969,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
                             shard_bit_idx = local_k % 32
                             shard_mask_words[q_slot * shard_words_per_row + shard_word_idx] |= 1 << shard_bit_idx
                             shard_allowed_pairs += 1
-                    shard_dense = (
-                        shard_allowed_pairs == q_count * shard_k_length
-                        and all(row_idx >= 0 for row_idx in shard_padded_k_rows)
-                    )
+                    shard_dense = shard_allowed_pairs == q_count * shard_k_length
                     direct_split_entries.append(
                         {
                             "qgroup_idx": qgroup_idx,
@@ -5572,17 +6086,27 @@ def _build_hsa_backward_synthetic_grid_metadata(
     )
 
 
+def _ensure_hsa_backward_synthetic_grid_metadata(
+    schedule: HSASchedule,
+    runtime: HSABlockSparseRuntime,
+) -> HSASyntheticGridMetadata:
+    if runtime.backward_synthetic_grid is None:
+        runtime.backward_synthetic_grid = _build_hsa_backward_synthetic_grid_metadata(schedule, runtime)
+    return runtime.backward_synthetic_grid
+
+
 def _ensure_hsa_synthetic_grid_metadata(
     schedule: HSASchedule,
     runtime: HSABlockSparseRuntime,
+    *,
+    require_full_forward_plan: bool = False,
+    require_backward: bool = False,
 ) -> HSASyntheticGridMetadata:
     forward_logical_block_q = _get_hsa_synthetic_logical_block_size("q")
     forward_logical_block_k = _get_hsa_synthetic_logical_block_size("k")
     forward_max_packed_k = _get_hsa_synthetic_max_packed_k(forward_logical_block_k)
     forward_max_direct_segments = _get_hsa_synthetic_max_direct_segments()
     forward_sparse_parse_fwd = _use_hsa_synthetic_sparse_parse_fwd()
-    if runtime.backward_synthetic_grid is None:
-        runtime.backward_synthetic_grid = _build_hsa_backward_synthetic_grid_metadata(schedule, runtime)
     needs_forward_rebuild = (
         runtime.forward_synthetic_grid is None
         or runtime.forward_synthetic_grid.logical_block_q != forward_logical_block_q
@@ -5592,6 +6116,38 @@ def _ensure_hsa_synthetic_grid_metadata(
         or bool(runtime.forward_synthetic_grid.sparse_parse_fwd) != forward_sparse_parse_fwd
     )
     if needs_forward_rebuild:
+        precomputed_direct_plan = None if require_full_forward_plan else _get_precomputed_forward_direct_plan(
+            schedule,
+            forward_block_q=runtime.forward_block_q,
+            logical_block_q=forward_logical_block_q,
+            logical_block_k=forward_logical_block_k,
+            max_packed_k=forward_max_packed_k,
+            max_direct_segments=forward_max_direct_segments,
+            device=runtime.forward_sparse.mask_block_cnt.device,
+        )
+        if precomputed_direct_plan is not None:
+            runtime.forward_synthetic_grid = _build_precomputed_direct_only_synthetic_grid_metadata(
+                device=runtime.forward_sparse.mask_block_cnt.device,
+                logical_block_q=forward_logical_block_q,
+                logical_block_k=forward_logical_block_k,
+                physical_block_q=runtime.forward_block_q,
+                physical_block_k=runtime.forward_block_k,
+                max_packed_k=forward_max_packed_k,
+                max_direct_segments=forward_max_direct_segments,
+                sparse_parse_fwd=forward_sparse_parse_fwd,
+                direct_execution_plan=precomputed_direct_plan,
+            )
+        else:
+            runtime.forward_synthetic_grid = _build_hsa_forward_synthetic_grid_metadata(
+                schedule,
+                runtime,
+                logical_block_q=forward_logical_block_q,
+                logical_block_k=forward_logical_block_k,
+                max_packed_k=forward_max_packed_k,
+            )
+    elif require_full_forward_plan and not _forward_execution_plan_has_bucket_execution(
+        runtime.forward_synthetic_grid.forward_execution_plan
+    ):
         runtime.forward_synthetic_grid = _build_hsa_forward_synthetic_grid_metadata(
             schedule,
             runtime,
@@ -5599,6 +6155,8 @@ def _ensure_hsa_synthetic_grid_metadata(
             logical_block_k=forward_logical_block_k,
             max_packed_k=forward_max_packed_k,
         )
+    if require_backward:
+        _ensure_hsa_backward_synthetic_grid_metadata(schedule, runtime)
     runtime.synthetic_grid = runtime.forward_synthetic_grid
     return runtime.synthetic_grid
 
@@ -6619,7 +7177,9 @@ def _run_hsa_packed_mask_backward(
     runtime: Optional[HSABlockSparseRuntime] = None,
 ):
     _, _, _, _, _, _, flash_attn_bwd = _lazy_cute_imports()
-    runtime = runtime if runtime is not None else _get_hsa_block_sparse_runtime(schedule, q, k)
+    runtime = runtime if runtime is not None else _get_hsa_block_sparse_runtime(schedule, q, k, require_backward=True)
+    if runtime.backward_sparse is None or runtime.backward_packed_masks is None or runtime.backward_sparse_torch is None:
+        runtime = _get_hsa_block_sparse_runtime(schedule, q, k, require_backward=True)
     return flash_attn_bwd(
         q,
         k,
@@ -6649,6 +7209,8 @@ def _schedule_has_only_sentence_backward_families(schedule: HSASchedule) -> bool
 
 
 def _get_hsa_blocksparse_backward_mode(schedule: HSASchedule) -> str:
+    if _use_hsa_runtime_forward_only():
+        return "sparse_mask"
     if (
         os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1"
         and _schedule_has_only_sentence_backward_families(schedule)
@@ -6828,6 +7390,13 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         q, k, v, out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             ctx.saved_tensors
         )
+        if ctx.block_sparse_runtime.backward_sparse is None:
+            ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                ctx.schedule,
+                q,
+                k,
+                require_backward=True,
+            )
         sentence_lse = sentence_lse if sentence_lse.numel() > 0 else None
         sentence_q_stream = sentence_q_stream if sentence_q_stream.numel() > 0 else None
         sentence_k_stream = sentence_k_stream if sentence_k_stream.numel() > 0 else None
@@ -6916,6 +7485,148 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
                 runtime=ctx.block_sparse_runtime,
             )
         return dq, dk, dv, None, None, None, None, None, None
+
+
+class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        keep_ids: Optional[torch.Tensor],
+        hash_ids: Optional[torch.Tensor],
+        schedule: HSASchedule,
+        cached_forward_payload: dict[str, Any],
+        softmax_scale: float,
+        deterministic: bool,
+        return_lse: bool,
+    ):
+        from flash_attn.cute.hsa_cached_2d_forward_analysis import (
+            can_use_cached_generalized_fused_backward,
+            run_cached_generalized_packed_forward,
+        )
+
+        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+        ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
+            schedule,
+            q,
+            k,
+            runtime=ctx.block_sparse_runtime,
+        )
+        ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
+        ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
+        ctx.cached_forward_payload = cached_forward_payload
+        ctx.use_cached_generalized_fused_bwd = (
+            ctx.hsa_backward_mode == "sparse_mask"
+            and os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "0") == "1"
+            and can_use_cached_generalized_fused_backward(
+                cached_forward_payload,
+                q,
+                k,
+                v,
+                deterministic=deterministic,
+            )
+        )
+        ctx.use_synthetic_micro_bwd = (
+            not ctx.use_cached_generalized_fused_bwd
+            and
+            ctx.hsa_backward_mode == "sparse_mask"
+            and _can_use_cached_generalized_synthetic_micro_bwd(schedule, ctx.block_sparse_runtime, q, k, v)
+        )
+        setattr(schedule, "_last_cached_generalized_fused_bwd_used", False)
+        out, lse = run_cached_generalized_packed_forward(
+            cached_forward_payload,
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            return_lse=True,
+        )
+        ctx.schedule = schedule
+        ctx.keep_ids = keep_ids
+        ctx.hash_ids = hash_ids
+        ctx.softmax_scale = softmax_scale
+        ctx.deterministic = deterministic
+        ctx.save_for_backward(q, k, v, out, lse)
+        if return_lse:
+            ctx.mark_non_differentiable(lse)
+            return out, lse
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, lse = ctx.saved_tensors
+        if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
+            try:
+                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                    ctx.schedule,
+                    q,
+                    k,
+                    require_backward=True,
+                )
+            except TypeError:
+                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                    ctx.schedule,
+                    q,
+                    k,
+                )
+        if ctx.use_cached_generalized_fused_bwd:
+            from flash_attn.cute.hsa_cached_2d_forward_analysis import run_cached_generalized_packed_backward
+
+            dq, dk, dv = run_cached_generalized_packed_backward(
+                ctx.cached_forward_payload,
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                softmax_scale=ctx.softmax_scale,
+                deterministic=ctx.deterministic,
+            )
+            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", True)
+        elif ctx.use_synthetic_micro_bwd:
+            from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
+
+            dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                ctx.keep_ids,
+                ctx.hash_ids,
+                forward_prob_token=ctx.synthetic_forward_prob_token,
+                runtime=ctx.block_sparse_runtime,
+            )
+            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+        else:
+            dq, dk, dv = _run_hsa_packed_mask_backward(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                ctx.schedule,
+                ctx.softmax_scale,
+                ctx.deterministic,
+                ctx.keep_ids,
+                ctx.hash_ids,
+                runtime=ctx.block_sparse_runtime,
+            )
+            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 class _FlashAttnHSASparseExactFunc(torch.autograd.Function):
@@ -7031,6 +7742,20 @@ def flash_attn_hsa_sparse_func(
             normalized_hash_ids = normalized_hash_ids.contiguous()
 
     if torch.cuda.get_device_capability(q.device)[0] >= 10:
+        cached_forward_payload = _resolve_precomputed_cached_generalized_forward_payload(hsa_schedule, q, k)
+        if isinstance(cached_forward_payload, dict):
+            return _FlashAttnHSACachedGeneralizedForwardFunc.apply(
+                q,
+                k,
+                v,
+                normalized_keep_ids,
+                normalized_hash_ids,
+                hsa_schedule,
+                cached_forward_payload,
+                scale,
+                deterministic,
+                return_lse,
+            )
         return _FlashAttnHSABlockSparseFunc.apply(
             q,
             k,

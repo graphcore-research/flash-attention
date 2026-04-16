@@ -1065,6 +1065,16 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
         h1 = [int(x) for x in hash_cpu[batch_idx, 1].tolist()]
         h2 = [int(x) for x in hash_cpu[batch_idx, 2].tolist()]
         row_base = batch_idx * seqlen
+        sentence_anchor_by_section_sent = {
+            (h1[pos], h0[pos]): pos
+            for pos in range(seqlen)
+            if ki0[pos] and ki1[pos] and not ki2[pos]
+        }
+        section_anchor_by_doc_sec = {
+            (h2[pos], h1[pos]): pos
+            for pos in range(seqlen)
+            if (not ki0[pos]) and ki1[pos] and ki2[pos]
+        }
 
         sentence_segments = _build_segments(ki0, h0)
         for seg in sentence_segments:
@@ -1115,6 +1125,29 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
                 query_start = idx + 1 if (ki0[pos] or ki1[pos]) else idx
                 if query_start < seg_len:
                     document_t_rows[flat_row].extend(seg[query_start:])
+
+        for pos in range(seqlen):
+            flat_row = row_base + pos
+            is_body = ki0[pos] and not ki1[pos]
+            is_sentence_anchor = ki0[pos] and ki1[pos] and not ki2[pos]
+
+            if is_body:
+                prev_sentence_anchor = sentence_anchor_by_section_sent.get((h1[pos], h0[pos] - 1))
+                if prev_sentence_anchor is not None:
+                    section_rows[flat_row].append(prev_sentence_anchor)
+                    section_t_rows[row_base + prev_sentence_anchor].append(pos)
+
+            if is_body or is_sentence_anchor:
+                prev_section_anchor = section_anchor_by_doc_sec.get((h2[pos], h1[pos] - 1))
+                if prev_section_anchor is not None:
+                    document_rows[flat_row].append(prev_section_anchor)
+                    document_t_rows[row_base + prev_section_anchor].append(pos)
+
+        for flat_row in range(row_base, row_base + seqlen):
+            section_rows[flat_row] = sorted(set(section_rows[flat_row]))
+            section_t_rows[flat_row] = sorted(set(section_t_rows[flat_row]))
+            document_rows[flat_row] = sorted(set(document_rows[flat_row]))
+            document_t_rows[flat_row] = sorted(set(document_t_rows[flat_row]))
 
     section_self_indices_tensor = (
         torch.tensor(section_self_indices, dtype=torch.int32, device=device) if section_self_indices else _empty_int32(device)
@@ -1408,53 +1441,13 @@ def _build_hsa_schedule_aux_tensors(schedule: HSASchedule) -> list[torch.Tensor]
 
 
 def schedule_aux_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
-    """Expand the schedule aux-tensor encoding into the exact dense bool attention mask."""
-    (
-        sentence_segment_id,
-        sentence_segment_offset,
-        section_segment_id,
-        section_segment_offset,
-        section_self_allowed,
-        document_segment_id,
-        document_segment_offset,
-        document_self_allowed,
-    ) = [tensor.detach().cpu() for tensor in _build_hsa_schedule_aux_tensors(schedule)]
-    bsz, seqlen = schedule.batch_size, schedule.seqlen
-    attend = torch.zeros(bsz, seqlen, seqlen, dtype=torch.bool)
+    """
+    Expand the schedule into the exact dense bool attention mask.
 
-    for batch_idx in range(bsz):
-        for q_idx in range(seqlen):
-            q_sentence_segment = int(sentence_segment_id[batch_idx, q_idx].item())
-            q_sentence_offset = int(sentence_segment_offset[batch_idx, q_idx].item())
-            q_section_segment = int(section_segment_id[batch_idx, q_idx].item())
-            q_section_offset = int(section_segment_offset[batch_idx, q_idx].item())
-            q_section_self = int(section_self_allowed[batch_idx, q_idx].item())
-            q_document_segment = int(document_segment_id[batch_idx, q_idx].item())
-            q_document_offset = int(document_segment_offset[batch_idx, q_idx].item())
-            q_document_self = int(document_self_allowed[batch_idx, q_idx].item())
-
-            for k_idx in range(seqlen):
-                allowed = False
-                k_sentence_segment = int(sentence_segment_id[batch_idx, k_idx].item())
-                if q_sentence_segment >= 0 and q_sentence_segment == k_sentence_segment:
-                    k_sentence_offset = int(sentence_segment_offset[batch_idx, k_idx].item())
-                    allowed = k_sentence_offset <= q_sentence_offset
-
-                if not allowed:
-                    k_section_segment = int(section_segment_id[batch_idx, k_idx].item())
-                    if q_section_segment >= 0 and q_section_segment == k_section_segment:
-                        k_section_offset = int(section_segment_offset[batch_idx, k_idx].item())
-                        allowed = k_section_offset < q_section_offset + q_section_self
-
-                if not allowed:
-                    k_document_segment = int(document_segment_id[batch_idx, k_idx].item())
-                    if q_document_segment >= 0 and q_document_segment == k_document_segment:
-                        k_document_offset = int(document_segment_offset[batch_idx, k_idx].item())
-                        allowed = k_document_offset < q_document_offset + q_document_self
-
-                attend[batch_idx, q_idx, k_idx] = allowed
-
-    return attend.to(device=schedule.sentence_start.device)
+    The compressed aux encoding does not currently represent all cross-level HSA
+    edges, so the exact row-CSR schedule is the source of truth here.
+    """
+    return schedule_to_attend_mask(schedule)
 
 
 def _build_hsa_forward_tile_mask_aux_tensors(tile_masks: HSAForwardTileMasks) -> list[torch.Tensor]:
@@ -6425,6 +6418,13 @@ def get_hsa_mask_mod():
         same_sent = q_h0 == k_h0
         same_sec = q_h1 == k_h1
         same_doc = q_h2 == k_h2
+        prev_sent = q_h0 == (k_h0 + 1)
+        prev_sec = q_h1 == (k_h1 + 1)
+
+        is_body_q = (q_ki0 != 0) & (q_ki1 == 0)
+        is_sen_q = (q_ki0 != 0) & (q_ki1 != 0) & (q_ki2 == 0)
+        is_sen_k = (k_ki0 != 0) & (k_ki1 != 0) & (k_ki2 == 0)
+        is_sec_k = (k_ki0 == 0) & (k_ki1 != 0) & (k_ki2 != 0)
 
         level0 = (
             (q_ki0 != 0)
@@ -6434,8 +6434,11 @@ def get_hsa_mask_mod():
         )
         level1 = (q_ki1 != 0) & (k_ki1 != 0) & same_sec
         level2 = (q_ki2 != 0) & (k_ki2 != 0) & same_doc
+        cross_body_sen = is_body_q & is_sen_k & prev_sent & same_sec
+        cross_body_sec = is_body_q & is_sec_k & prev_sec & same_doc
+        cross_sen_sec = is_sen_q & is_sec_k & prev_sec & same_doc
         causal = kv_idx <= q_idx
-        return in_bounds & causal & (level0 | level1 | level2)
+        return in_bounds & causal & (level0 | level1 | level2 | cross_body_sen | cross_body_sec | cross_sen_sec)
 
     return _hsa_mask
 
@@ -6472,7 +6475,18 @@ def compute_hsa_mask(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> torch.Te
     level0 = ki0.unsqueeze(2) & ki0.unsqueeze(1) & same_sent & ~cls_mask
     level1 = ki1.unsqueeze(2) & ki1.unsqueeze(1) & same_sec
     level2 = ki2.unsqueeze(2) & ki2.unsqueeze(1) & same_doc
-    attend = causal & (level0 | level1 | level2)
+
+    is_body_q = ki0.unsqueeze(2) & ~ki1.unsqueeze(2)
+    is_sen_q = ki0.unsqueeze(2) & ki1.unsqueeze(2) & ~ki2.unsqueeze(2)
+    is_sen_k = ki0.unsqueeze(1) & ki1.unsqueeze(1) & ~ki2.unsqueeze(1)
+    is_sec_k = ~ki0.unsqueeze(1) & ki1.unsqueeze(1) & ki2.unsqueeze(1)
+    prev_sent = h0.unsqueeze(2) == (h0.unsqueeze(1) + 1)
+    prev_sec = h1.unsqueeze(2) == (h1.unsqueeze(1) + 1)
+    cross_body_sen = is_body_q & is_sen_k & prev_sent & same_sec
+    cross_body_sec = is_body_q & is_sec_k & prev_sec & same_doc
+    cross_sen_sec = is_sen_q & is_sec_k & prev_sec & same_doc
+
+    attend = causal & (level0 | level1 | level2 | cross_body_sen | cross_body_sec | cross_sen_sec)
 
     mask = torch.zeros(bsz, seqlen, seqlen, device=device, dtype=torch.float32)
     mask.masked_fill_(~attend, float("-inf"))

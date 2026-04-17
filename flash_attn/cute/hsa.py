@@ -7194,6 +7194,9 @@ def _run_hsa_packed_mask_backward(
     runtime = runtime if runtime is not None else _get_hsa_block_sparse_runtime(schedule, q, k, require_backward=True)
     if runtime.backward_sparse is None or runtime.backward_packed_masks is None or runtime.backward_sparse_torch is None:
         runtime = _get_hsa_block_sparse_runtime(schedule, q, k, require_backward=True)
+    block_sparse_tensors = runtime.backward_sparse_torch
+    if _should_disable_hsa_block_sparse_backward(schedule, runtime):
+        block_sparse_tensors = None
     return flash_attn_bwd(
         q,
         k,
@@ -7212,7 +7215,7 @@ def _run_hsa_packed_mask_backward(
             runtime.backward_packed_masks.k_block_size,
         ),
         aux_tensors=runtime.backward_aux_tensors,
-        block_sparse_tensors=runtime.backward_sparse_torch,
+        block_sparse_tensors=block_sparse_tensors,
         subtile_factor_override=runtime.backward_subtile_factor,
     )
 
@@ -7230,6 +7233,26 @@ def _has_zero_upstream_grad(dout: torch.Tensor) -> bool:
     # upstream gradient. Returning exact zeros here avoids launching the sparse
     # backward on a case where the true result is known.
     return not bool(torch.any(dout).item())
+
+
+def _should_disable_hsa_block_sparse_backward(
+    schedule: HSASchedule,
+    runtime: HSABlockSparseRuntime,
+) -> bool:
+    """Dense traversal is more reliable when the backward work collapses to one tile.
+
+    In the single-tile case block sparsity prunes nothing, but the live SM100
+    sparse traversal path shows a dQ mismatch relative to the dense mask-mod
+    traversal. Prefer the dense traversal there until the generic sparse kernel
+    path is fixed.
+    """
+    sparse = runtime.backward_sparse
+    if sparse is None:
+        return True
+    q_block_size, k_block_size = sparse.block_size
+    num_q_blocks = (schedule.seqlen + q_block_size - 1) // q_block_size
+    num_k_blocks = (schedule.seqlen + k_block_size - 1) // k_block_size
+    return num_q_blocks <= 1 and num_k_blocks <= 1
 
 
 def _schedule_has_only_sentence_backward_families(schedule: HSASchedule) -> bool:

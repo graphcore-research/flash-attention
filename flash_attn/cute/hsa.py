@@ -7217,6 +7217,21 @@ def _run_hsa_packed_mask_backward(
     )
 
 
+def _zero_hsa_grads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+):
+    return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+
+
+def _has_zero_upstream_grad(dout: torch.Tensor) -> bool:
+    # The sparse kernels are not needed when the caller provides an exact zero
+    # upstream gradient. Returning exact zeros here avoids launching the sparse
+    # backward on a case where the true result is known.
+    return not bool(torch.any(dout).item())
+
+
 def _schedule_has_only_sentence_backward_families(schedule: HSASchedule) -> bool:
     monolithic_schedule = _get_hsa_monolithic_backward_schedule(schedule)
     return monolithic_schedule.anchor_full_q_row_start.numel() == 0 and monolithic_schedule.anchor_tail_q_row_start.numel() == 0
@@ -7404,6 +7419,9 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         q, k, v, out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             ctx.saved_tensors
         )
+        if _has_zero_upstream_grad(dout):
+            dq, dk, dv = _zero_hsa_grads(q, k, v)
+            return dq, dk, dv, None, None, None, None, None, None
         if ctx.block_sparse_runtime.backward_sparse is None:
             ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
                 ctx.schedule,
@@ -7571,6 +7589,10 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse = ctx.saved_tensors
+        if _has_zero_upstream_grad(dout):
+            dq, dk, dv = _zero_hsa_grads(q, k, v)
+            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+            return dq, dk, dv, None, None, None, None, None, None, None
         if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
             try:
                 ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
@@ -7689,6 +7711,9 @@ class _FlashAttnHSASparseExactFunc(torch.autograd.Function):
         from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_exact
 
         q, k, v, out, total_lse_flat, sentence_lse, section_prefix_lse, document_prefix_lse = ctx.saved_tensors
+        if _has_zero_upstream_grad(dout):
+            dq, dk, dv = _zero_hsa_grads(q, k, v)
+            return dq, dk, dv, None, None, None, None
         schedule = ctx.schedule
         dq, dk, dv = run_hsa_bwd_sm100_exact(
             q,

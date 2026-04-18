@@ -1,0 +1,673 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue,
+  pdftitle={HSA as Sparse Causal Routing and a Path Toward Typed Semantic Graphs},
+  pdfauthor={OpenAI Codex}
+}
+
+\title{HSA as Sparse Causal Routing\\
+\large Formalization, Current Packing Strategy, and a Path Toward Typed Semantic Graphs}
+\author{}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note formalizes the current hierarchical sparse attention (HSA) stack as a
+decoder-causal sparse routing problem over a sequence graph, explains the
+current dense HSA reference, schedule-based sparse realization, and packing
+strategy, and records why \texttt{sparse\_mask} backward remains the pragmatic
+training path even though it uses a coarser sparsification than the most
+aggressive forward-only packed routes. The note then sketches a realistic
+``leapfrog'' extension path from binary hierarchical masks toward typed,
+directed, and eventually signed semantic routing graphs that could support
+precursors to causal reasoning in autoregressive language models. The central
+claim is that the current implementation is not ``arbitrary graph attention,''
+but it already contains reusable pieces of a graph compiler, sparse runtime, and
+offline sidecar system that can be repurposed for richer semantic graphs.
+\end{abstract}
+
+\section{Motivation}
+
+The current HSA recipe uses semantic structure already present in text
+representation---sentence anchors, section anchors, document anchors, or other
+hierarchical boundary markers---to build a sparse causal attention graph. This
+graph is then realized either as a dense semantic mask or as an equivalent
+schedule-based sparse computation.
+
+The long-range motivation is twofold:
+\begin{enumerate}[leftmargin=1.5em]
+    \item reduce attention cost while preserving relevance over long contexts,
+    \item bias the model toward structured information flow rather than letting
+    dense attention allocate probability mass over all causal predecessors.
+\end{enumerate}
+
+That is already useful for ``context rot'' mitigation, but it also opens a more
+ambitious direction: moving from document hierarchy to typed semantic graphs and
+eventually to typed directional message passing that can approximate parts of
+causal reasoning without claiming true interventional semantics.
+
+\section{Formalizing Current HSA}
+
+\subsection{Sequence, graph, and support mask}
+
+Let a decoder consume tokens $x_1, \dots, x_T$. Standard causal self-attention
+defines a dense lower-triangular support:
+\[
+\mathcal{E}_{\mathrm{causal}} = \{(i,j) \mid 1 \le j \le i \le T\}.
+\]
+
+Current HSA replaces this with a sparse causal subgraph
+\[
+G = (V, E), \quad V = \{1, \dots, T\}, \quad E \subseteq \mathcal{E}_{\mathrm{causal}}.
+\]
+
+Equivalently, it defines a binary support mask
+\[
+S_{ij} =
+\begin{cases}
+1 & \text{if } (i,j) \in E,\\
+0 & \text{otherwise.}
+\end{cases}
+\]
+
+The graph $E$ is not learned online. It is compiled from token-side semantic
+metadata such as \texttt{keep\_ids} and \texttt{hash\_ids}, which encode the
+hierarchical structure of the document.
+
+\subsection{Dense HSA reference}
+
+Current dense HSA is a masked exact attention reference:
+\[
+\mathrm{score}_{ij} = \frac{q_i^\top k_j}{\sqrt{d}} + m_{ij},
+\]
+where
+\[
+m_{ij} =
+\begin{cases}
+0 & \text{if } S_{ij}=1,\\
+-\infty & \text{if } S_{ij}=0.
+\end{cases}
+\]
+Then
+\[
+\alpha_{ij} = \frac{\exp(\mathrm{score}_{ij})}
+{\sum_{\ell : S_{i\ell}=1}\exp(\mathrm{score}_{i\ell})},
+\qquad
+o_i = \sum_{j : S_{ij}=1} \alpha_{ij} v_j.
+\]
+
+This is the clean semantic reference: all questions about correctness reduce to
+whether the dense mask implements the intended graph.
+
+\subsection{Schedule-based sparse HSA}
+
+The schedule-based sparse implementation is supposed to compute exactly the same
+function as the dense mask, but using explicit sparse descriptors rather than a
+dense masked traversal. In the repository, that compiler/runtime split lives
+primarily in:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{flash\_attn/cute/hsa.py},
+    \item \texttt{flash\_attn/cute/hsa\_cached\_2d\_forward\_analysis.py},
+    \item \texttt{nanochat/hsa\_batch\_cache.py}.
+\end{itemize}
+
+The schedule is therefore a \emph{compiled sparse realization of the same
+binary support graph}, not a different model class.
+
+\section{What the Current Graph Semantics Actually Encode}
+
+Current HSA is not general graph attention. It is a decoder-causal sparse graph
+with a specific information-routing policy derived from hierarchy.
+
+In the present recipe, the graph includes:
+\begin{itemize}[leftmargin=1.5em]
+    \item same-sentence body-level connectivity,
+    \item same-section anchor connectivity,
+    \item same-document anchor connectivity,
+    \item cross-level edges such as body $\rightarrow$ previous sentence anchor,
+    \item body $\rightarrow$ previous section anchor,
+    \item sentence anchor $\rightarrow$ previous section anchor.
+\end{itemize}
+
+These cross-level edges matter. Without them, the graph is too lossy: a purely
+same-level tree-shaped routing policy under-connects the model and discards
+useful long-range semantic pathways.
+
+The important subtlety is that this graph is a \emph{routing graph}, not an
+ontology. The document hierarchy is a tree. Useful attention flow is closer to a
+causalized directed acyclic graph over the prefix.
+
+\section{Dense HSA Versus Sparse HSA}
+
+\subsection{Dense HSA}
+
+Dense HSA means: build the exact semantic mask, run the ordinary dense masked
+attention reference, and let the kernel traverse all entries in the lower
+triangle even if many entries are masked out. This is conceptually simple and is
+the best semantic oracle when debugging graph meaning.
+
+\subsection{Sparse HSA}
+
+Sparse HSA means: compile the same semantic mask into sparse descriptors and
+realize the same attention via sparse traversal, sparse runtime metadata, or
+packed subproblems. Sparse HSA is therefore a systems optimization problem on
+top of the same graph semantics.
+
+\subsection{Invariant that matters}
+
+The critical invariant is:
+\[
+\text{dense semantic mask} \equiv \text{sparse schedule} \equiv \text{kernel support}.
+\]
+
+When these differ, training behavior diverges even if the intended high-level
+semantics were correct. Much of the engineering difficulty in HSA is therefore
+not inventing a graph, but proving that every layer of the implementation
+realizes the same graph.
+
+\section{Why Packing Helps Forward More Than Backward}
+
+\subsection{Forward is naturally query-owned}
+
+Forward attention on a compressed subproblem is naturally row-owned:
+\[
+Q_b \in \mathbb{R}^{r \times d}, \quad
+K_b, V_b \in \mathbb{R}^{u \times d},
+\]
+with one output $O_b$ and one log-sum-exp state per query row. Packing reduces
+an irregular sparse neighborhood into a regular dense microproblem.
+
+That is why forward benefits strongly from packing:
+\begin{itemize}[leftmargin=1.5em]
+    \item gather and pack once,
+    \item compute one tiny dense exact attention,
+    \item write one output and one LSE per row.
+\end{itemize}
+
+\subsection{Backward has an ownership mismatch}
+
+Backward is harder because the natural ownership splits:
+\[
+dQ = dS K \quad \text{(query-row owned)}
+\]
+but
+\[
+dK \mathrel{+}= dS^\top Q, \qquad
+dV \mathrel{+}= P^\top dO
+\quad \text{(key-row owned)}.
+\]
+
+This means the same forward packing that makes a tiny dense forward problem does
+not automatically make a tiny dense backward problem with a natural writeback
+owner. The moment we leave the query-owned world, we pay for reductions,
+atomics, or extra saved-state movement.
+
+\subsection{Why \texttt{sparse\_mask} backward is still so good}
+
+Even though \texttt{sparse\_mask} backward is coarser and often less elegant
+than the most compressed forward path, it remains strong for several reasons:
+\begin{enumerate}[leftmargin=1.5em]
+    \item it stays close to the exact support graph;
+    \item it amortizes work in large regular backward kernels instead of carrying
+    fragile packed forward state into backward;
+    \item it avoids the q-owned / k-owned mismatch becoming a bespoke packed
+    writeback problem;
+    \item once numerical issues are fixed, it is robust and easy to validate
+    against the dense masked reference;
+    \item empirically, the forward gains from aggressive packing are large,
+    while the backward gains from the same packing are usually small or negative.
+\end{enumerate}
+
+This is the main reason the hybrid path---compressed forward plus
+\texttt{sparse\_mask} backward---has remained the best practical training
+configuration.
+
+\section{Row Packing, Column Packing, and Generalized 2-D Packing}
+
+\subsection{Row packing}
+
+Row packing compresses multiple query rows with similar neighborhoods into a
+single regular microproblem. Informally:
+\begin{itemize}[leftmargin=1.5em]
+    \item choose a small set of query rows,
+    \item take the union of their live keys,
+    \item gather that union once,
+    \item run one tiny dense attention over the packed rows.
+\end{itemize}
+
+This is the most natural packing because forward attention is query-owned.
+
+\subsection{Column packing}
+
+Column packing focuses on the key/value side:
+\begin{itemize}[leftmargin=1.5em]
+    \item compress repeated or shared key neighborhoods,
+    \item reduce redundant K/V gathers,
+    \item try to reuse union-K structure across rows.
+\end{itemize}
+
+This helps when many rows share similar key support, but on its own it is less
+complete than row packing because it does not resolve the query-side ownership
+pattern.
+
+\subsection{Generalized 2-D packing}
+
+Generalized 2-D packing treats the support matrix as a sparse binary matrix and
+tries to extract dense submatrices:
+\begin{itemize}[leftmargin=1.5em]
+    \item exact dense tiles when a row group shares a common live key set,
+    \item tiled residual tails for uncovered support,
+    \item range-level fused execution where exact tiles and tails share one
+    online softmax state.
+\end{itemize}
+
+That is more general than either pure row packing or pure column packing:
+\begin{itemize}[leftmargin=1.5em]
+    \item row packing asks ``which rows should be grouped?''
+    \item column packing asks ``which K/V neighborhoods should be reused?''
+    \item generalized 2-D packing asks ``which dense submatrices can be
+    extracted from the sparse support matrix, and how should the remainder be
+    tiled?''
+\end{itemize}
+
+The current cached generalized forward path in the repository is exactly this
+kind of 2-D extraction:
+\begin{itemize}[leftmargin=1.5em]
+    \item exact dense core tiles,
+    \item fused tiled tail,
+    \item one range-local softmax state,
+    \item one output write per row range.
+\end{itemize}
+
+\section{What the Current Implementation Already Gives Us}
+
+The current stack contains several reusable components that are more general
+than ``hierarchy only'' suggests.
+
+\subsection{1. A graph compiler from token annotations to sparse causal support}
+
+Today this compiler is expressed through:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{keep\_ids},
+    \item \texttt{hash\_ids},
+    \item \texttt{compute\_hsa\_mask(...)},
+    \item \texttt{build\_hsa\_schedule(...)}.
+\end{itemize}
+
+This is already a graph compiler. It just currently compiles one specific
+family of hierarchical binary support graphs.
+
+\subsection{2. Exact dense and sparse references}
+
+The repository already has the conceptual machinery needed to separate:
+\begin{itemize}[leftmargin=1.5em]
+    \item intended semantics,
+    \item sparse schedule,
+    \item kernel behavior.
+\end{itemize}
+
+That is crucial for any richer graph scheme. If the graph is extended to typed
+or directed edges, the same discipline will still be necessary.
+
+\subsection{3. Sidecars and offline precomputation}
+
+The schedule sidecar and forward sidecar system is not specific to hierarchy.
+It is a reusable vehicle for:
+\begin{itemize}[leftmargin=1.5em]
+    \item offline graph compilation,
+    \item offline packing,
+    \item runtime attachment of structural metadata,
+    \item avoiding host-side rebuild costs.
+\end{itemize}
+
+This becomes even more valuable if the graph moves from simple hierarchy to
+typed semantic edges, since graph compilation will likely become more expensive.
+
+\subsection{4. Packing policy and schedule families}
+
+The current row-compact and generalized 2-D packing framework is a reusable
+``graph-to-kernel-family'' compiler. The main idea is already in place:
+\begin{itemize}[leftmargin=1.5em]
+    \item start from an irregular support graph,
+    \item partition it into a small set of regular families,
+    \item run specialized kernels on each family.
+\end{itemize}
+
+That is exactly the right systems pattern for richer semantic graphs too.
+
+\section{What Does \emph{Not} Recycle Directly}
+
+Not every part of the current HSA stack is directly reusable for a leap toward
+semantic or causal graphs.
+
+\subsection{1. Binary support is too weak for typed semantics}
+
+If all edges are reduced to a single binary mask, then
+\[
+\texttt{Spain} \to \texttt{Europe}
+\quad\text{and}\quad
+\texttt{rain} \to \texttt{wet}
+\]
+look identical at the routing level. The graph topology survives, but relation
+type does not.
+
+\subsection{2. Standard softmax attention only models positive mixing weights}
+
+Softmax produces
+\[
+\alpha_{ij} \ge 0, \qquad \sum_j \alpha_{ij} = 1.
+\]
+This is appropriate for compatibility-based readout, but it is not a natural
+model of signed causal influence. The output can still become negative through
+the value vectors, but the weighting mechanism itself is not signed.
+
+\subsection{3. Current kernels assume binary support plus standard reductions}
+
+The current sparse kernels assume:
+\begin{itemize}[leftmargin=1.5em]
+    \item allowed or forbidden edges,
+    \item standard score computation,
+    \item standard softmax normalization,
+    \item standard $QK^\top$ and weighted $V$ reductions.
+\end{itemize}
+
+Typed, signed, or relation-conditioned message passing would require either:
+\begin{itemize}[leftmargin=1.5em]
+    \item multiple edge-family kernels,
+    \item relation-specific score transforms,
+    \item relation-specific value transforms,
+    \item or an alternative aggregator that is no longer a pure masked softmax.
+\end{itemize}
+
+\section{From Hierarchy to Typed Directed Semantic Graphs}
+
+\subsection{The right abstraction}
+
+The natural extension is not ``arbitrary graph attention'' in the abstract. The
+natural extension is:
+\begin{quote}
+decoder-causal sparse routing over tokens and semantic memory nodes, with typed
+directed edges.
+\end{quote}
+
+This still respects autoregressive training, but allows the graph to encode
+more than document boundaries.
+
+\subsection{Semantic direction versus attention direction}
+
+There are two distinct notions of direction:
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{semantic direction:} e.g.\ a knowledge or event relation,
+    \item \textbf{attention-flow direction:} which previously visible node a
+    token is allowed to read from.
+\end{enumerate}
+
+These are not the same thing. A semantic graph may contain a relation
+\[
+\texttt{rain} \to \texttt{wet},
+\]
+but in a decoder we still must causalize it into past-visible reads only. So a
+semantic graph must be compiled into a causal routing graph before it becomes an
+attention support.
+
+\subsection{A minimal typed extension}
+
+The smallest meaningful extension from current HSA is:
+\begin{itemize}[leftmargin=1.5em]
+    \item keep binary support families,
+    \item add edge type $\tau_{ij}$,
+    \item modify the score and/or transmitted message by type.
+\end{itemize}
+
+A minimal relation-aware score is:
+\[
+\mathrm{score}_{ij}
+=
+q_i^\top W_{\tau_{ij}} k_j + b_{\tau_{ij}}.
+\]
+
+A minimal relation-aware message is:
+\[
+m_{ij}
+=
+\alpha_{ij}\, T_{\tau_{ij}}(v_j),
+\qquad
+o_i = \sum_{j} m_{ij}.
+\]
+
+This already gives a typed directed semantic graph while remaining relatively
+close to the current masked-attention implementation model.
+
+\section{Toward Signed and Causal Message Passing}
+
+\subsection{Why signed edges are interesting}
+
+Some relations are naturally excitatory while others are inhibitory. For
+example, a world-state graph might treat
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{rain} $\to$ \texttt{wet-ground} as positive,
+    \item \texttt{watering} $\to$ \texttt{wet-ground} as positive,
+    \item \texttt{sun/heat} $\to$ \texttt{wet-ground} as negative or drying.
+\end{itemize}
+
+A pure binary mask cannot distinguish these. Even a typed score only changes who
+is read from, not whether the message should reinforce or inhibit the target.
+
+\subsection{What softmax cannot express directly}
+
+Softmax gives positive simplex weights. So if the goal is to model signed or
+inhibitory influence directly, one likely needs one of:
+\begin{enumerate}[leftmargin=1.5em]
+    \item relation-specific value transforms with sign,
+    \item dual positive/negative channels,
+    \item a non-simplex aggregator,
+    \item latent semantic state nodes where inhibitory structure is carried in
+    state rather than in the raw attention weights.
+\end{enumerate}
+
+\subsection{A realistic near-term precursor}
+
+The most practical precursor to causal reasoning is not true interventional
+causality. It is:
+\begin{quote}
+typed directed sparse message passing over tokens and semantic memory nodes,
+where the graph encodes permitted information pathways and relation-specific
+message transforms.
+\end{quote}
+
+That is already a meaningful leap beyond hierarchy, while remaining compatible
+with autoregressive training.
+
+\section{Why This Is Not Yet True Causal Reasoning}
+
+A directed semantic graph inside a next-token predictor is still an
+\emph{inductive bias}, not a causal model in Pearl's sense. True causal claims
+require more than directional edges:
+\begin{itemize}[leftmargin=1.5em]
+    \item intervention semantics,
+    \item counterfactual structure,
+    \item assumptions about latent confounding,
+    \item or explicit world-state modeling.
+\end{itemize}
+
+So the better description is:
+\begin{quote}
+the current HSA machinery can be extended into a typed semantic routing
+framework that may support precursors to causal reasoning, but not causal
+inference merely by virtue of using a directed graph.
+\end{quote}
+
+\section{A Concrete Leapfrog Plan}
+
+\subsection{Stage 1: typed sparse graph}
+
+Extend the current binary support into a small set of typed edge families:
+\begin{itemize}[leftmargin=1.5em]
+    \item local,
+    \item summary/hierarchy,
+    \item entity-link,
+    \item discourse,
+    \item causal-positive,
+    \item causal-negative.
+\end{itemize}
+
+This step can reuse:
+\begin{itemize}[leftmargin=1.5em]
+    \item token-side metadata extraction,
+    \item graph compilation,
+    \item sidecars,
+    \item packed family scheduling.
+\end{itemize}
+
+\subsection{Stage 2: relation-aware score and message transforms}
+
+Keep the sparse routing framework, but make score and message depend on edge
+type. This is still close enough to current HSA that the implementation can
+evolve incrementally.
+
+\subsection{Stage 3: semantic memory nodes}
+
+Introduce explicit non-token nodes such as:
+\begin{itemize}[leftmargin=1.5em]
+    \item entity nodes,
+    \item event nodes,
+    \item state nodes,
+    \item section or chapter summaries,
+    \item retrieved knowledge nodes.
+\end{itemize}
+
+Then sparse attention becomes routing between tokens and memory/state nodes,
+rather than only between raw tokens.
+
+\subsection{Stage 4: signed or non-simplex aggregation}
+
+Only after typed graph routing is stable should the scoring rule itself be
+generalized beyond pure masked softmax, for example by allowing signed message
+coefficients or separate positive/negative channels.
+
+\section{Summary}
+
+The current HSA implementation should be understood as \emph{sparse causal
+routing}, not arbitrary graph attention. Its graph compiler, exact dense/sparse
+references, sidecar system, and packing framework already provide reusable
+infrastructure for a richer semantic-graph program.
+
+The key engineering lessons so far are:
+\begin{enumerate}[leftmargin=1.5em]
+    \item correctness depends on semantic mask, sparse schedule, and kernel
+    support all matching exactly;
+    \item forward benefits strongly from aggressive packing because the problem
+    is query-owned and easy to regularize;
+    \item backward remains best as \texttt{sparse\_mask} because the q-owned /
+    k-owned mismatch makes packed backward substantially harder;
+    \item generalized 2-D packing is the right forward abstraction because it
+    extracts dense submatrices from the support matrix itself;
+    \item the natural next leap is typed directed semantic routing, not a jump
+    straight to unrestricted signed graph inference.
+\end{enumerate}
+
+In short: the current method will not work with \emph{any} graph and token
+scheme, but it is already close to a general graph compiler for \emph{causalized
+sparse semantic routing}. That is a strong base for the next stage.
+
+\section*{References}
+
+\begin{thebibliography}{99}
+
+\bibitem{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin.
+\newblock \emph{Attention Is All You Need}.
+\newblock NeurIPS, 2017.
+\newblock \url{https://arxiv.org/abs/1706.03762}
+
+\bibitem{dao2022flashattention}
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Re.
+\newblock \emph{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}.
+\newblock NeurIPS, 2022.
+\newblock \url{https://arxiv.org/abs/2205.14135}
+
+\bibitem{dao2023flashattention2}
+Tri Dao.
+\newblock \emph{FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning}.
+\newblock 2023.
+\newblock \url{https://arxiv.org/abs/2307.08691}
+
+\bibitem{beltagy2020longformer}
+Iz Beltagy, Matthew E. Peters, and Arman Cohan.
+\newblock \emph{Longformer: The Long-Document Transformer}.
+\newblock 2020.
+\newblock \url{https://arxiv.org/abs/2004.05150}
+
+\bibitem{zaheer2020bigbird}
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie,
+Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula,
+Qifan Wang, Li Yang, and Amr Ahmed.
+\newblock \emph{Big Bird: Transformers for Longer Sequences}.
+\newblock NeurIPS, 2020.
+\newblock \url{https://arxiv.org/abs/2007.14062}
+
+\bibitem{velivckovic2018gat}
+Petar Velickovic, Guillem Cucurull, Arantxa Casanova, Adriana Romero,
+Pietro Lio, and Yoshua Bengio.
+\newblock \emph{Graph Attention Networks}.
+\newblock ICLR, 2018.
+\newblock \url{https://arxiv.org/abs/1710.10903}
+
+\bibitem{schlichtkrull2018rgcn}
+Michael Schlichtkrull, Thomas N. Kipf, Peter Bloem, Rianne van den Berg,
+Ivan Titov, and Max Welling.
+\newblock \emph{Modeling Relational Data with Graph Convolutional Networks}.
+\newblock ESWC, 2018.
+\newblock \url{https://arxiv.org/abs/1703.06103}
+
+\bibitem{battaglia2018relational}
+Peter W. Battaglia, Jessica B. Hamrick, Victor Bapst, Alvaro Sanchez-Gonzalez,
+Vinicius Zambaldi, Mateusz Malinowski, Andrea Tacchetti, David Raposo,
+Adam Santoro, Ryan Faulkner, Caglar Gulcehre, H. Francis Song,
+Andrew J. Ballard, Justin Gilmer, George E. Dahl, Ashish Vaswani,
+Kelsey R. Allen, Charles Nash, Victoria Langston, Chris Dyer,
+Nicolas Heess, Daan Wierstra, Pushmeet Kohli, Matthew Botvinick,
+Oriol Vinyals, Yujia Li, and Razvan Pascanu.
+\newblock \emph{Relational Inductive Biases, Deep Learning, and Graph Networks}.
+\newblock 2018.
+\newblock \url{https://arxiv.org/abs/1806.01261}
+
+\bibitem{hu2020hgt}
+Ziniu Hu, Yuxiao Dong, Kuansan Wang, and Yizhou Sun.
+\newblock \emph{Heterogeneous Graph Transformer}.
+\newblock WWW, 2020.
+\newblock \url{https://arxiv.org/abs/2003.01332}
+
+\bibitem{derr2018signedgcn}
+Tyler Derr, Yao Ma, and Jiliang Tang.
+\newblock \emph{Signed Graph Convolutional Network}.
+\newblock ICDM, 2018.
+\newblock \url{https://arxiv.org/abs/1808.06354}
+
+\bibitem{pearl2009causality}
+Judea Pearl.
+\newblock \emph{Causality: Models, Reasoning, and Inference}.
+\newblock Cambridge University Press, second edition, 2009.
+\newblock \url{https://www.cambridge.org/core/books/causality/B0046844FAE10CBF274D4ACBDAEB5F5B}
+
+\end{thebibliography}
+
+\end{document}

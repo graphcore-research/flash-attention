@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
@@ -274,7 +275,7 @@ def _build_group_mask_words(
 def _decode_mask_words_to_bool(mask_words: torch.Tensor, width: int) -> torch.Tensor:
     if width <= 0:
         return torch.zeros((int(mask_words.shape[0]), 0), dtype=torch.bool)
-    bit_offsets = torch.arange(32, dtype=torch.int64).view(1, 1, 32)
+    bit_offsets = torch.arange(32, dtype=torch.int64, device=mask_words.device).view(1, 1, 32)
     mask_words_u32 = mask_words.to(dtype=torch.int64) & ((1 << 32) - 1)
     unpacked = ((mask_words_u32.unsqueeze(-1) >> bit_offsets) & 1).to(dtype=torch.bool)
     return unpacked.view(int(mask_words.shape[0]), -1)[:, :width].contiguous()
@@ -1150,6 +1151,9 @@ def _finalize_generalized_cached_forward_payload(
     }
     if mask_bool is not None:
         payload["mask_bool"] = mask_bool.contiguous()
+    backward_payload = build_cached_generalized_backward_payload(payload)
+    if isinstance(backward_payload, dict):
+        payload["cached_generalized_backward_payload"] = backward_payload
     return payload
 
 
@@ -1719,7 +1723,160 @@ def build_cached_direct_2d_forward_payload(
     }
     if mask_bool is not None:
         payload["mask_bool"] = mask_bool.contiguous()
+    backward_payload = build_cached_generalized_backward_payload(payload)
+    if isinstance(backward_payload, dict):
+        payload["cached_generalized_backward_payload"] = backward_payload
     return payload
+
+
+def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or payload.get("status") != "ready":
+        return None
+    if str(payload.get("exact_kernel_family", "")) != "tc8x8":
+        return None
+    if str(payload.get("residual_mode", "")) != "fused_tail":
+        return None
+    if int(payload.get("exact_dense_rows_per_range", 0)) != 8:
+        return None
+    if int(payload.get("exact_dense_keys_per_tile", 0)) != 8:
+        return None
+
+    fused_q_row_idx = payload.get("fused_q_row_idx")
+    fused_q_length = payload.get("fused_q_length")
+    fused_exact_tile_ptr = payload.get("fused_exact_tile_ptr")
+    fused_exact_k_row_idx = payload.get("fused_exact_k_row_idx")
+    fused_tail_tile_ptr = payload.get("fused_tail_tile_ptr")
+    fused_tail_k_row_idx = payload.get("fused_tail_k_row_idx")
+    fused_tail_mask_words = payload.get("fused_tail_mask_words")
+    if not all(
+        isinstance(tensor, torch.Tensor)
+        for tensor in (
+            fused_q_row_idx,
+            fused_q_length,
+            fused_exact_tile_ptr,
+            fused_exact_k_row_idx,
+            fused_tail_tile_ptr,
+            fused_tail_k_row_idx,
+            fused_tail_mask_words,
+        )
+    ):
+        return None
+
+    device = fused_q_row_idx.device
+    q_row_idx_cpu = fused_q_row_idx.detach().to("cpu").tolist()
+    q_length_cpu = fused_q_length.detach().to("cpu").tolist()
+    exact_tile_ptr_cpu = fused_exact_tile_ptr.detach().to("cpu").tolist()
+    exact_k_row_idx_cpu = fused_exact_k_row_idx.detach().to("cpu").tolist()
+    tail_tile_ptr_cpu = fused_tail_tile_ptr.detach().to("cpu").tolist()
+    tail_k_row_idx_cpu = fused_tail_k_row_idx.detach().to("cpu").tolist()
+    tail_mask_words_cpu = fused_tail_mask_words.detach().to("cpu").tolist()
+
+    q_rows_flat: list[int] = []
+    for range_idx, q_length_value in enumerate(q_length_cpu):
+        for row_idx in range(min(8, int(q_length_value))):
+            q_row = int(q_row_idx_cpu[range_idx][row_idx])
+            if q_row >= 0:
+                q_rows_flat.append(q_row)
+    if len(q_rows_flat) != len(set(q_rows_flat)):
+        return None
+
+    class _LocalKOverflow(Exception):
+        pass
+
+    max_local_k_per_range = 64
+    owned_occurrences: dict[int, list[tuple[int, int, int, int]]] = {}
+    range_local_k_ptr = [0]
+    range_local_k_row_idx: list[int] = []
+    exact_tile_local_k_idx = [[-1 for _ in range(8)] for _ in range(len(exact_k_row_idx_cpu))]
+    tail_tile_local_k_idx = [[-1 for _ in range(8)] for _ in range(len(tail_k_row_idx_cpu))]
+    try:
+        for range_idx, q_length_value in enumerate(q_length_cpu):
+            q_length_value = int(q_length_value)
+            if q_length_value <= 0:
+                range_local_k_ptr.append(len(range_local_k_row_idx))
+                continue
+            local_k_index: dict[int, int] = {}
+
+            def _get_local_k_idx(key_row: int) -> int:
+                local_idx = local_k_index.get(key_row)
+                if local_idx is None:
+                    local_idx = len(local_k_index)
+                    if local_idx >= max_local_k_per_range:
+                        raise _LocalKOverflow(
+                            f"cached_generalized_backward_local_k_overflow range={range_idx} count>{max_local_k_per_range}"
+                        )
+                    local_k_index[key_row] = local_idx
+                    range_local_k_row_idx.append(int(key_row))
+                return local_idx
+
+            exact_start = int(exact_tile_ptr_cpu[range_idx])
+            exact_end = int(exact_tile_ptr_cpu[range_idx + 1])
+            for tile_idx in range(exact_start, exact_end):
+                tile_rows = exact_k_row_idx_cpu[tile_idx]
+                for col_idx, key_row in enumerate(tile_rows):
+                    key_row = int(key_row)
+                    if key_row < 0:
+                        continue
+                    exact_tile_local_k_idx[tile_idx][col_idx] = _get_local_k_idx(key_row)
+                    owned_occurrences.setdefault(key_row, []).append((0, int(range_idx), int(tile_idx), int(col_idx)))
+
+            tail_start = int(tail_tile_ptr_cpu[range_idx])
+            tail_end = int(tail_tile_ptr_cpu[range_idx + 1])
+            for tile_idx in range(tail_start, tail_end):
+                tile_rows = tail_k_row_idx_cpu[tile_idx]
+                row_masks = [int(mask_words[0]) for mask_words in tail_mask_words_cpu[tile_idx][:q_length_value]]
+                active_cols = 0
+                for row_mask in row_masks:
+                    active_cols |= int(row_mask)
+                for col_idx, key_row in enumerate(tile_rows):
+                    key_row = int(key_row)
+                    if key_row < 0 or ((active_cols >> col_idx) & 1) == 0:
+                        continue
+                    tail_tile_local_k_idx[tile_idx][col_idx] = _get_local_k_idx(key_row)
+                    owned_occurrences.setdefault(key_row, []).append((1, int(range_idx), int(tile_idx), int(col_idx)))
+            range_local_k_ptr.append(len(range_local_k_row_idx))
+    except _LocalKOverflow:
+        return None
+
+    owned_k_row_idx: list[int] = []
+    owned_occurrence_ptr = [0]
+    owned_occurrence_kind: list[int] = []
+    owned_occurrence_range_idx: list[int] = []
+    owned_occurrence_tile_idx: list[int] = []
+    owned_occurrence_col_idx: list[int] = []
+    for key_row in sorted(owned_occurrences):
+        owned_k_row_idx.append(int(key_row))
+        for kind, range_idx, tile_idx, col_idx in owned_occurrences[key_row]:
+            owned_occurrence_kind.append(int(kind))
+            owned_occurrence_range_idx.append(int(range_idx))
+            owned_occurrence_tile_idx.append(int(tile_idx))
+            owned_occurrence_col_idx.append(int(col_idx))
+        owned_occurrence_ptr.append(len(owned_occurrence_kind))
+
+    return {
+        "status": "ready",
+        "backward_kernel_family": "cached_tc8x8_fused",
+        "rows_per_range": 8,
+        "keys_per_tile": 8,
+        "head_dim": 64,
+        "max_local_k_per_range": max_local_k_per_range,
+        "range_local_k_ptr": torch.tensor(range_local_k_ptr, dtype=torch.int32, device=device).contiguous(),
+        "range_local_k_row_idx": torch.tensor(range_local_k_row_idx, dtype=torch.int32, device=device).contiguous(),
+        "exact_tile_local_k_idx": torch.tensor(exact_tile_local_k_idx, dtype=torch.int32, device=device).contiguous(),
+        "tail_tile_local_k_idx": torch.tensor(tail_tile_local_k_idx, dtype=torch.int32, device=device).contiguous(),
+        "owned_k_row_idx": torch.tensor(owned_k_row_idx, dtype=torch.int32, device=device).contiguous(),
+        "owned_occurrence_ptr": torch.tensor(owned_occurrence_ptr, dtype=torch.int32, device=device).contiguous(),
+        "owned_occurrence_kind": torch.tensor(owned_occurrence_kind, dtype=torch.int32, device=device).contiguous(),
+        "owned_occurrence_range_idx": torch.tensor(
+            owned_occurrence_range_idx, dtype=torch.int32, device=device
+        ).contiguous(),
+        "owned_occurrence_tile_idx": torch.tensor(
+            owned_occurrence_tile_idx, dtype=torch.int32, device=device
+        ).contiguous(),
+        "owned_occurrence_col_idx": torch.tensor(
+            owned_occurrence_col_idx, dtype=torch.int32, device=device
+        ).contiguous(),
+    }
 
 
 def _get_cached_direct_2d_buffers(
@@ -2210,4 +2367,769 @@ def run_cached_generalized_packed_forward(
         v,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
+    )
+
+
+def _expand_kv_to_q_heads_local(x: torch.Tensor, num_q_heads: int) -> torch.Tensor:
+    if int(x.shape[2]) == int(num_q_heads):
+        return x
+    repeat_factor = int(num_q_heads) // int(x.shape[2])
+    return x.repeat_interleave(repeat_factor, dim=2)
+
+
+def _collapse_q_to_kv_heads_local(x: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
+    if int(x.shape[2]) == int(num_kv_heads):
+        return x
+    repeat_factor = int(x.shape[2]) // int(num_kv_heads)
+    return x.view(x.shape[0], x.shape[1], num_kv_heads, repeat_factor, x.shape[3]).sum(dim=3)
+
+
+def can_use_cached_generalized_fused_backward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    deterministic: bool = False,
+) -> bool:
+    if payload.get("status") != "ready" or deterministic:
+        return False
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return False
+    if q.shape[-1] != 64 or k.shape[-1] != 64:
+        return False
+    if q.dtype not in {torch.float16, torch.bfloat16}:
+        return False
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        return False
+    if str(payload.get("exact_kernel_family", "")) != "tc8x8":
+        return False
+    if str(payload.get("residual_mode", "")) != "fused_tail":
+        return False
+    if int(payload.get("exact_dense_rows_per_range", 0)) != 8:
+        return False
+    if int(payload.get("exact_dense_keys_per_tile", 0)) != 8:
+        return False
+    fused_q_row_idx = payload.get("fused_q_row_idx")
+    fused_exact_tile_ptr = payload.get("fused_exact_tile_ptr")
+    fused_tail_tile_ptr = payload.get("fused_tail_tile_ptr")
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (fused_q_row_idx, fused_exact_tile_ptr, fused_tail_tile_ptr)):
+        return False
+    if int(fused_q_row_idx.shape[0]) <= 0:
+        return False
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        return False
+    if float(geometry.get("fused_total_coverage_frac", 0.0)) < 0.999:
+        return False
+    if int(geometry.get("legacy_residual_fallback_range_count", 0)) != 0:
+        return False
+    backward_payload = payload.get("cached_generalized_backward_payload")
+    if q.is_cuda:
+        if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+            return False
+        if str(backward_payload.get("backward_kernel_family", "")) != "cached_tc8x8_fused":
+            return False
+        if int(backward_payload.get("rows_per_range", 0)) != 8:
+            return False
+        if int(backward_payload.get("keys_per_tile", 0)) != 8:
+            return False
+    return True
+
+
+def _get_cached_backward_workspace(payload: dict[str, Any]) -> dict[str, Any]:
+    workspace = payload.setdefault("_workspace", {})
+    if not isinstance(workspace, dict):
+        workspace = {}
+        payload["_workspace"] = workspace
+    return workspace
+
+
+def _get_tile_range_index(
+    payload: dict[str, Any],
+    *,
+    ptr_key: str,
+) -> torch.Tensor:
+    workspace = _get_cached_backward_workspace(payload)
+    cache_key = f"backward_{ptr_key}_range_idx"
+    cached = workspace.get(cache_key)
+    ptr = payload[ptr_key]
+    if isinstance(cached, torch.Tensor) and cached.device == ptr.device:
+        return cached
+    tile_counts = (ptr[1:] - ptr[:-1]).to(dtype=torch.long)
+    if int(tile_counts.numel()) <= 0 or int(tile_counts.sum().item()) <= 0:
+        cached = torch.empty((0,), dtype=torch.long, device=ptr.device)
+    else:
+        cached = torch.repeat_interleave(
+            torch.arange(int(tile_counts.shape[0]), device=ptr.device, dtype=torch.long),
+            tile_counts,
+        ).contiguous()
+    workspace[cache_key] = cached
+    return cached
+
+
+def _decode_tail_mask_words_chunk(mask_words: torch.Tensor, width: int) -> torch.Tensor:
+    if int(mask_words.numel()) <= 0:
+        return torch.zeros((int(mask_words.shape[0]), int(mask_words.shape[1]), width), dtype=torch.bool, device=mask_words.device)
+    flat_mask = mask_words.reshape(-1, mask_words.shape[-1]).contiguous()
+    decoded = _decode_mask_words_to_bool(flat_mask, width)
+    return decoded.view(int(mask_words.shape[0]), int(mask_words.shape[1]), width).contiguous()
+
+
+def _build_cached_generalized_pair_tile_backward_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    workspace = _get_cached_backward_workspace(payload)
+    fused_q_row_idx = payload["fused_q_row_idx"]
+    cache_key = ("pair_tile_backward_payload", str(fused_q_row_idx.device))
+    cached = workspace.get(cache_key)
+    if isinstance(cached, dict):
+        cached_q_row_idx = cached.get("q_row_idx")
+        if isinstance(cached_q_row_idx, torch.Tensor) and cached_q_row_idx.device == fused_q_row_idx.device:
+            return cached
+
+    device = fused_q_row_idx.device
+    q_row_idx_cpu = fused_q_row_idx.detach().to("cpu").tolist()
+    q_length_cpu = payload["fused_q_length"].detach().to("cpu").tolist()
+    exact_tile_ptr_cpu = payload["fused_exact_tile_ptr"].detach().to("cpu").tolist()
+    exact_k_row_idx_cpu = payload["fused_exact_k_row_idx"].detach().to("cpu").tolist()
+    tail_tile_ptr_cpu = payload["fused_tail_tile_ptr"].detach().to("cpu").tolist()
+    tail_k_row_idx_cpu = payload["fused_tail_k_row_idx"].detach().to("cpu").tolist()
+    tail_mask_words_cpu = payload["fused_tail_mask_words"].detach().to("cpu").tolist()
+
+    member_q_row_idx: list[list[int]] = []
+    member_q_length: list[int] = []
+    member_row_k_row_idx: list[list[list[int]]] = []
+    member_row_k_to_union_idx: list[list[list[int]]] = []
+    member_union_k_row_idx: list[list[int]] = []
+    member_union_to_row_slot: list[list[list[int]]] = []
+    member_row_k_length: list[list[int]] = []
+    member_union_k_length: list[int] = []
+    unique_key_occurrences: dict[int, list[tuple[int, int]]] = {}
+
+    def append_member(
+        pair_q_rows: list[int],
+        union_rows: list[int],
+        row_support_lists: list[list[int]],
+    ) -> None:
+        if not pair_q_rows or not union_rows:
+            return
+        member_idx = len(member_q_row_idx)
+        q_pair = [int(value) for value in pair_q_rows[:2]]
+        q_pair.extend([-1] * (2 - len(q_pair)))
+        member_q_row_idx.append(q_pair)
+        member_q_length.append(min(2, len(pair_q_rows)))
+
+        union_rows = [int(value) for value in union_rows[:8] if int(value) >= 0]
+        union_index = {int(key_row): idx for idx, key_row in enumerate(union_rows)}
+        padded_union_rows = union_rows + [-1] * (8 - len(union_rows))
+        member_union_k_row_idx.append(padded_union_rows)
+        member_union_k_length.append(len(union_rows))
+
+        row_k_rows_entry: list[list[int]] = []
+        row_k_to_union_entry: list[list[int]] = []
+        union_to_row_entry: list[list[int]] = []
+        row_k_length_entry: list[int] = []
+        for row_slot in range(2):
+            support_rows = [int(value) for value in row_support_lists[row_slot]] if row_slot < len(row_support_lists) else []
+            support_rows = [value for value in support_rows if value in union_index]
+            row_k_length_entry.append(len(support_rows))
+            row_k_rows_entry.append(support_rows + [-1] * (8 - len(support_rows)))
+            row_k_to_union_entry.append([union_index[value] for value in support_rows] + [-1] * (8 - len(support_rows)))
+            union_to_row = [-1] * 8
+            for row_local_slot, key_row in enumerate(support_rows):
+                union_to_row[union_index[key_row]] = row_local_slot
+            union_to_row_entry.append(union_to_row)
+        member_row_k_row_idx.append(row_k_rows_entry)
+        member_row_k_to_union_idx.append(row_k_to_union_entry)
+        member_union_to_row_slot.append(union_to_row_entry)
+        member_row_k_length.append(row_k_length_entry)
+
+        for union_idx, key_row in enumerate(union_rows):
+            unique_key_occurrences.setdefault(int(key_row), []).append((member_idx, union_idx))
+
+    for range_idx, q_length_value in enumerate(q_length_cpu):
+        q_length_value = int(q_length_value)
+        if q_length_value <= 0:
+            continue
+        range_q_rows = [int(value) for value in q_row_idx_cpu[range_idx][:q_length_value] if int(value) >= 0]
+        if not range_q_rows:
+            continue
+        exact_start = int(exact_tile_ptr_cpu[range_idx])
+        exact_end = int(exact_tile_ptr_cpu[range_idx + 1])
+        for tile_idx in range(exact_start, exact_end):
+            union_rows = [int(value) for value in exact_k_row_idx_cpu[tile_idx] if int(value) >= 0]
+            if not union_rows:
+                continue
+            for pair_start in range(0, len(range_q_rows), 2):
+                pair_q_rows = range_q_rows[pair_start : pair_start + 2]
+                row_support_lists = [list(union_rows) for _ in pair_q_rows]
+                append_member(pair_q_rows, union_rows, row_support_lists)
+
+        tail_start = int(tail_tile_ptr_cpu[range_idx])
+        tail_end = int(tail_tile_ptr_cpu[range_idx + 1])
+        for tile_idx in range(tail_start, tail_end):
+            tile_rows = [int(value) for value in tail_k_row_idx_cpu[tile_idx] if int(value) >= 0]
+            if not tile_rows:
+                continue
+            row_masks = [int(mask_words[0]) for mask_words in tail_mask_words_cpu[tile_idx][: len(range_q_rows)]]
+            for pair_start in range(0, len(range_q_rows), 2):
+                pair_q_rows = range_q_rows[pair_start : pair_start + 2]
+                pair_masks = row_masks[pair_start : pair_start + len(pair_q_rows)]
+                active_cols = [
+                    col_idx
+                    for col_idx, key_row in enumerate(tile_rows)
+                    if any(((int(row_mask) >> col_idx) & 1) for row_mask in pair_masks) and int(key_row) >= 0
+                ]
+                if not active_cols:
+                    continue
+                union_rows = [tile_rows[col_idx] for col_idx in active_cols]
+                row_support_lists = []
+                for local_row_idx, row_mask in enumerate(pair_masks):
+                    del local_row_idx
+                    row_support_lists.append(
+                        [
+                            tile_rows[col_idx]
+                            for col_idx in active_cols
+                            if ((int(row_mask) >> col_idx) & 1) and int(tile_rows[col_idx]) >= 0
+                        ]
+                    )
+                append_member(pair_q_rows, union_rows, row_support_lists)
+
+    if member_q_row_idx:
+        q_row_idx = torch.tensor(member_q_row_idx, dtype=torch.int32, device=device)
+        q_length = torch.tensor(member_q_length, dtype=torch.int32, device=device)
+        row_k_row_idx = torch.tensor(member_row_k_row_idx, dtype=torch.int32, device=device)
+        row_k_to_union_idx = torch.tensor(member_row_k_to_union_idx, dtype=torch.int32, device=device)
+        union_k_row_idx = torch.tensor(member_union_k_row_idx, dtype=torch.int32, device=device)
+        union_to_row_slot = torch.tensor(member_union_to_row_slot, dtype=torch.int32, device=device)
+        row_k_length = torch.tensor(member_row_k_length, dtype=torch.int32, device=device)
+        union_k_length = torch.tensor(member_union_k_length, dtype=torch.int32, device=device)
+    else:
+        q_row_idx = torch.empty((0, 2), dtype=torch.int32, device=device)
+        q_length = torch.empty((0,), dtype=torch.int32, device=device)
+        row_k_row_idx = torch.empty((0, 2, 8), dtype=torch.int32, device=device)
+        row_k_to_union_idx = torch.empty((0, 2, 8), dtype=torch.int32, device=device)
+        union_k_row_idx = torch.empty((0, 8), dtype=torch.int32, device=device)
+        union_to_row_slot = torch.empty((0, 2, 8), dtype=torch.int32, device=device)
+        row_k_length = torch.empty((0, 2), dtype=torch.int32, device=device)
+        union_k_length = torch.empty((0,), dtype=torch.int32, device=device)
+
+    unique_key_row_idx_list: list[int] = []
+    unique_key_member_idx_list: list[int] = []
+    unique_key_union_idx_list: list[int] = []
+    unique_key_occurrence_row_ptr_list = [0]
+    max_unique_key_occurrences = 0
+    for key_row in sorted(unique_key_occurrences):
+        occurrences = unique_key_occurrences[key_row]
+        max_unique_key_occurrences = max(max_unique_key_occurrences, len(occurrences))
+        unique_key_row_idx_list.append(int(key_row))
+        for member_idx, union_idx in occurrences:
+            unique_key_member_idx_list.append(int(member_idx))
+            unique_key_union_idx_list.append(int(union_idx))
+        unique_key_occurrence_row_ptr_list.append(len(unique_key_member_idx_list))
+
+    built = {
+        "q_row_idx": q_row_idx.contiguous(),
+        "q_length": q_length.contiguous(),
+        "row_k_row_idx": row_k_row_idx.contiguous(),
+        "row_k_to_union_idx": row_k_to_union_idx.contiguous(),
+        "union_k_row_idx": union_k_row_idx.contiguous(),
+        "union_to_row_slot": union_to_row_slot.contiguous(),
+        "row_k_length": row_k_length.contiguous(),
+        "union_k_length": union_k_length.contiguous(),
+        "unique_key_row_idx": torch.tensor(unique_key_row_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_member_idx": torch.tensor(unique_key_member_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_union_idx": torch.tensor(unique_key_union_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_occurrence_row_ptr": torch.tensor(
+            unique_key_occurrence_row_ptr_list,
+            dtype=torch.int32,
+            device=device,
+        ).contiguous(),
+        "max_unique_key_occurrences": int(max_unique_key_occurrences),
+    }
+    workspace[cache_key] = built
+    return built
+
+
+def _accumulate_cached_generalized_tile_backward(
+    *,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    dout_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    dq_acc: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+    q_row_idx: torch.Tensor,
+    q_length: torch.Tensor,
+    tile_k_row_idx: torch.Tensor,
+    tile_range_idx: torch.Tensor,
+    softmax_scale: float,
+    tail_mask_words: torch.Tensor | None = None,
+    chunk_tiles: int = 2048,
+) -> None:
+    total_tiles = int(tile_k_row_idx.shape[0])
+    if total_tiles <= 0:
+        return
+    device = q_flat.device
+    num_q_heads = int(q_flat.shape[1])
+    num_kv_heads = int(k_flat.shape[1])
+    q_slots = int(q_row_idx.shape[1])
+    k_slots = int(tile_k_row_idx.shape[1])
+    q_offsets = torch.arange(q_slots, device=device, dtype=torch.int32).view(1, q_slots)
+    for tile_start in range(0, total_tiles, chunk_tiles):
+        tile_end = min(total_tiles, tile_start + chunk_tiles)
+        chunk_range_idx = tile_range_idx[tile_start:tile_end]
+        chunk_q_row_idx = q_row_idx.index_select(0, chunk_range_idx).contiguous()
+        chunk_q_length = q_length.index_select(0, chunk_range_idx).contiguous()
+        q_valid = q_offsets < chunk_q_length.unsqueeze(1)
+        q_index = chunk_q_row_idx.clamp_min(0).to(dtype=torch.long)
+        q_sel = q_flat.index_select(0, q_index.reshape(-1)).view(tile_end - tile_start, q_slots, num_q_heads, q_flat.shape[-1]).contiguous()
+        out_sel = out_flat.index_select(0, q_index.reshape(-1)).view(tile_end - tile_start, q_slots, num_q_heads, out_flat.shape[-1]).contiguous()
+        dout_sel = dout_flat.index_select(0, q_index.reshape(-1)).view(tile_end - tile_start, q_slots, num_q_heads, dout_flat.shape[-1]).contiguous()
+        lse_sel = lse_flat.index_select(0, q_index.reshape(-1)).view(tile_end - tile_start, q_slots, num_q_heads).contiguous()
+
+        chunk_k_row_idx = tile_k_row_idx[tile_start:tile_end].contiguous()
+        k_valid = chunk_k_row_idx >= 0
+        k_index = chunk_k_row_idx.clamp_min(0).to(dtype=torch.long)
+        k_sel = k_flat.index_select(0, k_index.reshape(-1)).view(tile_end - tile_start, k_slots, num_kv_heads, k_flat.shape[-1]).contiguous()
+        v_sel = v_flat.index_select(0, k_index.reshape(-1)).view(tile_end - tile_start, k_slots, num_kv_heads, v_flat.shape[-1]).contiguous()
+        k_q_heads = _expand_kv_to_q_heads_local(k_sel, num_q_heads).permute(0, 2, 1, 3).contiguous()
+        v_q_heads = _expand_kv_to_q_heads_local(v_sel, num_q_heads).permute(0, 2, 1, 3).contiguous()
+
+        q_heads = q_sel.permute(0, 2, 1, 3).contiguous()
+        out_heads = out_sel.permute(0, 2, 1, 3).contiguous()
+        dout_heads = dout_sel.permute(0, 2, 1, 3).contiguous()
+        lse_heads = lse_sel.permute(0, 2, 1).unsqueeze(-1).float()
+
+        scores = torch.matmul(q_heads, k_q_heads.transpose(-1, -2)).float()
+        scores.mul_(float(softmax_scale))
+        pair_mask = torch.logical_and(q_valid.unsqueeze(-1), k_valid.unsqueeze(1))
+        if tail_mask_words is not None:
+            tail_mask = _decode_tail_mask_words_chunk(tail_mask_words[tile_start:tile_end], k_slots)
+            pair_mask = torch.logical_and(pair_mask, tail_mask)
+        scores.masked_fill_(~pair_mask.unsqueeze(1), float("-inf"))
+        probs = torch.exp(scores - lse_heads)
+        probs.mul_(pair_mask.unsqueeze(1))
+        dprob = torch.matmul(dout_heads, v_q_heads.transpose(-1, -2)).float()
+        delta = (out_sel.float() * dout_sel.float()).sum(dim=-1).permute(0, 2, 1).unsqueeze(-1)
+        dscores = probs * (dprob - delta)
+
+        dq_chunk = torch.matmul(dscores.to(dtype=q_heads.dtype), k_q_heads).float()
+        dq_chunk.mul_(float(softmax_scale))
+        dq_chunk = dq_chunk.permute(0, 2, 1, 3).contiguous()
+        dq_chunk.mul_(q_valid.unsqueeze(-1).unsqueeze(-1))
+
+        dk_chunk = torch.matmul(dscores.transpose(-1, -2).to(dtype=q_heads.dtype), q_heads).float()
+        dk_chunk.mul_(float(softmax_scale))
+        dk_chunk = _collapse_q_to_kv_heads_local(
+            dk_chunk.permute(0, 2, 1, 3).contiguous(),
+            num_kv_heads,
+        )
+        dk_chunk.mul_(k_valid.unsqueeze(-1).unsqueeze(-1))
+
+        dv_chunk = torch.matmul(probs.transpose(-1, -2).to(dtype=q_heads.dtype), dout_heads).float()
+        dv_chunk = _collapse_q_to_kv_heads_local(
+            dv_chunk.permute(0, 2, 1, 3).contiguous(),
+            num_kv_heads,
+        )
+        dv_chunk.mul_(k_valid.unsqueeze(-1).unsqueeze(-1))
+
+        dq_acc.index_add_(0, q_index.reshape(-1), dq_chunk.reshape(-1, num_q_heads, q_flat.shape[-1]))
+        dk_acc.index_add_(0, k_index.reshape(-1), dk_chunk.reshape(-1, num_kv_heads, k_flat.shape[-1]))
+        dv_acc.index_add_(0, k_index.reshape(-1), dv_chunk.reshape(-1, num_kv_heads, v_flat.shape[-1]))
+
+
+def _materialize_range_tile_chunk(
+    tile_ptr: torch.Tensor,
+    tile_k_row_idx: torch.Tensor,
+    *,
+    range_start: int,
+    range_end: int,
+    tail_mask_words: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    chunk_range_count = max(0, int(range_end) - int(range_start))
+    counts = (tile_ptr[range_start + 1 : range_end + 1] - tile_ptr[range_start:range_end]).to(dtype=torch.long)
+    if chunk_range_count <= 0 or int(counts.numel()) <= 0:
+        empty_rows = torch.empty((0, 0, int(tile_k_row_idx.shape[-1])), dtype=tile_k_row_idx.dtype, device=tile_k_row_idx.device)
+        empty_masks = None
+        if tail_mask_words is not None:
+            empty_masks = torch.empty(
+                (0, 0, int(tail_mask_words.shape[-2]), int(tail_mask_words.shape[-1])),
+                dtype=tail_mask_words.dtype,
+                device=tail_mask_words.device,
+            )
+        return counts, empty_rows, empty_masks
+    max_tiles = int(counts.max().item()) if int(counts.numel()) > 0 else 0
+    if max_tiles <= 0:
+        empty_rows = torch.empty((chunk_range_count, 0, int(tile_k_row_idx.shape[-1])), dtype=tile_k_row_idx.dtype, device=tile_k_row_idx.device)
+        empty_masks = None
+        if tail_mask_words is not None:
+            empty_masks = torch.empty(
+                (chunk_range_count, 0, int(tail_mask_words.shape[-2]), int(tail_mask_words.shape[-1])),
+                dtype=tail_mask_words.dtype,
+                device=tail_mask_words.device,
+            )
+        return counts, empty_rows, empty_masks
+
+    padded_k_rows = torch.full(
+        (chunk_range_count, max_tiles, int(tile_k_row_idx.shape[-1])),
+        -1,
+        dtype=tile_k_row_idx.dtype,
+        device=tile_k_row_idx.device,
+    )
+    padded_tail_masks = None
+    if tail_mask_words is not None:
+        padded_tail_masks = torch.zeros(
+            (chunk_range_count, max_tiles, int(tail_mask_words.shape[-2]), int(tail_mask_words.shape[-1])),
+            dtype=tail_mask_words.dtype,
+            device=tail_mask_words.device,
+        )
+    for local_range_idx in range(chunk_range_count):
+        tile_start = int(tile_ptr[range_start + local_range_idx].item())
+        tile_end = int(tile_ptr[range_start + local_range_idx + 1].item())
+        if tile_end <= tile_start:
+            continue
+        tile_count = tile_end - tile_start
+        padded_k_rows[local_range_idx, :tile_count].copy_(tile_k_row_idx[tile_start:tile_end])
+        if padded_tail_masks is not None:
+            padded_tail_masks[local_range_idx, :tile_count].copy_(tail_mask_words[tile_start:tile_end])
+    return counts, padded_k_rows, padded_tail_masks
+
+
+def _accumulate_cached_generalized_range_tiles(
+    *,
+    q_heads: torch.Tensor,
+    out_sel: torch.Tensor,
+    dout_sel: torch.Tensor,
+    lse_heads: torch.Tensor,
+    q_valid: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+    q_index: torch.Tensor,
+    dq_acc: torch.Tensor,
+    softmax_scale: float,
+    tile_counts: torch.Tensor,
+    padded_k_rows: torch.Tensor,
+    tail_mask_words: torch.Tensor | None = None,
+) -> None:
+    chunk_range_count = int(q_heads.shape[0])
+    if chunk_range_count <= 0 or int(padded_k_rows.shape[1]) <= 0:
+        return
+    num_q_heads = int(q_heads.shape[1])
+    num_kv_heads = int(k_flat.shape[1])
+    q_slots = int(q_heads.shape[2])
+    k_slots = int(padded_k_rows.shape[-1])
+    max_tiles = int(padded_k_rows.shape[1])
+    tile_active = torch.arange(max_tiles, device=q_heads.device, dtype=torch.long).view(1, max_tiles) < tile_counts.unsqueeze(1)
+    k_valid = padded_k_rows >= 0
+    k_index = padded_k_rows.clamp_min(0).to(dtype=torch.long)
+    k_sel = k_flat.index_select(0, k_index.reshape(-1)).view(
+        chunk_range_count,
+        max_tiles,
+        k_slots,
+        num_kv_heads,
+        k_flat.shape[-1],
+    ).contiguous()
+    v_sel = v_flat.index_select(0, k_index.reshape(-1)).view(
+        chunk_range_count,
+        max_tiles,
+        k_slots,
+        num_kv_heads,
+        v_flat.shape[-1],
+    ).contiguous()
+    k_q_heads = _expand_kv_to_q_heads_local(
+        k_sel.view(chunk_range_count * max_tiles, k_slots, num_kv_heads, k_flat.shape[-1]),
+        num_q_heads,
+    ).view(chunk_range_count, max_tiles, k_slots, num_q_heads, k_flat.shape[-1]).permute(0, 1, 3, 2, 4).contiguous()
+    v_q_heads = _expand_kv_to_q_heads_local(
+        v_sel.view(chunk_range_count * max_tiles, k_slots, num_kv_heads, v_flat.shape[-1]),
+        num_q_heads,
+    ).view(chunk_range_count, max_tiles, k_slots, num_q_heads, v_flat.shape[-1]).permute(0, 1, 3, 2, 4).contiguous()
+
+    q_heads_t = q_heads.unsqueeze(1)
+    dout_heads = dout_sel.permute(0, 2, 1, 3).contiguous().unsqueeze(1)
+    scores = torch.matmul(q_heads_t, k_q_heads.transpose(-1, -2)).float()
+    scores.mul_(float(softmax_scale))
+    pair_mask = torch.logical_and(
+        q_valid[:, None, None, :, None],
+        torch.logical_and(tile_active[:, :, None, None, None], k_valid[:, :, None, None, :]),
+    )
+    if tail_mask_words is not None:
+        tail_mask = _decode_tail_mask_words_chunk(
+            tail_mask_words.view(chunk_range_count * max_tiles, q_slots, tail_mask_words.shape[-1]).contiguous(),
+            k_slots,
+        ).view(chunk_range_count, max_tiles, q_slots, k_slots)
+        pair_mask = torch.logical_and(pair_mask, tail_mask[:, :, None, :, :])
+    scores.masked_fill_(~pair_mask, float("-inf"))
+    probs = torch.exp(scores - lse_heads.unsqueeze(1))
+    probs.mul_(pair_mask)
+    dprob = torch.matmul(dout_heads, v_q_heads.transpose(-1, -2)).float()
+    delta = (out_sel.float() * dout_sel.float()).sum(dim=-1).permute(0, 2, 1).unsqueeze(1).unsqueeze(-1)
+    dscores = probs * (dprob - delta)
+
+    dq_chunk = torch.matmul(dscores.to(dtype=q_heads.dtype), k_q_heads).float()
+    dq_chunk.mul_(float(softmax_scale))
+    dq_chunk = dq_chunk.sum(dim=1).permute(0, 2, 1, 3).contiguous()
+    dq_chunk.mul_(q_valid.unsqueeze(-1).unsqueeze(-1))
+    dq_acc.index_add_(0, q_index.reshape(-1), dq_chunk.reshape(-1, num_q_heads, q_heads.shape[-1]))
+
+    dk_chunk = torch.matmul(
+        dscores.transpose(-1, -2).to(dtype=q_heads.dtype),
+        q_heads_t.expand(-1, max_tiles, -1, -1, -1),
+    ).float()
+    dk_chunk.mul_(float(softmax_scale))
+    dk_chunk = _collapse_q_to_kv_heads_local(
+        dk_chunk.permute(0, 1, 3, 2, 4).reshape(chunk_range_count, max_tiles * k_slots, num_q_heads, q_heads.shape[-1]).contiguous(),
+        num_kv_heads,
+    ).view(chunk_range_count, max_tiles, k_slots, num_kv_heads, q_heads.shape[-1]).contiguous()
+    dk_chunk.mul_(torch.logical_and(tile_active.unsqueeze(-1), k_valid).unsqueeze(-1).unsqueeze(-1))
+    dk_acc.index_add_(0, k_index.reshape(-1), dk_chunk.reshape(-1, num_kv_heads, q_heads.shape[-1]))
+
+    dv_chunk = torch.matmul(
+        probs.transpose(-1, -2).to(dtype=q_heads.dtype),
+        dout_heads.expand(-1, max_tiles, -1, -1, -1),
+    ).float()
+    dv_chunk = _collapse_q_to_kv_heads_local(
+        dv_chunk.permute(0, 1, 3, 2, 4).reshape(chunk_range_count, max_tiles * k_slots, num_q_heads, dout_sel.shape[-1]).contiguous(),
+        num_kv_heads,
+    ).view(chunk_range_count, max_tiles, k_slots, num_kv_heads, dout_sel.shape[-1]).contiguous()
+    dv_chunk.mul_(torch.logical_and(tile_active.unsqueeze(-1), k_valid).unsqueeze(-1).unsqueeze(-1))
+    dv_acc.index_add_(0, k_index.reshape(-1), dv_chunk.reshape(-1, num_kv_heads, dout_sel.shape[-1]))
+
+
+def _accumulate_cached_generalized_range_backward(
+    *,
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    dout_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    dq_acc: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+    softmax_scale: float,
+    chunk_ranges: int = 1024,
+) -> None:
+    fused_q_row_idx = payload["fused_q_row_idx"]
+    fused_q_length = payload["fused_q_length"]
+    range_count = int(fused_q_row_idx.shape[0])
+    if range_count <= 0:
+        return
+    num_q_heads = int(q_flat.shape[1])
+    q_offsets = torch.arange(int(fused_q_row_idx.shape[1]), device=q_flat.device, dtype=torch.int32).view(1, -1)
+    for range_start in range(0, range_count, chunk_ranges):
+        range_end = min(range_count, range_start + chunk_ranges)
+        chunk_q_row_idx = fused_q_row_idx[range_start:range_end].contiguous()
+        chunk_q_length = fused_q_length[range_start:range_end].contiguous()
+        q_valid = q_offsets < chunk_q_length.unsqueeze(1)
+        q_index = chunk_q_row_idx.clamp_min(0).to(dtype=torch.long)
+        chunk_rows = range_end - range_start
+        q_sel = q_flat.index_select(0, q_index.reshape(-1)).view(chunk_rows, int(fused_q_row_idx.shape[1]), num_q_heads, q_flat.shape[-1]).contiguous()
+        out_sel = out_flat.index_select(0, q_index.reshape(-1)).view(chunk_rows, int(fused_q_row_idx.shape[1]), num_q_heads, out_flat.shape[-1]).contiguous()
+        dout_sel = dout_flat.index_select(0, q_index.reshape(-1)).view(chunk_rows, int(fused_q_row_idx.shape[1]), num_q_heads, dout_flat.shape[-1]).contiguous()
+        lse_heads = lse_flat.index_select(0, q_index.reshape(-1)).view(chunk_rows, int(fused_q_row_idx.shape[1]), num_q_heads).permute(0, 2, 1).unsqueeze(-1).float()
+        q_heads = q_sel.permute(0, 2, 1, 3).contiguous()
+
+        exact_counts, exact_k_rows, _ = _materialize_range_tile_chunk(
+            payload["fused_exact_tile_ptr"],
+            payload["fused_exact_k_row_idx"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        if int(exact_k_rows.shape[1]) > 0:
+            _accumulate_cached_generalized_range_tiles(
+                q_heads=q_heads,
+                out_sel=out_sel,
+                dout_sel=dout_sel,
+                lse_heads=lse_heads,
+                q_valid=q_valid,
+                k_flat=k_flat,
+                v_flat=v_flat,
+                dk_acc=dk_acc,
+                dv_acc=dv_acc,
+                q_index=q_index,
+                dq_acc=dq_acc,
+                softmax_scale=float(softmax_scale),
+                tile_counts=exact_counts,
+                padded_k_rows=exact_k_rows,
+            )
+
+        tail_counts, tail_k_rows, tail_masks = _materialize_range_tile_chunk(
+            payload["fused_tail_tile_ptr"],
+            payload["fused_tail_k_row_idx"],
+            range_start=range_start,
+            range_end=range_end,
+            tail_mask_words=payload["fused_tail_mask_words"],
+        )
+        if int(tail_k_rows.shape[1]) > 0 and tail_masks is not None:
+            _accumulate_cached_generalized_range_tiles(
+                q_heads=q_heads,
+                out_sel=out_sel,
+                dout_sel=dout_sel,
+                lse_heads=lse_heads,
+                q_valid=q_valid,
+                k_flat=k_flat,
+                v_flat=v_flat,
+                dk_acc=dk_acc,
+                dv_acc=dv_acc,
+                q_index=q_index,
+                dq_acc=dq_acc,
+                softmax_scale=float(softmax_scale),
+                tile_counts=tail_counts,
+                padded_k_rows=tail_k_rows,
+                tail_mask_words=tail_masks,
+            )
+
+
+def run_cached_generalized_packed_backward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    deterministic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not can_use_cached_generalized_fused_backward(payload, q, k, v, deterministic=deterministic):
+        raise RuntimeError("cached_generalized_fused_backward_unsupported")
+
+    q_flat = _flatten_row_tensor(q)
+    k_flat = _flatten_row_tensor(k)
+    v_flat = _flatten_row_tensor(v)
+    out_flat = _flatten_row_tensor(out)
+    dout_flat = _flatten_row_tensor(dout)
+    if q.ndim == 4:
+        lse_flat = lse.permute(0, 2, 1).contiguous().view(-1, q.shape[2]).float()
+    else:
+        lse_flat = lse.transpose(0, 1).contiguous().float()
+    if softmax_scale is None:
+        softmax_scale = q_flat.shape[-1] ** (-0.5)
+
+    dq_acc = torch.zeros_like(q_flat, dtype=torch.float32)
+    dk_acc = torch.zeros_like(k_flat, dtype=torch.float32)
+    dv_acc = torch.zeros_like(v_flat, dtype=torch.float32)
+    if q_flat.is_cuda:
+        local_k_chunk = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_LOCAL_K_CHUNK", "8"))
+        use_tile_atomic_dkdv = os.environ.get(
+            "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
+            "1",
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        backward_payload = payload.get("cached_generalized_backward_payload")
+        if (
+            not isinstance(backward_payload, dict)
+            or backward_payload.get("status") != "ready"
+            or "range_local_k_ptr" not in backward_payload
+            or "range_local_k_row_idx" not in backward_payload
+            or "exact_tile_local_k_idx" not in backward_payload
+            or "tail_tile_local_k_idx" not in backward_payload
+        ):
+            backward_payload = build_cached_generalized_backward_payload(payload)
+            if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+                raise RuntimeError("cached_generalized_fused_backward_missing_payload")
+            payload["cached_generalized_backward_payload"] = backward_payload
+        from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+            _run_cached_generalized_fused_bwd_dkdv_range_kernel,
+            _run_cached_generalized_fused_bwd_dq_kernel,
+        )
+
+        _run_cached_generalized_fused_bwd_dq_kernel(
+            q_flat,
+            k_flat,
+            v_flat,
+            out_flat,
+            dout_flat,
+            lse_flat,
+            payload["fused_q_row_idx"],
+            payload["fused_q_length"],
+            payload["fused_exact_tile_ptr"],
+            payload["fused_exact_k_row_idx"],
+            payload["fused_tail_tile_ptr"],
+            payload["fused_tail_k_row_idx"],
+            payload["fused_tail_mask_words"],
+            dq_acc,
+            dk_acc,
+            dv_acc,
+            softmax_scale=float(softmax_scale),
+        )
+        if (not use_tile_atomic_dkdv) and int(backward_payload["range_local_k_row_idx"].numel()) > 0:
+            _run_cached_generalized_fused_bwd_dkdv_range_kernel(
+                q_flat,
+                k_flat,
+                v_flat,
+                out_flat,
+                dout_flat,
+                lse_flat,
+                payload["fused_q_row_idx"],
+                payload["fused_q_length"],
+                payload["fused_exact_tile_ptr"],
+                backward_payload["exact_tile_local_k_idx"],
+                payload["fused_tail_tile_ptr"],
+                backward_payload["tail_tile_local_k_idx"],
+                payload["fused_tail_mask_words"],
+                backward_payload["range_local_k_ptr"],
+                backward_payload["range_local_k_row_idx"],
+                dk_acc,
+                dv_acc,
+                softmax_scale=float(softmax_scale),
+                local_k_chunk=local_k_chunk,
+            )
+        return (
+            dq_acc.to(dtype=q.dtype).view_as(q),
+            dk_acc.to(dtype=k.dtype).view_as(k),
+            dv_acc.to(dtype=v.dtype).view_as(v),
+        )
+
+    fused_q_row_idx = payload["fused_q_row_idx"]
+    fused_q_length = payload["fused_q_length"]
+    exact_tile_range_idx = _get_tile_range_index(payload, ptr_key="fused_exact_tile_ptr")
+    if int(exact_tile_range_idx.numel()) > 0:
+        _accumulate_cached_generalized_tile_backward(
+            q_flat=q_flat,
+            k_flat=k_flat,
+            v_flat=v_flat,
+            out_flat=out_flat.float(),
+            dout_flat=dout_flat,
+            lse_flat=lse_flat,
+            dq_acc=dq_acc,
+            dk_acc=dk_acc,
+            dv_acc=dv_acc,
+            q_row_idx=fused_q_row_idx,
+            q_length=fused_q_length,
+            tile_k_row_idx=payload["fused_exact_k_row_idx"],
+            tile_range_idx=exact_tile_range_idx,
+            softmax_scale=float(softmax_scale),
+            tail_mask_words=None,
+        )
+    tail_tile_range_idx = _get_tile_range_index(payload, ptr_key="fused_tail_tile_ptr")
+    if int(tail_tile_range_idx.numel()) > 0:
+        _accumulate_cached_generalized_tile_backward(
+            q_flat=q_flat,
+            k_flat=k_flat,
+            v_flat=v_flat,
+            out_flat=out_flat.float(),
+            dout_flat=dout_flat,
+            lse_flat=lse_flat,
+            dq_acc=dq_acc,
+            dk_acc=dk_acc,
+            dv_acc=dv_acc,
+            q_row_idx=fused_q_row_idx,
+            q_length=fused_q_length,
+            tile_k_row_idx=payload["fused_tail_k_row_idx"],
+            tile_range_idx=tail_tile_range_idx,
+            softmax_scale=float(softmax_scale),
+            tail_mask_words=payload["fused_tail_mask_words"],
+        )
+    return (
+        dq_acc.to(dtype=q.dtype).view_as(q),
+        dk_acc.to(dtype=k.dtype).view_as(k),
+        dv_acc.to(dtype=v.dtype).view_as(v),
     )

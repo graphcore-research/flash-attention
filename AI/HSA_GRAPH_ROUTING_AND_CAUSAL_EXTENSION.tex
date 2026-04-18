@@ -9,7 +9,7 @@
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{hyperref}
-\usepackage{xcolor}
+\usepackage[table]{xcolor}
 
 \hypersetup{
   colorlinks=true,
@@ -19,6 +19,14 @@
   pdftitle={HSA as Sparse Causal Routing and a Path Toward Typed Semantic Graphs},
   pdfauthor={OpenAI Codex}
 }
+
+\newcolumntype{C}{>{\centering\arraybackslash}m{1.5em}}
+\newcommand{\mempty}{\cellcolor{gray!10}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mlive}{\cellcolor{blue!20}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mrowpick}{\cellcolor{green!25}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mcolpick}{\cellcolor{violet!22}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mcore}{\cellcolor{green!30}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mtail}{\cellcolor{orange!30}\rule{0pt}{1.5ex}\hspace{0.75em}}
 
 \title{HSA as Sparse Causal Routing\\
 \large Formalization, Current Packing Strategy, and a Path Toward Typed Semantic Graphs}
@@ -295,6 +303,116 @@ kind of 2-D extraction:
     \item one range-local softmax state,
     \item one output write per row range.
 \end{itemize}
+
+\subsection{Packing illustrations}
+
+Figure~\ref{fig:packing-illustrations} shows the three packing viewpoints on a
+small support matrix. Blue cells are live edges in the original sparse support.
+Green cells indicate an extracted dense core, purple cells indicate a reused
+column family, and orange cells indicate a tiled residual tail.
+
+\begin{figure}[ht]
+\centering
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.1}
+
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{Row packing}\\[0.35em]
+\begin{tabular}{c|*{6}{C}}
+ & $k_1$ & $k_2$ & $k_3$ & $k_4$ & $k_5$ & $k_6$ \\
+\hline
+$q_1$ & \mrowpick & \mrowpick & \mempty & \mrowpick & \mempty & \mempty \\
+$q_2$ & \mrowpick & \mrowpick & \mempty & \mrowpick & \mempty & \mempty \\
+$q_3$ & \mempty & \mempty & \mlive & \mempty & \mlive & \mempty \\
+$q_4$ & \mempty & \mempty & \mlive & \mempty & \mlive & \mlive \\
+\end{tabular}
+
+\vspace{0.5em}
+
+\begin{tabular}{c|*{3}{C}}
+ & $u_1$ & $u_2$ & $u_3$ \\
+\hline
+$q_1$ & \mcore & \mcore & \mcore \\
+$q_2$ & \mcore & \mcore & \mcore \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+Select similar rows $\{q_1,q_2\}$, form the union
+$\{k_1,k_2,k_4\}$ once, and run one dense $2 \times 3$ microproblem.
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{Column packing}\\[0.35em]
+\begin{tabular}{c|*{6}{C}}
+ & $k_1$ & $k_2$ & $k_3$ & $k_4$ & $k_5$ & $k_6$ \\
+\hline
+$q_1$ & \mcolpick & \mcolpick & \mempty & \mcolpick & \mempty & \mempty \\
+$q_2$ & \mcolpick & \mcolpick & \mempty & \mcolpick & \mempty & \mempty \\
+$q_3$ & \mempty & \mempty & \mlive & \mempty & \mlive & \mempty \\
+$q_4$ & \mempty & \mempty & \mlive & \mempty & \mlive & \mlive \\
+\end{tabular}
+
+\vspace{0.5em}
+
+\begin{tabular}{c|*{3}{C}}
+ & $k_1$ & $k_2$ & $k_4$ \\
+\hline
+reuse & \mcolpick & \mcolpick & \mcolpick \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+Identify a repeated K/V family and gather those columns once. This reduces
+redundant K/V movement, but row ownership is still unresolved by itself.
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{Generalized 2-D packing}\\[0.35em]
+\begin{tabular}{c|*{6}{C}}
+ & $k_1$ & $k_2$ & $k_3$ & $k_4$ & $k_5$ & $k_6$ \\
+\hline
+$q_1$ & \mcore & \mcore & \mempty & \mcore & \mempty & \mempty \\
+$q_2$ & \mcore & \mcore & \mempty & \mcore & \mempty & \mempty \\
+$q_3$ & \mempty & \mempty & \mtail & \mempty & \mtail & \mempty \\
+$q_4$ & \mempty & \mempty & \mtail & \mempty & \mtail & \mtail \\
+\end{tabular}
+
+\vspace{0.5em}
+
+\begin{tabular}{c|*{3}{C}}
+ & $u_1$ & $u_2$ & $u_3$ \\
+\hline
+core & \mcore & \mcore & \mcore \\
+tail & \mtail & \mtail & \mtail \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+Extract dense submatrices from the support itself: an exact dense core tile for
+$(q_1,q_2)$, then cover the remainder with tiled residual tails that share one
+range-local softmax state.
+\end{minipage}
+
+\caption{Three views of packing. Row packing groups similar query rows, column
+packing reuses repeated K/V families, and generalized 2-D packing extracts
+dense submatrices from the support matrix and covers the remainder with fused
+tail tiles.}
+\label{fig:packing-illustrations}
+\end{figure}
+
+The important systems point is that all three methods operate on the support
+graph rather than on the exact scoring rule. This means the graph compiler,
+sidecars, schedule families, and most of the current packing machinery remain
+reusable if the score becomes relation-aware or typed. The part that changes is
+the kernel math inside each packed family: score evaluation, value transforms,
+and possibly normalization if the model moves beyond plain masked softmax.
 
 \section{What the Current Implementation Already Gives Us}
 

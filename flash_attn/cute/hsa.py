@@ -3527,7 +3527,6 @@ def _get_hsa_block_sparse_runtime(
         q_block_size=forward_block_q,
         k_block_size=forward_block_k,
     )
-
     if require_backward:
         backward_sparse, backward_packed_masks = _build_backward_hsa_packed_masks(
             schedule,
@@ -7239,15 +7238,21 @@ def _should_disable_hsa_block_sparse_backward(
     schedule: HSASchedule,
     runtime: HSABlockSparseRuntime,
 ) -> bool:
-    """Dense traversal is more reliable when the backward work collapses to one tile.
+    """Prefer dense traversal unless the legacy sparse backward is explicitly enabled.
 
-    In the single-tile case block sparsity prunes nothing, but the live SM100
-    sparse traversal path shows a dQ mismatch relative to the dense mask-mod
-    traversal. Prefer the dense traversal there until the generic sparse kernel
-    path is fixed.
+    The exact sparse forward path is parity-correct, but the live SM100
+    block-sparse backward traversal diverges from the dense mask-mod reference
+    on real multi-tile training workloads. Keep the exact packed mask-mod, but
+    route backward through dense traversal by default until the sparse kernel
+    path is fixed. The old sparse traversal can still be re-enabled explicitly
+    for kernel debugging.
     """
     sparse = runtime.backward_sparse
     if sparse is None:
+        return True
+    if os.environ.get("FLASH_ATTN_HSA_DISABLE_BLOCK_SPARSE_BWD", "0") == "1":
+        return True
+    if os.environ.get("FLASH_ATTN_HSA_ENABLE_BLOCK_SPARSE_BWD", "0") != "1":
         return True
     q_block_size, k_block_size = sparse.block_size
     num_q_blocks = (schedule.seqlen + q_block_size - 1) // q_block_size

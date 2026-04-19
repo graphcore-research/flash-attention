@@ -7238,26 +7238,33 @@ def _should_disable_hsa_block_sparse_backward(
     schedule: HSASchedule,
     runtime: HSABlockSparseRuntime,
 ) -> bool:
-    """Prefer dense traversal unless the legacy sparse backward is explicitly enabled.
+    """Route short contexts conservatively and long contexts through sparse traversal.
 
-    The exact sparse forward path is parity-correct, but the live SM100
-    block-sparse backward traversal diverges from the dense mask-mod reference
-    on real multi-tile training workloads. Keep the exact packed mask-mod, but
-    route backward through dense traversal by default until the sparse kernel
-    path is fixed. The old sparse traversal can still be re-enabled explicitly
-    for kernel debugging.
+    The dense-traversal fallback is parity-safe, but it is prohibitively slow on
+    real long-context training runs. After the recent parity fixes, the legacy
+    block-sparse traversal is the only viable long-context backward path we
+    have. Keep dense traversal for short contexts by default, but switch to the
+    sparse traversal once sequence length is clearly in the long-context regime.
     """
     sparse = runtime.backward_sparse
     if sparse is None:
         return True
     if os.environ.get("FLASH_ATTN_HSA_DISABLE_BLOCK_SPARSE_BWD", "0") == "1":
         return True
-    if os.environ.get("FLASH_ATTN_HSA_ENABLE_BLOCK_SPARSE_BWD", "0") != "1":
-        return True
     q_block_size, k_block_size = sparse.block_size
     num_q_blocks = (schedule.seqlen + q_block_size - 1) // q_block_size
     num_k_blocks = (schedule.seqlen + k_block_size - 1) // k_block_size
-    return num_q_blocks <= 1 and num_k_blocks <= 1
+    if num_q_blocks <= 1 and num_k_blocks <= 1:
+        return True
+    if os.environ.get("FLASH_ATTN_HSA_ENABLE_BLOCK_SPARSE_BWD", "0") == "1":
+        return False
+
+    min_seqlen_env = os.environ.get("FLASH_ATTN_HSA_BLOCK_SPARSE_BWD_MIN_SEQLEN", "")
+    try:
+        min_seqlen = int(min_seqlen_env) if min_seqlen_env else 16384
+    except ValueError:
+        min_seqlen = 16384
+    return schedule.seqlen < max(min_seqlen, 0)
 
 
 def _schedule_has_only_sentence_backward_families(schedule: HSASchedule) -> bool:

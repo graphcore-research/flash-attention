@@ -7238,13 +7238,12 @@ def _should_disable_hsa_block_sparse_backward(
     schedule: HSASchedule,
     runtime: HSABlockSparseRuntime,
 ) -> bool:
-    """Route short contexts conservatively and long contexts through sparse traversal.
+    """Keep the correctness-safe dense traversal unless block-sparse is opted in.
 
-    The dense-traversal fallback is parity-safe, but it is prohibitively slow on
-    real long-context training runs. After the recent parity fixes, the legacy
-    block-sparse traversal is the only viable long-context backward path we
-    have. Keep dense traversal for short contexts by default, but switch to the
-    sparse traversal once sequence length is clearly in the long-context regime.
+    The block-sparse backward is still useful for targeted kernel work, but it
+    is not the correctness default for training. Keep the dense traversal for
+    all multi-tile cases unless the caller explicitly opts into the sparse
+    traversal through environment flags.
     """
     sparse = runtime.backward_sparse
     if sparse is None:
@@ -7260,10 +7259,12 @@ def _should_disable_hsa_block_sparse_backward(
         return False
 
     min_seqlen_env = os.environ.get("FLASH_ATTN_HSA_BLOCK_SPARSE_BWD_MIN_SEQLEN", "")
+    if not min_seqlen_env:
+        return True
     try:
-        min_seqlen = int(min_seqlen_env) if min_seqlen_env else 16384
+        min_seqlen = int(min_seqlen_env)
     except ValueError:
-        min_seqlen = 16384
+        return True
     return schedule.seqlen < max(min_seqlen, 0)
 
 

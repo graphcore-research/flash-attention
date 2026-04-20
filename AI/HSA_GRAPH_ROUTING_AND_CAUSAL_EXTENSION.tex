@@ -284,13 +284,28 @@ Gutenberg batch at $T=262{,}144$:
 \end{itemize}
 
 This means the right conclusion is more precise than ``\texttt{sparse\_mask}
-backward is always the robust choice.'' The correct statement is:
+backward is always the robust choice.'' The intermediate conclusion during that
+phase was:
 \begin{quote}
 For short contexts, dense traversal is a useful conservative fallback. For
 long contexts, exact HSA training must use the block-sparse backward traversal,
 otherwise the backward runtime dominates everything and the packed forward wins
 never materialize end-to-end.
 \end{quote}
+
+That statement turned out to be incomplete. Once we ran fixed-seed
+post-update parity checks on real Gutenberg caches, the picture became:
+\begin{itemize}[leftmargin=1.5em]
+    \item at $4096$, dense / sparse / cached still match after the first optimizer update;
+    \item at $8192$, they still match;
+    \item at $32768$, the block-sparse backward reintroduces a real sparse/cached
+    mismatch on the first nonzero post-update step.
+\end{itemize}
+The decisive control is that forcing the dense traversal again at $32768$
+collapses that mismatch back to BF16-scale noise. So the current correctness
+policy is intentionally conservative: dense traversal is again the default for
+multi-tile training, and block-sparse backward is opt-in until the long-context
+nonzero-backward parity issue is fixed.
 
 \subsection{What changed in the implementation}
 
@@ -310,17 +325,18 @@ The key policy function is
 following:
 \begin{enumerate}[leftmargin=1.5em]
     \item always disable block-sparse backward for single-tile cases;
-    \item keep dense traversal by default for short multi-tile contexts;
-    \item default back to block-sparse traversal once sequence length is in the
-    clearly long-context regime (currently guarded by a minimum sequence length
-    threshold);
-    \item still allow explicit overrides for debugging.
+    \item keep dense traversal by default for all multi-tile contexts;
+    \item allow block-sparse backward only when the caller explicitly opts in,
+    either with \texttt{FLASH\_ATTN\_HSA\_ENABLE\_BLOCK\_SPARSE\_BWD=1} or by
+    setting an explicit \texttt{FLASH\_ATTN\_HSA\_BLOCK\_SPARSE\_BWD\_MIN\_SEQLEN};
+    \item still allow explicit disable overrides for debugging.
 \end{enumerate}
 
-In other words, the drastic speedup came from stopping the long-context cached
-training path from silently falling back to the dense traversal. The backward
-math did not suddenly become zero or trivial; we are simply running the right
-kernel family again for the sequence-length regime that needs it.
+In other words, the earlier speedup came from stopping the long-context cached
+training path from silently falling back to the dense traversal. The new
+correctness result is that this is not yet a safe default. The block-sparse
+backward remains the performance path we want, but it is currently a targeted
+optimization path rather than the default training path.
 
 \section{Row Packing, Column Packing, and Generalized 2-D Packing}
 

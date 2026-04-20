@@ -40,15 +40,17 @@
 This note formalizes the current hierarchical sparse attention (HSA) stack as a
 decoder-causal sparse routing problem over a sequence graph, explains the
 current dense HSA reference, schedule-based sparse realization, and packing
-strategy, and records why \texttt{sparse\_mask} backward remains the pragmatic
-training path even though it uses a coarser sparsification than the most
-aggressive forward-only packed routes. The note then sketches a realistic
-``leapfrog'' extension path from binary hierarchical masks toward typed,
-directed, and eventually signed semantic routing graphs that could support
-precursors to causal reasoning in autoregressive language models. The central
-claim is that the current implementation is not ``arbitrary graph attention,''
-but it already contains reusable pieces of a graph compiler, sparse runtime, and
-offline sidecar system that can be repurposed for richer semantic graphs.
+strategy, and distinguishes two operational HSA regimes that matter for current
+benchmarking: a naive adjacency-driven sparse realization and a packed HSA path
+that reuses precomputed cached sidecars. The note records the current isolated
+speedups of packed HSA over naive HSA, places those results next to flat and
+sliding-window FA4 baselines, and then sketches a realistic ``leapfrog''
+extension path from binary hierarchical masks toward typed, directed, and
+eventually signed semantic routing graphs that could support precursors to
+causal reasoning in autoregressive language models. The central claim is that
+the current implementation is not ``arbitrary graph attention,'' but it already
+contains reusable pieces of a graph compiler, sparse runtime, and offline
+sidecar system that can be repurposed for richer semantic graphs.
 \end{abstract}
 
 \section{Motivation}
@@ -243,9 +245,12 @@ than the most compressed forward path, it remains strong for several reasons:
     while the backward gains from the same packing are usually small or negative.
 \end{enumerate}
 
-This is the main reason the hybrid path---compressed forward plus
-\texttt{sparse\_mask} backward---has remained the best practical training
-configuration.
+Historically this is why the project leaned on compressed forward plus a more
+conservative backward. In the current codebase, however, the practical
+long-context training configuration is no longer ``plain
+\texttt{sparse\_mask}'' as such; it is the packed HSA path that reuses cached
+forward sidecars and the dedicated long-context backward route attached to that
+path.
 
 \subsection{Long-context caveat: the generic block-sparse \texorpdfstring{$dQ$}{dQ} path was the real bug}
 
@@ -533,6 +538,133 @@ sidecars, schedule families, and most of the current packing machinery remain
 reusable if the score becomes relation-aware or typed. The part that changes is
 the kernel math inside each packed family: score evaluation, value transforms,
 and possibly normalization if the model moves beyond plain masked softmax.
+
+\section{Benchmark Baselines and Preliminary Results}
+
+\subsection{Benchmark labels}
+
+The current benchmark story is easiest to understand if the runtime modes are
+named by \emph{what work is actually being done}:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{flat FA4}: ordinary dense causal FA4 with no hierarchical
+    sparsity;
+    \item \textbf{sliding\_log}: a causal sliding-window FA4 baseline with
+    window width $\lceil \log_2 T \rceil$;
+    \item \textbf{sliding\_fixed}: a causal sliding-window FA4 baseline with a
+    fixed window width of $1000$ tokens;
+    \item \textbf{HSA naive}: exact HSA with cached-forward fallback disabled,
+    i.e.\ the adjacency-driven sparse realization;
+    \item \textbf{HSA packed}: exact HSA with cached-forward fallback enabled,
+    i.e.\ the packed HSA path that reuses precomputed forward sidecars and the
+    corresponding long-context backward route.
+\end{itemize}
+
+This distinction matters because once runtime fallback to precomputed cached
+sidecars is enabled, a plain \texttt{sparse\_mask} benchmark is no longer a
+clean ``naive sparse'' baseline on cache-backed batches. In current cache-backed
+runs, the default exact HSA path can already reuse the packed cached forward
+representation. For that reason, the meaningful systems comparison is now
+\textbf{HSA naive} versus \textbf{HSA packed}, not \texttt{sparse\_mask} versus
+an older explicit cached preset.
+
+\subsection{Isolated packed-versus-naive HSA}
+
+Table~\ref{tab:isolated-packed-vs-naive} gives the clean isolated comparison on
+cache-backed resident batches. These are the same HSA semantics, same cached
+batches, same model, and same losses to numerical noise; the only difference is
+whether the runtime is forced onto the naive adjacency-driven sparse path or is
+allowed to consume the packed cached sidecars.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+$T$ & naive dt (ms) & packed dt (ms) & packed tok/s & speedup & loss match \\
+\midrule
+$65536$ & $6549.4$ & $118.2$ & $554.6$k & $55.4\times$ & yes \\
+$131072$ & $15657.0$ & $207.5$ & $631.6$k & $75.4\times$ & yes \\
+$262144$ & $29184.6$ & $344.7$ & $760.6$k & $84.7\times$ & yes \\
+\bottomrule
+\end{tabular}
+\caption{Isolated HSA systems comparison on cache-backed resident batches. The
+packed path is the intended method; the naive path is the adjacency-driven
+reference that does not reuse packed cached sidecars.}
+\label{tab:isolated-packed-vs-naive}
+\end{table}
+
+The key result is not subtle: the packed path is already doing the intended
+systems job. The speedup over the naive exact sparse realization grows with
+sequence length, from roughly $55\times$ at $64$K to roughly $85\times$ at
+$262144$, while preserving the same hierarchical support semantics.
+
+\subsection{Preliminary repeated-batch training runs}
+
+Table~\ref{tab:preliminary-repeated-batch} shows longer repeated single-batch
+resident training smokes on the real Gutenberg cache-backed batches. These are
+still short internal training runs, not full downstream experiments, but they
+are long enough to give a first indication of where the runtime crossover sits
+and how the simple sliding baselines compare.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{llrrr}
+\toprule
+$T$ & mode & final loss & mean dt (ms) & tok/s \\
+\midrule
+$65536$ & flat FA4 & $2.6773$ & $142.5$ & $460.0$k \\
+$65536$ & sliding\_log & $2.1822$ & $57.7$ & $1135.2$k \\
+$65536$ & sliding\_fixed & $2.6590$ & $60.0$ & $1091.6$k \\
+$65536$ & HSA packed & $2.4808$ & $118.6$ & $552.8$k \\
+\midrule
+$131072$ & flat FA4 & $2.6736$ & $488.8$ & $268.1$k \\
+$131072$ & sliding\_log & $2.5746$ & $291.5$ & $449.7$k \\
+$131072$ & sliding\_fixed & $2.6528$ & $138.8$ & $944.2$k \\
+$131072$ & HSA packed & $2.5972$ & $252.3$ & $519.5$k \\
+\midrule
+$262144$ & flat FA4 & $2.9803$ & $1734.7$ & $151.1$k \\
+$262144$ & sliding\_log & $2.9657$ & $359.5$ & $729.3$k \\
+$262144$ & sliding\_fixed & $2.9793$ & $367.3$ & $713.7$k \\
+$262144$ & HSA packed & $2.9611$ & $344.3$ & $761.5$k \\
+\bottomrule
+\end{tabular}
+\caption{Preliminary repeated-batch resident training runs on real Gutenberg
+cache-backed batches. These are useful internal smokes for runtime crossover and
+loss trend, but they are not yet the full long-horizon training report.}
+\label{tab:preliminary-repeated-batch}
+\end{table}
+
+Several points matter immediately.
+\begin{enumerate}[leftmargin=1.5em]
+    \item The packed HSA path has already crossed the flat dense FA4 baseline
+    on throughput by $64$K and remains ahead at $128$K.
+    \item The sliding-window baselines are much stronger than a toy strawman.
+    They are not hierarchical and they should eventually lose on relevance when
+    the task genuinely requires nonlocal graph structure, but they are very fast
+    and must be included in any honest benchmark table.
+    \item On these short repeated-batch runs, \texttt{sliding\_log} is
+    surprisingly competitive in loss. That is a useful warning: any claim that
+    HSA ``obviously'' dominates sliding windows needs to be supported by longer
+    and less degenerate training, not by intuition alone.
+\end{enumerate}
+
+The $262144$ row is the first regime where the packed HSA path cleanly clears
+both the dense flat baseline and the simple sliding baselines on this repeated
+single-batch smoke. That does not prove a general downstream quality win by
+itself, but it is exactly the systems crossover the packing story was supposed
+to produce.
+
+\subsection{MFU caveat}
+
+The benchmark harness currently reports MFU using a dense-equivalent FLOP
+estimate. That is serviceable for flat and sliding-window FA4 rows, but it is
+not publishable for HSA rows because the packed and sparse paths do not execute
+the dense-equivalent workload. For now, the trustworthy systems metrics are:
+\begin{itemize}[leftmargin=1.5em]
+    \item mean step time,
+    \item tokens per second,
+    \item peak memory,
+    \item and loss trajectories.
+\end{itemize}
 
 \section{What the Current Implementation Already Gives Us}
 

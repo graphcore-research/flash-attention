@@ -7286,6 +7286,14 @@ def _get_hsa_blocksparse_backward_mode(schedule: HSASchedule) -> str:
         or os.environ.get("FLASH_ATTN_HSA_USE_HYBRID_BWD", "0") == "1"
     ):
         return "legacy_packed"
+    try:
+        auto_legacy_packed_min_seqlen = int(
+            os.environ.get("FLASH_ATTN_HSA_AUTO_LEGACY_PACKED_BWD_MIN_SEQLEN", "32768")
+        )
+    except ValueError:
+        auto_legacy_packed_min_seqlen = 32768
+    if schedule.seqlen >= max(auto_legacy_packed_min_seqlen, 0):
+        return "legacy_packed"
     return "sparse_mask"
 
 
@@ -7363,6 +7371,60 @@ def _run_hsa_blocksparse_backward(
             )
         except NotImplementedError:
             return _run_hsa_hybrid_backward(q, k, v, out, dout, lse, schedule, softmax_scale)
+    return _run_hsa_packed_mask_backward(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        schedule,
+        softmax_scale,
+        deterministic,
+        keep_ids,
+        hash_ids,
+        runtime=runtime,
+        )
+
+
+def _run_hsa_cached_generalized_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    schedule: HSASchedule,
+    softmax_scale: float,
+    deterministic: bool,
+    keep_ids: Optional[torch.Tensor] = None,
+    hash_ids: Optional[torch.Tensor] = None,
+    runtime: Optional[HSABlockSparseRuntime] = None,
+):
+    backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
+    if backward_mode == "legacy_packed":
+        del keep_ids, hash_ids
+        from flash_attn.cute.flash_hsa_bwd_sm100 import run_hsa_bwd_sm100_packed
+
+        try:
+            return run_hsa_bwd_sm100_packed(
+                q,
+                k,
+                v,
+                out,
+                dout,
+                lse,
+                schedule,
+                softmax_scale,
+                deterministic,
+            )
+        except NotImplementedError:
+            return _run_hsa_hybrid_backward(q, k, v, out, dout, lse, schedule, softmax_scale)
+    if backward_mode == "monolithic_sentence":
+        # Cached generalized forward does not save the sentence-stream intermediates
+        # required by the monolithic sentence backward. Fall back to the exact
+        # packed-mask traversal for correctness.
+        backward_mode = "sparse_mask"
     return _run_hsa_packed_mask_backward(
         q,
         k,
@@ -7683,7 +7745,7 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             )
             setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
         else:
-            dq, dk, dv = _run_hsa_packed_mask_backward(
+            dq, dk, dv = _run_hsa_cached_generalized_backward(
                 q,
                 k,
                 v,

@@ -2426,14 +2426,24 @@ def can_use_cached_generalized_fused_backward(
         return False
     backward_payload = payload.get("cached_generalized_backward_payload")
     if q.is_cuda:
-        if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
-            return False
-        if str(backward_payload.get("backward_kernel_family", "")) != "cached_tc8x8_fused":
-            return False
-        if int(backward_payload.get("rows_per_range", 0)) != 8:
-            return False
-        if int(backward_payload.get("keys_per_tile", 0)) != 8:
-            return False
+        use_tile_atomic_dkdv = os.environ.get(
+            "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
+            "1",
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        if not use_tile_atomic_dkdv and (
+            not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready"
+        ):
+            backward_payload = build_cached_generalized_backward_payload(payload)
+            if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+                return False
+            payload["cached_generalized_backward_payload"] = backward_payload
+        if isinstance(backward_payload, dict):
+            if str(backward_payload.get("backward_kernel_family", "")) != "cached_tc8x8_fused":
+                return False
+            if int(backward_payload.get("rows_per_range", 0)) != 8:
+                return False
+            if int(backward_payload.get("keys_per_tile", 0)) != 8:
+                return False
     return True
 
 
@@ -3023,19 +3033,21 @@ def run_cached_generalized_packed_backward(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
             "1",
         ).strip().lower() not in {"0", "false", "off", "no"}
-        backward_payload = payload.get("cached_generalized_backward_payload")
-        if (
-            not isinstance(backward_payload, dict)
-            or backward_payload.get("status") != "ready"
-            or "range_local_k_ptr" not in backward_payload
-            or "range_local_k_row_idx" not in backward_payload
-            or "exact_tile_local_k_idx" not in backward_payload
-            or "tail_tile_local_k_idx" not in backward_payload
-        ):
-            backward_payload = build_cached_generalized_backward_payload(payload)
-            if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
-                raise RuntimeError("cached_generalized_fused_backward_missing_payload")
-            payload["cached_generalized_backward_payload"] = backward_payload
+        backward_payload = None
+        if not use_tile_atomic_dkdv:
+            backward_payload = payload.get("cached_generalized_backward_payload")
+            if (
+                not isinstance(backward_payload, dict)
+                or backward_payload.get("status") != "ready"
+                or "range_local_k_ptr" not in backward_payload
+                or "range_local_k_row_idx" not in backward_payload
+                or "exact_tile_local_k_idx" not in backward_payload
+                or "tail_tile_local_k_idx" not in backward_payload
+            ):
+                backward_payload = build_cached_generalized_backward_payload(payload)
+                if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+                    raise RuntimeError("cached_generalized_fused_backward_missing_payload")
+                payload["cached_generalized_backward_payload"] = backward_payload
         from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
             _run_cached_generalized_fused_bwd_dkdv_range_kernel,
             _run_cached_generalized_fused_bwd_dq_kernel,

@@ -3820,7 +3820,8 @@ def _resolve_precomputed_cached_generalized_forward_payload(
         return None
     if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") != "1":
         return None
-    if _get_hsa_blocksparse_backward_mode(schedule) != "sparse_mask":
+    backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
+    if backward_mode == "monolithic_sentence":
         return None
     logical_block_q = _get_hsa_synthetic_logical_block_size("q")
     logical_block_k = _get_hsa_synthetic_logical_block_size("k")
@@ -7647,9 +7648,16 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
         ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
         ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
         ctx.cached_forward_payload = cached_forward_payload
+        fused_bwd_env = os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "auto").strip().lower()
+        if fused_bwd_env in {"0", "false", "off", "no"}:
+            enable_cached_generalized_fused_bwd = False
+        elif fused_bwd_env in {"1", "true", "on", "yes"}:
+            enable_cached_generalized_fused_bwd = True
+        else:
+            enable_cached_generalized_fused_bwd = int(getattr(schedule, "seqlen", 0)) >= 32768
         ctx.use_cached_generalized_fused_bwd = (
-            ctx.hsa_backward_mode == "sparse_mask"
-            and os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "0") == "1"
+            ctx.hsa_backward_mode != "monolithic_sentence"
+            and enable_cached_generalized_fused_bwd
             and can_use_cached_generalized_fused_backward(
                 cached_forward_payload,
                 q,

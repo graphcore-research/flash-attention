@@ -247,6 +247,81 @@ This is the main reason the hybrid path---compressed forward plus
 \texttt{sparse\_mask} backward---has remained the best practical training
 configuration.
 
+\subsection{Long-context caveat: the safe dense fallback is not a viable training path}
+
+That pragmatic statement needs one important update. During the long-context
+debugging pass we temporarily forced exact HSA backward to use the dense
+\texttt{mask\_mod} traversal, because the legacy block-sparse backward had
+earlier parity issues on short-context real-data runs. That was safe, but it
+turned out to be unusable at real long sequence lengths.
+
+The important measurement trap was that the original isolated
+\texttt{fwdbwd} benchmark was profiling a degenerate backward regime. At step
+$0$, the attention output projection \texttt{c\_proj} is zero-initialized, so
+the upstream gradient flowing into the attention output is effectively zero.
+Because the implementation has an exact zero-\texttt{dout} fast path, that
+benchmark mostly measured:
+\begin{itemize}[leftmargin=1.5em]
+    \item the real packed forward cost, plus
+    \item an almost trivial backward.
+\end{itemize}
+
+Once we added a profiler mode that performs a real optimizer update before the
+profiled step, the true long-context picture became obvious. On a resident real
+Gutenberg batch at $T=262{,}144$:
+\begin{itemize}[leftmargin=1.5em]
+    \item dense-traversal fallback backward made the exact sparse path take on
+    the order of tens of seconds per training step;
+    \item re-enabling the legacy block-sparse traversal immediately removed that
+    wall and brought the attention backward back down to the sub-second regime;
+    \item for cached generalized forward with sparse backward, the post-update
+    resident step is now approximately
+    \[
+    \text{forward} \approx 224\ \mathrm{ms}, \qquad
+    \text{backward} \approx 176\ \mathrm{ms},
+    \]
+    so the packed method is no longer backward-bound.
+\end{itemize}
+
+This means the right conclusion is more precise than ``\texttt{sparse\_mask}
+backward is always the robust choice.'' The correct statement is:
+\begin{quote}
+For short contexts, dense traversal is a useful conservative fallback. For
+long contexts, exact HSA training must use the block-sparse backward traversal,
+otherwise the backward runtime dominates everything and the packed forward wins
+never materialize end-to-end.
+\end{quote}
+
+\subsection{What changed in the implementation}
+
+The practical speedup came from a routing change, not from changing the HSA
+algebra. The exact packed mask backward helper
+\texttt{\_run\_hsa\_packed\_mask\_backward(...)} already knew how to call
+FlashAttention backward with either:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{block\_sparse\_tensors=None}, which forces dense traversal
+    over the exact packed mask modifier; or
+    \item a real \texttt{block\_sparse\_tensors} descriptor, which enables the
+    legacy block-sparse traversal.
+\end{itemize}
+
+The key policy function is
+\texttt{\_should\_disable\_hsa\_block\_sparse\_backward(...)}. It now does the
+following:
+\begin{enumerate}[leftmargin=1.5em]
+    \item always disable block-sparse backward for single-tile cases;
+    \item keep dense traversal by default for short multi-tile contexts;
+    \item default back to block-sparse traversal once sequence length is in the
+    clearly long-context regime (currently guarded by a minimum sequence length
+    threshold);
+    \item still allow explicit overrides for debugging.
+\end{enumerate}
+
+In other words, the drastic speedup came from stopping the long-context cached
+training path from silently falling back to the dense traversal. The backward
+math did not suddenly become zero or trivial; we are simply running the right
+kernel family again for the sequence-length regime that needs it.
+
 \section{Row Packing, Column Packing, and Generalized 2-D Packing}
 
 \subsection{Row packing}
@@ -693,8 +768,9 @@ The key engineering lessons so far are:
     support all matching exactly;
     \item forward benefits strongly from aggressive packing because the problem
     is query-owned and easy to regularize;
-    \item backward remains best as \texttt{sparse\_mask} because the q-owned /
-    k-owned mismatch makes packed backward substantially harder;
+    \item packed training still uses the exact sparse backward, but long-context
+    runtime now depends critically on choosing the block-sparse traversal
+    instead of the dense fallback;
     \item generalized 2-D packing is the right forward abstraction because it
     extracts dense submatrices from the support matrix itself;
     \item the natural next leap is typed directed semantic routing, not a jump

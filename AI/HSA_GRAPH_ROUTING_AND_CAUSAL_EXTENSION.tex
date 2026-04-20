@@ -597,61 +597,79 @@ systems job. The speedup over the naive exact sparse realization grows with
 sequence length, from roughly $55\times$ at $64$K to roughly $85\times$ at
 $262144$, while preserving the same hierarchical support semantics.
 
-\subsection{Preliminary repeated-batch training runs}
+\subsection{True multi-batch resident training runs}
 
-Table~\ref{tab:preliminary-repeated-batch} shows longer repeated single-batch
-resident training smokes on the real Gutenberg cache-backed batches. These are
-still short internal training runs, not full downstream experiments, but they
-are long enough to give a first indication of where the runtime crossover sits
-and how the simple sliding baselines compare.
+The earlier repeated-single-batch resident smokes were useful for quick systems
+checks, but they were too degenerate to say much about relative learning
+behavior. Table~\ref{tab:true-multibatch-resident} replaces that with
+\emph{true multi-batch} resident training on real Gutenberg long-context
+caches:
+\begin{itemize}[leftmargin=1.5em]
+    \item $64$K: $4$ distinct resident train batches;
+    \item $128$K: $2$ distinct resident train batches;
+    \item $262144$: $2$ distinct resident train batches.
+\end{itemize}
+All rows below use real cache-backed batches and cycle over multiple distinct
+resident schedules rather than memorizing a single cached example.
 
 \begin{table}[ht]
 \centering
-\begin{tabular}{llrrr}
+\begin{tabular}{llrrrr}
 \toprule
-$T$ & mode & final loss & mean dt (ms) & tok/s \\
+$T$ & mode & train batches & final loss & mean dt (ms) & tok/s \\
 \midrule
-$65536$ & flat FA4 & $2.6773$ & $142.5$ & $460.0$k \\
-$65536$ & sliding\_log & $2.1822$ & $57.7$ & $1135.2$k \\
-$65536$ & sliding\_fixed & $2.6590$ & $60.0$ & $1091.6$k \\
-$65536$ & HSA packed & $2.4808$ & $118.6$ & $552.8$k \\
+$65536$ & flat FA4 & $4$ & $2.7987$ & $143.1$ & $458.0$k \\
+$65536$ & sliding\_log & $4$ & $2.1064$ & $60.6$ & $1082.1$k \\
+$65536$ & sliding\_fixed & $4$ & $2.7185$ & $62.2$ & $1054.0$k \\
+$65536$ & HSA packed & $4$ & $2.2537$ & $2085.8$ & $31.4$k \\
 \midrule
-$131072$ & flat FA4 & $2.6736$ & $488.8$ & $268.1$k \\
-$131072$ & sliding\_log & $2.5746$ & $291.5$ & $449.7$k \\
-$131072$ & sliding\_fixed & $2.6528$ & $138.8$ & $944.2$k \\
-$131072$ & HSA packed & $2.5972$ & $252.3$ & $519.5$k \\
+$131072$ & flat FA4 & $2$ & $2.8541$ & $581.4$ & $225.4$k \\
+$131072$ & sliding\_log & $2$ & $1.6485$ & $158.3$ & $827.8$k \\
+$131072$ & sliding\_fixed & $2$ & $2.7604$ & $167.8$ & $780.9$k \\
+$131072$ & HSA packed & $2$ & $1.8864$ & $181.7$ & $721.3$k \\
 \midrule
-$262144$ & flat FA4 & $2.9803$ & $1734.7$ & $151.1$k \\
-$262144$ & sliding\_log & $2.9657$ & $359.5$ & $729.3$k \\
-$262144$ & sliding\_fixed & $2.9793$ & $367.3$ & $713.7$k \\
-$262144$ & HSA packed & $2.9611$ & $344.3$ & $761.5$k \\
+$262144$ & flat FA4 & $2$ & $2.8824$ & $1742.1$ & $150.5$k \\
+$262144$ & sliding\_log & $2$ & $1.6699$ & $363.6$ & $721.0$k \\
+$262144$ & sliding\_fixed & $2$ & $2.7400$ & $368.5$ & $711.3$k \\
+$262144$ & HSA packed & $2$ & $1.8003$ & $344.5$ & $760.9$k \\
 \bottomrule
 \end{tabular}
-\caption{Preliminary repeated-batch resident training runs on real Gutenberg
-cache-backed batches. These are useful internal smokes for runtime crossover and
-loss trend, but they are not yet the full long-horizon training report.}
-\label{tab:preliminary-repeated-batch}
+\caption{True multi-batch resident training runs on real Gutenberg long-context
+caches. These are still internal benchmark runs rather than full downstream
+training jobs, but they are materially stronger than repeated-single-batch
+smokes because they cycle over multiple distinct resident schedules.}
+\label{tab:true-multibatch-resident}
 \end{table}
 
 Several points matter immediately.
 \begin{enumerate}[leftmargin=1.5em]
-    \item The packed HSA path has already crossed the flat dense FA4 baseline
-    on throughput by $64$K and remains ahead at $128$K.
+    \item By $128$K and $262144$, the packed HSA path is comfortably faster
+    than flat dense FA4 while also landing at lower loss on these short
+    internal runs.
     \item The sliding-window baselines are much stronger than a toy strawman.
     They are not hierarchical and they should eventually lose on relevance when
     the task genuinely requires nonlocal graph structure, but they are very fast
     and must be included in any honest benchmark table.
-    \item On these short repeated-batch runs, \texttt{sliding\_log} is
+    \item On these short true multi-batch resident runs, \texttt{sliding\_log}
     surprisingly competitive in loss. That is a useful warning: any claim that
     HSA ``obviously'' dominates sliding windows needs to be supported by longer
     and less degenerate training, not by intuition alone.
+    \item The $64$K packed row is currently anomalous. A direct profiler pass on
+    the true multi-batch $64$K packed run shows that the packed forward and
+    backward kernels are active and cheap, but the step is dominated by
+    gather/scatter-style tensor plumbing (\texttt{nonzero}, \texttt{index},
+    \texttt{gather}, \texttt{copy\_}) around the packed runtime on these more
+    fragmented $64$K resident schedules. This is a real implementation issue,
+    not a dispatch failure.
 \end{enumerate}
 
-The $262144$ row is the first regime where the packed HSA path cleanly clears
-both the dense flat baseline and the simple sliding baselines on this repeated
-single-batch smoke. That does not prove a general downstream quality win by
-itself, but it is exactly the systems crossover the packing story was supposed
-to produce.
+The $262144$ row is the first true multi-batch regime where the packed HSA path
+cleanly clears the dense flat baseline on both throughput and loss while also
+staying competitive with the stronger sliding-window baselines. That still does
+not prove a general downstream quality win by itself, but it is the right
+systems crossover: the packed hierarchical path is now winning in the regime it
+was designed for, and the remaining work is to improve the smaller long-context
+regimes and run longer multi-batch training.
 
 \subsection{MFU caveat}
 

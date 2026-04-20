@@ -3816,28 +3816,47 @@ def _resolve_precomputed_cached_generalized_forward_payload(
     q: torch.Tensor,
     k: torch.Tensor,
 ) -> Optional[dict]:
-    if not _use_hsa_synthetic_grid():
-        return None
-    if os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") != "1":
-        return None
     backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
     if backward_mode == "monolithic_sentence":
         return None
-    logical_block_q = _get_hsa_synthetic_logical_block_size("q")
-    logical_block_k = _get_hsa_synthetic_logical_block_size("k")
-    max_packed_k = _get_hsa_synthetic_max_packed_k(logical_block_k)
-    max_direct_segments = _get_hsa_synthetic_max_direct_segments()
     forward_block_q = _get_hsa_forward_q_block_size(q, k)
-    allow_forward_block_fallback = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+    use_env_matched_lookup = (
+        _use_hsa_synthetic_grid()
+        and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") == "1"
+    )
+    if use_env_matched_lookup:
+        logical_block_q = _get_hsa_synthetic_logical_block_size("q")
+        logical_block_k = _get_hsa_synthetic_logical_block_size("k")
+        max_packed_k = _get_hsa_synthetic_max_packed_k(logical_block_k)
+        max_direct_segments = _get_hsa_synthetic_max_direct_segments()
+        allow_forward_block_fallback = os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+        resolved = _get_precomputed_cached_generalized_forward_payload(
+            schedule,
+            forward_block_q=forward_block_q,
+            logical_block_q=logical_block_q,
+            logical_block_k=logical_block_k,
+            max_packed_k=max_packed_k,
+            max_direct_segments=max_direct_segments,
+            device=q.device,
+            allow_same_forward_block_fallback=allow_forward_block_fallback,
+        )
+        if resolved is not None:
+            return resolved
+    allow_general_fallback = os.environ.get(
+        "FLASH_ATTN_HSA_ALLOW_CACHED_GENERALIZED_FORWARD_FALLBACK",
+        "1",
+    ).strip().lower() not in {"0", "false", "off", "no"}
+    if not allow_general_fallback:
+        return None
     return _get_precomputed_cached_generalized_forward_payload(
         schedule,
         forward_block_q=forward_block_q,
-        logical_block_q=logical_block_q,
-        logical_block_k=logical_block_k,
-        max_packed_k=max_packed_k,
-        max_direct_segments=max_direct_segments,
+        logical_block_q=-1,
+        logical_block_k=-1,
+        max_packed_k=-1,
+        max_direct_segments=-1,
         device=q.device,
-        allow_same_forward_block_fallback=allow_forward_block_fallback,
+        allow_same_forward_block_fallback=True,
     )
 
 

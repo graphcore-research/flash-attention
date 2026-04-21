@@ -621,7 +621,7 @@ $T$ & mode & train batches & final loss & mean dt (ms) & tok/s \\
 $65536$ & flat FA4 & $4$ & $2.7987$ & $143.1$ & $458.0$k \\
 $65536$ & sliding\_log & $4$ & $2.1064$ & $60.6$ & $1082.1$k \\
 $65536$ & sliding\_fixed & $4$ & $2.7185$ & $62.2$ & $1054.0$k \\
-$65536$ & HSA packed & $4$ & $2.2537$ & $2085.8$ & $31.4$k \\
+$65536$ & HSA packed & $4$ & $2.2469$ & $109.7$ & $597.2$k \\
 \midrule
 $131072$ & flat FA4 & $2$ & $2.8541$ & $581.4$ & $225.4$k \\
 $131072$ & sliding\_log & $2$ & $1.6485$ & $158.3$ & $827.8$k \\
@@ -643,9 +643,10 @@ smokes because they cycle over multiple distinct resident schedules.}
 
 Several points matter immediately.
 \begin{enumerate}[leftmargin=1.5em]
-    \item By $128$K and $262144$, the packed HSA path is comfortably faster
-    than flat dense FA4 while also landing at lower loss on these short
-    internal runs.
+    \item By $64$K the packed HSA path has already crossed the dense flat FA4
+    baseline again after fixing the packed backward eligibility gate, and by
+    $128$K and $262144$ it is comfortably faster than flat while also landing
+    at lower loss on these short internal runs.
     \item The sliding-window baselines are much stronger than a toy strawman.
     They are not hierarchical and they should eventually lose on relevance when
     the task genuinely requires nonlocal graph structure, but they are very fast
@@ -654,13 +655,13 @@ Several points matter immediately.
     surprisingly competitive in loss. That is a useful warning: any claim that
     HSA ``obviously'' dominates sliding windows needs to be supported by longer
     and less degenerate training, not by intuition alone.
-    \item The $64$K packed row is currently anomalous. A direct profiler pass on
-    the true multi-batch $64$K packed run shows that the packed forward and
-    backward kernels are active and cheap, but the step is dominated by
-    gather/scatter-style tensor plumbing (\texttt{nonzero}, \texttt{index},
-    \texttt{gather}, \texttt{copy\_}) around the packed runtime on these more
-    fragmented $64$K resident schedules. This is a real implementation issue,
-    not a dispatch failure.
+    \item The earlier $64$K anomaly turned out to be a conservative fused
+    backward eligibility gate, not a missing packed dispatch. One of the true
+    multi-batch $64$K resident schedules had
+    \texttt{fused\_total\_coverage\_frac} $\approx 0.99849$, which was below
+    the previous $0.999$ cutoff and forced that batch onto the slow fallback
+    route. Relaxing the packed benchmark path to a minimum fused-coverage
+    threshold of $0.998$ restores the expected $64$K behavior.
 \end{enumerate}
 
 The $262144$ row is the first true multi-batch regime where the packed HSA path

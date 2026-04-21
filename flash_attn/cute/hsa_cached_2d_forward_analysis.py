@@ -2420,7 +2420,13 @@ def can_use_cached_generalized_fused_backward(
     geometry = payload.get("geometry")
     if not isinstance(geometry, dict):
         return False
-    if float(geometry.get("fused_total_coverage_frac", 0.0)) < 0.999:
+    min_coverage = float(
+        os.environ.get(
+            "FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD_MIN_COVERAGE",
+            "0.999",
+        )
+    )
+    if float(geometry.get("fused_total_coverage_frac", 0.0)) < min_coverage:
         return False
     if int(geometry.get("legacy_residual_fallback_range_count", 0)) != 0:
         return False

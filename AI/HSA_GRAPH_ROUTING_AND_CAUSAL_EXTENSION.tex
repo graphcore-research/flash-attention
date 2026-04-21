@@ -602,11 +602,15 @@ $262144$, while preserving the same hierarchical support semantics.
 The earlier repeated-single-batch resident smokes were useful for quick systems
 checks, but they were too degenerate to say much about relative learning
 behavior. Table~\ref{tab:true-multibatch-resident} replaces that with
-\emph{true multi-batch} resident training on real Gutenberg long-context
-caches:
+\emph{true multi-batch} resident training on a scaled Gutenberg corpus
+(\texttt{gutenberg\_large}, $31$ books, $\approx 23.6$M characters, and real
+long-context train-cache budgets of $227$ batches at $64$K, $116$ at $128$K,
+and $59$ at $262144$). To keep the resident benchmark memory-bounded while
+still avoiding repeated-single-batch memorization, the runs below cycle over
+selected resident subsets:
 \begin{itemize}[leftmargin=1.5em]
-    \item $64$K: $4$ distinct resident train batches;
-    \item $128$K: $2$ distinct resident train batches;
+    \item $64$K: $8$ distinct resident train batches;
+    \item $128$K: $3$ distinct resident train batches;
     \item $262144$: $2$ distinct resident train batches.
 \end{itemize}
 All rows below use real cache-backed batches and cycle over multiple distinct
@@ -618,59 +622,64 @@ resident schedules rather than memorizing a single cached example.
 \toprule
 $T$ & mode & train batches & final loss & mean dt (ms) & tok/s \\
 \midrule
-$65536$ & flat FA4 & $4$ & $2.7987$ & $143.1$ & $458.0$k \\
-$65536$ & sliding\_log & $4$ & $2.1064$ & $60.6$ & $1082.1$k \\
-$65536$ & sliding\_fixed & $4$ & $2.7185$ & $62.2$ & $1054.0$k \\
-$65536$ & HSA packed & $4$ & $2.2469$ & $109.7$ & $597.2$k \\
+$65536$ & flat FA4 & $8$ & $2.9195$ & $299.7$ & $218.7$k \\
+$65536$ & sliding\_log & $8$ & $2.3961$ & $65.4$ & $1001.8$k \\
+$65536$ & sliding\_fixed & $8$ & $2.8806$ & $60.3$ & $1087.0$k \\
+$65536$ & HSA packed & $8$ & $2.4858$ & $130.2$ & $503.3$k \\
 \midrule
-$131072$ & flat FA4 & $2$ & $2.8541$ & $581.4$ & $225.4$k \\
-$131072$ & sliding\_log & $2$ & $1.6485$ & $158.3$ & $827.8$k \\
-$131072$ & sliding\_fixed & $2$ & $2.7604$ & $167.8$ & $780.9$k \\
-$131072$ & HSA packed & $2$ & $1.8864$ & $181.7$ & $721.3$k \\
+$131072$ & flat FA4 & $3$ & $2.8504$ & $947.2$ & $138.4$k \\
+$131072$ & sliding\_log & $3$ & $1.7216$ & $199.6$ & $656.7$k \\
+$131072$ & sliding\_fixed & $3$ & $2.8088$ & $306.2$ & $428.1$k \\
+$131072$ & HSA packed & $3$ & $1.8358$ & $178.8$ & $733.2$k \\
 \midrule
-$262144$ & flat FA4 & $2$ & $2.8824$ & $1742.1$ & $150.5$k \\
-$262144$ & sliding\_log & $2$ & $1.6699$ & $363.6$ & $721.0$k \\
-$262144$ & sliding\_fixed & $2$ & $2.7400$ & $368.5$ & $711.3$k \\
-$262144$ & HSA packed & $2$ & $1.8003$ & $344.5$ & $760.9$k \\
+$262144$ & flat FA4 & $2$ & $2.8278$ & $1740.8$ & $150.6$k \\
+$262144$ & sliding\_log & $2$ & $1.3794$ & $358.4$ & $731.3$k \\
+$262144$ & sliding\_fixed & $2$ & $2.6345$ & $367.8$ & $712.7$k \\
+$262144$ & HSA packed & $2$ & $1.4889$ & $351.6$ & $745.6$k \\
 \bottomrule
 \end{tabular}
-\caption{True multi-batch resident training runs on real Gutenberg long-context
-caches. These are still internal benchmark runs rather than full downstream
-training jobs, but they are materially stronger than repeated-single-batch
-smokes because they cycle over multiple distinct resident schedules.}
+\caption{True multi-batch resident training runs on the scaled
+\texttt{gutenberg\_large} long-context caches. These are still internal
+benchmark runs rather than full downstream training jobs, but they are
+materially stronger than repeated-single-batch smokes because they cycle over
+multiple distinct resident schedules from a larger real corpus.}
 \label{tab:true-multibatch-resident}
 \end{table}
 
 Several points matter immediately.
 \begin{enumerate}[leftmargin=1.5em]
-    \item By $64$K the packed HSA path has already crossed the dense flat FA4
-    baseline again after fixing the packed backward eligibility gate, and by
-    $128$K and $262144$ it is comfortably faster than flat while also landing
-    at lower loss on these short internal runs.
+    \item On the scaled corpus, the packed HSA path is already clearly ahead of
+    dense flat FA4 by $64$K on both throughput and loss, and by $128$K and
+    $262144$ the throughput gap is large: about $5.3\times$ at $128$K and
+    about $5.0\times$ at $262144$, while also landing at materially lower loss
+    on these short internal runs.
     \item The sliding-window baselines are much stronger than a toy strawman.
     They are not hierarchical and they should eventually lose on relevance when
     the task genuinely requires nonlocal graph structure, but they are very fast
     and must be included in any honest benchmark table.
     \item On these short true multi-batch resident runs, \texttt{sliding\_log}
-    surprisingly competitive in loss. That is a useful warning: any claim that
-    HSA ``obviously'' dominates sliding windows needs to be supported by longer
-    and less degenerate training, not by intuition alone.
-    \item The earlier $64$K anomaly turned out to be a conservative fused
-    backward eligibility gate, not a missing packed dispatch. One of the true
-    multi-batch $64$K resident schedules had
-    \texttt{fused\_total\_coverage\_frac} $\approx 0.99849$, which was below
-    the previous $0.999$ cutoff and forced that batch onto the slow fallback
-    route. Relaxing the packed benchmark path to a minimum fused-coverage
-    threshold of $0.998$ restores the expected $64$K behavior.
+    remains the strongest quality baseline. That is a useful warning: any claim
+    that HSA ``obviously'' dominates sliding windows needs to be supported by
+    longer and less degenerate training, not by intuition alone.
+    \item The earlier scaled-corpus $64$K anomaly was not a missing packed
+    dispatch. It came from a bad interaction between first-use per-schedule
+    costs and a subset of packed sidecars that chose grouped
+    \texttt{k\_window}/direct families instead of the fast \texttt{union\_2d}
+    family. Rebuilding the selected $64$K sidecars with a benchmark-only
+    policy override that forces the efficient unionized family, and warming all
+    selected resident batches before timing, restores the expected packed-HSA
+    regime.
 \end{enumerate}
 
-The $262144$ row is the first true multi-batch regime where the packed HSA path
-cleanly clears the dense flat baseline on both throughput and loss while also
-staying competitive with the stronger sliding-window baselines. That still does
-not prove a general downstream quality win by itself, but it is the right
-systems crossover: the packed hierarchical path is now winning in the regime it
-was designed for, and the remaining work is to improve the smaller long-context
-regimes and run longer multi-batch training.
+The $262144$ row remains the clearest systems crossover. Packed HSA cleanly
+clears the dense flat baseline on both throughput and loss while landing
+slightly ahead of both sliding baselines on throughput, though still behind
+\texttt{sliding\_log} on loss. That still does not prove a general downstream
+quality win by itself, but it is the right systems crossover: the packed
+hierarchical path is now winning in the regime it was designed for, and the
+remaining work is to run longer multi-batch training on larger corpora and to
+improve smaller long-context regimes without relying on benchmark-specific
+sidecar retuning.
 
 \subsection{MFU caveat}
 

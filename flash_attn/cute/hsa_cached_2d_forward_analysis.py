@@ -1492,20 +1492,18 @@ def build_cached_generalized_packed_forward_payload(
             }
         )
 
-    direct_entries_by_qgroup: dict[int, list[tuple[int, list[int]]]] = {}
+    merged_direct_q_rows: list[int] = []
+    merged_direct_support_lists: list[list[int]] = []
     for bucket_entry in direct_bucket_entries:
-        qgroup_entries = direct_entries_by_qgroup.setdefault(bucket_entry["qgroup_bucket_idx"], [])
-        qgroup_entries.extend(zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True))
-
-    for qgroup_bucket_idx in sorted(direct_entries_by_qgroup):
-        qgroup_entries = direct_entries_by_qgroup[qgroup_bucket_idx]
-        if not qgroup_entries:
-            continue
-        merged_q_rows = [int(q_row) for q_row, _support_list in qgroup_entries]
-        merged_support_lists = [list(support_list) for _q_row, support_list in qgroup_entries]
+        for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True):
+            if not support_list:
+                continue
+            merged_direct_q_rows.append(int(q_row))
+            merged_direct_support_lists.append(list(support_list))
+    if merged_direct_q_rows:
         _append_direct_passthrough_groups(
-            q_rows=merged_q_rows,
-            support_lists=merged_support_lists,
+            q_rows=merged_direct_q_rows,
+            support_lists=merged_direct_support_lists,
             policy=resolved_policy,
             group_q_rows=group_q_rows,
             group_k_rows=group_k_rows,

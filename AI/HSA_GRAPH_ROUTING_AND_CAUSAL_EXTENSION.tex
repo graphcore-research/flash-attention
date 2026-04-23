@@ -429,6 +429,88 @@ kind of 2-D extraction:
     \item one output write per row range.
 \end{itemize}
 
+\subsection{What packed forward actually computes}
+
+The easiest way to say it precisely is: packing does \emph{not} change the
+attention rule. It changes the layout of the live support so that dead
+``white-space'' entries are physically removed before the kernel runs.
+
+Take one sparse support subproblem with query rows $R=\{r_1,\dots,r_m\}$ and
+key rows $C=\{c_1,\dots,c_n\}$. Packing defines two gather maps
+\[
+g_Q(a)=r_a,\qquad g_K(b)=c_b,
+\]
+then gathers
+\[
+\widetilde Q_a = Q_{g_Q(a)},\qquad
+\widetilde K_b = K_{g_K(b)},\qquad
+\widetilde V_b = V_{g_K(b)}.
+\]
+It also defines the packed binary mask
+\[
+\widetilde M_{ab} =
+\begin{cases}
+1 & \text{if } (g_Q(a),g_K(b)) \text{ is live in the original HSA graph},\\
+0 & \text{otherwise.}
+\end{cases}
+\]
+
+Then the packed microproblem is just exact masked attention on the reindexed
+live rows and columns:
+\[
+\widetilde S_{ab} = \frac{\widetilde Q_a^\top \widetilde K_b}{\sqrt d},
+\qquad
+\widetilde P_{ab}
+=
+\frac{\exp(\widetilde S_{ab})\widetilde M_{ab}}
+{\sum_c \exp(\widetilde S_{ac})\widetilde M_{ac}},
+\qquad
+\widetilde O_a = \sum_b \widetilde P_{ab}\widetilde V_b.
+\]
+
+So the intuitive picture
+\begin{quote}
+identify sparse tiles, remove the white space, fill the survivors into a dense
+tile, run GEMM, and then reindex so the softmax is correct
+\end{quote}
+is basically right, with one important refinement: the softmax is not
+``corrected afterward'' in an ad hoc way. The packed row/column indices and the
+packed mask \(\widetilde M\) define the exact local normalization domain. When a
+single original HSA row is split across several packed families or ranges, the
+implementation carries an exact online softmax state (LSE / running max-sum)
+across those pieces and merges them before the final writeback. That is what
+keeps the packed forward algebraically identical to the original sparse row.
+
+\subsection{What packed backward actually computes}
+
+Backward uses the same gather maps, but the ownership is no longer as clean as
+in forward. In packed coordinates,
+\[
+d\widetilde Q = d\widetilde S\,\widetilde K,\qquad
+d\widetilde K \mathrel{+}= d\widetilde S^\top \widetilde Q,\qquad
+d\widetilde V \mathrel{+}= \widetilde P^\top d\widetilde O.
+\]
+The writeback is then:
+\begin{itemize}[leftmargin=1.5em]
+    \item scatter \(d\widetilde Q\) back to the original query rows \(g_Q(a)\);
+    \item scatter-add \(d\widetilde K\) and \(d\widetilde V\) back to the
+    original key rows \(g_K(b)\).
+\end{itemize}
+
+This is the core asymmetry:
+\begin{itemize}[leftmargin=1.5em]
+    \item forward is naturally query-owned, so packing mostly gives a small
+    exact dense microproblem plus one output write per row;
+    \item backward must reduce many packed contributions back into shared
+    original \(K/V\) rows, so the host-side descriptor path, batching policy,
+    and scatter-add structure matter much more.
+\end{itemize}
+
+That is why ``packing helps forward'' does not automatically imply ``the same
+packing gives an equally clean backward.'' The algebra is exact in both cases;
+the systems problem is harder in backward because the packed representation has
+to support cheap accumulation back into the original coordinates.
+
 \subsection{Packing illustrations}
 
 Figure~\ref{fig:packing-illustrations} shows the three packing viewpoints on a
@@ -525,10 +607,15 @@ $(q_1,q_2)$, then cover the remainder with tiled residual tails that share one
 range-local softmax state.
 \end{minipage}
 
-\caption{Three views of packing. Row packing groups similar query rows, column
-packing reuses repeated K/V families, and generalized 2-D packing extracts
-dense submatrices from the support matrix and covers the remainder with fused
-tail tiles.}
+\caption{Three views of packing. In every case the blue/green/orange cells are
+\emph{live} support and the white cells are dead support that is physically
+removed from the packed microproblem. Row packing groups similar query rows,
+column packing reuses repeated K/V families, and generalized 2-D packing
+extracts dense submatrices from the support matrix and covers the remainder
+with fused tail tiles. The packed microproblem is still exact masked attention
+on the reindexed live rows and columns, and online softmax/LSE merging keeps
+normalization identical to the original sparse row even when one row is split
+across several packed ranges.}
 \label{fig:packing-illustrations}
 \end{figure}
 
@@ -550,6 +637,9 @@ named by \emph{what work is actually being done}:
     sparsity;
     \item \textbf{sliding\_log}: a causal sliding-window FA4 baseline with
     window width $\lceil \log_2 T \rceil$;
+    \item \textbf{strict\_log}: the same logarithmic sliding-window width
+    $\lceil \log_2 T \rceil$ applied at \emph{every} layer, including the final
+    layer;
     \item \textbf{sliding\_fixed}: a causal sliding-window FA4 baseline with a
     fixed window width of $1000$ tokens;
     \item \textbf{HSA naive}: exact HSA with cached-forward fallback disabled,
@@ -566,6 +656,13 @@ runs, the default exact HSA path can already reuse the packed cached forward
 representation. For that reason, the meaningful systems comparison is now
 \textbf{HSA naive} versus \textbf{HSA packed}, not \texttt{sparse\_mask} versus
 an older explicit cached preset.
+
+The distinction between \textbf{sliding\_log} and \textbf{strict\_log} is
+operationally important. \textbf{sliding\_log} is not a pure local baseline; it
+is a logarithmic local stack plus one dense global final layer. By contrast,
+\textbf{strict\_log} is a pure log-band local stack. Recent Gutenberg, FineWeb,
+and Wikipedia slices suggest that both are much stronger than a toy sparse
+strawman and should remain in the benchmark set.
 
 \subsection{Isolated packed-versus-naive HSA}
 
@@ -680,6 +777,49 @@ hierarchical path is now winning in the regime it was designed for, and the
 remaining work is to run longer multi-batch training on larger corpora and to
 improve smaller long-context regimes without relying on benchmark-specific
 sidecar retuning.
+
+\subsection{Issues encountered after the Gutenberg crossover}
+
+The Gutenberg table established that packed HSA can already cross over dense
+flat FA4 in the long-context regime. The next debugging pass on Wikipedia and
+FineWeb exposed a different issue: the packed representation is
+dataset-geometry-sensitive.
+
+The main problems were:
+\begin{enumerate}[leftmargin=1.5em]
+    \item some wiki/web batches produced packed sidecars with large grouped
+    \texttt{k\_window} / direct families rather than the compact
+    \texttt{union\_2d} regime that worked well on Gutenberg;
+    \item those sidecars often lacked a cheap cached fused-backward route, so
+    the runtime fell back to the legacy packed backward machinery;
+    \item the remaining runtime bottleneck on those batches was not the dense
+    GEMM itself, but host-side descriptor building and thousands of tiny packed
+    backward panel calls.
+\end{enumerate}
+
+One concrete improvement already landed: sorting and coalescing legacy packed
+backward panels by shape before execution. On a representative Wikipedia $64$K
+batch, that reduced the hybrid backward batch count from roughly
+\[
+165 \;\longrightarrow\; 15
+\]
+under the current default merge budget, and reduced the first real post-update
+step from about
+\[
+9.17\ \mathrm{s} \;\longrightarrow\; 1.65\ \mathrm{s}.
+\]
+
+That is an important refinement of the current state:
+\begin{itemize}[leftmargin=1.5em]
+    \item the remaining non-Gutenberg blocker is not ``HSA semantics are
+    wrong'';
+    \item it is also not ``GEMM packing is inherently slower than FA4'';
+    \item it is a systems issue in the packed backward descriptor/batching path
+    on less favorable support geometries.
+\end{itemize}
+
+So the current non-Gutenberg work is about making the packed backward path less
+fragile to wiki/web geometry, not about changing the HSA graph definition.
 
 \subsection{MFU caveat}
 

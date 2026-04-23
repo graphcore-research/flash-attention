@@ -5256,6 +5256,95 @@ def _gather_batch_tensors(
     return q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel
 
 
+@dataclass
+class _HSAHybridBackwardBatchRuntime:
+    q_indices_long: torch.Tensor
+    k_indices_long: torch.Tensor
+    q_indices_flat_long: torch.Tensor
+    k_indices_flat_long: torch.Tensor
+    prefix_len: torch.Tensor
+    q_length_table: torch.Tensor
+    k_length_table: torch.Tensor
+    q_valid_flat_idx: torch.Tensor
+    k_valid_flat_idx: torch.Tensor
+    q_valid_row_indices: torch.Tensor
+    k_valid_row_indices: torch.Tensor
+
+
+def _get_hsa_hybrid_backward_batch_runtime(batch) -> _HSAHybridBackwardBatchRuntime:
+    runtime = getattr(batch, "_hsa_runtime_cache", None)
+    if runtime is not None:
+        return runtime
+
+    device = batch.q_indices.device
+    q_indices_long = batch.q_indices.long()
+    k_indices_long = batch.k_indices.long()
+    q_indices_flat_long = q_indices_long.reshape(-1)
+    k_indices_flat_long = k_indices_long.reshape(-1)
+    prefix_len = _build_sentence_prefix_len(batch) if batch.prefix_len is None else batch.prefix_len.contiguous()
+    q_length_table = batch.q_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
+    k_length_table = batch.k_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
+    prefix_len.__leading_dim__ = 1
+    q_length_table.__leading_dim__ = 1
+    k_length_table.__leading_dim__ = 1
+
+    q_offsets = torch.arange(batch.q_indices.shape[1], device=device, dtype=batch.q_length.dtype).view(1, -1)
+    k_offsets = torch.arange(batch.k_indices.shape[1], device=device, dtype=batch.k_length.dtype).view(1, -1)
+    q_valid_flat_idx = (q_offsets < batch.q_length.unsqueeze(1)).reshape(-1).nonzero(as_tuple=False).flatten()
+    k_valid_flat_idx = (k_offsets < batch.k_length.unsqueeze(1)).reshape(-1).nonzero(as_tuple=False).flatten()
+    q_valid_row_indices = q_indices_flat_long.index_select(0, q_valid_flat_idx)
+    k_valid_row_indices = k_indices_flat_long.index_select(0, k_valid_flat_idx)
+
+    runtime = _HSAHybridBackwardBatchRuntime(
+        q_indices_long=q_indices_long,
+        k_indices_long=k_indices_long,
+        q_indices_flat_long=q_indices_flat_long,
+        k_indices_flat_long=k_indices_flat_long,
+        prefix_len=prefix_len,
+        q_length_table=q_length_table,
+        k_length_table=k_length_table,
+        q_valid_flat_idx=q_valid_flat_idx,
+        k_valid_flat_idx=k_valid_flat_idx,
+        q_valid_row_indices=q_valid_row_indices,
+        k_valid_row_indices=k_valid_row_indices,
+    )
+    setattr(batch, "_hsa_runtime_cache", runtime)
+    return runtime
+
+
+def _gather_batch_tensors_cached(
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    out_flat: torch.Tensor,
+    dout_flat: torch.Tensor,
+    lse_flat: torch.Tensor,
+    batch,
+    runtime: _HSAHybridBackwardBatchRuntime,
+):
+    q_sel = q_flat.index_select(0, runtime.q_indices_flat_long).view(
+        runtime.q_indices_long.shape[0], runtime.q_indices_long.shape[1], q_flat.shape[1], q_flat.shape[2]
+    ).contiguous()
+    k_sel = k_flat.index_select(0, runtime.k_indices_flat_long).view(
+        runtime.k_indices_long.shape[0], runtime.k_indices_long.shape[1], k_flat.shape[1], k_flat.shape[2]
+    ).contiguous()
+    v_sel = v_flat.index_select(0, runtime.k_indices_flat_long).view(
+        runtime.k_indices_long.shape[0], runtime.k_indices_long.shape[1], v_flat.shape[1], v_flat.shape[2]
+    ).contiguous()
+    out_sel = out_flat.index_select(0, runtime.q_indices_flat_long).view(
+        runtime.q_indices_long.shape[0], runtime.q_indices_long.shape[1], out_flat.shape[1], out_flat.shape[2]
+    ).contiguous()
+    dout_sel = dout_flat.index_select(0, runtime.q_indices_flat_long).view(
+        runtime.q_indices_long.shape[0], runtime.q_indices_long.shape[1], dout_flat.shape[1], dout_flat.shape[2]
+    ).contiguous()
+    lse_sel_base = lse_flat.index_select(0, runtime.q_indices_flat_long).view(
+        runtime.q_indices_long.shape[0], runtime.q_indices_long.shape[1], lse_flat.shape[1]
+    ).permute(0, 2, 1)
+    lse_sel = torch.empty(lse_sel_base.shape, dtype=lse_sel_base.dtype, device=lse_sel_base.device)
+    lse_sel.copy_(lse_sel_base)
+    return runtime.q_indices_long, runtime.k_indices_long, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel
+
+
 def _build_sentence_prefix_len(batch) -> torch.Tensor:
     row_offsets = torch.arange(batch.q_indices.shape[1], device=batch.q_indices.device, dtype=torch.int32).view(1, -1)
     prefix_len = row_offsets + 1
@@ -5399,20 +5488,13 @@ def _run_panel_batch_cute(
     out_sel: torch.Tensor,
     dout_sel: torch.Tensor,
     lse_sel: torch.Tensor,
-    prefix_len: torch.Tensor,
-    q_length: torch.Tensor,
-    k_length: torch.Tensor,
+    runtime: _HSAHybridBackwardBatchRuntime,
     softmax_scale: float,
     deterministic: bool,
 ):
     hsa_mod = _load_hsa_module()
     _, _, _, _, _, _, flash_attn_bwd = _lazy_cute_imports()
-    q_length_table = q_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
-    k_length_table = k_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
-    prefix_len.__leading_dim__ = 1
-    q_length_table.__leading_dim__ = 1
-    k_length_table.__leading_dim__ = 1
-    aux_tensors = [prefix_len, q_length_table, k_length_table]
+    aux_tensors = [runtime.prefix_len, runtime.q_length_table, runtime.k_length_table]
     return flash_attn_bwd(
         q_sel,
         k_sel,
@@ -5446,9 +5528,10 @@ def _run_hsa_descriptor_mma_batches(
     if batch is None or batch.q_indices.numel() == 0:
         return False
 
+    runtime = _get_hsa_hybrid_backward_batch_runtime(batch)
     hsa_mod = _load_hsa_module()
     _, _, _, _, _, _, flash_attn_bwd = _lazy_cute_imports()
-    q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors(
+    q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors_cached(
         q_flat,
         k_flat,
         v_flat,
@@ -5456,13 +5539,8 @@ def _run_hsa_descriptor_mma_batches(
         dout_flat,
         lse_flat,
         batch,
+        runtime,
     )
-    prefix_len = batch.prefix_len.contiguous()
-    q_length_table = batch.q_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
-    k_length_table = batch.k_length.unsqueeze(1).expand(-1, prefix_len.shape[1]).contiguous()
-    prefix_len.__leading_dim__ = 1
-    q_length_table.__leading_dim__ = 1
-    k_length_table.__leading_dim__ = 1
 
     dq, dk, dv = flash_attn_bwd(
         q_sel,
@@ -5476,13 +5554,17 @@ def _run_hsa_descriptor_mma_batches(
         pack_gqa=False,
         deterministic=deterministic,
         mask_mod=hsa_mod.get_hsa_panel_prefix_mask_mod(),
-        aux_tensors=[prefix_len, q_length_table, k_length_table],
+        aux_tensors=[runtime.prefix_len, runtime.q_length_table, runtime.k_length_table],
     )
-    q_valid = torch.arange(q_indices.shape[1], device=q_flat.device).view(1, -1) < batch.q_length.unsqueeze(1)
-    k_valid = torch.arange(k_indices.shape[1], device=k_flat.device).view(1, -1) < batch.k_length.unsqueeze(1)
-    dq_accum_rows.index_add_(0, q_indices[q_valid].long(), dq[q_valid].float())
-    dk_accum_rows.index_add_(0, k_indices[k_valid].long(), dk[k_valid].float())
-    dv_accum_rows.index_add_(0, k_indices[k_valid].long(), dv[k_valid].float())
+    dq_accum_rows.index_add_(
+        0,
+        runtime.q_valid_row_indices,
+        dq.reshape(-1, dq.shape[2], dq.shape[3]).index_select(0, runtime.q_valid_flat_idx).float(),
+    )
+    dk_selected = dk.reshape(-1, dk.shape[2], dk.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+    dv_selected = dv.reshape(-1, dv.shape[2], dv.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+    dk_accum_rows.index_add_(0, runtime.k_valid_row_indices, dk_selected)
+    dv_accum_rows.index_add_(0, runtime.k_valid_row_indices, dv_selected)
     return True
 
 
@@ -6065,7 +6147,8 @@ def run_hsa_bwd_sm100_packed(
     dv_acc = torch.zeros_like(v_flat, dtype=torch.float32)
 
     for batch in sentence_batches:
-        q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors(
+        runtime = _get_hsa_hybrid_backward_batch_runtime(batch)
+        q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors_cached(
             q_flat,
             k_flat,
             v_flat,
@@ -6073,6 +6156,7 @@ def run_hsa_bwd_sm100_packed(
             dout_flat,
             lse_flat,
             batch,
+            runtime,
         )
         dq, dk, dv = _run_panel_batch_cute(
             q_sel,
@@ -6081,20 +6165,23 @@ def run_hsa_bwd_sm100_packed(
             out_sel,
             dout_sel,
             lse_sel,
-            _build_sentence_prefix_len(batch),
-            batch.q_length,
-            batch.k_length,
+            runtime,
             softmax_scale,
             deterministic,
         )
-        q_valid = torch.arange(q_indices.shape[1], device=q.device).view(1, -1) < batch.q_length.unsqueeze(1)
-        k_valid = torch.arange(k_indices.shape[1], device=q.device).view(1, -1) < batch.k_length.unsqueeze(1)
-        dq_acc.index_add_(0, q_indices[q_valid].long(), dq[q_valid].float())
-        dk_acc.index_add_(0, k_indices[k_valid].long(), dk[k_valid].float())
-        dv_acc.index_add_(0, k_indices[k_valid].long(), dv[k_valid].float())
+        dq_acc.index_add_(
+            0,
+            runtime.q_valid_row_indices,
+            dq.reshape(-1, dq.shape[2], dq.shape[3]).index_select(0, runtime.q_valid_flat_idx).float(),
+        )
+        dk_selected = dk.reshape(-1, dk.shape[2], dk.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+        dv_selected = dv.reshape(-1, dv.shape[2], dv.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+        dk_acc.index_add_(0, runtime.k_valid_row_indices, dk_selected)
+        dv_acc.index_add_(0, runtime.k_valid_row_indices, dv_selected)
 
     for batch in anchor_batches:
-        q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors(
+        runtime = _get_hsa_hybrid_backward_batch_runtime(batch)
+        q_indices, k_indices, q_sel, k_sel, v_sel, out_sel, dout_sel, lse_sel = _gather_batch_tensors_cached(
             q_flat,
             k_flat,
             v_flat,
@@ -6102,6 +6189,7 @@ def run_hsa_bwd_sm100_packed(
             dout_flat,
             lse_flat,
             batch,
+            runtime,
         )
         dq, dk, dv = _run_panel_batch_cute(
             q_sel,
@@ -6110,17 +6198,19 @@ def run_hsa_bwd_sm100_packed(
             out_sel,
             dout_sel,
             lse_sel,
-            batch.prefix_len,
-            batch.q_length,
-            batch.k_length,
+            runtime,
             softmax_scale,
             deterministic,
         )
-        q_valid = torch.arange(q_indices.shape[1], device=q.device).view(1, -1) < batch.q_length.unsqueeze(1)
-        k_valid = torch.arange(k_indices.shape[1], device=q.device).view(1, -1) < batch.k_length.unsqueeze(1)
-        dq_acc.index_add_(0, q_indices[q_valid].long(), dq[q_valid].float())
-        dk_acc.index_add_(0, k_indices[k_valid].long(), dk[k_valid].float())
-        dv_acc.index_add_(0, k_indices[k_valid].long(), dv[k_valid].float())
+        dq_acc.index_add_(
+            0,
+            runtime.q_valid_row_indices,
+            dq.reshape(-1, dq.shape[2], dq.shape[3]).index_select(0, runtime.q_valid_flat_idx).float(),
+        )
+        dk_selected = dk.reshape(-1, dk.shape[2], dk.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+        dv_selected = dv.reshape(-1, dv.shape[2], dv.shape[3]).index_select(0, runtime.k_valid_flat_idx).float()
+        dk_acc.index_add_(0, runtime.k_valid_row_indices, dk_selected)
+        dv_acc.index_add_(0, runtime.k_valid_row_indices, dv_selected)
 
     return _cast_hsa_row_accums_to_outputs(q, k, v, dq_acc, dk_acc, dv_acc)
 

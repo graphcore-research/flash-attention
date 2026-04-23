@@ -592,6 +592,20 @@ def _coalesce_hsa_hybrid_backward_batches(batches: list[HSAHybridBackwardBatch])
     return merged_batches
 
 
+def _get_hsa_hybrid_backward_batch_cache_key(
+    schedule: "HSASchedule",
+    hybrid_schedule: "HSAHybridBackwardSchedule",
+) -> tuple[str, int, int, int, float, bool]:
+    return (
+        str(schedule.sentence_start.device),
+        hybrid_schedule.k_block_size,
+        hybrid_schedule.anchor_row_panel_size,
+        _get_hsa_legacy_packed_merge_max_batch_entries(),
+        _get_hsa_legacy_packed_merge_max_pad_ratio(),
+        _use_hsa_legacy_packed_sort_batches(),
+    )
+
+
 @dataclass
 class HSAMonolithicBackwardSchedule:
     """Kernel-facing packed backward descriptors grouped by key block."""
@@ -3400,7 +3414,7 @@ def _get_hsa_hybrid_backward_batches(
     hybrid_schedule: HSAHybridBackwardSchedule,
 ) -> tuple[list[HSAHybridBackwardBatch], list[HSAHybridBackwardBatch]]:
     cache = getattr(schedule, "_hsa_hybrid_backward_batch_cache", None)
-    cache_key = (str(schedule.sentence_start.device), hybrid_schedule.k_block_size, hybrid_schedule.anchor_row_panel_size)
+    cache_key = _get_hsa_hybrid_backward_batch_cache_key(schedule, hybrid_schedule)
     if cache is not None and cache_key in cache:
         return cache[cache_key]
 

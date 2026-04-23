@@ -373,35 +373,97 @@ def _build_masked_tail_tiles(
 ) -> tuple[list[list[int]], list[list[int]], int]:
     if rows_per_range <= 0 or keys_per_tile <= 0:
         raise ValueError("tail tile builder parameters must be positive")
-    key_row_masks: dict[int, int] = {}
+    flat_support_rows: list[int] = []
+    flat_row_bits: list[int] = []
     for row_idx, support_list in enumerate(tail_support_lists):
         if row_idx >= rows_per_range:
             break
-        for support_row in support_list:
-            key_row_masks[int(support_row)] = key_row_masks.get(int(support_row), 0) | (1 << row_idx)
-    if not key_row_masks:
+        if not support_list:
+            continue
+        row_bit = 1 << row_idx
+        flat_support_rows.extend(int(support_row) for support_row in support_list)
+        flat_row_bits.extend(row_bit for _ in support_list)
+    if not flat_support_rows:
         return [], [], 0
-
-    key_entries = sorted(
-        key_row_masks.items(),
-        key=lambda item: (-int(item[1]).bit_count(), int(item[1]), int(item[0])),
-    )
+    support_row_tensor = torch.tensor(flat_support_rows, dtype=torch.int32)
+    row_bit_tensor = torch.tensor(flat_row_bits, dtype=torch.int64)
+    sort_idx = torch.argsort(support_row_tensor, stable=True)
+    sorted_support_rows = support_row_tensor[sort_idx]
+    sorted_row_bits = row_bit_tensor[sort_idx]
+    unique_support_rows, counts = torch.unique_consecutive(sorted_support_rows, return_counts=True)
+    counts64 = counts.to(dtype=torch.int64)
+    prefix_sums = torch.cumsum(sorted_row_bits, dim=0)
+    segment_ends = torch.cumsum(counts64, dim=0) - 1
+    segment_starts = segment_ends - counts64 + 1
+    previous_prefix = torch.zeros_like(segment_ends)
+    has_previous = segment_starts > 0
+    if bool(has_previous.any().item()):
+        previous_prefix[has_previous] = prefix_sums[segment_starts[has_previous] - 1]
+    row_masks = prefix_sums[segment_ends] - previous_prefix
+    support_row_list = [int(support_row) for support_row in unique_support_rows.tolist()]
+    row_mask_list = [int(row_mask) for row_mask in row_masks.tolist()]
     tail_tiles: list[list[int]] = []
     tail_mask_rows: list[list[int]] = []
     tail_live_pairs = 0
-    for chunk_start in range(0, len(key_entries), keys_per_tile):
-        chunk = key_entries[chunk_start : chunk_start + keys_per_tile]
+    for chunk_start in range(0, len(support_row_list), keys_per_tile):
+        chunk_support_rows = support_row_list[chunk_start : chunk_start + keys_per_tile]
+        chunk_row_masks = row_mask_list[chunk_start : chunk_start + keys_per_tile]
         tile_rows = [-1] * keys_per_tile
         row_masks = [0] * rows_per_range
-        for col_idx, (support_row, row_mask) in enumerate(chunk):
+        tail_live_pairs += int(sum(int(row_mask).bit_count() for row_mask in chunk_row_masks))
+        for col_idx, (support_row, row_mask) in enumerate(zip(chunk_support_rows, chunk_row_masks, strict=True)):
             tile_rows[col_idx] = int(support_row)
-            tail_live_pairs += int(row_mask).bit_count()
-            for row_idx in range(rows_per_range):
-                if (int(row_mask) >> row_idx) & 1:
+            while row_mask:
+                lowest_bit = row_mask & -row_mask
+                row_idx = lowest_bit.bit_length() - 1
+                if row_idx < rows_per_range:
                     row_masks[row_idx] |= 1 << col_idx
+                row_mask ^= lowest_bit
         tail_tiles.append(tile_rows)
         tail_mask_rows.append(row_masks)
     return tail_tiles, tail_mask_rows, tail_live_pairs
+
+
+def _build_rowwise_tail_tiles(
+    tail_support_lists: list[list[int]],
+    *,
+    rows_per_range: int,
+    keys_per_tile: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    tail_tile_tensors: list[torch.Tensor] = []
+    tail_mask_tensors: list[torch.Tensor] = []
+    tail_live_pairs = 0
+    for row_idx, support_list in enumerate(tail_support_lists):
+        if row_idx >= rows_per_range:
+            break
+        if not support_list:
+            continue
+        support_tensor = torch.tensor(support_list, dtype=torch.int32)
+        support_count = int(support_tensor.numel())
+        if support_count <= 0:
+            continue
+        tile_count = (support_count + keys_per_tile - 1) // keys_per_tile
+        padded = torch.full((tile_count * keys_per_tile,), -1, dtype=torch.int32)
+        padded[:support_count] = support_tensor
+        tile_rows_tensor = padded.view(tile_count, keys_per_tile)
+        row_mask_tensor = torch.zeros((tile_count, rows_per_range), dtype=torch.int32)
+        row_mask_tensor[:, row_idx] = (1 << keys_per_tile) - 1
+        tail_count = support_count - ((tile_count - 1) * keys_per_tile)
+        row_mask_tensor[-1, row_idx] = (1 << tail_count) - 1
+        tail_tile_tensors.append(tile_rows_tensor)
+        tail_mask_tensors.append(row_mask_tensor)
+        tail_live_pairs += support_count
+    if not tail_tile_tensors:
+        return (
+            torch.empty((0, keys_per_tile), dtype=torch.int32),
+            torch.empty((0, rows_per_range), dtype=torch.int32),
+            0,
+        )
+    return (
+        torch.cat(tail_tile_tensors, dim=0).contiguous(),
+        torch.cat(tail_mask_tensors, dim=0).contiguous(),
+        tail_live_pairs,
+    )
 
 
 def _extract_fused_exact_tail_ranges(
@@ -415,10 +477,16 @@ def _extract_fused_exact_tail_ranges(
     if rows_per_range <= 0 or keys_per_tile <= 0 or min_rows <= 0:
         raise ValueError("fused exact/tail extractor parameters must be positive")
     support_sets = [set(int(value) for value in support_list) for support_list in support_lists]
-    remaining_rows = [row_idx for row_idx, support_set in enumerate(support_sets) if support_set]
+    active_rows = [row_idx for row_idx, support_set in enumerate(support_sets) if support_set]
     fused_ranges: list[dict[str, Any]] = []
     exact_live_pairs = 0
     tail_live_pairs = 0
+    rowwise_tail_live_pairs_threshold = int(
+        os.environ.get(
+            "FLASH_ATTN_HSA_FUSED_TAIL_ROWWISE_LIVE_PAIRS_THRESHOLD",
+            "1024",
+        )
+    )
 
     def _ordered_rows(row_indices: list[int]) -> list[int]:
         return sorted(
@@ -431,99 +499,64 @@ def _extract_fused_exact_tail_ranges(
             ),
         )
 
-    while remaining_rows:
-        active_rows = [row_idx for row_idx in remaining_rows if len(support_sets[row_idx]) >= keys_per_tile]
-        best_group: list[int] | None = None
-        best_common: set[int] | None = None
-        best_score: tuple[int, int, int, int] | None = None
-
-        for seed_idx in active_rows:
-            seed_support = support_sets[seed_idx]
-            candidate_rows = sorted(
-                (row_idx for row_idx in active_rows if row_idx != seed_idx),
-                key=lambda row_idx: (
-                    len(seed_support.intersection(support_sets[row_idx])),
-                    len(support_sets[row_idx]),
-                    -row_idx,
-                ),
-                reverse=True,
-            )
-            subgroup = [seed_idx]
-            common_support = set(seed_support)
-            for row_idx in candidate_rows:
-                if len(subgroup) >= rows_per_range:
+    ordered_active_rows = _ordered_rows(active_rows)
+    for group_start in range(0, len(ordered_active_rows), rows_per_range):
+        ordered_group = ordered_active_rows[group_start : group_start + rows_per_range]
+        if not ordered_group:
+            continue
+        exact_tiles: list[list[int]] = []
+        covered_keys: set[int] = set()
+        group_live_pairs = int(sum(len(support_sets[row_idx]) for row_idx in ordered_group))
+        use_rowwise_tail = (
+            rowwise_tail_live_pairs_threshold > 0
+            and group_live_pairs >= rowwise_tail_live_pairs_threshold
+        )
+        if not use_rowwise_tail and len(ordered_group) >= min_rows:
+            common_support = set(support_sets[ordered_group[0]])
+            for row_idx in ordered_group[1:]:
+                common_support.intersection_update(support_sets[row_idx])
+                if len(common_support) < keys_per_tile:
                     break
-                candidate_common = common_support.intersection(support_sets[row_idx])
-                if len(candidate_common) < keys_per_tile:
-                    continue
-                subgroup.append(row_idx)
-                common_support = candidate_common
-            if len(subgroup) < min_rows:
-                continue
-            tile_count = len(common_support) // keys_per_tile
-            if tile_count <= 0:
-                continue
-            score = (
-                len(subgroup) * tile_count * keys_per_tile,
-                len(subgroup),
-                tile_count,
-                len(common_support),
+            if len(common_support) >= keys_per_tile:
+                sorted_common = sorted(common_support)
+                tile_count = len(sorted_common) // keys_per_tile
+                exact_tiles = [
+                    sorted_common[tile_idx * keys_per_tile : (tile_idx + 1) * keys_per_tile]
+                    for tile_idx in range(tile_count)
+                ]
+                covered_keys = {key for tile in exact_tiles for key in tile}
+                exact_live_pairs += len(ordered_group) * len(covered_keys)
+        tail_support_lists = [
+            sorted(support_sets[row_idx].difference(covered_keys))
+            for row_idx in ordered_group
+        ]
+        if use_rowwise_tail:
+            tail_tile_tensor, tail_mask_tensor, group_tail_live_pairs = _build_rowwise_tail_tiles(
+                tail_support_lists,
+                rows_per_range=rows_per_range,
+                keys_per_tile=keys_per_tile,
             )
-            if best_score is None or score > best_score:
-                best_group = subgroup
-                best_common = common_support
-                best_score = score
-
-        if best_group is None or best_common is None or best_score is None:
-            tail_group = _ordered_rows(remaining_rows[:rows_per_range] if len(remaining_rows) <= rows_per_range else _ordered_rows(remaining_rows)[:rows_per_range])
-            tail_support_lists = [sorted(support_sets[row_idx]) for row_idx in tail_group]
+            tail_tiles: list[list[int]] = []
+            tail_mask_rows: list[list[int]] = []
+        else:
             tail_tiles, tail_mask_rows, group_tail_live_pairs = _build_masked_tail_tiles(
                 tail_support_lists,
                 rows_per_range=rows_per_range,
                 keys_per_tile=keys_per_tile,
             )
-            fused_ranges.append(
-                {
-                    "q_rows": [int(q_rows[row_idx]) for row_idx in tail_group],
-                    "exact_tiles": [],
-                    "tail_tiles": tail_tiles,
-                    "tail_mask_rows": tail_mask_rows,
-                }
-            )
-            tail_live_pairs += int(group_tail_live_pairs)
-            remaining_set = set(tail_group)
-            remaining_rows = [row_idx for row_idx in remaining_rows if row_idx not in remaining_set]
-            continue
-
-        ordered_group = _ordered_rows(best_group)
-        sorted_common = sorted(best_common)
-        tile_count = best_score[2]
-        exact_tiles = [
-            sorted_common[tile_idx * keys_per_tile : (tile_idx + 1) * keys_per_tile]
-            for tile_idx in range(tile_count)
-        ]
-        covered_keys = set(key for tile in exact_tiles for key in tile)
-        tail_support_lists = [
-            sorted(support_sets[row_idx].difference(covered_keys))
-            for row_idx in ordered_group
-        ]
-        tail_tiles, tail_mask_rows, group_tail_live_pairs = _build_masked_tail_tiles(
-            tail_support_lists,
-            rows_per_range=rows_per_range,
-            keys_per_tile=keys_per_tile,
-        )
+            tail_tile_tensor = None
+            tail_mask_tensor = None
         fused_ranges.append(
             {
                 "q_rows": [int(q_rows[row_idx]) for row_idx in ordered_group],
                 "exact_tiles": exact_tiles,
                 "tail_tiles": tail_tiles,
                 "tail_mask_rows": tail_mask_rows,
-            }
-        )
-        exact_live_pairs += len(ordered_group) * len(covered_keys)
+                "tail_tile_tensor": tail_tile_tensor,
+                "tail_mask_tensor": tail_mask_tensor,
+                }
+            )
         tail_live_pairs += int(group_tail_live_pairs)
-        remaining_set = set(best_group)
-        remaining_rows = [row_idx for row_idx in remaining_rows if row_idx not in remaining_set]
 
     return fused_ranges, exact_live_pairs, tail_live_pairs
 
@@ -536,23 +569,28 @@ def _materialize_exact_dense_range_tensors(
     keys_per_tile: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     range_count = len(exact_ranges)
-    q_row_idx = torch.full((range_count, rows_per_range), -1, dtype=torch.int32, device=device)
-    q_length = torch.zeros((range_count,), dtype=torch.int32, device=device)
-    tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
     tile_count = sum(len(range_entry["tiles"]) for range_entry in exact_ranges)
-    tile_k_row_idx = torch.full((tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
-
+    q_row_idx_cpu = [[-1] * rows_per_range for _ in range(range_count)]
+    q_length_cpu = [0] * range_count
+    tile_ptr_cpu = [0] * (range_count + 1)
+    tile_k_row_idx_cpu = [[-1] * keys_per_tile for _ in range(tile_count)]
     tile_offset = 0
     for range_idx, range_entry in enumerate(exact_ranges):
         q_rows = [int(value) for value in range_entry["q_rows"]]
         tiles = range_entry["tiles"]
-        q_length[range_idx] = len(q_rows)
-        q_row_idx[range_idx, : len(q_rows)] = torch.tensor(q_rows, dtype=torch.int32, device=device)
+        q_length_cpu[range_idx] = len(q_rows)
+        q_row_idx_cpu[range_idx][: len(q_rows)] = q_rows
         for tile in tiles:
-            tile_k_row_idx[tile_offset] = torch.tensor(tile, dtype=torch.int32, device=device)
+            tile_values = [int(value) for value in tile]
+            tile_k_row_idx_cpu[tile_offset][: len(tile_values)] = tile_values
             tile_offset += 1
-        tile_ptr[range_idx + 1] = tile_offset
-    return q_row_idx, q_length, tile_ptr, tile_k_row_idx
+        tile_ptr_cpu[range_idx + 1] = tile_offset
+    return (
+        torch.tensor(q_row_idx_cpu, dtype=torch.int32, device=device).contiguous(),
+        torch.tensor(q_length_cpu, dtype=torch.int32, device=device).contiguous(),
+        torch.tensor(tile_ptr_cpu, dtype=torch.int32, device=device).contiguous(),
+        torch.tensor(tile_k_row_idx_cpu, dtype=torch.int32, device=device).contiguous(),
+    )
 
 
 def _materialize_fused_exact_tail_range_tensors(
@@ -563,57 +601,71 @@ def _materialize_fused_exact_tail_range_tensors(
     keys_per_tile: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     range_count = len(fused_ranges)
-    q_row_idx = torch.full((range_count, rows_per_range), -1, dtype=torch.int32, device=device)
-    q_length = torch.zeros((range_count,), dtype=torch.int32, device=device)
-    exact_tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
     exact_tile_count = sum(len(range_entry.get("exact_tiles", ())) for range_entry in fused_ranges)
-    exact_k_row_idx = torch.full((exact_tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
-    tail_tile_ptr = torch.zeros((range_count + 1,), dtype=torch.int32, device=device)
-    tail_tile_count = sum(len(range_entry.get("tail_tiles", ())) for range_entry in fused_ranges)
-    tail_k_row_idx = torch.full((tail_tile_count, keys_per_tile), -1, dtype=torch.int32, device=device)
-    tail_mask_words = torch.zeros((tail_tile_count, rows_per_range, 1), dtype=torch.int32, device=device)
-
+    tail_tile_count = 0
+    for range_entry in fused_ranges:
+        tail_tile_tensor = range_entry.get("tail_tile_tensor")
+        if isinstance(tail_tile_tensor, torch.Tensor):
+            tail_tile_count += int(tail_tile_tensor.shape[0])
+        else:
+            tail_tile_count += len(range_entry.get("tail_tiles", ()))
+    q_row_idx_cpu = torch.full((range_count, rows_per_range), -1, dtype=torch.int32)
+    q_length_cpu = torch.zeros((range_count,), dtype=torch.int32)
+    exact_tile_ptr_cpu = torch.zeros((range_count + 1,), dtype=torch.int32)
+    exact_k_row_idx_cpu = torch.full((exact_tile_count, keys_per_tile), -1, dtype=torch.int32)
+    tail_tile_ptr_cpu = torch.zeros((range_count + 1,), dtype=torch.int32)
+    tail_k_row_idx_cpu = torch.full((tail_tile_count, keys_per_tile), -1, dtype=torch.int32)
+    tail_mask_words_cpu = torch.zeros((tail_tile_count, rows_per_range, 1), dtype=torch.int32)
     exact_tile_offset = 0
     tail_tile_offset = 0
     for range_idx, range_entry in enumerate(fused_ranges):
         q_rows = [int(value) for value in range_entry["q_rows"]]
         exact_tiles = [[int(value) for value in tile] for tile in range_entry.get("exact_tiles", ())]
-        tail_tiles = [
-            [int(value) for value in tail_tile]
-            for tail_tile in range_entry.get("tail_tiles", ())
-        ]
-        tail_mask_rows = [
-            [int(value) for value in row_masks]
-            for row_masks in range_entry.get("tail_mask_rows", ())
-        ]
-        q_length[range_idx] = len(q_rows)
+        q_length_cpu[range_idx] = int(len(q_rows))
         if q_rows:
-            q_row_idx[range_idx, : len(q_rows)] = torch.tensor(q_rows, dtype=torch.int32, device=device)
-        for tile in exact_tiles:
-            exact_k_row_idx[exact_tile_offset, : len(tile)] = torch.tensor(tile, dtype=torch.int32, device=device)
-            exact_tile_offset += 1
-        exact_tile_ptr[range_idx + 1] = exact_tile_offset
-        for tile_rows, row_masks in zip(tail_tiles, tail_mask_rows, strict=True):
-            tail_k_row_idx[tail_tile_offset, : len(tile_rows)] = torch.tensor(
-                tile_rows,
-                dtype=torch.int32,
-                device=device,
-            )
-            tail_mask_words[tail_tile_offset, : len(row_masks), 0] = torch.tensor(
-                row_masks,
-                dtype=torch.int32,
-                device=device,
-            )
-            tail_tile_offset += 1
-        tail_tile_ptr[range_idx + 1] = tail_tile_offset
+            q_row_idx_cpu[range_idx, : len(q_rows)] = torch.tensor(q_rows, dtype=torch.int32)
+        if exact_tiles:
+            exact_tile_tensor = torch.tensor(exact_tiles, dtype=torch.int32)
+            exact_tile_count_range = int(exact_tile_tensor.shape[0])
+            exact_k_row_idx_cpu[exact_tile_offset : exact_tile_offset + exact_tile_count_range, : exact_tile_tensor.shape[1]] = exact_tile_tensor
+            exact_tile_offset += exact_tile_count_range
+        exact_tile_ptr_cpu[range_idx + 1] = int(exact_tile_offset)
+
+        tail_tile_tensor = range_entry.get("tail_tile_tensor")
+        tail_mask_tensor = range_entry.get("tail_mask_tensor")
+        if isinstance(tail_tile_tensor, torch.Tensor) and isinstance(tail_mask_tensor, torch.Tensor):
+            tail_tile_tensor = tail_tile_tensor.to(dtype=torch.int32, device="cpu").contiguous()
+            tail_mask_tensor = tail_mask_tensor.to(dtype=torch.int32, device="cpu").contiguous()
+            tail_tile_count_range = int(tail_tile_tensor.shape[0])
+            if tail_tile_count_range > 0:
+                tail_k_row_idx_cpu[tail_tile_offset : tail_tile_offset + tail_tile_count_range] = tail_tile_tensor
+                tail_mask_words_cpu[tail_tile_offset : tail_tile_offset + tail_tile_count_range, :, 0] = tail_mask_tensor
+                tail_tile_offset += tail_tile_count_range
+        else:
+            tail_tiles = [
+                [int(value) for value in tail_tile]
+                for tail_tile in range_entry.get("tail_tiles", ())
+            ]
+            tail_mask_rows = [
+                [int(value) for value in row_masks]
+                for row_masks in range_entry.get("tail_mask_rows", ())
+            ]
+            if tail_tiles:
+                tail_tile_tensor = torch.tensor(tail_tiles, dtype=torch.int32)
+                tail_mask_tensor = torch.tensor(tail_mask_rows, dtype=torch.int32)
+                tail_tile_count_range = int(tail_tile_tensor.shape[0])
+                tail_k_row_idx_cpu[tail_tile_offset : tail_tile_offset + tail_tile_count_range, : tail_tile_tensor.shape[1]] = tail_tile_tensor
+                tail_mask_words_cpu[tail_tile_offset : tail_tile_offset + tail_tile_count_range, :, 0] = tail_mask_tensor
+                tail_tile_offset += tail_tile_count_range
+        tail_tile_ptr_cpu[range_idx + 1] = int(tail_tile_offset)
     return (
-        q_row_idx,
-        q_length,
-        exact_tile_ptr,
-        exact_k_row_idx,
-        tail_tile_ptr,
-        tail_k_row_idx,
-        tail_mask_words,
+        q_row_idx_cpu.to(device=device).contiguous(),
+        q_length_cpu.to(device=device).contiguous(),
+        exact_tile_ptr_cpu.to(device=device).contiguous(),
+        exact_k_row_idx_cpu.to(device=device).contiguous(),
+        tail_tile_ptr_cpu.to(device=device).contiguous(),
+        tail_k_row_idx_cpu.to(device=device).contiguous(),
+        tail_mask_words_cpu.to(device=device).contiguous(),
     )
 
 
@@ -685,7 +737,7 @@ def _append_group_entries(
     for row_group in row_groups:
         if not row_group:
             continue
-        union_rows = sorted({support_row for row_idx in row_group for support_row in support_lists[row_idx]})
+        union_rows = _merge_support_segments([support_lists[row_idx] for row_idx in row_group])
         union_k = len(union_rows)
         if union_k <= 0:
             continue
@@ -713,7 +765,7 @@ def _build_range_execution_metadata(
                 continue
             row_counts[q_row_int] = row_counts.get(q_row_int, 0) + 1
 
-    range_execution: list[dict[str, int | bool]] = []
+    range_execution: list[dict[str, int | bool | str]] = []
     for group_start, group_end in combine_group_ranges:
         range_rows: list[int] = []
         for group_idx in range(int(group_start), int(group_end)):
@@ -721,19 +773,36 @@ def _build_range_execution_metadata(
                 int(q_row) for q_row in group_q_rows[group_idx] if int(q_row) >= 0
             )
         scatter_only = bool(range_rows) and all(row_counts.get(q_row, 0) == 1 for q_row in range_rows)
-        range_execution.append(
-            {
-                "group_start": int(group_start),
-                "group_end": int(group_end),
-                "scatter_only": scatter_only,
-                **(
-                    {}
-                    if group_families is None or int(group_start) >= len(group_families)
-                    else {"family": str(group_families[int(group_start)])}
-                ),
-            }
-        )
-    return range_execution
+        range_entry: dict[str, int | bool | str] = {
+            "group_start": int(group_start),
+            "group_end": int(group_end),
+            "scatter_only": scatter_only,
+        }
+        if group_families is not None and int(group_start) < len(group_families):
+            range_entry["family"] = str(group_families[int(group_start)])
+        range_execution.append(range_entry)
+    return _merge_adjacent_range_execution_metadata(range_execution)
+
+
+def _merge_adjacent_range_execution_metadata(
+    range_execution: list[dict[str, int | bool | str]],
+) -> list[dict[str, int | bool | str]]:
+    if len(range_execution) <= 1:
+        return [dict(entry) for entry in range_execution]
+
+    merged: list[dict[str, int | bool | str]] = [dict(range_execution[0])]
+    for entry in range_execution[1:]:
+        current = dict(entry)
+        previous = merged[-1]
+        if (
+            int(previous["group_end"]) == int(current["group_start"])
+            and bool(previous.get("scatter_only")) == bool(current.get("scatter_only"))
+            and previous.get("family") == current.get("family")
+        ):
+            previous["group_end"] = int(current["group_end"])
+            continue
+        merged.append(current)
+    return merged
 
 
 def _coerce_cached_packing_policy(
@@ -778,12 +847,61 @@ def _summarize_bucket_support_geometry(
     support_lists: list[list[int]],
 ) -> dict[str, float | int]:
     live_pairs = sum(len(support_list) for support_list in support_lists)
-    live_k_rows = sorted({support_row for support_list in support_lists for support_row in support_list})
     num_live_rows = len(q_rows)
-    num_live_k = len(live_k_rows)
-    k_extent = live_k_rows[-1] - live_k_rows[0] + 1 if live_k_rows else 0
     q_extent = max(q_rows) - min(q_rows) + 1 if q_rows else 0
     max_row_support = max((len(support_list) for support_list in support_lists), default=0)
+    live_k_min = min((int(support_list[0]) for support_list in support_lists if support_list), default=0)
+    live_k_max = max((int(support_list[-1]) for support_list in support_lists if support_list), default=-1)
+    approx_live_pairs_threshold = int(
+        os.environ.get(
+            "FLASH_ATTN_HSA_CACHED_PACKING_APPROX_STATS_LIVE_PAIRS_THRESHOLD",
+            "4096",
+        )
+    )
+    if live_pairs >= approx_live_pairs_threshold and max_row_support > 0 and live_k_max >= live_k_min:
+        num_live_k = max_row_support
+        k_extent = live_k_max - live_k_min + 1
+        active_density = live_pairs / max(1, num_live_rows * max(1, num_live_k)) if num_live_rows > 0 else 0.0
+        return {
+            "num_live_rows": num_live_rows,
+            "num_live_k": num_live_k,
+            "live_pairs": live_pairs,
+            "k_extent": k_extent,
+            "q_extent": q_extent,
+            "active_density": active_density,
+            "k_gap_ratio": (k_extent / max(1, num_live_k)) if num_live_k > 0 else 0.0,
+            "q_gap_ratio": (q_extent / max(1, num_live_rows)) if num_live_rows > 0 else 0.0,
+            "max_row_support": max_row_support,
+        }
+    intervals: list[tuple[int, int]] = []
+    for support_list in support_lists:
+        if not support_list:
+            continue
+        start = prev = int(support_list[0])
+        for support_row in support_list[1:]:
+            support_row = int(support_row)
+            if support_row == prev + 1:
+                prev = support_row
+                continue
+            intervals.append((start, prev))
+            start = prev = support_row
+        intervals.append((start, prev))
+    if intervals:
+        intervals.sort(key=lambda item: (item[0], item[1]))
+        merged_start, merged_end = intervals[0]
+        num_live_k = 0
+        for start, end in intervals[1:]:
+            if start <= merged_end + 1:
+                if end > merged_end:
+                    merged_end = end
+                continue
+            num_live_k += merged_end - merged_start + 1
+            merged_start, merged_end = start, end
+        num_live_k += merged_end - merged_start + 1
+        k_extent = intervals[-1][1] - intervals[0][0] + 1
+    else:
+        num_live_k = 0
+        k_extent = 0
     active_density = live_pairs / max(1, num_live_rows * max(1, num_live_k)) if num_live_rows > 0 else 0.0
     return {
         "num_live_rows": num_live_rows,
@@ -796,6 +914,18 @@ def _summarize_bucket_support_geometry(
         "q_gap_ratio": (q_extent / max(1, num_live_rows)) if num_live_rows > 0 else 0.0,
         "max_row_support": max_row_support,
     }
+
+
+def _merge_support_segments(segments: list[list[int]]) -> list[int]:
+    if not segments:
+        return []
+    if len(segments) == 1:
+        return [int(value) for value in segments[0]]
+    flat_values = [int(value) for segment in segments for value in segment]
+    if not flat_values:
+        return []
+    merged_values = torch.unique(torch.tensor(flat_values, dtype=torch.int32), sorted=True)
+    return [int(value) for value in merged_values.tolist()]
 
 
 def _choose_cached_packing_family(
@@ -860,11 +990,10 @@ def _append_direct_passthrough_groups(
     combine_group_ranges: list[tuple[int, int]],
     group_families: list[str],
 ) -> int:
-    device = torch.device("cpu")
-    bucket_mask = _build_bucket_mask_from_support_lists(support_lists, device=device)
-    row_groups = _group_rows_by_support_patterns(
-        bucket_mask,
+    row_groups = _group_support_lists_by_span(
+        support_lists,
         max_rows_per_group=min(int(policy.max_rows_per_group), len(q_rows)),
+        max_union_k=max(1, int(policy.max_union_k_direct)),
     )
     group_start = len(group_q_rows)
     _append_group_entries(
@@ -898,19 +1027,29 @@ def _append_k_window_groups(
     combine_group_ranges: list[tuple[int, int]],
     group_families: list[str],
 ) -> int:
-    max_union_k = max(
-        int(policy.max_union_k_direct),
-        max((len(support_list) for support_list in support_lists), default=0),
-    )
+    max_union_k = max(1, int(policy.max_union_k_2d))
+    expanded_q_rows: list[int] = []
+    expanded_support_lists: list[list[int]] = []
+    for q_row, support_list in zip(q_rows, support_lists, strict=True):
+        if len(support_list) <= max_union_k:
+            expanded_q_rows.append(q_row)
+            expanded_support_lists.append(support_list)
+            continue
+        for segment_start in range(0, len(support_list), max_union_k):
+            segment = support_list[segment_start : segment_start + max_union_k]
+            if not segment:
+                continue
+            expanded_q_rows.append(q_row)
+            expanded_support_lists.append(segment)
     row_groups = _group_support_lists_by_span(
-        support_lists,
-        max_rows_per_group=min(int(policy.max_rows_per_group), len(q_rows)),
+        expanded_support_lists,
+        max_rows_per_group=min(int(policy.max_rows_per_group), len(expanded_q_rows)),
         max_union_k=max_union_k,
     )
     group_start = len(group_q_rows)
     _append_group_entries(
-        q_rows=q_rows,
-        support_lists=support_lists,
+        q_rows=expanded_q_rows,
+        support_lists=expanded_support_lists,
         row_groups=row_groups,
         group_q_rows=group_q_rows,
         group_k_rows=group_k_rows,
@@ -997,12 +1136,21 @@ def _finalize_generalized_cached_forward_payload(
     scatter_only_ranges = sum(1 for entry in range_execution if bool(entry["scatter_only"]))
     scatter_only_rows = 0
     family_group_counts = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_q_rows = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_group_area = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    family_group_fill_sums = {family: 0.0 for family in ("direct_passthrough", "k_window", "union_2d")}
     family_union_k_sums = {family: 0.0 for family in ("direct_passthrough", "k_window", "union_2d")}
     family_scatter_only_rows = {family: 0 for family in ("direct_passthrough", "k_window", "union_2d")}
+    grouped_hardware_area = 0
     for group_idx, family in enumerate(group_families):
         q_count = len(group_q_rows[group_idx])
+        group_area = q_count * len(group_k_rows[group_idx])
         family_group_counts[family] = family_group_counts.get(family, 0) + 1
+        family_q_rows[family] = family_q_rows.get(family, 0) + q_count
+        family_group_area[family] = family_group_area.get(family, 0) + group_area
+        family_group_fill_sums[family] = family_group_fill_sums.get(family, 0.0) + float(group_fill[group_idx])
         family_union_k_sums[family] = family_union_k_sums.get(family, 0.0) + float(len(group_k_rows[group_idx]))
+        grouped_hardware_area += group_area
         is_scatter_only = any(
             int(entry["group_start"]) <= group_idx < int(entry["group_end"]) and bool(entry["scatter_only"])
             for entry in range_execution
@@ -1074,13 +1222,50 @@ def _finalize_generalized_cached_forward_payload(
             "cached_generalized_rows_per_group": rows_per_group,
             "cached_generalized_avg_union_k": float(k_length.float().mean().item()) if group_count > 0 else 0.0,
             "cached_generalized_max_union_k": max_union_k,
+            "cached_generalized_grouped_hardware_area": int(grouped_hardware_area),
+            "cached_generalized_total_hardware_area": int(geometry_base.get("cached_generalized_total_hardware_area", 0)),
+            "cached_generalized_total_area_reduction": (
+                0.0
+                if int(geometry_base.get("cached_generalized_baseline_packed_area", 0)) <= 0
+                else 1.0
+                - (
+                    float(geometry_base.get("cached_generalized_total_hardware_area", 0))
+                    / float(geometry_base["cached_generalized_baseline_packed_area"])
+                )
+            ),
             "cached_generalized_avg_group_fill": float(sum(group_fill) / len(group_fill)) if group_fill else 0.0,
             "cached_generalized_scatter_only_ranges": scatter_only_ranges,
             "cached_generalized_scatter_only_rows": scatter_only_rows,
             "family_group_counts": family_group_counts,
+            "family_q_rows": family_q_rows,
+            "family_group_area": family_group_area,
             "family_avg_union_k": {
                 family: (
                     family_union_k_sums[family] / family_group_counts[family]
+                    if family_group_counts[family] > 0
+                    else 0.0
+                )
+                for family in family_group_counts
+            },
+            "family_avg_q_rows": {
+                family: (
+                    family_q_rows[family] / family_group_counts[family]
+                    if family_group_counts[family] > 0
+                    else 0.0
+                )
+                for family in family_group_counts
+            },
+            "family_avg_group_area": {
+                family: (
+                    family_group_area[family] / family_group_counts[family]
+                    if family_group_counts[family] > 0
+                    else 0.0
+                )
+                for family in family_group_counts
+            },
+            "family_avg_group_fill": {
+                family: (
+                    family_group_fill_sums[family] / family_group_counts[family]
                     if family_group_counts[family] > 0
                     else 0.0
                 )
@@ -1198,6 +1383,7 @@ def build_cached_generalized_packed_forward_payload(
         family: {"active_density": 0.0, "k_gap_ratio": 0.0, "q_gap_ratio": 0.0, "count": 0}
         for family in ("direct_passthrough", "k_window", "union_2d")
     }
+    direct_bucket_entries: list[dict[str, Any]] = []
     union_bucket_entries: list[dict[str, Any]] = []
     baseline_live_row_count = 0
     baseline_packed_k_sum = 0
@@ -1215,31 +1401,57 @@ def build_cached_generalized_packed_forward_payload(
         and q_flat.shape[-1] == 64
         and q_flat.dtype in {torch.bfloat16, torch.float16}
     )
+    disable_direct_for_fused_tail = use_fused_tail and os.environ.get(
+        "FLASH_ATTN_HSA_FUSED_TAIL_DISABLE_DIRECT",
+        "0",
+    ).strip().lower() not in {"0", "false", "off", "no"}
+    precomputed_q_rows = direct_plan.get("bucket_live_q_rows_list")
+    precomputed_support_lists = direct_plan.get("bucket_live_support_lists")
 
     for bucket_idx in range(len(direct_plan["bucket_size"])):
-        live_q_rows, live_support_rows, live_support_valid, zero_support_rows, packed_k = _extract_bucket_live_row_supports(
-            direct_plan,
-            row_plan,
-            bucket_idx,
-        )
-        zero_support_rows_count += int(zero_support_rows)
-        live_row_count = int(live_q_rows.numel())
-        if live_row_count <= 0:
+        packed_k = int(direct_plan["bucket_packed_k"][bucket_idx])
+        q_rows: list[int]
+        support_lists: list[list[int]]
+        if (
+            isinstance(precomputed_q_rows, list)
+            and isinstance(precomputed_support_lists, list)
+            and bucket_idx < len(precomputed_q_rows)
+            and bucket_idx < len(precomputed_support_lists)
+        ):
+            q_rows = precomputed_q_rows[bucket_idx]
+            support_lists = precomputed_support_lists[bucket_idx]
+        else:
+            live_q_rows, live_support_rows, live_support_valid, zero_support_rows, _ = _extract_bucket_live_row_supports(
+                direct_plan,
+                row_plan,
+                bucket_idx,
+            )
+            zero_support_rows_count += int(zero_support_rows)
+            live_row_count = int(live_q_rows.numel())
+            if live_row_count <= 0:
+                continue
+            live_q_rows_cpu = [int(value) for value in live_q_rows.detach().cpu().tolist()]
+            live_support_rows_cpu = live_support_rows.detach().cpu().tolist()
+            live_support_valid_cpu = live_support_valid.detach().cpu().tolist()
+            support_lists = [
+                [int(support_row) for support_row, valid in zip(row_supports, row_valid, strict=True) if valid and int(support_row) >= 0]
+                for row_supports, row_valid in zip(live_support_rows_cpu, live_support_valid_cpu, strict=True)
+            ]
+            q_rows = [int(q_row) for q_row in live_q_rows_cpu]
+        if q_rows:
+            filtered_pairs = [(q_row, support_rows) for q_row, support_rows in zip(q_rows, support_lists, strict=True) if support_rows]
+            zero_support_rows_count += len(q_rows) - len(filtered_pairs)
+            q_rows = [q_row for q_row, _support_rows in filtered_pairs]
+            support_lists = [support_rows for _q_row, support_rows in filtered_pairs]
+        live_row_count = len(q_rows)
+        if not q_rows:
             continue
         baseline_live_row_count += live_row_count
         baseline_packed_k_sum += int(packed_k) * live_row_count
-        live_q_rows_cpu = [int(value) for value in live_q_rows.detach().cpu().tolist()]
-        live_support_rows_cpu = live_support_rows.detach().cpu().tolist()
-        live_support_valid_cpu = live_support_valid.detach().cpu().tolist()
-        support_lists = [
-            [int(support_row) for support_row, valid in zip(row_supports, row_valid, strict=True) if valid and int(support_row) >= 0]
-            for row_supports, row_valid in zip(live_support_rows_cpu, live_support_valid_cpu, strict=True)
-        ]
-        q_rows = [int(q_row) for q_row in live_q_rows_cpu]
-        if not q_rows:
-            continue
         bucket_stats = _summarize_bucket_support_geometry(q_rows, support_lists)
         family = _choose_cached_packing_family(bucket_stats, resolved_policy)
+        if disable_direct_for_fused_tail and family == "direct_passthrough":
+            family = "union_2d"
         family_counts[family] = family_counts.get(family, 0) + 1
         family_live_pairs[family] = family_live_pairs.get(family, 0) + int(bucket_stats["live_pairs"])
         total_live_pairs += int(bucket_stats["live_pairs"])
@@ -1249,16 +1461,13 @@ def build_cached_generalized_packed_forward_payload(
         family_bucket_stats[family]["count"] += 1
         qgroup_bucket_idx = bucket_idx if bucket_qgroup_bucket_idx is None else int(bucket_qgroup_bucket_idx[bucket_idx])
         if family == "direct_passthrough":
-            _append_direct_passthrough_groups(
-                q_rows=q_rows,
-                support_lists=support_lists,
-                policy=resolved_policy,
-                group_q_rows=group_q_rows,
-                group_k_rows=group_k_rows,
-                group_mask_words=group_mask_words,
-                group_fill=group_fill,
-                combine_group_ranges=combine_group_ranges,
-                group_families=group_families,
+            direct_bucket_entries.append(
+                {
+                    "bucket_idx": bucket_idx,
+                    "qgroup_bucket_idx": qgroup_bucket_idx,
+                    "q_rows": q_rows,
+                    "support_lists": support_lists,
+                }
             )
             continue
         if family == "k_window":
@@ -1283,19 +1492,44 @@ def build_cached_generalized_packed_forward_payload(
             }
         )
 
+    direct_entries_by_qgroup: dict[int, list[tuple[int, list[int]]]] = {}
+    for bucket_entry in direct_bucket_entries:
+        qgroup_entries = direct_entries_by_qgroup.setdefault(bucket_entry["qgroup_bucket_idx"], [])
+        qgroup_entries.extend(zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True))
+
+    for qgroup_bucket_idx in sorted(direct_entries_by_qgroup):
+        qgroup_entries = direct_entries_by_qgroup[qgroup_bucket_idx]
+        if not qgroup_entries:
+            continue
+        merged_q_rows = [int(q_row) for q_row, _support_list in qgroup_entries]
+        merged_support_lists = [list(support_list) for _q_row, support_list in qgroup_entries]
+        _append_direct_passthrough_groups(
+            q_rows=merged_q_rows,
+            support_lists=merged_support_lists,
+            policy=resolved_policy,
+            group_q_rows=group_q_rows,
+            group_k_rows=group_k_rows,
+            group_mask_words=group_mask_words,
+            group_fill=group_fill,
+            combine_group_ranges=combine_group_ranges,
+            group_families=group_families,
+        )
+
     union_entries_by_qgroup: dict[int, list[tuple[int, list[int]]]] = {}
     for bucket_entry in union_bucket_entries:
-        qgroup_entries = union_entries_by_qgroup.setdefault(int(bucket_entry["qgroup_bucket_idx"]), [])
+        qgroup_entries = union_entries_by_qgroup.setdefault(bucket_entry["qgroup_bucket_idx"], [])
         qgroup_entries.extend(zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True))
 
     for qgroup_bucket_idx in sorted(union_entries_by_qgroup):
-        row_support_map: dict[int, set[int]] = {}
+        row_support_segments: dict[int, list[list[int]]] = {}
         for q_row, support_list in union_entries_by_qgroup[qgroup_bucket_idx]:
             if not support_list:
                 continue
-            row_support_map.setdefault(int(q_row), set()).update(int(support_row) for support_row in support_list)
-        merged_q_rows = [int(q_row) for q_row in sorted(row_support_map)]
-        merged_support_lists = [sorted(row_support_map[q_row]) for q_row in sorted(row_support_map)]
+            row_support_segments.setdefault(int(q_row), []).append(support_list)
+        merged_q_rows = sorted(row_support_segments)
+        merged_support_lists = [
+            _merge_support_segments(row_support_segments[q_row]) for q_row in merged_q_rows
+        ]
         if use_fused_tail:
             if not merged_q_rows:
                 continue
@@ -1329,9 +1563,9 @@ def build_cached_generalized_packed_forward_payload(
         filtered_support_lists: list[list[int]] = []
         for q_row, support_list in zip(merged_q_rows, merged_support_lists, strict=True):
             if len(support_list) > int(resolved_policy.max_union_k_2d):
-                fallback_rows.add(int(q_row))
+                fallback_rows.add(q_row)
                 continue
-            filtered_q_rows.append(int(q_row))
+            filtered_q_rows.append(q_row)
             filtered_support_lists.append(support_list)
         residual_q_rows: list[int] = []
         residual_support_lists: list[list[int]] = []
@@ -1361,7 +1595,7 @@ def build_cached_generalized_packed_forward_payload(
                 for q_row, support_list in zip(grouped_q_rows, group_residual_support_lists, strict=True):
                     if not support_list:
                         continue
-                    residual_q_rows.append(int(q_row))
+                    residual_q_rows.append(q_row)
                     residual_support_lists.append(support_list)
         if residual_q_rows:
             row_groups = _group_support_lists_by_span(
@@ -1415,6 +1649,8 @@ def build_cached_generalized_packed_forward_payload(
         "cached_generalized_buckets": sum(family_counts.values()),
         "cached_generalized_zero_support_rows": zero_support_rows_count,
         "cached_generalized_live_pairs": total_live_pairs,
+        "cached_generalized_baseline_packed_area": int(baseline_packed_k_sum),
+        "cached_generalized_total_hardware_area": int(total_group_area),
         "cached_generalized_case_fill_rate": total_live_pairs / max(1, total_group_area),
         "cached_generalized_support_reduction": (
             0.0
@@ -1879,14 +2115,40 @@ def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[s
     }
 
 
-def _get_cached_direct_2d_buffers(
+def _get_cached_direct_2d_output_buffers(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace = payload.setdefault("_workspace", {})
+    key = (
+        "output",
+        str(q_flat.device),
+        q_flat.dtype,
+        v_flat.dtype,
+        q_flat.shape[1],
+        v_flat.shape[2],
+        int(payload["total_rows"]),
+    )
+    buffers = workspace.get(key)
+    if buffers is None:
+        buffers = (
+            torch.zeros((int(payload["total_rows"]), q_flat.shape[1], v_flat.shape[2]), dtype=torch.float32, device=v_flat.device),
+            torch.empty((int(payload["total_rows"]), q_flat.shape[1]), dtype=torch.float32, device=v_flat.device),
+        )
+        workspace[key] = buffers
+    return buffers
+
+
+def _get_cached_direct_2d_pack_buffers(
     payload: dict[str, Any],
     q_flat: torch.Tensor,
     k_flat: torch.Tensor,
     v_flat: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     workspace = payload.setdefault("_workspace", {})
     key = (
+        "pack",
         str(q_flat.device),
         q_flat.dtype,
         k_flat.dtype,
@@ -1900,7 +2162,6 @@ def _get_cached_direct_2d_buffers(
         int(payload["packed_q"]),
         int(payload["support_rows"]),
         int(payload["q_row_idx"].shape[0]),
-        int(payload["total_rows"]),
     )
     buffers = workspace.get(key)
     if buffers is None:
@@ -1911,8 +2172,6 @@ def _get_cached_direct_2d_buffers(
             torch.empty((group_count * packed_q, q_flat.shape[1], q_flat.shape[2]), dtype=q_flat.dtype, device=q_flat.device),
             torch.empty((group_count * support_rows, k_flat.shape[1], k_flat.shape[2]), dtype=k_flat.dtype, device=k_flat.device),
             torch.empty((group_count * support_rows, v_flat.shape[1], v_flat.shape[2]), dtype=v_flat.dtype, device=v_flat.device),
-            torch.zeros((int(payload["total_rows"]), q_flat.shape[1], v_flat.shape[2]), dtype=torch.float32, device=v_flat.device),
-            torch.empty((int(payload["total_rows"]), q_flat.shape[1]), dtype=torch.float32, device=v_flat.device),
         )
         workspace[key] = buffers
     return buffers
@@ -2123,7 +2382,7 @@ def _run_cached_masked_payload_forward(
     if group_count <= 0:
         return 0, 0, 0, 0
 
-    q_buf_flat, k_buf_flat, v_buf_flat, _, _ = _get_cached_direct_2d_buffers(payload, q_flat, k_flat, v_flat)
+    pack_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     range_execution = payload.get("range_execution")
     if not range_execution:
         range_execution = [
@@ -2137,6 +2396,10 @@ def _run_cached_masked_payload_forward(
     union_tc_row_count = 0
     union_scalar_group_count = 0
     union_scalar_row_count = 0
+    try:
+        group_chunk_limit = max(1, int(os.environ.get("FLASH_ATTN_HSA_CACHED_MASKED_GROUP_CHUNK", "128")))
+    except ValueError:
+        group_chunk_limit = 128
 
     def _run_range_packed(group_start: int, group_end: int) -> tuple[torch.Tensor, torch.Tensor]:
         range_group_count = group_end - group_start
@@ -2154,6 +2417,10 @@ def _run_cached_masked_payload_forward(
                 tile_k=tile_k,
             )
         except Exception:
+            nonlocal pack_buffers
+            if pack_buffers is None:
+                pack_buffers = _get_cached_direct_2d_pack_buffers(payload, q_flat, k_flat, v_flat)
+            q_buf_flat, k_buf_flat, v_buf_flat = pack_buffers
             q_buf_range = q_buf_flat[: range_group_count * packed_q]
             k_buf_range = k_buf_flat[: range_group_count * packed_k]
             v_buf_range = v_buf_flat[: range_group_count * packed_k]
@@ -2183,11 +2450,10 @@ def _run_cached_masked_payload_forward(
                 tile_k=tile_k,
             )
 
-    for range_entry in range_execution:
-        group_start = int(range_entry["group_start"])
-        group_end = int(range_entry["group_end"])
+    def _run_masked_group_range(group_start: int, group_end: int, range_entry: dict[str, Any]) -> None:
+        nonlocal union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
         if group_end <= group_start:
-            continue
+            return
         if _can_use_cached_union_tc(
             payload,
             q_flat,
@@ -2215,7 +2481,7 @@ def _run_cached_masked_payload_forward(
                 tc_groups, tc_rows = _cached_union_range_counts(payload, group_start=group_start, group_end=group_end)
                 union_tc_group_count += tc_groups
                 union_tc_row_count += tc_rows
-                continue
+                return
             except Exception:
                 pass
         if bool(range_entry.get("scatter_only")):
@@ -2242,7 +2508,7 @@ def _run_cached_masked_payload_forward(
                     softmax_scale=float(softmax_scale),
                     tile_k=tile_k,
                 )
-                continue
+                return
             except Exception:
                 pass
         packed_out, packed_lse = _run_range_packed(group_start, group_end)
@@ -2256,6 +2522,17 @@ def _run_cached_masked_payload_forward(
             out_flat,
             lse_flat,
         )
+    for range_entry in range_execution:
+        group_start = int(range_entry["group_start"])
+        group_end = int(range_entry["group_end"])
+        if group_end <= group_start:
+            continue
+        if group_end - group_start <= group_chunk_limit:
+            _run_masked_group_range(group_start, group_end, range_entry)
+            continue
+        for chunk_start in range(group_start, group_end, group_chunk_limit):
+            chunk_end = min(group_end, chunk_start + group_chunk_limit)
+            _run_masked_group_range(chunk_start, chunk_end, range_entry)
     return union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
 
 
@@ -2281,13 +2558,10 @@ def run_cached_direct_2d_forward(
         softmax_scale = q_flat.shape[-1] ** (-0.5)
     has_exact_dense = int(getattr(payload.get("exact_dense_q_row_idx"), "shape", [0])[0]) > 0
     has_fused_ranges = int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
-    if packed_k > 0 and not _can_use_synthetic_2d_masked_fwd(q_flat, k_flat, v_flat, packed_q=packed_q, packed_k=packed_k):
-        raise RuntimeError("cached_direct_2d_forward_unsupported")
     if not has_exact_dense and not has_fused_ranges and int(payload["q_row_idx"].shape[0]) <= 0:
         raise RuntimeError("cached_direct_2d_forward_empty")
 
-    q_buf_flat, k_buf_flat, v_buf_flat, out_flat, lse_flat = _get_cached_direct_2d_buffers(payload, q_flat, k_flat, v_flat)
-    del q_buf_flat, k_buf_flat, v_buf_flat
+    out_flat, lse_flat = _get_cached_direct_2d_output_buffers(payload, q_flat, v_flat)
     out_flat.zero_()
     lse_flat.fill_(float("-inf"))
     fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(

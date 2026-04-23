@@ -479,19 +479,32 @@ class HSAHybridBackwardBatch:
 
 
 def _get_hsa_legacy_packed_merge_max_batch_entries() -> int:
-    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_BATCH_ENTRIES", "16")
+    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_BATCH_ENTRIES", "64")
     try:
         return max(int(raw_value), 1)
     except ValueError:
-        return 16
+        return 64
 
 
 def _get_hsa_legacy_packed_merge_max_pad_ratio() -> float:
-    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_PAD_RATIO", "1.3")
+    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_PAD_RATIO", "2.0")
     try:
         return max(float(raw_value), 1.0)
     except ValueError:
-        return 1.3
+        return 2.0
+
+
+def _use_hsa_legacy_packed_sort_batches() -> bool:
+    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_SORT_BATCHES", "1").strip().lower()
+    return raw_value not in {"0", "false", "no", "off"}
+
+
+def _hsa_hybrid_backward_batch_sort_key(batch: HSAHybridBackwardBatch) -> tuple[int, int, int]:
+    return (
+        int(batch.q_indices.shape[1]),
+        int(batch.k_indices.shape[1]),
+        int(batch.q_indices.shape[0]),
+    )
 
 
 def _merge_hsa_hybrid_backward_batch_group(batches: list[HSAHybridBackwardBatch]) -> HSAHybridBackwardBatch:
@@ -537,6 +550,8 @@ def _coalesce_hsa_hybrid_backward_batches(batches: list[HSAHybridBackwardBatch])
     max_pad_ratio = _get_hsa_legacy_packed_merge_max_pad_ratio()
     if max_batch_entries <= 1:
         return batches
+    if _use_hsa_legacy_packed_sort_batches():
+        batches = sorted(batches, key=_hsa_hybrid_backward_batch_sort_key, reverse=True)
 
     def _storage_shape_cost(items: list[HSAHybridBackwardBatch]) -> tuple[int, int, int]:
         total_entries = sum(int(item.q_indices.shape[0]) for item in items)

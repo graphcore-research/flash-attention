@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional
@@ -475,6 +476,105 @@ class HSAHybridBackwardBatch:
             k_length=self.k_length.to(device=device),
             prefix_len=None if self.prefix_len is None else self.prefix_len.to(device=device),
         )
+
+
+def _get_hsa_legacy_packed_merge_max_batch_entries() -> int:
+    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_BATCH_ENTRIES", "16")
+    try:
+        return max(int(raw_value), 1)
+    except ValueError:
+        return 16
+
+
+def _get_hsa_legacy_packed_merge_max_pad_ratio() -> float:
+    raw_value = os.environ.get("FLASH_ATTN_HSA_LEGACY_PACKED_MERGE_MAX_PAD_RATIO", "1.3")
+    try:
+        return max(float(raw_value), 1.0)
+    except ValueError:
+        return 1.3
+
+
+def _merge_hsa_hybrid_backward_batch_group(batches: list[HSAHybridBackwardBatch]) -> HSAHybridBackwardBatch:
+    if len(batches) == 1:
+        return batches[0]
+    device = batches[0].q_indices.device
+    batch_entries = sum(int(batch.q_indices.shape[0]) for batch in batches)
+    max_q = max(int(batch.q_indices.shape[1]) for batch in batches)
+    max_k = max(int(batch.k_indices.shape[1]) for batch in batches)
+    q_indices = torch.zeros((batch_entries, max_q), dtype=batches[0].q_indices.dtype, device=device)
+    k_indices = torch.zeros((batch_entries, max_k), dtype=batches[0].k_indices.dtype, device=device)
+    q_length = torch.zeros(batch_entries, dtype=batches[0].q_length.dtype, device=device)
+    k_length = torch.zeros(batch_entries, dtype=batches[0].k_length.dtype, device=device)
+    use_prefix = batches[0].prefix_len is not None
+    prefix_len = (
+        torch.zeros((batch_entries, max_q), dtype=batches[0].prefix_len.dtype, device=device) if use_prefix else None
+    )
+    row_offset = 0
+    for batch in batches:
+        rows = int(batch.q_indices.shape[0])
+        q_width = int(batch.q_indices.shape[1])
+        k_width = int(batch.k_indices.shape[1])
+        q_indices[row_offset : row_offset + rows, :q_width] = batch.q_indices
+        k_indices[row_offset : row_offset + rows, :k_width] = batch.k_indices
+        q_length[row_offset : row_offset + rows] = batch.q_length
+        k_length[row_offset : row_offset + rows] = batch.k_length
+        if prefix_len is not None and batch.prefix_len is not None:
+            prefix_len[row_offset : row_offset + rows, :q_width] = batch.prefix_len
+        row_offset += rows
+    return HSAHybridBackwardBatch(
+        q_indices=q_indices,
+        k_indices=k_indices,
+        q_length=q_length,
+        k_length=k_length,
+        prefix_len=prefix_len,
+    )
+
+
+def _coalesce_hsa_hybrid_backward_batches(batches: list[HSAHybridBackwardBatch]) -> list[HSAHybridBackwardBatch]:
+    if len(batches) <= 1:
+        return batches
+    max_batch_entries = _get_hsa_legacy_packed_merge_max_batch_entries()
+    max_pad_ratio = _get_hsa_legacy_packed_merge_max_pad_ratio()
+    if max_batch_entries <= 1:
+        return batches
+
+    def _storage_shape_cost(items: list[HSAHybridBackwardBatch]) -> tuple[int, int, int]:
+        total_entries = sum(int(item.q_indices.shape[0]) for item in items)
+        q_cost = sum(int(item.q_indices.shape[0] * item.q_indices.shape[1]) for item in items)
+        k_cost = sum(int(item.k_indices.shape[0] * item.k_indices.shape[1]) for item in items)
+        return total_entries, q_cost, k_cost
+
+    def _fits(chunk: list[HSAHybridBackwardBatch], candidate: HSAHybridBackwardBatch) -> bool:
+        if (chunk[0].prefix_len is None) != (candidate.prefix_len is None):
+            return False
+        merged = chunk + [candidate]
+        total_entries, q_cost, k_cost = _storage_shape_cost(merged)
+        if total_entries > max_batch_entries:
+            return False
+        max_q = max(int(item.q_indices.shape[1]) for item in merged)
+        max_k = max(int(item.k_indices.shape[1]) for item in merged)
+        padded_q_cost = total_entries * max_q
+        padded_k_cost = total_entries * max_k
+        if padded_q_cost > max_pad_ratio * max(q_cost, 1):
+            return False
+        if padded_k_cost > max_pad_ratio * max(k_cost, 1):
+            return False
+        return True
+
+    merged_batches: list[HSAHybridBackwardBatch] = []
+    chunk: list[HSAHybridBackwardBatch] = []
+    for batch in batches:
+        if not chunk:
+            chunk = [batch]
+            continue
+        if _fits(chunk, batch):
+            chunk.append(batch)
+            continue
+        merged_batches.append(_merge_hsa_hybrid_backward_batch_group(chunk))
+        chunk = [batch]
+    if chunk:
+        merged_batches.append(_merge_hsa_hybrid_backward_batch_group(chunk))
+    return merged_batches
 
 
 @dataclass
@@ -1945,7 +2045,7 @@ def _build_backward_hsa_packed_masks(
     num_q_blocks = (seqlen + q_block_size - 1) // q_block_size
     num_k_blocks = (seqlen + k_block_size - 1) // k_block_size
     words_per_row = (k_block_size + 31) // 32
-    block_masks: dict[tuple[int, int, int], list[list[int]]] = {}
+    block_masks: dict[tuple[int, int, int], torch.Tensor] = {}
 
     sentence_q_start = schedule.sentence_q_start.detach().cpu().tolist()
     sentence_q_len = schedule.sentence_q_len.detach().cpu().tolist()
@@ -1954,16 +2054,45 @@ def _build_backward_hsa_packed_masks(
     document_t_row_ptr = schedule.document_t_row_ptr.detach().cpu().tolist()
     document_t_col_idx = schedule.document_t_col_idx.detach().cpu().tolist()
 
-    def add_pair(batch_idx: int, key_idx: int, query_idx: int):
+    def _get_block_words(batch_idx: int, k_block: int, q_block: int) -> torch.Tensor:
+        block_key = (batch_idx, k_block, q_block)
+        block_words = block_masks.get(block_key)
+        if block_words is None:
+            block_words = torch.zeros((q_block_size, words_per_row), dtype=torch.int64)
+            block_masks[block_key] = block_words
+        return block_words
+
+    def _set_query_rows(batch_idx: int, key_idx: int, query_rows: torch.Tensor) -> None:
+        if query_rows.numel() == 0:
+            return
         k_block = key_idx // k_block_size
-        q_block = query_idx // q_block_size
-        q_local = query_idx - q_block * q_block_size
         k_local = key_idx - k_block * k_block_size
-        block_words = block_masks.setdefault(
-            (batch_idx, k_block, q_block),
-            [[0 for _ in range(words_per_row)] for _ in range(q_block_size)],
-        )
-        _set_block_mask_bit(block_words, q_local=q_local, k_local=k_local)
+        word_idx = k_local // 32
+        bit_value = 1 << (k_local % 32)
+        q_blocks = torch.div(query_rows, q_block_size, rounding_mode="floor")
+        for q_block in torch.unique(q_blocks, sorted=True).tolist():
+            q_block = int(q_block)
+            q_locals = query_rows[q_blocks == q_block] - q_block * q_block_size
+            block_words = _get_block_words(batch_idx, k_block, q_block)
+            block_words[q_locals.long(), word_idx] |= bit_value
+
+    def _set_sentence_range(batch_idx: int, key_idx: int, query_start: int, query_len: int) -> None:
+        if query_len <= 0:
+            return
+        k_block = key_idx // k_block_size
+        k_local = key_idx - k_block * k_block_size
+        word_idx = k_local // 32
+        bit_value = 1 << (k_local % 32)
+        query_end = query_start + query_len
+        first_q_block = query_start // q_block_size
+        last_q_block = (query_end - 1) // q_block_size
+        for q_block in range(first_q_block, last_q_block + 1):
+            local_start = max(query_start - q_block * q_block_size, 0)
+            local_end = min(query_end - q_block * q_block_size, q_block_size)
+            if local_end <= local_start:
+                continue
+            block_words = _get_block_words(batch_idx, k_block, q_block)
+            block_words[local_start:local_end, word_idx] |= bit_value
 
     for flat_key in range(schedule.num_rows):
         batch_idx, key_idx = divmod(flat_key, seqlen)
@@ -1971,13 +2100,24 @@ def _build_backward_hsa_packed_masks(
         sent_q_len = sentence_q_len[flat_key]
         if sent_q_len > 0:
             sent_q_start = sentence_q_start[flat_key]
-            for query_idx in range(sent_q_start, sent_q_start + sent_q_len):
-                add_pair(batch_idx, key_idx, query_idx)
+            _set_sentence_range(batch_idx, key_idx, sent_q_start, sent_q_len)
 
-        for offset in range(section_t_row_ptr[flat_key], section_t_row_ptr[flat_key + 1]):
-            add_pair(batch_idx, key_idx, section_t_col_idx[offset])
-        for offset in range(document_t_row_ptr[flat_key], document_t_row_ptr[flat_key + 1]):
-            add_pair(batch_idx, key_idx, document_t_col_idx[offset])
+        section_start = section_t_row_ptr[flat_key]
+        section_end = section_t_row_ptr[flat_key + 1]
+        if section_end > section_start:
+            _set_query_rows(
+                batch_idx,
+                key_idx,
+                torch.tensor(section_t_col_idx[section_start:section_end], dtype=torch.int64),
+            )
+        document_start = document_t_row_ptr[flat_key]
+        document_end = document_t_row_ptr[flat_key + 1]
+        if document_end > document_start:
+            _set_query_rows(
+                batch_idx,
+                key_idx,
+                torch.tensor(document_t_col_idx[document_start:document_end], dtype=torch.int64),
+            )
 
     mask_block_cnt = torch.zeros((bsz, 1, num_k_blocks), dtype=torch.int32, device=schedule.sentence_start.device)
     mask_block_idx = torch.zeros(
@@ -1997,9 +2137,7 @@ def _build_backward_hsa_packed_masks(
         device=schedule.sentence_start.device,
     )
 
-    partial_mask_words: list[list[list[int]]] = [
-        [[0 for _ in range(words_per_row)] for _ in range(q_block_size)]
-    ]
+    partial_mask_words: list[torch.Tensor] = [torch.zeros((q_block_size, words_per_row), dtype=torch.int32)]
     partial_row_group_nonempty: list[int] = [0]
 
     for batch_idx in range(bsz):
@@ -2019,13 +2157,10 @@ def _build_backward_hsa_packed_masks(
                 block_words = block_masks[(batch_idx, k_block, q_block)]
                 q_len = min(q_block_size, seqlen - q_block * q_block_size)
                 valid_count = q_len * k_len
-                allowed_count = 0
-                for row_idx in range(q_len):
-                    for word_idx, word in enumerate(block_words[row_idx]):
-                        clamped_word = word
-                        if tail_mask is not None and word_idx == words_per_row - 1:
-                            clamped_word &= tail_mask
-                        allowed_count += int(clamped_word).bit_count()
+                clamped_words = block_words[:q_len].clone()
+                if tail_mask is not None:
+                    clamped_words[:, words_per_row - 1] &= tail_mask
+                allowed_count = sum(int(word).bit_count() for word in clamped_words.reshape(-1).tolist())
 
                 if allowed_count == valid_count:
                     full_indices.append(q_block)
@@ -2033,17 +2168,13 @@ def _build_backward_hsa_packed_masks(
 
                 mask_indices.append(q_block)
                 block_id_table[batch_idx, k_block, q_block] = len(partial_mask_words)
-                partial_mask_words.append(block_words)
+                partial_mask_words.append(block_words.to(dtype=torch.int32))
                 row_group_bits = 0
                 half_rows = q_block_size // 2
-                for q_local in range(min(q_len, half_rows)):
-                    if any(block_words[q_local]):
-                        row_group_bits |= 1
-                        break
-                for q_local in range(half_rows, q_len):
-                    if any(block_words[q_local]):
-                        row_group_bits |= 2
-                        break
+                if bool(block_words[: min(q_len, half_rows)].any()):
+                    row_group_bits |= 1
+                if bool(block_words[half_rows:q_len].any()):
+                    row_group_bits |= 2
                 partial_row_group_nonempty.append(row_group_bits)
 
             mask_block_cnt[batch_idx, 0, k_block] = len(mask_indices)
@@ -2070,14 +2201,7 @@ def _build_backward_hsa_packed_masks(
     )
     packed_masks = HSABwdPackedMasks(
         block_id_table=block_id_table,
-        mask_words=torch.tensor(
-            [
-                [[_as_signed_int32(word) for word in row] for row in block_words]
-                for block_words in partial_mask_words
-            ],
-            dtype=torch.int32,
-            device=schedule.sentence_start.device,
-        ),
+        mask_words=torch.stack(partial_mask_words, dim=0).to(device=schedule.sentence_start.device),
         row_group_nonempty=torch.tensor(
             partial_row_group_nonempty,
             dtype=torch.int32,
@@ -3350,6 +3474,9 @@ def _get_hsa_hybrid_backward_batches(
                 )
             )
 
+    sentence_batches = _coalesce_hsa_hybrid_backward_batches(sentence_batches)
+    anchor_batches = _coalesce_hsa_hybrid_backward_batches(anchor_batches)
+
     if cache is None:
         cache = {}
         setattr(schedule, "_hsa_hybrid_backward_batch_cache", cache)
@@ -3873,7 +4000,7 @@ def _can_use_cached_generalized_synthetic_micro_bwd(
         return False
     from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import _can_use_direct_synthetic_micro_runtime
 
-    metadata = _ensure_hsa_synthetic_grid_metadata(schedule, runtime, require_backward=True)
+    metadata = _ensure_hsa_synthetic_grid_metadata(schedule, runtime, require_backward=False)
     q_flat = q.reshape(-1, q.shape[2], q.shape[3]).contiguous()
     k_flat = k.reshape(-1, k.shape[2], k.shape[3]).contiguous()
     v_flat = v.reshape(-1, v.shape[2], v.shape[3]).contiguous()
@@ -4328,6 +4455,17 @@ def _build_hsa_forward_synthetic_grid_metadata(
     logical_block_k: int,
     max_packed_k: int,
 ) -> HSASyntheticGridMetadata:
+    debug_synth_timings = os.environ.get("FLASH_ATTN_HSA_DEBUG_SYNTHETIC_TIMINGS", "0") == "1"
+    t_debug_prev = time.time() if debug_synth_timings else None
+
+    def _debug_timing(label: str) -> None:
+        nonlocal t_debug_prev
+        if not debug_synth_timings or t_debug_prev is None:
+            return
+        t_now = time.time()
+        print(f"[hsa synthetic] {label}: {t_now - t_debug_prev:.3f}s", flush=True)
+        t_debug_prev = t_now
+
     sparse_tensors = runtime.forward_sparse
     tile_masks = runtime.forward_tile_masks
     q_block_size, k_block_size = sparse_tensors.block_size
@@ -4517,19 +4655,15 @@ def _build_hsa_forward_synthetic_grid_metadata(
             {
                 "logical_k_idx": logical_k_idx,
                 "allowed_pairs": 0,
-                "active_local_cols": set(),
-                "cols_by_q_local": {},
+                "active_local_cols_mask": 0,
+                "cols_mask_by_q_local": {},
             },
         )
         block["allowed_pairs"] = int(block["allowed_pairs"]) + 1
-        active_local_cols = block["active_local_cols"]
-        assert isinstance(active_local_cols, set)
-        active_local_cols.add(local_k)
-        cols_by_q_local = block["cols_by_q_local"]
-        assert isinstance(cols_by_q_local, dict)
-        cols_for_q = cols_by_q_local.setdefault(q_local, set())
-        assert isinstance(cols_for_q, set)
-        cols_for_q.add(local_k)
+        block["active_local_cols_mask"] = int(block["active_local_cols_mask"]) | (1 << local_k)
+        cols_mask_by_q_local = block["cols_mask_by_q_local"]
+        assert isinstance(cols_mask_by_q_local, dict)
+        cols_mask_by_q_local[q_local] = int(cols_mask_by_q_local.get(q_local, 0)) | (1 << local_k)
 
     def _append_forward_qgroup(
         batch_idx: int,
@@ -4545,13 +4679,13 @@ def _build_hsa_forward_synthetic_grid_metadata(
         packed_q = _align_up(q_count, logical_block_q)
         q_slot_for_local = {q_local: q_slot for q_slot, q_local in enumerate(q_rows_local)}
         for block in logical_blocks.values():
-            cols_by_q_local = block.pop("cols_by_q_local")
-            assert isinstance(cols_by_q_local, dict)
-            cols_by_qslot = {}
-            for q_local, cols in cols_by_q_local.items():
+            cols_mask_by_q_local = block.pop("cols_mask_by_q_local")
+            assert isinstance(cols_mask_by_q_local, dict)
+            cols_mask_by_qslot = {}
+            for q_local, cols_mask in cols_mask_by_q_local.items():
                 q_slot = q_slot_for_local[int(q_local)]
-                cols_by_qslot[q_slot] = cols
-            block["cols_by_qslot"] = cols_by_qslot
+                cols_mask_by_qslot[q_slot] = int(cols_mask)
+            block["cols_mask_by_qslot"] = cols_mask_by_qslot
 
         qgroup_idx = len(qgroup_length)
         batch_base = batch_idx * seqlen
@@ -4576,30 +4710,31 @@ def _build_hsa_forward_synthetic_grid_metadata(
 
             for block_pos, block in enumerate(split_blocks):
                 logical_k_idx = int(block["logical_k_idx"])
-                cols_by_qslot = block["cols_by_qslot"]
-                assert isinstance(cols_by_qslot, dict)
-                active_local_cols = block["active_local_cols"]
-                assert isinstance(active_local_cols, set)
+                cols_mask_by_qslot = block["cols_mask_by_qslot"]
+                assert isinstance(cols_mask_by_qslot, dict)
+                active_local_cols_mask = int(block["active_local_cols_mask"])
                 block_base = logical_k_idx * logical_block_k
                 packed_col_base = block_pos * logical_block_k
                 for local_k in range(logical_block_k):
                     global_row = block_base + local_k
-                    if global_row < seqlen and local_k in active_local_cols:
+                    if global_row < seqlen and ((active_local_cols_mask >> local_k) & 1):
                         padded_k_rows.append(batch_base + global_row)
                         if not forward_plan_only:
                             active_k_rows_sorted.append(global_row)
                     else:
                         padded_k_rows.append(-1)
                         active_rows_dense = False
-                for q_slot in sorted(cols_by_qslot):
-                    cols = cols_by_qslot[q_slot]
-                    assert isinstance(cols, set)
-                    if cols and not forward_plan_only:
+                for q_slot in sorted(cols_mask_by_qslot):
+                    cols_mask = int(cols_mask_by_qslot[q_slot])
+                    if cols_mask and not forward_plan_only:
                         logical_pairs_local.append((q_slot // logical_block_q, block_pos))
-                    for local_k in sorted(cols):
+                    while cols_mask:
+                        col_lsb = cols_mask & -cols_mask
+                        local_k = col_lsb.bit_length() - 1
                         split_packed_cols[q_slot].append(packed_col_base + local_k)
                         if split_global_rows is not None:
                             split_global_rows[q_slot].append(block_base + local_k)
+                        cols_mask ^= col_lsb
 
             allowed_pairs = sum(len(cols) for cols in split_packed_cols)
             split_fill = allowed_pairs / max(packed_q * packed_k, 1)
@@ -4666,91 +4801,106 @@ def _build_hsa_forward_synthetic_grid_metadata(
             if q_len <= 0:
                 continue
             num_q_subgroups = (q_len + logical_block_q - 1) // logical_block_q
+            base_full_logical_blocks: dict[int, int] = {}
+            full_cnt = 0 if full_block_cnt is None else int(full_block_cnt[batch_idx, 0, q_block_idx].item())
+            for offset in range(full_cnt):
+                k_block_idx = int(full_block_idx[batch_idx, 0, q_block_idx, offset].item())
+                k_start = k_block_idx * k_block_size
+                k_len = min(k_block_size, seqlen - k_start)
+                if k_len <= 0:
+                    continue
+                for global_k_row in range(k_start, k_start + k_len):
+                    logical_k_idx = global_k_row // logical_block_k
+                    local_k = global_k_row % logical_block_k
+                    base_full_logical_blocks[logical_k_idx] = int(base_full_logical_blocks.get(logical_k_idx, 0)) | (
+                        1 << local_k
+                    )
+
+            row_partial_support_rows = [[] for _ in range(q_len)]
+            partial_cnt = int(mask_block_cnt[batch_idx, 0, q_block_idx].item())
+            for offset in range(partial_cnt):
+                k_block_idx = int(mask_block_idx[batch_idx, 0, q_block_idx, offset].item())
+                k_start = k_block_idx * k_block_size
+                k_len = min(k_block_size, seqlen - k_start)
+                if k_len <= 0:
+                    continue
+                block_id = int(block_id_table[batch_idx, q_block_idx, k_block_idx].item())
+                kind = int(tile_kind[block_id].item())
+
+                if kind in (_HSA_FWD_TILE_AFFINE_PREFIX, _HSA_FWD_TILE_ROW_PREFIX):
+                    for q_local in range(q_len):
+                        if kind == _HSA_FWD_TILE_AFFINE_PREFIX:
+                            prefix = max(0, min(k_len, int(affine_base[block_id].item()) + q_local))
+                        else:
+                            prefix_start = int(row_prefix_row_ptr[block_id].item())
+                            prefix = max(0, min(k_len, int(row_prefix_len[prefix_start + q_local].item())))
+                        if prefix > 0:
+                            row_partial_support_rows[q_local].extend(range(k_start, k_start + prefix))
+                else:
+                    block_support_rows = bitmap_block_support_cache.get(block_id)
+                    if block_support_rows is None:
+                        word_start = int(bitmap_word_row_ptr[block_id].item())
+                        block_support_rows = [[] for _ in range(q_block_size)]
+                        for bitmap_q_local in range(q_block_size):
+                            row_support_rows: list[int] = []
+                            for word_idx in range(words_per_row):
+                                word = (
+                                    int(bitmap_words[word_start + bitmap_q_local * words_per_row + word_idx].item())
+                                    & 0xFFFFFFFF
+                                )
+                                while word:
+                                    bit = word & -word
+                                    bit_idx = bit.bit_length() - 1
+                                    k_local = word_idx * 32 + bit_idx
+                                    if k_local < k_len:
+                                        row_support_rows.append(k_start + k_local)
+                                    word ^= bit
+                            block_support_rows[bitmap_q_local] = row_support_rows
+                        bitmap_block_support_cache[block_id] = block_support_rows
+                    for q_local in range(q_len):
+                        support_rows = block_support_rows[q_local]
+                        if support_rows:
+                            row_partial_support_rows[q_local].extend(support_rows)
+
+            has_full_support = bool(base_full_logical_blocks)
             for q_subgroup_idx in range(num_q_subgroups):
                 subgroup_q_start = q_subgroup_idx * logical_block_q
                 subgroup_q_end = min(q_len, subgroup_q_start + logical_block_q)
-                q_rows_local: set[int] = set()
+                q_rows_local = [
+                    q_local
+                    for q_local in range(subgroup_q_start, subgroup_q_end)
+                    if has_full_support or row_partial_support_rows[q_local]
+                ]
+                if not q_rows_local:
+                    continue
+
+                q_count = len(q_rows_local)
                 logical_blocks: dict[int, dict[str, object]] = {}
+                if has_full_support:
+                    for logical_k_idx, active_local_cols_mask in base_full_logical_blocks.items():
+                        active_local_cols_mask = int(active_local_cols_mask)
+                        logical_blocks[logical_k_idx] = {
+                            "logical_k_idx": logical_k_idx,
+                            "allowed_pairs": q_count * active_local_cols_mask.bit_count(),
+                            "active_local_cols_mask": active_local_cols_mask,
+                            "cols_mask_by_q_local": {
+                                int(q_local): active_local_cols_mask for q_local in q_rows_local
+                            },
+                        }
 
-                full_cnt = 0 if full_block_cnt is None else int(full_block_cnt[batch_idx, 0, q_block_idx].item())
-                for offset in range(full_cnt):
-                    k_block_idx = int(full_block_idx[batch_idx, 0, q_block_idx, offset].item())
-                    k_start = k_block_idx * k_block_size
-                    k_len = min(k_block_size, seqlen - k_start)
-                    if k_len <= 0:
-                        continue
-                    for q_local in range(subgroup_q_start, subgroup_q_end):
-                        q_rows_local.add(q_local)
-                        for global_k_row in range(k_start, k_start + k_len):
-                            _accumulate_forward_qgroup_logical_block(
-                                logical_blocks,
-                                q_local=q_local,
-                                global_k_row=global_k_row,
-                            )
+                for q_local in q_rows_local:
+                    for global_k_row in row_partial_support_rows[q_local]:
+                        _accumulate_forward_qgroup_logical_block(
+                            logical_blocks,
+                            q_local=q_local,
+                            global_k_row=global_k_row,
+                        )
 
-                partial_cnt = int(mask_block_cnt[batch_idx, 0, q_block_idx].item())
-                for offset in range(partial_cnt):
-                    k_block_idx = int(mask_block_idx[batch_idx, 0, q_block_idx, offset].item())
-                    k_start = k_block_idx * k_block_size
-                    k_len = min(k_block_size, seqlen - k_start)
-                    if k_len <= 0:
-                        continue
-                    block_id = int(block_id_table[batch_idx, q_block_idx, k_block_idx].item())
-                    kind = int(tile_kind[block_id].item())
-
-                    if kind in (_HSA_FWD_TILE_AFFINE_PREFIX, _HSA_FWD_TILE_ROW_PREFIX):
-                        for q_local in range(subgroup_q_start, subgroup_q_end):
-                            if kind == _HSA_FWD_TILE_AFFINE_PREFIX:
-                                prefix = max(0, min(k_len, int(affine_base[block_id].item()) + q_local))
-                            else:
-                                prefix_start = int(row_prefix_row_ptr[block_id].item())
-                                prefix = max(0, min(k_len, int(row_prefix_len[prefix_start + q_local].item())))
-                            if prefix <= 0:
-                                continue
-                            q_rows_local.add(q_local)
-                            for global_k_row in range(k_start, k_start + prefix):
-                                _accumulate_forward_qgroup_logical_block(
-                                    logical_blocks,
-                                    q_local=q_local,
-                                    global_k_row=global_k_row,
-                                )
-                    else:
-                        block_support_rows = bitmap_block_support_cache.get(block_id)
-                        if block_support_rows is None:
-                            word_start = int(bitmap_word_row_ptr[block_id].item())
-                            block_support_rows = [[] for _ in range(q_block_size)]
-                            for bitmap_q_local in range(q_block_size):
-                                row_support_rows: list[int] = []
-                                for word_idx in range(words_per_row):
-                                    word = (
-                                        int(bitmap_words[word_start + bitmap_q_local * words_per_row + word_idx].item())
-                                        & 0xFFFFFFFF
-                                    )
-                                    while word:
-                                        bit = word & -word
-                                        bit_idx = bit.bit_length() - 1
-                                        k_local = word_idx * 32 + bit_idx
-                                        if k_local < k_len:
-                                            row_support_rows.append(k_start + k_local)
-                                        word ^= bit
-                                block_support_rows[bitmap_q_local] = row_support_rows
-                            bitmap_block_support_cache[block_id] = block_support_rows
-                        for q_local in range(subgroup_q_start, subgroup_q_end):
-                            support_rows = block_support_rows[q_local]
-                            if not support_rows:
-                                continue
-                            q_rows_local.add(q_local)
-                            for global_k_row in support_rows:
-                                _accumulate_forward_qgroup_logical_block(
-                                    logical_blocks,
-                                    q_local=q_local,
-                                    global_k_row=global_k_row,
-                                )
                 _append_forward_qgroup(
                     batch_idx,
                     q_block_idx,
                     q_subgroup_idx,
-                    sorted(q_rows_local),
+                    q_rows_local,
                     logical_blocks,
                 )
 
@@ -5192,6 +5342,8 @@ def _build_hsa_forward_synthetic_grid_metadata(
             qgroup_bucket_q_row_idx.extend([-1] * (packed_q - len(q_rows)))
         qgroup_bucket_q_row_idx_row_ptr.append(len(qgroup_bucket_q_row_idx))
 
+    _debug_timing("build_qgroups_and_buckets")
+
     def _build_direct_execution_plan(
         *,
         split_entries_ref: list[dict[str, object]],
@@ -5199,6 +5351,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
         target_max_segments: int | None,
         merge_k_cap: int,
         allowed_qgroups: set[int] | None = None,
+        include_union_row_compact_plan: bool = True,
     ) -> dict[str, object] | None:
         direct_bucket_row_ptr = [0]
         direct_bucket_qgroup_bucket_idx: list[int] = []
@@ -5364,7 +5517,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
                 bucket_mask_words=direct_bucket_mask_words,
             )
             union_row_compact_plan = None
-            if sparse_parse_fwd and logical_block_k > 2:
+            if include_union_row_compact_plan and sparse_parse_fwd and logical_block_k > 2:
                 union_bucket_row_ptr = [0]
                 union_bucket_qgroup_bucket_idx: list[int] = []
                 union_bucket_packed_q: list[int] = []
@@ -5570,14 +5723,90 @@ def _build_hsa_forward_synthetic_grid_metadata(
                 split_indices_by_qgroup_ref=row_compact_split_indices_by_qgroup,
                 target_max_segments=None,
                 merge_k_cap=row_compact_cap,
+                include_union_row_compact_plan=not forward_plan_only,
             )
+            _debug_timing("direct_plan_row_compact_sharded")
         if direct_execution_plan is None or direct_execution_plan.get("row_compact_plan") is None:
             direct_execution_plan = _build_direct_execution_plan(
                 split_entries_ref=split_entries,
                 split_indices_by_qgroup_ref=split_indices_by_qgroup,
                 target_max_segments=max_direct_segments,
                 merge_k_cap=max_packed_k,
+                include_union_row_compact_plan=not forward_plan_only,
             )
+            _debug_timing("direct_plan_full")
+
+    if forward_plan_only:
+        empty_int32 = _empty_int32(device)
+        empty_bool = torch.empty((0,), dtype=torch.bool, device=device)
+        empty_float32 = torch.empty((0,), dtype=torch.float32, device=device)
+        forward_execution_plan = {
+            "direct_execution_plan": direct_execution_plan,
+            "hybrid_direct_execution_plan": None,
+            "hybrid_regular_execution_plan": None,
+            "hybrid_selected_qgroup_idx": [],
+        }
+        return HSASyntheticGridMetadata(
+            logical_block_q=logical_block_q,
+            logical_block_k=logical_block_k,
+            physical_block_q=q_block_size,
+            physical_block_k=k_block_size,
+            tile_batch_idx=empty_int32,
+            tile_q_block_idx=empty_int32,
+            tile_q_subgroup_idx=empty_int32,
+            tile_k_block_idx=empty_int32,
+            tile_q_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            tile_q_rows=empty_int32,
+            tile_k_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            tile_k_rows=empty_int32,
+            tile_logical_pair_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            tile_logical_pairs=torch.empty((0, 2), dtype=torch.int32, device=device),
+            compact_mask_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            compact_mask_col_idx=empty_int32,
+            tile_allowed_pairs=empty_int32,
+            tile_packed_q=empty_int32,
+            tile_packed_k=empty_int32,
+            tile_dense=empty_bool,
+            bucket_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            bucket_tile_idx=empty_int32,
+            bucket_packed_q=empty_int32,
+            bucket_packed_k=empty_int32,
+            bucket_dense=empty_bool,
+            bucket_allowed_pairs=empty_int32,
+            bucket_fill=empty_float32,
+            max_packed_k=max_packed_k,
+            max_direct_segments=max_direct_segments,
+            sparse_parse_fwd=sparse_parse_fwd,
+            tile_fill=empty_float32,
+            tile_q_length=empty_int32,
+            tile_k_length=empty_int32,
+            bucket_q_row_idx_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            bucket_q_row_idx=empty_int32,
+            bucket_q_src_row_idx=empty_int32,
+            bucket_k_row_idx_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            bucket_k_row_idx=empty_int32,
+            bucket_q_length=empty_int32,
+            bucket_k_length=empty_int32,
+            bucket_split_slot=empty_int32,
+            bucket_qgroup_bucket_idx=empty_int32,
+            bucket_mask_word_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            bucket_mask_words=empty_int32,
+            bucket_words_per_row=empty_int32,
+            qgroup_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            qgroup_rows=empty_int32,
+            qgroup_length=empty_int32,
+            qgroup_packed_q=empty_int32,
+            qgroup_num_splits=empty_int32,
+            qgroup_bucket_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            qgroup_bucket_idx=empty_int32,
+            qgroup_bucket_packed_q=empty_int32,
+            qgroup_bucket_q_row_idx_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            qgroup_bucket_q_row_idx=empty_int32,
+            qgroup_bucket_split_bucket_row_ptr=torch.tensor([0], dtype=torch.int32, device=device),
+            qgroup_bucket_split_bucket_idx=empty_int32,
+            forward_execution_plan=forward_execution_plan,
+        )
+
     def _build_forward_execution_plan(
         *,
         excluded_qgroups: set[int] | None = None,
@@ -5839,6 +6068,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
         }
 
     forward_execution_plan = _build_forward_execution_plan(direct_execution_plan_value=direct_execution_plan)
+    _debug_timing("forward_execution_plan")
     hybrid_selected_qgroups = _select_hybrid_direct_qgroups(
         direct_execution_plan,
         max_qgroup_segments=_get_hsa_synthetic_hybrid_max_qgroup_segments(),
@@ -5852,6 +6082,7 @@ def _build_hsa_forward_synthetic_grid_metadata(
             target_max_segments=None,
             merge_k_cap=row_compact_cap,
             allowed_qgroups=hybrid_selected_qgroups,
+            include_union_row_compact_plan=True,
         )
         if hybrid_direct_execution_plan is None or hybrid_direct_execution_plan.get("row_compact_plan") is None:
             hybrid_direct_execution_plan = None
@@ -5860,9 +6091,11 @@ def _build_hsa_forward_synthetic_grid_metadata(
                 excluded_qgroups=hybrid_selected_qgroups,
                 direct_execution_plan_value=direct_execution_plan,
             )
+            _debug_timing("hybrid_regular_execution_plan")
     forward_execution_plan["hybrid_direct_execution_plan"] = hybrid_direct_execution_plan
     forward_execution_plan["hybrid_regular_execution_plan"] = hybrid_regular_execution_plan
     forward_execution_plan["hybrid_selected_qgroup_idx"] = sorted(hybrid_selected_qgroups)
+    _debug_timing("finalize_forward_plan")
 
     return HSASyntheticGridMetadata(
         logical_block_q=logical_block_q,
@@ -7657,15 +7890,7 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             run_cached_generalized_packed_forward,
         )
 
-        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
-        ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
-            schedule,
-            q,
-            k,
-            runtime=ctx.block_sparse_runtime,
-        )
         ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
-        ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
         ctx.cached_forward_payload = cached_forward_payload
         fused_bwd_env = os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "auto").strip().lower()
         if fused_bwd_env in {"0", "false", "off", "no"}:
@@ -7685,10 +7910,38 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
                 deterministic=deterministic,
             )
         )
-        ctx.use_synthetic_micro_bwd = (
+        ctx.block_sparse_runtime = None
+        ctx.use_synthetic_grid = False
+        ctx.synthetic_forward_prob_token = 0
+        wants_synthetic_micro_bwd = (
             not ctx.use_cached_generalized_fused_bwd
-            and
-            ctx.hsa_backward_mode == "sparse_mask"
+            and ctx.hsa_backward_mode in {"sparse_mask", "legacy_packed"}
+            and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+        )
+        if (
+            not ctx.use_cached_generalized_fused_bwd
+            and (ctx.hsa_backward_mode != "legacy_packed" or wants_synthetic_micro_bwd)
+        ):
+            runtime_require_backward = False if wants_synthetic_micro_bwd else None
+            if runtime_require_backward is None:
+                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+            else:
+                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                    schedule,
+                    q,
+                    k,
+                    require_backward=runtime_require_backward,
+                )
+            ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
+                schedule,
+                q,
+                k,
+                runtime=ctx.block_sparse_runtime,
+            )
+            ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
+        ctx.use_synthetic_micro_bwd = (
+            wants_synthetic_micro_bwd
+            and ctx.use_synthetic_grid
             and _can_use_cached_generalized_synthetic_micro_bwd(schedule, ctx.block_sparse_runtime, q, k, v)
         )
         setattr(schedule, "_last_cached_generalized_fused_bwd_used", False)
@@ -7718,20 +7971,6 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             dq, dk, dv = _zero_hsa_grads(q, k, v)
             setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
             return dq, dk, dv, None, None, None, None, None, None, None
-        if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
-            try:
-                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                    ctx.schedule,
-                    q,
-                    k,
-                    require_backward=True,
-                )
-            except TypeError:
-                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                    ctx.schedule,
-                    q,
-                    k,
-                )
         if ctx.use_cached_generalized_fused_bwd:
             from flash_attn.cute.hsa_cached_2d_forward_analysis import run_cached_generalized_packed_backward
 
@@ -7748,6 +7987,20 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             )
             setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", True)
         elif ctx.use_synthetic_micro_bwd:
+            if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
+                try:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        ctx.schedule,
+                        q,
+                        k,
+                        require_backward=True,
+                    )
+                except TypeError:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        ctx.schedule,
+                        q,
+                        k,
+                    )
             from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
 
             dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
@@ -7772,6 +8025,20 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             )
             setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
         else:
+            if ctx.hsa_backward_mode != "legacy_packed" and getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
+                try:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        ctx.schedule,
+                        q,
+                        k,
+                        require_backward=True,
+                    )
+                except TypeError:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        ctx.schedule,
+                        q,
+                        k,
+                    )
             dq, dk, dv = _run_hsa_cached_generalized_backward(
                 q,
                 k,

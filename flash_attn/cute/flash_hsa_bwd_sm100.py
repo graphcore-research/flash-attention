@@ -5208,8 +5208,8 @@ def run_hsa_bwd_sm100_monolithic(
         softmax_scale,
         workspaces,
         compile_key,
-        precomputed_row_accums=precomputed_row_accums,
-        precomputed_done_families=precomputed_done_families,
+        precomputed_row_accums=sentence_stage.row_accums,
+        precomputed_done_families=sentence_stage.done_families,
     )
 
 

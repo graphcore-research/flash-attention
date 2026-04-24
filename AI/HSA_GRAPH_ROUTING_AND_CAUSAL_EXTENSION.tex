@@ -893,9 +893,10 @@ The main problems were:
     backward panel calls.
 \end{enumerate}
 
-One concrete improvement already landed: sorting and coalescing legacy packed
-backward panels by shape before execution. On a representative Wikipedia $64$K
-batch, that reduced the hybrid backward batch count from roughly
+One concrete improvement already landed early in this pass: sorting and
+coalescing legacy packed backward panels by shape before execution. On a
+representative Wikipedia $64$K batch, that reduced the hybrid backward batch
+count from roughly
 \[
 165 \;\longrightarrow\; 15
 \]
@@ -916,6 +917,35 @@ That is an important refinement of the current state:
 
 So the current non-Gutenberg work is about making the packed backward path less
 fragile to wiki/web geometry, not about changing the HSA graph definition.
+
+The later fixes were more important still:
+\begin{enumerate}[leftmargin=1.5em]
+    \item regroup \texttt{direct\_passthrough} families across qgroups instead
+    of respecting qgroup boundaries too aggressively;
+    \item regroup \texttt{k\_window} families across qgroups in the same way;
+    \item add a real cached backward fast path for \texttt{masked\_union}
+    payloads rather than falling back to legacy packed backward;
+    \item increase the cached masked-forward range chunk size so very large
+    \texttt{k\_window} ranges are not executed as dozens of tiny masked-kernel
+    launches.
+\end{enumerate}
+
+The effect of the masked-union cached backward path is easy to see on single
+batches:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+case & old backward & new backward \\
+\midrule
+Wikipedia $64$K batch $0$ & $250.2$ ms & $34.3$ ms \\
+FineWeb $128$K batch $0$ & $586.6$ ms & $106.0$ ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+That eliminated the old backward-plumbing bottleneck. After that point, the
+remaining wiki/web cost was mostly in packed forward geometry, especially on
+large \texttt{k\_window} ranges.
 
 \subsection{What the wiki/web geometry actually says}
 
@@ -967,6 +997,54 @@ but reduces packed forward time by about \(2.44\times\). That is the missing
 systems lesson: on non-Gutenberg geometry we were over-optimizing for local
 packing density and under-optimizing for group granularity.
 
+The same pattern reappeared once direct regrouping was fixed. On Wikipedia
+\(64\)K, batches \(2\) through \(4\) were still dominated by huge
+\texttt{k\_window} ranges. After the \texttt{k\_window} regrouping fix and the
+masked-union cached backward path, those batches were no longer
+backward-dominated; they were forward-dominated. The next winning change was to
+raise the cached masked-forward range chunk size from \(128\) groups to
+\(512\). On representative slow wiki batches this reduced forward time as
+follows:
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+batch & chunk \(128\) & chunk \(512\) \\
+\midrule
+Wikipedia $64$K batch $2$ & $149.0$ ms & $103.3$ ms \\
+Wikipedia $64$K batch $4$ & $154.3$ ms & $112.5$ ms \\
+FineWeb $128$K batch $0$ & $160.9$ ms & $109.8$ ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So the final non-Gutenberg crossover was not one bug. It was a sequence:
+\begin{enumerate}[leftmargin=1.5em]
+    \item reduce direct fragmentation,
+    \item reduce \texttt{k\_window} fragmentation,
+    \item replace legacy packed backward with cached masked-union backward,
+    \item then reduce forward launch overhead on the remaining large masked
+    ranges.
+\end{enumerate}
+
+With those fixes in place, the representative non-Gutenberg resident runs now
+look like this:
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+dataset & mode & mean dt & tok/s \\
+\midrule
+Wikipedia $64$K & flat FA4 & $143.5$ ms & $456.8$k \\
+Wikipedia $64$K & HSA packed & $128.8$ ms & $509.0$k \\
+FineWeb $128$K & flat FA4 & $476.2$ ms & $275.2$k \\
+FineWeb $128$K & HSA packed & $188.3$ ms & $696.2$k \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+That is the first point where the cross-dataset story becomes coherent:
+Wikipedia \(64\)K now clears flat FA4, and FineWeb \(128\)K is well into the
+regime where packed HSA is materially faster than flat.
+
 \subsection{Which knobs are actually worth tuning}
 
 The current tuning picture is now clearer:
@@ -991,13 +1069,21 @@ The current tuning picture is now clearer:
     \item \texttt{tile\_k}: kernel tile width. This matters only after the
     group shapes are in a reasonable regime; it is not the first lever to pull
     when the payload is still exploding into tiny groups.
+    \item \texttt{FLASH\_ATTN\_HSA\_CACHED\_MASKED\_GROUP\_CHUNK}: runtime
+    chunking for large masked ranges. Once the payload has already been
+    regrouped, this becomes the main forward-side launch-amortization knob for
+    very large \texttt{k\_window} ranges. On the current wiki/web slices,
+    \(512\) was clearly better than \(128\), while \(1024\) did not improve
+    further.
 \end{itemize}
 
 So the practical tuning order is:
 \begin{enumerate}[leftmargin=1.5em]
     \item reduce group fragmentation,
-    \item then tune direct-versus-union family assignment,
-    \item only then tune tile-level kernel parameters.
+    \item then fix the backward path for the dominant residual family,
+    \item then tune masked-range runtime chunking,
+    \item only then tune direct-versus-union family assignment and tile-level
+    kernel parameters.
 \end{enumerate}
 
 \subsection{MFU caveat}

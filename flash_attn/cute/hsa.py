@@ -7955,12 +7955,19 @@ class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
             if runtime_require_backward is None:
                 ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
             else:
-                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                    schedule,
-                    q,
-                    k,
-                    require_backward=runtime_require_backward,
-                )
+                try:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        schedule,
+                        q,
+                        k,
+                        require_backward=runtime_require_backward,
+                    )
+                except TypeError:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                        schedule,
+                        q,
+                        k,
+                    )
             ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
                 schedule,
                 q,

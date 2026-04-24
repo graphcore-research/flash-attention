@@ -1336,9 +1336,10 @@ def _finalize_generalized_cached_forward_payload(
     }
     if mask_bool is not None:
         payload["mask_bool"] = mask_bool.contiguous()
-    backward_payload = build_cached_generalized_backward_payload(payload)
-    if isinstance(backward_payload, dict):
-        payload["cached_generalized_backward_payload"] = backward_payload
+    if str(payload.get("residual_mode", "")) == "fused_tail":
+        backward_payload = build_cached_generalized_backward_payload(payload)
+        if isinstance(backward_payload, dict):
+            payload["cached_generalized_backward_payload"] = backward_payload
     return payload
 
 
@@ -1976,10 +1977,174 @@ def build_cached_direct_2d_forward_payload(
     }
     if mask_bool is not None:
         payload["mask_bool"] = mask_bool.contiguous()
-    backward_payload = build_cached_generalized_backward_payload(payload)
-    if isinstance(backward_payload, dict):
-        payload["cached_generalized_backward_payload"] = backward_payload
+    if str(payload.get("residual_mode", "")) == "fused_tail":
+        backward_payload = build_cached_generalized_backward_payload(payload)
+        if isinstance(backward_payload, dict):
+            payload["cached_generalized_backward_payload"] = backward_payload
     return payload
+
+
+def _build_cached_generalized_masked_union_row_compact_backward_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    q_row_idx = payload.get("q_row_idx")
+    k_row_idx = payload.get("k_row_idx")
+    mask_words = payload.get("mask_words")
+    q_length = payload.get("q_length")
+    k_length = payload.get("k_length")
+    if not all(
+        isinstance(tensor, torch.Tensor)
+        for tensor in (q_row_idx, k_row_idx, mask_words, q_length, k_length)
+    ):
+        return None
+
+    device = q_row_idx.device
+    rows_per_member = 2
+    union_chunk_cap = 16
+
+    member_q_row_idx: list[list[int]] = []
+    member_q_length: list[int] = []
+    member_row_k_row_idx: list[list[list[int]]] = []
+    member_row_k_to_union_idx: list[list[list[int]]] = []
+    member_union_k_row_idx: list[list[int]] = []
+    member_union_to_row_slot: list[list[list[int]]] = []
+    member_row_k_length: list[list[int]] = []
+    member_union_k_length: list[int] = []
+    unique_key_occurrences: dict[int, list[tuple[int, int]]] = {}
+
+    def append_member(
+        pair_q_rows: list[int],
+        union_rows: list[int],
+        row_support_lists: list[list[int]],
+    ) -> None:
+        if not pair_q_rows or not union_rows:
+            return
+        member_idx = len(member_q_row_idx)
+        q_pair = [int(value) for value in pair_q_rows[:rows_per_member]]
+        q_pair.extend([-1] * (rows_per_member - len(q_pair)))
+        member_q_row_idx.append(q_pair)
+        member_q_length.append(min(rows_per_member, len(pair_q_rows)))
+
+        union_rows = [int(value) for value in union_rows[:union_chunk_cap] if int(value) >= 0]
+        if not union_rows:
+            return
+        union_index = {int(key_row): idx for idx, key_row in enumerate(union_rows)}
+        padded_union_rows = union_rows + [-1] * (union_chunk_cap - len(union_rows))
+        member_union_k_row_idx.append(padded_union_rows)
+        member_union_k_length.append(len(union_rows))
+
+        row_k_rows_entry: list[list[int]] = []
+        row_k_to_union_entry: list[list[int]] = []
+        union_to_row_entry: list[list[int]] = []
+        row_k_length_entry: list[int] = []
+        for row_slot in range(rows_per_member):
+            support_rows = (
+                [int(value) for value in row_support_lists[row_slot]]
+                if row_slot < len(row_support_lists)
+                else []
+            )
+            support_rows = [value for value in support_rows if value in union_index]
+            row_k_length_entry.append(len(support_rows))
+            row_k_rows_entry.append(support_rows + [-1] * (union_chunk_cap - len(support_rows)))
+            row_k_to_union_entry.append(
+                [union_index[value] for value in support_rows] + [-1] * (union_chunk_cap - len(support_rows))
+            )
+            union_to_row = [-1] * union_chunk_cap
+            for row_local_slot, key_row in enumerate(support_rows):
+                union_to_row[union_index[key_row]] = row_local_slot
+            union_to_row_entry.append(union_to_row)
+        member_row_k_row_idx.append(row_k_rows_entry)
+        member_row_k_to_union_idx.append(row_k_to_union_entry)
+        member_union_to_row_slot.append(union_to_row_entry)
+        member_row_k_length.append(row_k_length_entry)
+
+        for union_idx, key_row in enumerate(union_rows):
+            unique_key_occurrences.setdefault(int(key_row), []).append((member_idx, union_idx))
+
+    group_count = int(q_row_idx.shape[0])
+    for group_idx in range(group_count):
+        q_length_value = int(q_length[group_idx].item())
+        k_length_value = int(k_length[group_idx].item())
+        if q_length_value <= 0 or k_length_value <= 0:
+            continue
+        group_q_rows = [int(value) for value in q_row_idx[group_idx, :q_length_value].detach().to("cpu").tolist()]
+        group_k_rows = [int(value) for value in k_row_idx[group_idx, :k_length_value].detach().to("cpu").tolist()]
+        if not group_q_rows or not group_k_rows:
+            continue
+        word_cols = (k_length_value + 31) // 32
+        group_mask_words = mask_words[group_idx, :q_length_value, :word_cols].detach().to("cpu").contiguous()
+        mask_bool = _decode_mask_words_to_bool(group_mask_words, k_length_value)
+        support_lists: list[list[int]] = []
+        for row_idx in range(q_length_value):
+            row_support = [
+                group_k_rows[col_idx]
+                for col_idx, keep in enumerate(mask_bool[row_idx].tolist())
+                if keep
+            ]
+            support_lists.append(row_support)
+        for pair_start in range(0, len(group_q_rows), rows_per_member):
+            pair_q_rows = group_q_rows[pair_start : pair_start + rows_per_member]
+            pair_support_lists = support_lists[pair_start : pair_start + len(pair_q_rows)]
+            union_rows_all: list[int] = []
+            seen_union_rows: set[int] = set()
+            for support in pair_support_lists:
+                for key_row in support:
+                    key_row = int(key_row)
+                    if key_row not in seen_union_rows:
+                        seen_union_rows.add(key_row)
+                        union_rows_all.append(key_row)
+            if not union_rows_all:
+                continue
+            for chunk_start in range(0, len(union_rows_all), union_chunk_cap):
+                union_chunk = union_rows_all[chunk_start : chunk_start + union_chunk_cap]
+                union_chunk_set = set(union_chunk)
+                row_support_chunk = [
+                    [key_row for key_row in support if key_row in union_chunk_set]
+                    for support in pair_support_lists
+                ]
+                append_member(pair_q_rows, union_chunk, row_support_chunk)
+
+    if not member_q_row_idx:
+        return None
+
+    unique_key_row_idx_list: list[int] = []
+    unique_key_member_idx_list: list[int] = []
+    unique_key_union_idx_list: list[int] = []
+    unique_key_occurrence_row_ptr_list = [0]
+    max_unique_key_occurrences = 0
+    for key_row in sorted(unique_key_occurrences):
+        occurrences = unique_key_occurrences[key_row]
+        max_unique_key_occurrences = max(max_unique_key_occurrences, len(occurrences))
+        unique_key_row_idx_list.append(int(key_row))
+        for member_idx, union_idx in occurrences:
+            unique_key_member_idx_list.append(int(member_idx))
+            unique_key_union_idx_list.append(int(union_idx))
+        unique_key_occurrence_row_ptr_list.append(len(unique_key_member_idx_list))
+
+    return {
+        "status": "ready",
+        "backward_kernel_family": "cached_masked_union_row_compact",
+        "rows_per_member": int(rows_per_member),
+        "union_chunk_cap": int(union_chunk_cap),
+        "q_row_idx": torch.tensor(member_q_row_idx, dtype=torch.int32, device=device).contiguous(),
+        "q_length": torch.tensor(member_q_length, dtype=torch.int32, device=device).contiguous(),
+        "row_k_row_idx": torch.tensor(member_row_k_row_idx, dtype=torch.int32, device=device).contiguous(),
+        "row_k_to_union_idx": torch.tensor(member_row_k_to_union_idx, dtype=torch.int32, device=device).contiguous(),
+        "union_k_row_idx": torch.tensor(member_union_k_row_idx, dtype=torch.int32, device=device).contiguous(),
+        "union_to_row_slot": torch.tensor(member_union_to_row_slot, dtype=torch.int32, device=device).contiguous(),
+        "row_k_length": torch.tensor(member_row_k_length, dtype=torch.int32, device=device).contiguous(),
+        "union_k_length": torch.tensor(member_union_k_length, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_row_idx": torch.tensor(unique_key_row_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_member_idx": torch.tensor(unique_key_member_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_union_idx": torch.tensor(unique_key_union_idx_list, dtype=torch.int32, device=device).contiguous(),
+        "unique_key_occurrence_row_ptr": torch.tensor(
+            unique_key_occurrence_row_ptr_list,
+            dtype=torch.int32,
+            device=device,
+        ).contiguous(),
+        "max_unique_key_occurrences": int(max_unique_key_occurrences),
+        "_workspace": {},
+    }
 
 
 def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1987,7 +2152,10 @@ def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[s
         return None
     if str(payload.get("exact_kernel_family", "")) != "tc8x8":
         return None
-    if str(payload.get("residual_mode", "")) != "fused_tail":
+    residual_mode = str(payload.get("residual_mode", ""))
+    if residual_mode == "masked_union":
+        return _build_cached_generalized_masked_union_row_compact_backward_payload(payload)
+    if residual_mode != "fused_tail":
         return None
     if int(payload.get("exact_dense_rows_per_range", 0)) != 8:
         return None
@@ -2695,7 +2863,36 @@ def can_use_cached_generalized_fused_backward(
         return False
     if str(payload.get("exact_kernel_family", "")) != "tc8x8":
         return False
-    if str(payload.get("residual_mode", "")) != "fused_tail":
+    residual_mode = str(payload.get("residual_mode", ""))
+    backward_payload = payload.get("cached_generalized_backward_payload")
+    if residual_mode == "masked_union":
+        if not q.is_cuda:
+            return False
+        if (
+            not isinstance(backward_payload, dict)
+            or backward_payload.get("status") != "ready"
+            or str(backward_payload.get("backward_kernel_family", "")) != "cached_masked_union_row_compact"
+        ):
+            backward_payload = build_cached_generalized_backward_payload(payload)
+            if (
+                not isinstance(backward_payload, dict)
+                or backward_payload.get("status") != "ready"
+                or str(backward_payload.get("backward_kernel_family", "")) != "cached_masked_union_row_compact"
+            ):
+                return False
+            payload["cached_generalized_backward_payload"] = backward_payload
+        q_row_idx = backward_payload.get("q_row_idx")
+        union_k_row_idx = backward_payload.get("union_k_row_idx")
+        unique_key_occurrence_row_ptr = backward_payload.get("unique_key_occurrence_row_ptr")
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (q_row_idx, union_k_row_idx, unique_key_occurrence_row_ptr)
+        ):
+            return False
+        if int(q_row_idx.shape[0]) <= 0 or int(union_k_row_idx.shape[1]) > 16:
+            return False
+        return True
+    if residual_mode != "fused_tail":
         return False
     if int(payload.get("exact_dense_rows_per_range", 0)) != 8:
         return False
@@ -2721,7 +2918,6 @@ def can_use_cached_generalized_fused_backward(
         return False
     if int(geometry.get("legacy_residual_fallback_range_count", 0)) != 0:
         return False
-    backward_payload = payload.get("cached_generalized_backward_payload")
     if q.is_cuda:
         use_tile_atomic_dkdv = os.environ.get(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
@@ -3325,6 +3521,47 @@ def run_cached_generalized_packed_backward(
     dk_acc = torch.zeros_like(k_flat, dtype=torch.float32)
     dv_acc = torch.zeros_like(v_flat, dtype=torch.float32)
     if q_flat.is_cuda:
+        backward_payload = payload.get("cached_generalized_backward_payload")
+        if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+            backward_payload = build_cached_generalized_backward_payload(payload)
+            if isinstance(backward_payload, dict):
+                payload["cached_generalized_backward_payload"] = backward_payload
+        if isinstance(backward_payload, dict) and str(backward_payload.get("backward_kernel_family", "")) == "cached_masked_union_row_compact":
+            from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+                _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel,
+            )
+
+            _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
+                q_flat,
+                k_flat,
+                v_flat,
+                out_flat,
+                dout_flat,
+                lse_flat,
+                backward_payload["q_row_idx"],
+                backward_payload["row_k_row_idx"],
+                backward_payload["union_k_row_idx"],
+                backward_payload["row_k_to_union_idx"],
+                backward_payload["union_to_row_slot"],
+                backward_payload["q_length"],
+                backward_payload["row_k_length"],
+                backward_payload["union_k_length"],
+                backward_payload.get("unique_key_row_idx"),
+                backward_payload.get("unique_key_member_idx"),
+                backward_payload.get("unique_key_union_idx"),
+                backward_payload.get("unique_key_occurrence_row_ptr"),
+                dq_acc,
+                dk_acc,
+                dv_acc,
+                softmax_scale=float(softmax_scale),
+                max_unique_key_occurrences=int(backward_payload.get("max_unique_key_occurrences", 0)),
+                workspace=_get_cached_backward_workspace(payload),
+            )
+            return (
+                dq_acc.to(dtype=q.dtype).view_as(q),
+                dk_acc.to(dtype=k.dtype).view_as(k),
+                dv_acc.to(dtype=v.dtype).view_as(v),
+            )
         local_k_chunk = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_LOCAL_K_CHUNK", "8"))
         use_tile_atomic_dkdv = os.environ.get(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",

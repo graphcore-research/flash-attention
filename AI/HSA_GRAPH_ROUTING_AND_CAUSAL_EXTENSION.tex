@@ -27,6 +27,9 @@
 \newcommand{\mcolpick}{\cellcolor{violet!22}\rule{0pt}{1.5ex}\hspace{0.75em}}
 \newcommand{\mcore}{\cellcolor{green!30}\rule{0pt}{1.5ex}\hspace{0.75em}}
 \newcommand{\mtail}{\cellcolor{orange!30}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mforward}{\cellcolor{teal!24}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mgradq}{\cellcolor{red!24}\rule{0pt}{1.5ex}\hspace{0.75em}}
+\newcommand{\mgradkv}{\cellcolor{yellow!35}\rule{0pt}{1.5ex}\hspace{0.75em}}
 
 \title{HSA as Sparse Causal Routing\\
 \large Formalization, Current Packing Strategy, and a Path Toward Typed Semantic Graphs}
@@ -511,6 +514,99 @@ packing gives an equally clean backward.'' The algebra is exact in both cases;
 the systems problem is harder in backward because the packed representation has
 to support cheap accumulation back into the original coordinates.
 
+\subsection{Operational picture: what the kernels are actually doing}
+
+The shortest faithful description is:
+\begin{enumerate}[leftmargin=1.5em]
+    \item start from one sparse support tile in the original coordinates;
+    \item remove dead rows/columns and gather the surviving rows/columns into a
+    smaller packed microproblem;
+    \item run exact masked attention on that packed microproblem;
+    \item scatter the output rows back, and in backward scatter
+    \(d\widetilde Q\) while scatter-adding \(d\widetilde K,d\widetilde V\) into
+    shared original key rows.
+\end{enumerate}
+
+Figure~\ref{fig:operational-packed-picture} makes this concrete. The packed
+forward does \emph{not} approximate the softmax. It evaluates the exact masked
+attention rule on a reindexed live submatrix, then maps the result back to the
+original rows.
+
+\begin{figure}[ht]
+\centering
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{1. Original sparse tile}\\[0.35em]
+\begin{tabular}{c|*{6}{C}}
+ & $k_1$ & $k_2$ & $k_3$ & $k_4$ & $k_5$ & $k_6$ \\
+\hline
+$q_1$ & \mlive & \mlive & \mempty & \mlive & \mempty & \mempty \\
+$q_2$ & \mlive & \mlive & \mempty & \mlive & \mempty & \mempty \\
+$q_3$ & \mempty & \mlive & \mempty & \mlive & \mlive & \mempty \\
+$q_4$ & \mempty & \mlive & \mempty & \mempty & \mlive & \mempty \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+White cells are dead support. They never need scores, softmax mass, or value
+lookups.
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{2. Packed forward microproblem}\\[0.35em]
+\begin{tabular}{c|*{4}{C}}
+ & $u_1{=}k_1$ & $u_2{=}k_2$ & $u_3{=}k_4$ & $u_4{=}k_5$ \\
+\hline
+$\tilde q_1{=}q_1$ & \mforward & \mforward & \mforward & \mempty \\
+$\tilde q_2{=}q_2$ & \mforward & \mforward & \mforward & \mempty \\
+$\tilde q_3{=}q_3$ & \mempty & \mforward & \mforward & \mforward \\
+$\tilde q_4{=}q_4$ & \mempty & \mforward & \mempty & \mforward \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+Gather \(Q,K,V\) onto the live union columns only, keep the exact packed mask
+\(\widetilde M\), and run exact masked attention there. The softmax domain is
+the packed live support itself.
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.31\textwidth}
+\centering
+\textbf{3. Backward writeback}\\[0.35em]
+\begin{tabular}{c|*{4}{C}}
+ & $q_1$ & $q_2$ & $q_3$ & $q_4$ \\
+\hline
+$dQ$ & \mgradq & \mgradq & \mgradq & \mgradq \\
+\end{tabular}
+
+\vspace{0.45em}
+
+\begin{tabular}{c|*{4}{C}}
+ & $k_1$ & $k_2$ & $k_4$ & $k_5$ \\
+\hline
+$dK,dV$ & \mgradkv & \mgradkv & \mgradkv & \mgradkv \\
+\end{tabular}
+
+\vspace{0.35em}
+\raggedright
+\footnotesize
+\(d\widetilde Q\) is row-owned and scatters cleanly. \(d\widetilde K\) and
+\(d\widetilde V\) must scatter-add back into shared original key rows, which is
+why backward batching and descriptor reuse matter much more than in forward.
+\end{minipage}
+\caption{Operational picture of packed HSA. Forward removes dead support,
+reindexes the live rows/columns into a smaller exact masked microproblem, and
+scatters the result back. Backward uses the same gather maps, but \(K/V\) are
+shared across rows so the writeback is a reduction problem rather than a simple
+row write.}
+\label{fig:operational-packed-picture}
+\end{figure}
+
 \subsection{Packing illustrations}
 
 Figure~\ref{fig:packing-illustrations} shows the three packing viewpoints on a
@@ -820,6 +916,89 @@ That is an important refinement of the current state:
 
 So the current non-Gutenberg work is about making the packed backward path less
 fragile to wiki/web geometry, not about changing the HSA graph definition.
+
+\subsection{What the wiki/web geometry actually says}
+
+Once the backward setup path was fixed, the next blocker was no longer generic
+host-side sparse plumbing. It was the \emph{shape} of the packed problem on
+wiki/web batches.
+
+On a representative Wikipedia $64$K batch, the cached packed payload was:
+\begin{itemize}[leftmargin=1.5em]
+    \item total groups: \(8008\),
+    \item \texttt{direct\_passthrough} groups: \(7756\),
+    \item \texttt{k\_window} groups: \(28\),
+    \item \texttt{union\_2d} groups: \(224\).
+\end{itemize}
+
+The more important number is the implied hardware area. On that same batch, the
+direct family alone accounted for roughly
+\[
+881{,}966 / 896{,}751 \approx 98.3\%
+\]
+of the packed hardware area. So the practical problem was not ``a few awkward
+tails.'' The practical problem was that the payload had been fragmented into
+thousands of tiny direct groups.
+
+This led to the current planner insight:
+\begin{quote}
+for these wiki/web batches, it is better to accept a slightly larger packed
+union if it materially reduces group count and launch count.
+\end{quote}
+
+That is visible in the direct-family regroup experiment on the same Wikipedia
+$64$K batch:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+quantity & old payload & regrouped direct payload \\
+\midrule
+direct group count & \(7756\) & \(995\) \\
+total group count & \(8008\) & \(1247\) \\
+direct hardware area & \(881{,}966\) & \(1{,}040{,}390\) \\
+packed forward time & \(5.46\) ms & \(2.24\) ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So the direct regrouping increases direct packed area by only about \(18\%\),
+but reduces packed forward time by about \(2.44\times\). That is the missing
+systems lesson: on non-Gutenberg geometry we were over-optimizing for local
+packing density and under-optimizing for group granularity.
+
+\subsection{Which knobs are actually worth tuning}
+
+The current tuning picture is now clearer:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{max\_rows\_per\_group}: the main granularity knob. Larger
+    groups amortize launch and descriptor cost, but can increase union area.
+    This is the first knob to push once fragmentation is the dominant problem.
+    \item \texttt{max\_union\_k\_direct}: the ceiling for direct-family unions.
+    If it is too small, direct work fragments; if it is too large, direct
+    groups bloat and lose their advantage.
+    \item \texttt{direct\_density\_threshold}: a secondary family-assignment
+    knob. On the current Wikipedia \(64\)K slice, lowering it from \(0.85\) to
+    \(0.55\) only moved runtime by about \(1.1\%\), so it is not the dominant
+    lever.
+    \item \texttt{window\_density\_threshold} and
+    \texttt{k\_gap\_threshold}: route work between
+    \texttt{direct\_passthrough}, \texttt{k\_window}, and \texttt{union\_2d}.
+    They matter when families are misclassified, but they do not fix
+    fragmentation by themselves.
+    \item \texttt{packed\_forward\_block\_q}: q-side granularity. On the
+    current Wikipedia \(64\)K benchmark, \(256\) outperformed \(128\).
+    \item \texttt{tile\_k}: kernel tile width. This matters only after the
+    group shapes are in a reasonable regime; it is not the first lever to pull
+    when the payload is still exploding into tiny groups.
+\end{itemize}
+
+So the practical tuning order is:
+\begin{enumerate}[leftmargin=1.5em]
+    \item reduce group fragmentation,
+    \item then tune direct-versus-union family assignment,
+    \item only then tune tile-level kernel parameters.
+\end{enumerate}
 
 \subsection{MFU caveat}
 

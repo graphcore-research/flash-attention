@@ -1384,6 +1384,7 @@ def build_cached_generalized_packed_forward_payload(
         for family in ("direct_passthrough", "k_window", "union_2d")
     }
     direct_bucket_entries: list[dict[str, Any]] = []
+    kwindow_bucket_entries: list[dict[str, Any]] = []
     union_bucket_entries: list[dict[str, Any]] = []
     baseline_live_row_count = 0
     baseline_packed_k_sum = 0
@@ -1471,16 +1472,13 @@ def build_cached_generalized_packed_forward_payload(
             )
             continue
         if family == "k_window":
-            _append_k_window_groups(
-                q_rows=q_rows,
-                support_lists=support_lists,
-                policy=resolved_policy,
-                group_q_rows=group_q_rows,
-                group_k_rows=group_k_rows,
-                group_mask_words=group_mask_words,
-                group_fill=group_fill,
-                combine_group_ranges=combine_group_ranges,
-                group_families=group_families,
+            kwindow_bucket_entries.append(
+                {
+                    "bucket_idx": bucket_idx,
+                    "qgroup_bucket_idx": qgroup_bucket_idx,
+                    "q_rows": q_rows,
+                    "support_lists": support_lists,
+                }
             )
             continue
         union_bucket_entries.append(
@@ -1504,6 +1502,27 @@ def build_cached_generalized_packed_forward_payload(
         _append_direct_passthrough_groups(
             q_rows=merged_direct_q_rows,
             support_lists=merged_direct_support_lists,
+            policy=resolved_policy,
+            group_q_rows=group_q_rows,
+            group_k_rows=group_k_rows,
+            group_mask_words=group_mask_words,
+            group_fill=group_fill,
+            combine_group_ranges=combine_group_ranges,
+            group_families=group_families,
+        )
+
+    merged_kwindow_q_rows: list[int] = []
+    merged_kwindow_support_lists: list[list[int]] = []
+    for bucket_entry in kwindow_bucket_entries:
+        for q_row, support_list in zip(bucket_entry["q_rows"], bucket_entry["support_lists"], strict=True):
+            if not support_list:
+                continue
+            merged_kwindow_q_rows.append(int(q_row))
+            merged_kwindow_support_lists.append(list(support_list))
+    if merged_kwindow_q_rows:
+        _append_k_window_groups(
+            q_rows=merged_kwindow_q_rows,
+            support_lists=merged_kwindow_support_lists,
             policy=resolved_policy,
             group_q_rows=group_q_rows,
             group_k_rows=group_k_rows,

@@ -2582,7 +2582,7 @@ def _run_cached_masked_payload_forward(
     union_scalar_group_count = 0
     union_scalar_row_count = 0
     try:
-        group_chunk_limit = max(1, int(os.environ.get("FLASH_ATTN_HSA_CACHED_MASKED_GROUP_CHUNK", "128")))
+        group_chunk_limit = max(1, int(os.environ.get("FLASH_ATTN_HSA_CACHED_MASKED_GROUP_CHUNK", "512")))
     except ValueError:
         group_chunk_limit = 128
 

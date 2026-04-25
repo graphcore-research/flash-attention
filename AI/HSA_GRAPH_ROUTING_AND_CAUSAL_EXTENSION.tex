@@ -1045,6 +1045,43 @@ That is the first point where the cross-dataset story becomes coherent:
 Wikipedia \(64\)K now clears flat FA4, and FineWeb \(128\)K is well into the
 regime where packed HSA is materially faster than flat.
 
+\subsection{The apparent non-convergence issue was a benchmark LR mismatch}
+
+One later scaled benchmark pass initially suggested that packed HSA was not
+converging on Wikipedia and FineWeb, even though the step times were already in
+the right systems regime. That turned out to be a harness issue, not an HSA
+correctness failure: the hierarchical rows in that pass had been run with
+\texttt{--hierarchical-lr-scale 0.1}, so the packed model was effectively
+trained at one tenth of the baseline learning rate.
+
+After rerunning the same resident benchmarks at
+\texttt{hierarchical\_lr\_scale}=1.0, the packed rows returned to the same loss
+regime as flat FA4:
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+dataset & mode & lr scale & final loss & tok/s \\
+\midrule
+Wikipedia $131072$ & flat FA4 & $1.0$ & $3.3347$ & $276.2$k \\
+Wikipedia $131072$ & HSA packed & $1.0$ & $3.3210$ & $854.9$k \\
+Wikipedia $131072$ & strict\_log & $1.0$ & $3.3208$ & $1.527$M \\
+FineWeb $262144$ & flat FA4 & $1.0$ & $3.3236$ & $151.1$k \\
+FineWeb $262144$ & HSA packed & $1.0$ & $3.3011$ & $692.5$k \\
+FineWeb $262144$ & strict\_log & $1.0$ & $3.2968$ & $1.586$M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+So the corrected conclusion is narrower and cleaner:
+\begin{itemize}[leftmargin=1.5em]
+    \item packed HSA does converge comparably to flat FA4 on these scaled
+    wiki/web runs when trained at the same learning rate,
+    \item the earlier poor packed-loss rows were an unfair benchmark setting,
+    not evidence of a masked-union backward correctness problem,
+    \item and the remaining competitive problem is the strength of
+    \textbf{strict\_log}, not a flat-versus-packed convergence failure.
+\end{itemize}
+
 \subsection{Which knobs are actually worth tuning}
 
 The current tuning picture is now clearer:

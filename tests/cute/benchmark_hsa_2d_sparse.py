@@ -6,6 +6,7 @@ import torch
 from flash_attn.cute import (
     analyze_explicit_2d_sparse_forward,
     summarize_explicit_2d_sparse_forward,
+    summarize_explicit_2d_sparse_suite,
 )
 
 
@@ -48,7 +49,7 @@ DEFAULT_CASES = (
     },
 )
 
-VALID_VARIANTS = ("dense", "custom_masked", "fa4_packed", "direct_2d", "shared_support")
+VALID_VARIANTS = ("dense", "custom_masked", "fa4_packed", "direct_2d", "direct_2d_compact", "shared_support")
 
 
 def _format_ms(payload):
@@ -62,6 +63,17 @@ def _format_best(summary):
     if not isinstance(best, dict):
         return "-"
     return f"{best['name']}={float(best['fwd_ms']):.3f}"
+
+
+def _variant_column(variant: str) -> str:
+    return {
+        "dense": "dense_ms",
+        "custom_masked": "custom_ms",
+        "fa4_packed": "fa4_ms",
+        "direct_2d": "direct2d_ms",
+        "direct_2d_compact": "direct2d_compact_ms",
+        "shared_support": "shared_ms",
+    }[variant]
 
 
 def _custom_case_requested(args) -> bool:
@@ -161,7 +173,8 @@ def main(argv=None):
     case_specs = _build_case_specs(args)
     case_payloads = []
 
-    print("case family live_pairs fill dense_ms custom_ms fa4_ms direct2d_ms best go_no_go")
+    metric_columns = [_variant_column(variant) for variant in variants]
+    print(" ".join(["case", "family", "live_pairs", "fill", *metric_columns, "best", "go_no_go"]))
     for case_idx, spec in enumerate(case_specs):
         report = analyze_explicit_2d_sparse_forward(
             case_family=spec["case_family"],
@@ -182,14 +195,19 @@ def main(argv=None):
         summary = summarize_explicit_2d_sparse_forward(report)
         geometry = report["geometry"]
         results = report["results"]
+        metric_values = [_format_ms(results.get(variant, {})) for variant in variants]
         print(
-            f"{spec['name']} {spec['case_family']} "
-            f"{int(geometry['live_pairs'])} {float(geometry['fill_rate']):.4f} "
-            f"{_format_ms(results.get('dense', {}))} "
-            f"{_format_ms(results.get('custom_masked', {}))} "
-            f"{_format_ms(results.get('fa4_packed', {}))} "
-            f"{_format_ms(results.get('direct_2d', {}))} "
-            f"{_format_best(summary)} {report['go_no_go']['status']}"
+            " ".join(
+                [
+                    spec["name"],
+                    spec["case_family"],
+                    str(int(geometry["live_pairs"])),
+                    f"{float(geometry['fill_rate']):.4f}",
+                    *metric_values,
+                    _format_best(summary),
+                    str(report["go_no_go"]["status"]),
+                ]
+            )
         )
         case_payloads.append(
             {
@@ -200,8 +218,19 @@ def main(argv=None):
             }
         )
 
+    suite_summary = summarize_explicit_2d_sparse_suite(case_payloads)
+    primary_confetti = suite_summary["primary_confetti_go_no_go"]
+    runtime_routing = suite_summary["runtime_routing_recommendation"]
+    print(
+        "suite "
+        f"primary_confetti={primary_confetti['status']} "
+        f"runtime_routing={runtime_routing['status']} "
+        f"cases={suite_summary['num_cases']}"
+    )
+
     payload = {
         "cases": case_payloads,
+        "suite_summary": suite_summary,
         "variants": list(variants),
         "warmup_iters": args.warmup_iters,
         "benchmark_iters": args.benchmark_iters,

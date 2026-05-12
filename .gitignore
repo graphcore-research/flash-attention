@@ -2,6 +2,9 @@
 *.sass
 *.ptx
 *.cubin
+AI/*.aux
+AI/*.log
+AI/*.out
 .DS_store
 .vscode
 

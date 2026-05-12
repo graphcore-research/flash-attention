@@ -1465,6 +1465,102 @@ def schedule_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
     return attend
 
 
+def _append_cross_csr_forward_entries(
+    anchor_entries: list[tuple[list[int], list[int], list[int]]],
+    schedule: HSASchedule,
+) -> None:
+    """Append cross-level CSR edges not represented by segment-prefix descriptors.
+
+    The packed fused-forward batches are built from contiguous sentence/anchor
+    segments. Cross-level edges such as body -> previous sentence anchor live in
+    the canonical section/document CSR rows instead, because the query row is not
+    itself a section/document anchor. Keep these as small explicit prefix panels.
+    """
+
+    def append_from(row_ptr: torch.Tensor, col_idx: torch.Tensor, segment_id: torch.Tensor) -> None:
+        row_ptr_cpu = row_ptr.detach().cpu().tolist()
+        col_idx_cpu = col_idx.detach().cpu().tolist()
+        segment_id_cpu = segment_id.detach().cpu().tolist()
+        for flat_q, seg_id in enumerate(segment_id_cpu):
+            if int(seg_id) >= 0:
+                continue
+            start = int(row_ptr_cpu[flat_q])
+            end = int(row_ptr_cpu[flat_q + 1])
+            if end > start:
+                keys = [int(key) for key in col_idx_cpu[start:end]]
+                anchor_entries.append(([flat_q], keys, [len(keys)]))
+
+    append_from(schedule.section_row_ptr, schedule.section_col_idx, schedule.section_segment_id)
+    append_from(schedule.document_row_ptr, schedule.document_col_idx, schedule.document_segment_id)
+
+
+def _add_cross_csr_edges_to_mask(attend: torch.Tensor, schedule: HSASchedule) -> torch.Tensor:
+    """Overlay the cross-level CSR rows on a packed schedule reconstruction."""
+
+    seqlen = schedule.seqlen
+
+    def add_from(row_ptr: torch.Tensor, col_idx: torch.Tensor, segment_id: torch.Tensor) -> None:
+        row_ptr_cpu = row_ptr.detach().cpu().tolist()
+        col_idx_cpu = col_idx.detach().cpu().tolist()
+        segment_id_cpu = segment_id.detach().cpu().tolist()
+        for flat_q, seg_id in enumerate(segment_id_cpu):
+            if int(seg_id) >= 0:
+                continue
+            start = int(row_ptr_cpu[flat_q])
+            end = int(row_ptr_cpu[flat_q + 1])
+            if end <= start:
+                continue
+            batch_idx, q_pos = divmod(flat_q, seqlen)
+            key_rows = torch.tensor(
+                [int(key) % seqlen for key in col_idx_cpu[start:end]],
+                dtype=torch.long,
+                device=attend.device,
+            )
+            attend[batch_idx, q_pos, key_rows] = True
+
+    add_from(schedule.section_row_ptr, schedule.section_col_idx, schedule.section_segment_id)
+    add_from(schedule.document_row_ptr, schedule.document_col_idx, schedule.document_segment_id)
+    return attend
+
+
+def _append_cross_csr_backward_buckets(
+    anchor_buckets: list[list[tuple[int, int, list[int], list[int], list[int]]]],
+    schedule: HSASchedule,
+    *,
+    k_block_size: int,
+    blocks_per_batch: int,
+) -> None:
+    """Append cross-level CSR edges to key-block grouped backward buckets."""
+
+    seqlen = schedule.seqlen
+
+    def append_from(
+        kind: int,
+        row_ptr: torch.Tensor,
+        col_idx: torch.Tensor,
+        segment_id: torch.Tensor,
+    ) -> None:
+        row_ptr_cpu = row_ptr.detach().cpu().tolist()
+        col_idx_cpu = col_idx.detach().cpu().tolist()
+        segment_id_cpu = segment_id.detach().cpu().tolist()
+        for flat_q, seg_id in enumerate(segment_id_cpu):
+            if int(seg_id) >= 0:
+                continue
+            start = int(row_ptr_cpu[flat_q])
+            end = int(row_ptr_cpu[flat_q + 1])
+            for flat_k in col_idx_cpu[start:end]:
+                flat_k = int(flat_k)
+                batch_idx, key_pos = divmod(flat_k, seqlen)
+                k_block = key_pos // k_block_size
+                global_k_block = batch_idx * blocks_per_batch + k_block
+                anchor_buckets[global_k_block].append(
+                    (kind, -1, [int(flat_q)], [flat_k], [1])
+                )
+
+    append_from(_DESC_SECTION, schedule.section_row_ptr, schedule.section_col_idx, schedule.section_segment_id)
+    append_from(_DESC_DOCUMENT, schedule.document_row_ptr, schedule.document_col_idx, schedule.document_segment_id)
+
+
 def forward_descriptors_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
     """Expand forward block descriptors back into the exact dense bool attention mask."""
     bsz, seqlen = schedule.batch_size, schedule.seqlen
@@ -1506,7 +1602,7 @@ def forward_descriptors_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
                 key_rows = seg_pos[segment_start : segment_start + key_offset_end].long() % seqlen
                 attend[batch_idx, q_pos, key_rows] = True
 
-    return attend
+    return _add_cross_csr_edges_to_mask(attend, schedule)
 
 
 def backward_descriptors_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
@@ -2492,6 +2588,12 @@ def _build_hsa_hybrid_backward_schedule(
     append_sentence_descriptors(sentence_segment_ptr, sentence_segment_pos)
     append_anchor_descriptors(_DESC_SECTION, section_segment_ptr, section_segment_pos, section_self_allowed)
     append_anchor_descriptors(_DESC_DOCUMENT, document_segment_ptr, document_segment_pos, document_self_allowed)
+    _append_cross_csr_backward_buckets(
+        anchor_buckets,
+        schedule,
+        k_block_size=k_block_size,
+        blocks_per_batch=blocks_per_batch,
+    )
 
     sentence_kblock_row_ptr = [0]
     sentence_segment_id: list[int] = []
@@ -3374,7 +3476,7 @@ def fused_forward_to_attend_mask(
                 if prefix > 0:
                     attend[batch_idx, query_pos, key_rows[:prefix].long()] = True
 
-    return attend
+    return _add_cross_csr_edges_to_mask(attend, schedule)
 
 
 def _get_hsa_forward_q_block_size(q: torch.Tensor, k: torch.Tensor) -> int:
@@ -3613,6 +3715,7 @@ def _get_hsa_fused_forward_batches(
                 fused_schedule.anchor_prefix_len[prefix_start:prefix_end].detach().cpu().tolist(),
             )
         )
+    _append_cross_csr_forward_entries(anchor_entries, schedule)
 
     anchor_batches: list[HSAFusedForwardBatch] = []
     if anchor_entries:

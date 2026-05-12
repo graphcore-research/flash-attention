@@ -176,57 +176,91 @@ def _load_external_hdt_attention():
 
 
 def _make_hsa_metadata(batch_size, seqlen, device):
-    keep_ids = torch.zeros(batch_size, 3, seqlen, dtype=torch.int32, device=device)
-    hash_ids = torch.zeros(batch_size, 3, seqlen, dtype=torch.int32, device=device)
+    keep_batches = []
+    hash_batches = []
+    min_doc_tokens = 1 + 2 + 4 * (1 + 7)
+    doc_marker = 0
+    section_marker = 1
+    sentence_span = 2
 
     for batch_idx in range(batch_size):
-        cursor = 0
-        doc_id = 0
-        sec_id = 0
-        sent_id = 0
-        while cursor < seqlen:
-            keep_ids[batch_idx, 2, cursor] = 1
-            hash_ids[batch_idx, 0, cursor] = sent_id
-            hash_ids[batch_idx, 1, cursor] = sec_id
-            hash_ids[batch_idx, 2, cursor] = doc_id
-            cursor += 1
-            if cursor >= seqlen:
-                break
+        num_docs = max(1, math.ceil(seqlen / min_doc_tokens) + 1)
+        doc_ids = torch.arange(num_docs, dtype=torch.int32)
+        sent_ids = torch.arange(num_docs * 4, dtype=torch.int32)
+        sent_total = 1 + 7 + ((sent_ids + batch_idx) % 5)
+        sent_total = sent_total.view(num_docs, 4)
+        sent_base = (doc_ids * 4).view(-1, 1)
+        sec_base = (doc_ids * 2).view(-1, 1)
+        ones = torch.ones((num_docs, 1), dtype=torch.int32)
 
-            for _ in range(2):
-                if cursor >= seqlen:
-                    break
-                keep_ids[batch_idx, 1, cursor] = 1
-                keep_ids[batch_idx, 2, cursor] = 1
-                hash_ids[batch_idx, 0, cursor] = sent_id
-                hash_ids[batch_idx, 1, cursor] = sec_id
-                hash_ids[batch_idx, 2, cursor] = doc_id
-                cursor += 1
-                if cursor >= seqlen:
-                    break
+        seg_lens = torch.cat(
+            [
+                ones,
+                ones,
+                sent_total[:, 0:1],
+                sent_total[:, 1:2],
+                ones,
+                sent_total[:, 2:3],
+                sent_total[:, 3:4],
+            ],
+            dim=1,
+        ).reshape(-1)
+        seg_sent = torch.cat(
+            [
+                sent_base,
+                sent_base,
+                sent_base,
+                sent_base + 1,
+                sent_base + 2,
+                sent_base + 2,
+                sent_base + 3,
+            ],
+            dim=1,
+        ).reshape(-1)
+        seg_sec = torch.cat(
+            [
+                sec_base,
+                sec_base,
+                sec_base,
+                sec_base,
+                sec_base + 1,
+                sec_base + 1,
+                sec_base + 1,
+            ],
+            dim=1,
+        ).reshape(-1)
+        seg_doc = doc_ids.repeat_interleave(7)
+        seg_type = torch.tensor(
+            [doc_marker, section_marker, sentence_span, sentence_span, section_marker, sentence_span, sentence_span],
+            dtype=torch.int32,
+        ).repeat(num_docs)
 
-                for _ in range(2):
-                    if cursor >= seqlen:
-                        break
-                    keep_ids[batch_idx, 0, cursor] = 1
-                    keep_ids[batch_idx, 1, cursor] = 1
-                    hash_ids[batch_idx, 0, cursor] = sent_id
-                    hash_ids[batch_idx, 1, cursor] = sec_id
-                    hash_ids[batch_idx, 2, cursor] = doc_id
-                    cursor += 1
-                    if cursor >= seqlen:
-                        break
+        seg_cum = seg_lens.to(torch.int64).cumsum(0)
+        seg_count = int(torch.searchsorted(seg_cum, torch.tensor(seqlen, dtype=torch.int64), right=False).item()) + 1
+        seg_lens = seg_lens[:seg_count]
+        seg_sent = seg_sent[:seg_count]
+        seg_sec = seg_sec[:seg_count]
+        seg_doc = seg_doc[:seg_count]
+        seg_type = seg_type[:seg_count]
+        seg_starts = seg_lens.to(torch.int64).cumsum(0) - seg_lens.to(torch.int64)
 
-                    body_tokens = min(7 + ((sent_id + batch_idx) % 5), seqlen - cursor)
-                    keep_ids[batch_idx, 0, cursor:cursor + body_tokens] = 1
-                    hash_ids[batch_idx, 0, cursor:cursor + body_tokens] = sent_id
-                    hash_ids[batch_idx, 1, cursor:cursor + body_tokens] = sec_id
-                    hash_ids[batch_idx, 2, cursor:cursor + body_tokens] = doc_id
-                    cursor += body_tokens
-                    sent_id += 1
-                sec_id += 1
-            doc_id += 1
+        token_sent = torch.repeat_interleave(seg_sent, seg_lens.to(torch.int64))[:seqlen]
+        token_sec = torch.repeat_interleave(seg_sec, seg_lens.to(torch.int64))[:seqlen]
+        token_doc = torch.repeat_interleave(seg_doc, seg_lens.to(torch.int64))[:seqlen]
+        token_type = torch.repeat_interleave(seg_type, seg_lens.to(torch.int64))[:seqlen]
 
+        keep0 = (token_type == sentence_span).to(torch.int32)
+        keep1 = (token_type == section_marker).to(torch.int32)
+        keep2 = ((token_type == doc_marker) | (token_type == section_marker)).to(torch.int32)
+        sent_starts = seg_starts[seg_type == sentence_span]
+        sent_starts = sent_starts[sent_starts < seqlen]
+        keep1[sent_starts.to(torch.long)] = 1
+
+        keep_batches.append(torch.stack((keep0, keep1, keep2), dim=0))
+        hash_batches.append(torch.stack((token_sent, token_sec, token_doc), dim=0).to(torch.int32))
+
+    keep_ids = torch.stack(keep_batches, dim=0).to(device=device)
+    hash_ids = torch.stack(hash_batches, dim=0).to(device=device)
     return keep_ids, hash_ids
 
 
@@ -337,6 +371,37 @@ def _measure_triplet_or_status(
         }
 
 
+def _measure_forward_or_status(
+    forward_fn,
+    q_data,
+    k_data,
+    v_data,
+    warmup_iters: int,
+    benchmark_iters: int,
+    *,
+    env_updates: dict[str, str | None] | None = None,
+):
+    try:
+        return {
+            "fwd_ms": _measure_forward_ms(
+                forward_fn,
+                q_data,
+                k_data,
+                v_data,
+                warmup_iters,
+                benchmark_iters,
+                env_updates=env_updates,
+            ),
+            "status": "measured",
+        }
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+        torch.cuda.empty_cache()
+        return {
+            "fwd_ms": None,
+            "status": f"unavailable_{type(exc).__name__}",
+        }
+
+
 def _measure_forward_diff_or_status(reference_output, forward_fn, q_data, k_data, v_data, *, env_updates=None):
     env_updates = env_updates or {}
     try:
@@ -383,6 +448,24 @@ def _append_labeled_triplet_fields(
         parts.append(f"{prefix}_status={status}")
 
 
+def _append_labeled_forward_fields(
+    parts: list[str],
+    *,
+    prefix: str,
+    label: str,
+    fwd_ms,
+    status: str,
+    extra_fields: list[str] | None = None,
+):
+    parts.append(f"{prefix}_label={label}")
+    if extra_fields:
+        parts.extend(extra_fields)
+    if fwd_ms is not None:
+        parts.append(f"{prefix}_fwd_ms={fwd_ms:.3f}")
+    else:
+        parts.append(f"{prefix}_status={status}")
+
+
 def _append_dense_triplet_fields(
     parts: list[str],
     *,
@@ -403,6 +486,18 @@ def _append_dense_triplet_fields(
         parts.append(f"dense_fa4_status={status}")
 
 
+def _append_dense_forward_fields(
+    parts: list[str],
+    *,
+    fwd_ms,
+    status: str,
+):
+    if fwd_ms is not None:
+        parts.append(f"dense_fa4_fwd_ms={fwd_ms:.3f}")
+    else:
+        parts.append(f"dense_fa4_status={status}")
+
+
 def _append_sparse_plain_triplet_fields(
     parts: list[str],
     *,
@@ -418,6 +513,21 @@ def _append_sparse_plain_triplet_fields(
         fwd_ms=fwd_ms,
         bwd_ms=bwd_ms,
         fwd_bwd_ms=fwd_bwd_ms,
+        status=status,
+    )
+
+
+def _append_sparse_plain_forward_fields(
+    parts: list[str],
+    *,
+    fwd_ms,
+    status: str = "measured",
+):
+    _append_labeled_forward_fields(
+        parts,
+        prefix="sparse_mask_plain",
+        label=_plain_sparse_mask_baseline_label(),
+        fwd_ms=fwd_ms,
         status=status,
     )
 
@@ -856,6 +966,24 @@ def _use_sparse_profile_mode() -> bool:
 
 def _use_primary_long_only_mode() -> bool:
     return os.environ.get("FLASH_ATTN_HSA_PRIMARY_LONG_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _use_primary_long_forward_only_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_PRIMARY_LONG_FORWARD_ONLY", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _use_primary_long_minimal_mode() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_PRIMARY_LONG_MINIMAL", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _use_unpacked_direct_compare_mode() -> bool:
@@ -1977,8 +2105,9 @@ def _run_geometry_sweep_once():
 
 
 def _run_primary_long_only_case(case: BenchmarkCase):
-    import flash_attn.cute.hsa as hsa_module
-
+    forward_only = _use_primary_long_forward_only_mode()
+    minimal_forward = forward_only and _use_primary_long_minimal_mode()
+    schedule_env = {"FLASH_ATTN_HSA_RUNTIME_FORWARD_ONLY": "1"} if minimal_forward else {}
     (
         build_hsa_schedule,
         flash_attn_func,
@@ -1990,151 +2119,270 @@ def _run_primary_long_only_case(case: BenchmarkCase):
     device = "cuda"
     dtype = torch.bfloat16
     keep_ids, hash_ids = _make_hsa_metadata(case.batch_size, case.seqlen, device)
-    schedule = build_hsa_schedule(keep_ids, hash_ids)
+    with _temporary_env(**schedule_env):
+        schedule = build_hsa_schedule(keep_ids, hash_ids)
     n_kv_heads = case.n_kv_heads if case.n_kv_heads is not None else case.nheads
     q_data = torch.randn(case.batch_size, case.seqlen, case.nheads, case.headdim, device=device, dtype=dtype)
     k_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     v_data = torch.randn(case.batch_size, case.seqlen, n_kv_heads, case.headdim, device=device, dtype=dtype)
     plain_env = _plain_sparse_mask_baseline_env(case)
-
-    with _temporary_env(**_one_kernel_synthetic_long_env(case)):
-        runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
-    occupancy = _summarize_sparse_backward_occupancy(
-        runtime.backward_sparse,
-        runtime.backward_packed_masks,
-        seqlen=case.seqlen,
-    )
+    if minimal_forward:
+        plain_env = {**plain_env, "FLASH_ATTN_HSA_RUNTIME_FORWARD_ONLY": "1"}
 
     plain_forward = lambda q, k, v: _run_sparse_attention(
         q, k, v, keep_ids, hash_ids, schedule, env_updates=plain_env
     )
     dense_causal_forward = lambda q, k, v: _unwrap_output(flash_attn_func(q, k, v, causal=True))
-    sliding_log_tokens = _log_sliding_window_tokens(case.seqlen)
-    sliding_log_window = (max(0, sliding_log_tokens - 1), 0)
-    sliding_log_pairs = _causal_sliding_window_pairs(case.seqlen, sliding_log_tokens)
-    sliding_flopmatched_tokens, sliding_flopmatched_window = _flop_matched_sliding_window(
-        case.seqlen, occupancy["allowed_pairs"]
-    )
-    sliding_flopmatched_pairs = _causal_sliding_window_pairs(case.seqlen, sliding_flopmatched_tokens)
-    sliding_log_forward = lambda q, k, v: _unwrap_output(
-        flash_attn_func(q, k, v, causal=True, window_size=sliding_log_window)
-    )
-    sliding_flopmatched_forward = lambda q, k, v: _unwrap_output(
-        flash_attn_func(q, k, v, causal=True, window_size=sliding_flopmatched_window)
-    )
+    occupancy = None
+    sliding_log_tokens = None
+    sliding_log_window = None
+    sliding_log_pairs = None
+    sliding_log_forward = None
+    sliding_flopmatched_tokens = None
+    sliding_flopmatched_window = None
+    sliding_flopmatched_pairs = None
+    sliding_flopmatched_forward = None
+    if not minimal_forward:
+        import flash_attn.cute.hsa as hsa_module
 
-    plain_result = _measure_triplet_or_status(
-        plain_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-        env_updates=plain_env,
-    )
-    sliding_log_result = _measure_triplet_or_status(
-        sliding_log_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    sliding_flopmatched_result = _measure_triplet_or_status(
-        sliding_flopmatched_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
-    dense_result = _measure_triplet_or_status(
-        dense_causal_forward,
-        q_data,
-        k_data,
-        v_data,
-        case.warmup_iters,
-        case.benchmark_iters,
-    )
+        with _temporary_env(**_one_kernel_synthetic_long_env(case)):
+            runtime = hsa_module._get_hsa_block_sparse_runtime(schedule, q_data, k_data)
+        occupancy = _summarize_sparse_backward_occupancy(
+            runtime.backward_sparse,
+            runtime.backward_packed_masks,
+            seqlen=case.seqlen,
+        )
+        sliding_log_tokens = _log_sliding_window_tokens(case.seqlen)
+        sliding_log_window = (max(0, sliding_log_tokens - 1), 0)
+        sliding_log_pairs = _causal_sliding_window_pairs(case.seqlen, sliding_log_tokens)
+        sliding_flopmatched_tokens, sliding_flopmatched_window = _flop_matched_sliding_window(
+            case.seqlen, occupancy["allowed_pairs"]
+        )
+        sliding_flopmatched_pairs = _causal_sliding_window_pairs(case.seqlen, sliding_flopmatched_tokens)
+        sliding_log_forward = lambda q, k, v: _unwrap_output(
+            flash_attn_func(q, k, v, causal=True, window_size=sliding_log_window)
+        )
+        sliding_flopmatched_forward = lambda q, k, v: _unwrap_output(
+            flash_attn_func(q, k, v, causal=True, window_size=sliding_flopmatched_window)
+        )
+
+    if forward_only:
+        plain_result = _measure_forward_or_status(
+            plain_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=plain_env,
+        )
+        dense_result = _measure_forward_or_status(
+            dense_causal_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+        )
+        if minimal_forward:
+            sliding_log_result = {"fwd_ms": None, "status": "skipped_primary_long_minimal"}
+            sliding_flopmatched_result = {"fwd_ms": None, "status": "skipped_primary_long_minimal"}
+        else:
+            sliding_log_result = _measure_forward_or_status(
+                sliding_log_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+            sliding_flopmatched_result = _measure_forward_or_status(
+                sliding_flopmatched_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+            )
+    else:
+        plain_result = _measure_triplet_or_status(
+            plain_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+            env_updates=plain_env,
+        )
+        sliding_log_result = _measure_triplet_or_status(
+            sliding_log_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+        )
+        sliding_flopmatched_result = _measure_triplet_or_status(
+            sliding_flopmatched_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+        )
+        dense_result = _measure_triplet_or_status(
+            dense_causal_forward,
+            q_data,
+            k_data,
+            v_data,
+            case.warmup_iters,
+            case.benchmark_iters,
+        )
 
     hybrid_fwd_ms = None
     hybrid_bwd_ms = None
     hybrid_fwd_bwd_ms = None
     hybrid_status = "unavailable_unsupported_case"
-    if _should_measure_sparse_mask_mixed_backward_baseline(case):
+    if not minimal_forward and _should_measure_sparse_mask_mixed_backward_baseline(case):
         hybrid_env = _sparse_mask_mixed_backward_baseline_env(case)
         hybrid_forward = lambda q, k, v: _run_sparse_attention(
             q, k, v, keep_ids, hash_ids, schedule, env_updates=hybrid_env
         )
-        hybrid_fwd_ms = _measure_forward_ms(
-            hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
-        )
-        hybrid_bwd_ms = _measure_backward_ms(
-            hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
-        )
-        hybrid_fwd_bwd_ms = _measure_forward_backward_ms(
-            hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
-        )
-        hybrid_status = "measured"
+        if forward_only:
+            hybrid_result = _measure_forward_or_status(
+                hybrid_forward,
+                q_data,
+                k_data,
+                v_data,
+                case.warmup_iters,
+                case.benchmark_iters,
+                env_updates=hybrid_env,
+            )
+            hybrid_fwd_ms = hybrid_result["fwd_ms"]
+            hybrid_status = hybrid_result["status"]
+        else:
+            hybrid_fwd_ms = _measure_forward_ms(
+                hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
+            )
+            hybrid_bwd_ms = _measure_backward_ms(
+                hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
+            )
+            hybrid_fwd_bwd_ms = _measure_forward_backward_ms(
+                hybrid_forward, q_data, k_data, v_data, case.warmup_iters, case.benchmark_iters, env_updates=hybrid_env
+            )
+            hybrid_status = "measured"
 
     parts = [
         f"{case.name}: mode={_benchmark_mode_label(case)} {_benchmark_sparse_bwd_config_label()}",
         f"primary_only=1",
+        f"forward_only={1 if forward_only else 0}",
+        f"primary_minimal={1 if minimal_forward else 0}",
         f"shape=(B={case.batch_size}, T={case.seqlen}, H={case.nheads}, KV={n_kv_heads}, D={case.headdim})",
-        f"allowed_pairs={occupancy['allowed_pairs']}",
-        f"token_density={occupancy['token_density']:.6f}",
     ]
-    _append_sparse_plain_triplet_fields(
-        parts,
-        fwd_ms=plain_result["fwd_ms"],
-        bwd_ms=plain_result["bwd_ms"],
-        fwd_bwd_ms=plain_result["fwd_bwd_ms"],
-        status=plain_result["status"],
-    )
-    _append_labeled_triplet_fields(
-        parts,
-        prefix="hybrid",
-        label=_sparse_mask_mixed_backward_baseline_label(),
-        fwd_ms=hybrid_fwd_ms,
-        bwd_ms=hybrid_bwd_ms,
-        fwd_bwd_ms=hybrid_fwd_bwd_ms,
-        status=hybrid_status,
-    )
-    _append_labeled_triplet_fields(
-        parts,
-        prefix="sliding_log_fa4",
-        label="plain_fa4_sliding_logS_causal",
-        fwd_ms=sliding_log_result["fwd_ms"],
-        bwd_ms=sliding_log_result["bwd_ms"],
-        fwd_bwd_ms=sliding_log_result["fwd_bwd_ms"],
-        status=sliding_log_result["status"],
-        extra_fields=[
-            f"sliding_log_fa4_window_tokens={sliding_log_tokens}",
-            f"sliding_log_fa4_window_left={sliding_log_window[0]}",
-            f"sliding_log_fa4_pairs={sliding_log_pairs}",
-        ],
-    )
-    _append_labeled_triplet_fields(
-        parts,
-        prefix="sliding_flopmatched_fa4",
-        label="plain_fa4_sliding_flopmatched_causal",
-        fwd_ms=sliding_flopmatched_result["fwd_ms"],
-        bwd_ms=sliding_flopmatched_result["bwd_ms"],
-        fwd_bwd_ms=sliding_flopmatched_result["fwd_bwd_ms"],
-        status=sliding_flopmatched_result["status"],
-        extra_fields=[
-            f"sliding_flopmatched_fa4_window_tokens={sliding_flopmatched_tokens}",
-            f"sliding_flopmatched_fa4_window_left={sliding_flopmatched_window[0]}",
-            f"sliding_flopmatched_fa4_pairs={sliding_flopmatched_pairs}",
-        ],
-    )
-    _append_dense_triplet_fields(
-        parts,
-        fwd_ms=dense_result["fwd_ms"],
-        bwd_ms=dense_result["bwd_ms"],
-        fwd_bwd_ms=dense_result["fwd_bwd_ms"],
-        status=dense_result["status"],
-    )
+    if occupancy is not None:
+        parts.extend(
+            [
+                f"allowed_pairs={occupancy['allowed_pairs']}",
+                f"token_density={occupancy['token_density']:.6f}",
+            ]
+        )
+    if forward_only:
+        _append_sparse_plain_forward_fields(
+            parts,
+            fwd_ms=plain_result["fwd_ms"],
+            status=plain_result["status"],
+        )
+        if not minimal_forward:
+            _append_labeled_forward_fields(
+                parts,
+                prefix="hybrid",
+                label=_sparse_mask_mixed_backward_baseline_label(),
+                fwd_ms=hybrid_fwd_ms,
+                status=hybrid_status,
+            )
+            _append_labeled_forward_fields(
+                parts,
+                prefix="sliding_log_fa4",
+                label="plain_fa4_sliding_logS_causal",
+                fwd_ms=sliding_log_result["fwd_ms"],
+                status=sliding_log_result["status"],
+                extra_fields=[
+                    f"sliding_log_fa4_window_tokens={sliding_log_tokens}",
+                    f"sliding_log_fa4_window_left={sliding_log_window[0]}",
+                    f"sliding_log_fa4_pairs={sliding_log_pairs}",
+                ],
+            )
+            _append_labeled_forward_fields(
+                parts,
+                prefix="sliding_flopmatched_fa4",
+                label="plain_fa4_sliding_flopmatched_causal",
+                fwd_ms=sliding_flopmatched_result["fwd_ms"],
+                status=sliding_flopmatched_result["status"],
+                extra_fields=[
+                    f"sliding_flopmatched_fa4_window_tokens={sliding_flopmatched_tokens}",
+                    f"sliding_flopmatched_fa4_window_left={sliding_flopmatched_window[0]}",
+                    f"sliding_flopmatched_fa4_pairs={sliding_flopmatched_pairs}",
+                ],
+            )
+        _append_dense_forward_fields(
+            parts,
+            fwd_ms=dense_result["fwd_ms"],
+            status=dense_result["status"],
+        )
+        if plain_result["fwd_ms"] is not None and dense_result["fwd_ms"] is not None and plain_result["fwd_ms"] > 0:
+            parts.append(f"dense_fa4_vs_sparse_mask_fwd={dense_result['fwd_ms'] / plain_result['fwd_ms']:.2f}x")
+    else:
+        _append_sparse_plain_triplet_fields(
+            parts,
+            fwd_ms=plain_result["fwd_ms"],
+            bwd_ms=plain_result["bwd_ms"],
+            fwd_bwd_ms=plain_result["fwd_bwd_ms"],
+            status=plain_result["status"],
+        )
+        _append_labeled_triplet_fields(
+            parts,
+            prefix="hybrid",
+            label=_sparse_mask_mixed_backward_baseline_label(),
+            fwd_ms=hybrid_fwd_ms,
+            bwd_ms=hybrid_bwd_ms,
+            fwd_bwd_ms=hybrid_fwd_bwd_ms,
+            status=hybrid_status,
+        )
+        _append_labeled_triplet_fields(
+            parts,
+            prefix="sliding_log_fa4",
+            label="plain_fa4_sliding_logS_causal",
+            fwd_ms=sliding_log_result["fwd_ms"],
+            bwd_ms=sliding_log_result["bwd_ms"],
+            fwd_bwd_ms=sliding_log_result["fwd_bwd_ms"],
+            status=sliding_log_result["status"],
+            extra_fields=[
+                f"sliding_log_fa4_window_tokens={sliding_log_tokens}",
+                f"sliding_log_fa4_window_left={sliding_log_window[0]}",
+                f"sliding_log_fa4_pairs={sliding_log_pairs}",
+            ],
+        )
+        _append_labeled_triplet_fields(
+            parts,
+            prefix="sliding_flopmatched_fa4",
+            label="plain_fa4_sliding_flopmatched_causal",
+            fwd_ms=sliding_flopmatched_result["fwd_ms"],
+            bwd_ms=sliding_flopmatched_result["bwd_ms"],
+            fwd_bwd_ms=sliding_flopmatched_result["fwd_bwd_ms"],
+            status=sliding_flopmatched_result["status"],
+            extra_fields=[
+                f"sliding_flopmatched_fa4_window_tokens={sliding_flopmatched_tokens}",
+                f"sliding_flopmatched_fa4_window_left={sliding_flopmatched_window[0]}",
+                f"sliding_flopmatched_fa4_pairs={sliding_flopmatched_pairs}",
+            ],
+        )
+        _append_dense_triplet_fields(
+            parts,
+            fwd_ms=dense_result["fwd_ms"],
+            bwd_ms=dense_result["bwd_ms"],
+            fwd_bwd_ms=dense_result["fwd_bwd_ms"],
+            status=dense_result["status"],
+        )
     print(" ".join(parts))
 
 

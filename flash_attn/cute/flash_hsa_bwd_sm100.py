@@ -2947,6 +2947,11 @@ class FlashHSABackwardSm100(FlashAttentionBackwardSm100):
             has_aux_tensors=False,
             subtile_factor=1,
         )
+        self._flash_bwd_init_kwargs = {
+            "is_persistent": True,
+            "cluster_size": 1,
+            "use_2cta_instrs": False,
+        }
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         self.k_block_size = k_block_size

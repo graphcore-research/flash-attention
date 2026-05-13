@@ -9,7 +9,10 @@ try:
     import cutlass
     import cutlass.cute as cute
     from cutlass import Float32, Int32
+    from cutlass.cute.nvgpu import warp
+    from quack import layout_utils
 
+    from flash_attn.cute import ampere_helpers as sm80_utils
     from flash_attn.cute import copy_utils
     from flash_attn.cute import utils as cute_utils
     from flash_attn.cute.cache_utils import get_jit_cache
@@ -1267,6 +1270,422 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
                     mDenom[query_idx, head_idx] = denom.to(mDenom.element_type)
                     mWeightedGradSum[query_idx, head_idx] = weighted_grad_sum.to(
                         mWeightedGradSum.element_type
+                    )
+
+
+class ARHSALeafReadoutBackwardStatsTensorCoreD64Sm100:
+    """Experimental D=64 stats pass using one warp-level MMA per query/head.
+
+    This pads a single query/head into a 16x8x64 MMA tile and uses only row 0 of
+    the M dimension. It is useful for measuring whether tensor cores help the
+    per-leaf dO dot V inner products despite the row-specific leaf set.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradReadout: cute.Tensor,
+        mLeafGradAttn: cute.Tensor,
+        mDenom: cute.Tensor,
+        mWeightedGradSum: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mP,
+            mLeafNodeIndex,
+            mLeafValueIndex,
+            mQueryLeafRowPtr,
+            mQueryLeafEntryIndex,
+            mValue,
+            mGradReadout,
+            mLeafGradAttn,
+            mDenom,
+            mWeightedGradSum,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradReadout: cute.Tensor,
+        mLeafGradAttn: cute.Tensor,
+        mDenom: cute.Tensor,
+        mWeightedGradSum: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        active = task_idx < total_tasks
+        num_heads = Int32(mP.shape[1])
+        query_idx = Int32(0)
+        head_idx = Int32(0)
+        start = Int32(0)
+        end = Int32(0)
+        leaf_count = Int32(0)
+        if active:
+            num_heads = Int32(mP.shape[1])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mQueryLeafRowPtr[query_idx])
+            end = Int32(mQueryLeafRowPtr[query_idx + 1])
+            leaf_count = end - start
+
+        smem = cutlass.utils.SmemAllocator()
+        sDOAll = smem.allocate_tensor(
+            mGradReadout.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mGradReadout.element_type, 64),
+                (self.warps_per_cta * 16, 64),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sVAll = smem.allocate_tensor(
+            mValue.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mValue.element_type, 64),
+                (self.warps_per_cta * 8, 64),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sGradAttnAll = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((self.warps_per_cta, 8)),
+            byte_alignment=16,
+        )
+        sDO = cute.local_tile(sDOAll, (16, 64), (warp_idx, 0))
+        sV = cute.local_tile(sVAll, (8, 64), (warp_idx, 0))
+        sGradAttn = sGradAttnAll[warp_idx, None]
+
+        # Only C row 0 is consumed, so rows 1-15 of A do not need initialization.
+        for dim_idx in cutlass.range(lane, Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            do_val = Float32(0.0).to(sDO.element_type)
+            if active:
+                do_val = mGradReadout[query_idx, head_idx, dim_idx]
+            sDO[Int32(0), dim_idx] = do_val
+        for elem_idx in cutlass.range(lane, Int32(8) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            leaf_slot = elem_idx // Int32(64)
+            dim_idx = elem_idx - leaf_slot * Int32(64)
+            v_val = Float32(0.0).to(sV.element_type)
+            if active:
+                if leaf_slot < leaf_count:
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_slot])
+                    value_idx = Int32(mLeafValueIndex[leaf_entry])
+                    v_val = mValue[value_idx, head_idx, dim_idx]
+            sV[leaf_slot, dim_idx] = v_val
+        if lane < Int32(8):
+            sGradAttn[lane] = Float32(0.0)
+        cute.arch.barrier()
+
+        if active:
+            tiled_mma = cute.make_tiled_mma(
+                warp.MmaF16BF16Op(mGradReadout.element_type, Float32, (16, 8, 16)),
+                (1, 1, 1),
+                permutation_mnk=(16, 8, 16),
+            )
+            thr_mma = tiled_mma.get_slice(lane)
+            smem_copy_atom = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                mGradReadout.element_type,
+            )
+            smem_thr_copy_do = cute_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(lane)
+            smem_thr_copy_v = cute_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(lane)
+            tSrDO = cute_utils.mma_make_fragment_A(sDO, thr_mma)
+            tSrV = cute_utils.mma_make_fragment_B(sV, thr_mma)
+            tSsDO = smem_thr_copy_do.partition_S(sDO)
+            tSsV = smem_thr_copy_v.partition_S(sV)
+            acc_shape = thr_mma.partition_shape_C((16, 8))
+            c_tile = cute.make_identity_tensor((16, 8))
+            tCc = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(c_tile))
+            acc = cute.make_fragment(acc_shape, Float32)
+            acc.fill(0.0)
+            sm80_utils.gemm(
+                thr_mma,
+                acc,
+                tSrDO,
+                tSrV,
+                tSsDO,
+                tSsV,
+                smem_thr_copy_do,
+                smem_thr_copy_v,
+            )
+            acc_mn = layout_utils.reshape_acc_to_mn(acc)
+            for mi in cutlass.range_constexpr(cute.size(tCc.shape[0])):
+                for ni in cutlass.range_constexpr(cute.size(tCc.shape[1])):
+                    row_idx = tCc[mi, ni][0]
+                    leaf_slot = tCc[mi, ni][1]
+                    if row_idx == Int32(0) and leaf_slot < leaf_count:
+                        sGradAttn[leaf_slot] = acc_mn[mi, ni]
+        cute.arch.barrier()
+
+        if active and lane == Int32(0):
+            denom = Float32.zero
+            weighted_grad_sum = Float32.zero
+            for leaf_slot in cutlass.range(Int32(0), leaf_count, unroll=1):
+                leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_slot])
+                node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                mass = Float32(mP[node_idx, head_idx])
+                grad_attn = Float32(sGradAttn[leaf_slot])
+                denom += mass
+                weighted_grad_sum += mass * grad_attn
+                mLeafGradAttn[leaf_entry, head_idx] = grad_attn.to(mLeafGradAttn.element_type)
+            if denom < Float32(1.0e-8):
+                denom = Float32(1.0e-8)
+            mDenom[query_idx, head_idx] = denom.to(mDenom.element_type)
+            mWeightedGradSum[query_idx, head_idx] = weighted_grad_sum.to(mWeightedGradSum.element_type)
+
+
+class ARHSALeafReadoutBackwardFusedTensorCoreD64Sm100:
+    """Experimental fused D=64 readout backward with tensor-core dO dot V stats."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradReadout: cute.Tensor,
+        mGradP: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mP,
+            mLeafNodeIndex,
+            mLeafValueIndex,
+            mQueryLeafRowPtr,
+            mQueryLeafEntryIndex,
+            mValue,
+            mGradReadout,
+            mGradP,
+            mGradValue,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradReadout: cute.Tensor,
+        mGradP: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        active = task_idx < total_tasks
+        num_heads = Int32(mP.shape[1])
+        query_idx = Int32(0)
+        head_idx = Int32(0)
+        start = Int32(0)
+        end = Int32(0)
+        leaf_count = Int32(0)
+        if active:
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mQueryLeafRowPtr[query_idx])
+            end = Int32(mQueryLeafRowPtr[query_idx + 1])
+            leaf_count = end - start
+
+        smem = cutlass.utils.SmemAllocator()
+        sDOAll = smem.allocate_tensor(
+            mGradReadout.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mGradReadout.element_type, 64),
+                (self.warps_per_cta * 16, 64),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sVAll = smem.allocate_tensor(
+            mValue.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mValue.element_type, 64),
+                (self.warps_per_cta * 8, 64),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sGradAttnAll = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((self.warps_per_cta, 8)),
+            byte_alignment=16,
+        )
+        sStatsAll = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((self.warps_per_cta, 2)),
+            byte_alignment=16,
+        )
+        sDO = cute.local_tile(sDOAll, (16, 64), (warp_idx, 0))
+        sV = cute.local_tile(sVAll, (8, 64), (warp_idx, 0))
+        sGradAttn = sGradAttnAll[warp_idx, None]
+        sStats = sStatsAll[warp_idx, None]
+
+        # Only C row 0 is consumed, so rows 1-15 of A do not need initialization.
+        for dim_idx in cutlass.range(lane, Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            do_val = Float32(0.0).to(sDO.element_type)
+            if active:
+                do_val = mGradReadout[query_idx, head_idx, dim_idx]
+            sDO[Int32(0), dim_idx] = do_val
+        for elem_idx in cutlass.range(lane, Int32(8) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+            leaf_slot = elem_idx // Int32(64)
+            dim_idx = elem_idx - leaf_slot * Int32(64)
+            v_val = Float32(0.0).to(sV.element_type)
+            if active:
+                if leaf_slot < leaf_count:
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_slot])
+                    value_idx = Int32(mLeafValueIndex[leaf_entry])
+                    v_val = mValue[value_idx, head_idx, dim_idx]
+            sV[leaf_slot, dim_idx] = v_val
+        if lane < Int32(8):
+            sGradAttn[lane] = Float32(0.0)
+        if lane < Int32(2):
+            sStats[lane] = Float32(0.0)
+        cute.arch.barrier()
+
+        if active:
+            tiled_mma = cute.make_tiled_mma(
+                warp.MmaF16BF16Op(mGradReadout.element_type, Float32, (16, 8, 16)),
+                (1, 1, 1),
+                permutation_mnk=(16, 8, 16),
+            )
+            thr_mma = tiled_mma.get_slice(lane)
+            smem_copy_atom = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                mGradReadout.element_type,
+            )
+            smem_thr_copy_do = cute_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(lane)
+            smem_thr_copy_v = cute_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(lane)
+            tSrDO = cute_utils.mma_make_fragment_A(sDO, thr_mma)
+            tSrV = cute_utils.mma_make_fragment_B(sV, thr_mma)
+            tSsDO = smem_thr_copy_do.partition_S(sDO)
+            tSsV = smem_thr_copy_v.partition_S(sV)
+            acc_shape = thr_mma.partition_shape_C((16, 8))
+            c_tile = cute.make_identity_tensor((16, 8))
+            tCc = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(c_tile))
+            acc = cute.make_fragment(acc_shape, Float32)
+            acc.fill(0.0)
+            sm80_utils.gemm(
+                thr_mma,
+                acc,
+                tSrDO,
+                tSrV,
+                tSsDO,
+                tSsV,
+                smem_thr_copy_do,
+                smem_thr_copy_v,
+            )
+            acc_mn = layout_utils.reshape_acc_to_mn(acc)
+            for mi in cutlass.range_constexpr(cute.size(tCc.shape[0])):
+                for ni in cutlass.range_constexpr(cute.size(tCc.shape[1])):
+                    row_idx = tCc[mi, ni][0]
+                    leaf_slot = tCc[mi, ni][1]
+                    if row_idx == Int32(0) and leaf_slot < leaf_count:
+                        sGradAttn[leaf_slot] = acc_mn[mi, ni]
+        cute.arch.barrier()
+
+        if active:
+            if lane == Int32(0):
+                denom = Float32.zero
+                weighted_grad_sum = Float32.zero
+                for leaf_slot in cutlass.range(Int32(0), leaf_count, unroll=1):
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_slot])
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    mass = Float32(mP[node_idx, head_idx])
+                    grad_attn = Float32(sGradAttn[leaf_slot])
+                    denom += mass
+                    weighted_grad_sum += mass * grad_attn
+                if denom < Float32(1.0e-8):
+                    denom = Float32(1.0e-8)
+                inv_denom = Float32(1.0) / denom
+                sStats[0] = inv_denom
+                sStats[1] = weighted_grad_sum * inv_denom
+        cute.arch.barrier()
+
+        if active:
+            inv_denom = Float32(sStats[0])
+            weighted_grad_mean = Float32(sStats[1])
+            if lane < leaf_count:
+                leaf_entry = Int32(mQueryLeafEntryIndex[start + lane])
+                node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                grad_attn = Float32(sGradAttn[lane])
+                grad_mass = (grad_attn - weighted_grad_mean) * inv_denom
+                cute_utils.atomic_add_fp32(
+                    grad_mass,
+                    cute_utils.elem_pointer(mGradP, (node_idx, head_idx)),
+                )
+
+            leaf_lane = lane // Int32(16)
+            dim_group = lane - leaf_lane * Int32(16)
+            for leaf_base in cutlass.range(Int32(0), leaf_count, Int32(2), unroll=1):
+                leaf_offset = leaf_base + leaf_lane
+                if leaf_offset < leaf_count:
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_offset])
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    value_idx = Int32(mLeafValueIndex[leaf_entry])
+                    mass = Float32(mP[node_idx, head_idx])
+                    attn = mass * inv_denom
+                    dim0 = dim_group * Int32(4)
+                    dim1 = dim0 + Int32(1)
+                    dim2 = dim0 + Int32(2)
+                    dim3 = dim0 + Int32(3)
+                    copy_utils.atomic_add_fp32x4(
+                        attn * Float32(mGradReadout[query_idx, head_idx, dim0]),
+                        attn * Float32(mGradReadout[query_idx, head_idx, dim1]),
+                        attn * Float32(mGradReadout[query_idx, head_idx, dim2]),
+                        attn * Float32(mGradReadout[query_idx, head_idx, dim3]),
+                        cute_utils.elem_pointer(mGradValue, (value_idx, head_idx, dim0)),
                     )
 
 
@@ -2716,6 +3135,199 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
     return leaf_grad_attn, denom, weighted_grad_sum
 
 
+def run_arhsa_leaf_readout_backward_stats_tensor_core_d64(
+    p: torch.Tensor,
+    leaf_node_index: torch.Tensor,
+    leaf_value_index: torch.Tensor,
+    query_leaf_row_ptr: torch.Tensor,
+    query_leaf_entry_index: torch.Tensor,
+    value: torch.Tensor,
+    grad_readout: torch.Tensor,
+    *,
+    n_queries: int,
+    leaf_grad_attn: torch.Tensor | None = None,
+    denom: torch.Tensor | None = None,
+    weighted_grad_sum: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Experimental tensor-core D=64 stats pass for <=8 leaves per query."""
+    _require_cute_runtime()
+    if p.device.type != "cuda":
+        raise ValueError("p must be a CUDA tensor")
+    if value.dtype != torch.bfloat16 or grad_readout.dtype != torch.bfloat16:
+        raise ValueError("tensor-core D64 stats currently requires bfloat16 value and grad_readout")
+    if value.ndim != 3 or value.shape[1] != p.shape[1] or int(value.shape[2]) != 64:
+        raise ValueError("tensor-core D64 stats requires value shape [n_values, n_heads, 64]")
+    if grad_readout.shape != (int(n_queries), value.shape[1], 64):
+        raise ValueError(f"grad_readout shape mismatch: got {tuple(grad_readout.shape)}")
+
+    n_queries = int(n_queries)
+    if n_queries > 0:
+        max_leaves = int((query_leaf_row_ptr[1:] - query_leaf_row_ptr[:-1]).max().item())
+        if max_leaves > 8:
+            raise ValueError(f"tensor-core D64 stats currently supports <=8 leaves per query, got {max_leaves}")
+    stats_shape = (n_queries, p.shape[1])
+    leaf_grad_shape = (leaf_node_index.numel(), p.shape[1])
+    if leaf_grad_attn is None:
+        leaf_grad_attn = torch.empty(leaf_grad_shape, dtype=torch.float32, device=p.device)
+    if denom is None:
+        denom = torch.empty(stats_shape, dtype=torch.float32, device=p.device)
+    if weighted_grad_sum is None:
+        weighted_grad_sum = torch.empty(stats_shape, dtype=torch.float32, device=p.device)
+    if leaf_grad_attn.shape != leaf_grad_shape:
+        raise ValueError("leaf_grad_attn must have shape [n_leaf_entries, n_heads]")
+    if denom.shape != stats_shape or weighted_grad_sum.shape != stats_shape:
+        raise ValueError("denom and weighted_grad_sum must have shape [n_queries, n_heads]")
+    if leaf_grad_attn.dtype != torch.float32 or denom.dtype != torch.float32 or weighted_grad_sum.dtype != torch.float32:
+        raise ValueError("leaf_grad_attn, denom, and weighted_grad_sum must be float32 tensors")
+
+    p = p.contiguous()
+    value = value.contiguous()
+    grad_readout = grad_readout.contiguous()
+    leaf_grad_attn = leaf_grad_attn.contiguous()
+    denom = denom.contiguous()
+    weighted_grad_sum = weighted_grad_sum.contiguous()
+    leaf_node_index = leaf_node_index.to(device=p.device, dtype=torch.int32).contiguous()
+    leaf_value_index = leaf_value_index.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_row_ptr = query_leaf_row_ptr.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_entry_index = query_leaf_entry_index.to(device=p.device, dtype=torch.int32).contiguous()
+
+    total_tasks = int(n_queries * p.shape[1])
+    if total_tasks == 0:
+        return leaf_grad_attn, denom, weighted_grad_sum
+
+    compile_key = (
+        "arhsa_leaf_readout_backward_stats_tensor_core_d64",
+        p.dtype,
+        value.dtype,
+        grad_readout.dtype,
+        value.shape[1],
+        torch.cuda.get_device_capability(p.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_leaf_readout_backward_stats_tensor_core_d64.compile_cache:
+        op = ARHSALeafReadoutBackwardStatsTensorCoreD64Sm100()
+        run_arhsa_leaf_readout_backward_stats_tensor_core_d64.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(p),
+            to_cute_tensor(leaf_node_index, assumed_align=4),
+            to_cute_tensor(leaf_value_index, assumed_align=4),
+            to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
+            to_cute_tensor(query_leaf_entry_index, assumed_align=4),
+            to_cute_tensor(value),
+            to_cute_tensor(grad_readout),
+            to_cute_tensor(leaf_grad_attn),
+            to_cute_tensor(denom),
+            to_cute_tensor(weighted_grad_sum),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_leaf_readout_backward_stats_tensor_core_d64.compile_cache[compile_key](
+        p,
+        leaf_node_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value,
+        grad_readout,
+        leaf_grad_attn,
+        denom,
+        weighted_grad_sum,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return leaf_grad_attn, denom, weighted_grad_sum
+
+
+def run_arhsa_leaf_readout_backward_fused_tensor_core_d64(
+    p: torch.Tensor,
+    leaf_node_index: torch.Tensor,
+    leaf_value_index: torch.Tensor,
+    query_leaf_row_ptr: torch.Tensor,
+    query_leaf_entry_index: torch.Tensor,
+    value: torch.Tensor,
+    grad_readout: torch.Tensor,
+    grad_p: torch.Tensor,
+    grad_value: torch.Tensor,
+    *,
+    n_queries: int,
+) -> None:
+    """Experimental fused tensor-core D=64 readout backward for <=8 leaves/query."""
+    _require_cute_runtime()
+    if p.device.type != "cuda":
+        raise ValueError("p must be a CUDA tensor")
+    if value.dtype != torch.bfloat16 or grad_readout.dtype != torch.bfloat16:
+        raise ValueError("fused tensor-core D64 backward currently requires bfloat16 value and grad_readout")
+    if value.ndim != 3 or value.shape[1] != p.shape[1] or int(value.shape[2]) != 64:
+        raise ValueError("fused tensor-core D64 backward requires value shape [n_values, n_heads, 64]")
+    if grad_readout.shape != (int(n_queries), value.shape[1], 64):
+        raise ValueError(f"grad_readout shape mismatch: got {tuple(grad_readout.shape)}")
+    if grad_p.shape != p.shape or grad_p.dtype != torch.float32:
+        raise ValueError("grad_p must be a float32 tensor with shape matching p")
+    if grad_value.shape != value.shape or grad_value.dtype != torch.float32:
+        raise ValueError("grad_value must be a float32 tensor with shape matching value")
+
+    n_queries = int(n_queries)
+    if n_queries > 0:
+        max_leaves = int((query_leaf_row_ptr[1:] - query_leaf_row_ptr[:-1]).max().item())
+        if max_leaves > 8:
+            raise ValueError(f"fused tensor-core D64 backward currently supports <=8 leaves per query, got {max_leaves}")
+
+    p = p.contiguous()
+    value = value.contiguous()
+    grad_readout = grad_readout.contiguous()
+    grad_p = grad_p.contiguous()
+    grad_value = grad_value.contiguous()
+    leaf_node_index = leaf_node_index.to(device=p.device, dtype=torch.int32).contiguous()
+    leaf_value_index = leaf_value_index.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_row_ptr = query_leaf_row_ptr.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_entry_index = query_leaf_entry_index.to(device=p.device, dtype=torch.int32).contiguous()
+
+    total_tasks = int(n_queries * p.shape[1])
+    if total_tasks == 0:
+        return
+
+    compile_key = (
+        "arhsa_leaf_readout_backward_fused_tensor_core_d64",
+        p.dtype,
+        value.dtype,
+        grad_readout.dtype,
+        value.shape[1],
+        torch.cuda.get_device_capability(p.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_leaf_readout_backward_fused_tensor_core_d64.compile_cache:
+        op = ARHSALeafReadoutBackwardFusedTensorCoreD64Sm100()
+        run_arhsa_leaf_readout_backward_fused_tensor_core_d64.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(p),
+            to_cute_tensor(leaf_node_index, assumed_align=4),
+            to_cute_tensor(leaf_value_index, assumed_align=4),
+            to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
+            to_cute_tensor(query_leaf_entry_index, assumed_align=4),
+            to_cute_tensor(value),
+            to_cute_tensor(grad_readout),
+            to_cute_tensor(grad_p),
+            to_cute_tensor(grad_value),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_leaf_readout_backward_fused_tensor_core_d64.compile_cache[compile_key](
+        p,
+        leaf_node_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value,
+        grad_readout,
+        grad_p,
+        grad_value,
+        Int32(total_tasks),
+        current_stream,
+    )
+
+
 def run_arhsa_leaf_readout_backward_scatter(
     p: torch.Tensor,
     leaf_node_index: torch.Tensor,
@@ -3128,6 +3740,8 @@ def run_arhsa_leaf_readout_backward(
     query_warp_stats: bool = False,
     query_warp_scatter: bool = False,
     query_warp_fused: bool = False,
+    tensor_core_stats: bool = False,
+    tensor_core_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the CuTe direct leaf readout backward kernel."""
     _require_cute_runtime()
@@ -3174,6 +3788,30 @@ def run_arhsa_leaf_readout_backward(
             raise ValueError("query_warp_stats=True cannot be combined with packed_value")
         if denom_precomputed:
             raise ValueError("query_warp_stats=True cannot reuse a precomputed denom")
+    if tensor_core_stats:
+        if tensor_core_fused:
+            raise ValueError("tensor_core_stats=True cannot be combined with tensor_core_fused=True")
+        if not leaf_major_stats:
+            raise ValueError("tensor_core_stats=True currently requires leaf_major_stats=True")
+        if query_warp_fused:
+            raise ValueError("tensor_core_stats=True cannot be combined with query_warp_fused=True")
+        if packed_value is not None:
+            raise ValueError("tensor_core_stats=True cannot be combined with packed_value")
+        if denom_precomputed:
+            raise ValueError("tensor_core_stats=True cannot reuse a precomputed denom")
+        if value.dtype != torch.bfloat16 or grad_readout.dtype != torch.bfloat16 or int(value.shape[2]) != 64:
+            raise ValueError("tensor_core_stats=True currently requires bfloat16 D=64 value and grad_readout")
+    if tensor_core_fused:
+        if max_leaves_per_query is not None:
+            raise ValueError("tensor_core_fused=True cannot be combined with max_leaves_per_query fused-small path")
+        if query_warp_fused:
+            raise ValueError("tensor_core_fused=True cannot be combined with query_warp_fused=True")
+        if packed_value is not None:
+            raise ValueError("tensor_core_fused=True cannot be combined with packed_value")
+        if denom_precomputed:
+            raise ValueError("tensor_core_fused=True cannot reuse a precomputed denom")
+        if value.dtype != torch.bfloat16 or grad_readout.dtype != torch.bfloat16 or int(value.shape[2]) != 64:
+            raise ValueError("tensor_core_fused=True currently requires bfloat16 D=64 value and grad_readout")
     if query_warp_fused:
         if int(value.shape[2]) != 64:
             raise ValueError("query_warp_fused=True currently requires head_dim_v=64")
@@ -3261,6 +3899,21 @@ def run_arhsa_leaf_readout_backward(
         )
         return finalize_outputs()
 
+    if tensor_core_fused:
+        run_arhsa_leaf_readout_backward_fused_tensor_core_d64(
+            p,
+            leaf_node_index,
+            leaf_value_index,
+            query_leaf_row_ptr,
+            query_leaf_entry_index,
+            value,
+            grad_readout,
+            grad_p,
+            grad_value,
+            n_queries=int(n_queries),
+        )
+        return finalize_outputs()
+
     if query_warp_fused:
         run_arhsa_leaf_readout_backward_fused_query_warp_d64(
             p,
@@ -3279,7 +3932,21 @@ def run_arhsa_leaf_readout_backward(
         return finalize_outputs()
 
     if leaf_major_stats:
-        if query_warp_stats:
+        if tensor_core_stats:
+            leaf_grad_attn, denom, weighted_grad_sum = run_arhsa_leaf_readout_backward_stats_tensor_core_d64(
+                p,
+                leaf_node_index,
+                leaf_value_index,
+                query_leaf_row_ptr,
+                query_leaf_entry_index,
+                value,
+                grad_readout,
+                n_queries=int(n_queries),
+                leaf_grad_attn=leaf_grad_attn,
+                denom=denom,
+                weighted_grad_sum=weighted_grad_sum,
+            )
+        elif query_warp_stats:
             leaf_grad_attn, denom, weighted_grad_sum = run_arhsa_leaf_readout_backward_stats_query_warp(
                 p,
                 leaf_node_index,
@@ -3900,6 +4567,8 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     query_warp_stats: bool = False,
     query_warp_scatter: bool = False,
     query_warp_fused: bool = False,
+    tensor_core_stats: bool = False,
+    tensor_core_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CuTe-backed backward for fixed-iteration ARHSA direct-PV readout."""
     _require_cute_runtime()
@@ -3971,6 +4640,8 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
         query_warp_stats=query_warp_stats,
         query_warp_scatter=query_warp_scatter,
         query_warp_fused=query_warp_fused,
+        tensor_core_stats=tensor_core_stats,
+        tensor_core_fused=tensor_core_fused,
     )
     grad_edge_prob = torch.zeros_like(edge_prob)
     grad_next = grad_p_final
@@ -4030,6 +4701,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         query_warp_readout: bool,
         query_warp_scatter: bool,
         query_warp_fused: bool,
+        tensor_core_stats: bool,
+        tensor_core_fused: bool,
     ) -> torch.Tensor:
         ctx.save_for_backward(
             p0,
@@ -4055,6 +4728,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.query_warp_stats = bool(query_warp_stats)
         ctx.query_warp_scatter = bool(query_warp_scatter)
         ctx.query_warp_fused = bool(query_warp_fused)
+        ctx.tensor_core_stats = bool(tensor_core_stats)
+        ctx.tensor_core_fused = bool(tensor_core_fused)
         with torch.no_grad():
             if bool(use_cute_softmax):
                 edge_prob = run_arhsa_outgoing_softmax(
@@ -4136,6 +4811,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 query_warp_stats=ctx.query_warp_stats,
                 query_warp_scatter=ctx.query_warp_scatter,
                 query_warp_fused=ctx.query_warp_fused,
+                tensor_core_stats=ctx.tensor_core_stats,
+                tensor_core_fused=ctx.tensor_core_fused,
             )
         else:
             grad_p0, grad_edge_scores, grad_value = torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
@@ -4183,6 +4860,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -4212,6 +4891,8 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     query_warp_readout: bool = False,
     query_warp_scatter: bool = False,
     query_warp_fused: bool = False,
+    tensor_core_stats: bool = False,
+    tensor_core_fused: bool = False,
 ) -> torch.Tensor:
     """
     Differentiable ARHSA readout: CuTe forward and CuTe-backed fp32/BF16 backward.
@@ -4262,6 +4943,8 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         bool(query_warp_readout),
         bool(query_warp_scatter),
         bool(query_warp_fused),
+        bool(tensor_core_stats),
+        bool(tensor_core_fused),
     )
 
 
@@ -4280,6 +4963,12 @@ run_arhsa_leaf_readout_backward_stats_leaf_major_packed.compile_cache = get_jit_
 )
 run_arhsa_leaf_readout_backward_stats_query_warp.compile_cache = get_jit_cache(
     "arhsa_leaf_readout_backward_stats_query_warp"
+)
+run_arhsa_leaf_readout_backward_stats_tensor_core_d64.compile_cache = get_jit_cache(
+    "arhsa_leaf_readout_backward_stats_tensor_core_d64"
+)
+run_arhsa_leaf_readout_backward_fused_tensor_core_d64.compile_cache = get_jit_cache(
+    "arhsa_leaf_readout_backward_fused_tensor_core_d64"
 )
 run_arhsa_leaf_readout_backward_scatter.compile_cache = get_jit_cache("arhsa_leaf_readout_backward_scatter")
 run_arhsa_leaf_readout_backward_scatter_query_warp.compile_cache = get_jit_cache(

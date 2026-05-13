@@ -329,6 +329,16 @@ def main():
         help="Fuse query-warp readout-backward stats and scatter for head_dim_v=64.",
     )
     parser.add_argument(
+        "--tensor-core-stats-bwd",
+        action="store_true",
+        help="Use experimental tensor-core D=64 readout-backward stats pass.",
+    )
+    parser.add_argument(
+        "--tensor-core-fused-bwd",
+        action="store_true",
+        help="Use experimental fused tensor-core D=64 readout backward.",
+    )
+    parser.add_argument(
         "--profile-target",
         choices=(
             "cute_fwd_bwd",
@@ -361,6 +371,30 @@ def main():
         raise ValueError("--query-warp-fused-bwd cannot be combined with --pack-leaf-values")
     if args.query_warp_fused_bwd and args.head_dim_v != 64:
         raise ValueError("--query-warp-fused-bwd currently requires --head-dim-v 64")
+    if args.tensor_core_stats_bwd and not args.leaf_major_stats:
+        raise ValueError("--tensor-core-stats-bwd requires --leaf-major-stats")
+    if args.tensor_core_stats_bwd and args.query_warp_fused_bwd:
+        raise ValueError("--tensor-core-stats-bwd cannot be combined with --query-warp-fused-bwd")
+    if args.tensor_core_stats_bwd and args.query_warp_stats:
+        raise ValueError("--tensor-core-stats-bwd cannot be combined with --query-warp-stats")
+    if args.tensor_core_stats_bwd and args.pack_leaf_values:
+        raise ValueError("--tensor-core-stats-bwd cannot be combined with --pack-leaf-values")
+    if args.tensor_core_stats_bwd and args.reuse_forward_denom:
+        raise ValueError("--tensor-core-stats-bwd cannot be combined with --reuse-forward-denom")
+    if args.tensor_core_stats_bwd and args.head_dim_v != 64:
+        raise ValueError("--tensor-core-stats-bwd currently requires --head-dim-v 64")
+    if args.tensor_core_fused_bwd and args.head_dim_v != 64:
+        raise ValueError("--tensor-core-fused-bwd currently requires --head-dim-v 64")
+    if args.tensor_core_fused_bwd and args.tensor_core_stats_bwd:
+        raise ValueError("--tensor-core-fused-bwd cannot be combined with --tensor-core-stats-bwd")
+    if args.tensor_core_fused_bwd and args.query_warp_fused_bwd:
+        raise ValueError("--tensor-core-fused-bwd cannot be combined with --query-warp-fused-bwd")
+    if args.tensor_core_fused_bwd and args.fused_readout_bwd:
+        raise ValueError("--tensor-core-fused-bwd cannot be combined with --fused-readout-bwd")
+    if args.tensor_core_fused_bwd and args.pack_leaf_values:
+        raise ValueError("--tensor-core-fused-bwd cannot be combined with --pack-leaf-values")
+    if args.tensor_core_fused_bwd and args.reuse_forward_denom:
+        raise ValueError("--tensor-core-fused-bwd cannot be combined with --reuse-forward-denom")
     case = _make_case(args)
     if not args.no_check:
         _check(case, args)
@@ -455,6 +489,8 @@ def main():
             query_warp_readout=args.query_warp_readout,
             query_warp_scatter=args.query_warp_scatter,
             query_warp_fused=args.query_warp_fused_bwd,
+            tensor_core_stats=args.tensor_core_stats_bwd,
+            tensor_core_fused=args.tensor_core_fused_bwd,
         )
         out.backward(grad_readout)
 
@@ -515,6 +551,8 @@ def main():
             query_warp_stats=args.query_warp_stats,
             query_warp_scatter=args.query_warp_scatter,
             query_warp_fused=args.query_warp_fused_bwd,
+            tensor_core_stats=args.tensor_core_stats_bwd,
+            tensor_core_fused=args.tensor_core_fused_bwd,
         )
         grad_edge_prob.zero_()
         grad_next = grad_p_final
@@ -600,6 +638,8 @@ def main():
             query_warp_stats=args.query_warp_stats,
             query_warp_scatter=args.query_warp_scatter,
             query_warp_fused=args.query_warp_fused_bwd,
+            tensor_core_stats=args.tensor_core_stats_bwd,
+            tensor_core_fused=args.tensor_core_fused_bwd,
         )
 
     def _full_cute_hot():
@@ -860,6 +900,8 @@ def main():
             "query_warp_readout": args.query_warp_readout,
             "query_warp_scatter": args.query_warp_scatter,
             "query_warp_fused_bwd": args.query_warp_fused_bwd,
+            "tensor_core_stats_bwd": args.tensor_core_stats_bwd,
+            "tensor_core_fused_bwd": args.tensor_core_fused_bwd,
             **{key: round(value, 4) for key, value in timings.items()},
             **{key: round(value, 2) for key, value in memory.items()},
         }

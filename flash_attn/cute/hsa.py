@@ -1439,6 +1439,129 @@ def build_hsa_schedule(keep_ids: torch.Tensor, hash_ids: torch.Tensor) -> HSASch
     )
 
 
+def build_hsa_schedule_from_support(support: torch.Tensor) -> HSASchedule:
+    """
+    Build an FA4 HSA-compatible sparse schedule from an explicit support mask.
+
+    The regular HSA builder derives support from keep/hash hierarchy metadata.
+    Route experiments such as ARMIXED-style closed-summary routing instead
+    produce a boolean ``[B, T, T]`` causal support mask directly. This builder
+    stores all allowed key positions in the CSR cross-edge view and leaves the
+    dense HSA segment streams empty, so the existing block-sparse FA4 path can
+    execute the same masked softmax without needing a new mask_mod kernel.
+    """
+    if support.ndim != 3 or support.shape[-1] != support.shape[-2]:
+        raise ValueError(
+            "support must have shape [batch, seqlen, seqlen], "
+            f"got {tuple(support.shape)}"
+        )
+    support = support.to(dtype=torch.bool).contiguous()
+    bsz, seqlen, _ = support.shape
+    device = support.device
+    total_rows = bsz * seqlen
+
+    support_cpu = support.detach().cpu()
+    section_rows: list[list[int]] = [[] for _ in range(total_rows)]
+    section_t_rows: list[list[int]] = [[] for _ in range(total_rows)]
+    empty_rows: list[list[int]] = [[] for _ in range(total_rows)]
+
+    for batch_idx in range(bsz):
+        row_base = batch_idx * seqlen
+        for q_pos in range(seqlen):
+            keys = torch.where(support_cpu[batch_idx, q_pos])[0].tolist()
+            flat_q = row_base + q_pos
+            section_rows[flat_q] = [int(k) for k in keys]
+            for key_pos in keys:
+                section_t_rows[row_base + int(key_pos)].append(q_pos)
+
+    for flat_row in range(total_rows):
+        section_rows[flat_row] = sorted(set(section_rows[flat_row]))
+        section_t_rows[flat_row] = sorted(set(section_t_rows[flat_row]))
+
+    section_row_ptr, section_col_idx = _rows_to_csr(section_rows, device)
+    section_t_row_ptr, section_t_col_idx = _rows_to_csr(section_t_rows, device)
+    document_row_ptr, document_col_idx = _rows_to_csr(empty_rows, device)
+    document_t_row_ptr, document_t_col_idx = _rows_to_csr(empty_rows, device)
+
+    empty_segments: list[list[int]] = []
+    sentence_segment_ptr, sentence_segment_pos, sentence_segment_id, sentence_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+    section_segment_ptr, section_segment_pos, section_segment_id, section_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+    document_segment_ptr, document_segment_pos, document_segment_id, document_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+
+    block_size = 128
+    empty_descriptors = _build_block_descriptors(
+        batch_size=bsz,
+        seqlen=seqlen,
+        block_size=block_size,
+        sentence_segments_flat=empty_segments,
+        section_segments_flat=empty_segments,
+        document_segments_flat=empty_segments,
+        device=device,
+    )
+    empty_stream = _make_stream_pack(
+        query_indices=[],
+        key_indices=[],
+        row_indices=[],
+        cu_seqlens_q=[0],
+        cu_seqlens_k=[0],
+        max_seqlen_q=0,
+        max_seqlen_k=0,
+        device=device,
+    )
+    empty_int = _empty_int32(device)
+
+    return HSASchedule(
+        batch_size_value=bsz,
+        seqlen_value=seqlen,
+        block_size_value=block_size,
+        sentence_start=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        sentence_len=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        section_row_ptr=section_row_ptr,
+        section_col_idx=section_col_idx,
+        document_row_ptr=document_row_ptr,
+        document_col_idx=document_col_idx,
+        sentence_q_start=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        sentence_q_len=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        section_t_row_ptr=section_t_row_ptr,
+        section_t_col_idx=section_t_col_idx,
+        document_t_row_ptr=document_t_row_ptr,
+        document_t_col_idx=document_t_col_idx,
+        sentence_segment_ptr=sentence_segment_ptr,
+        sentence_segment_pos=sentence_segment_pos,
+        sentence_segment_id=sentence_segment_id,
+        sentence_segment_offset=sentence_segment_offset,
+        section_segment_ptr=section_segment_ptr,
+        section_segment_pos=section_segment_pos,
+        section_segment_id=section_segment_id,
+        section_segment_offset=section_segment_offset,
+        section_self_allowed=torch.zeros(total_rows, dtype=torch.bool, device=device),
+        document_segment_ptr=document_segment_ptr,
+        document_segment_pos=document_segment_pos,
+        document_segment_id=document_segment_id,
+        document_segment_offset=document_segment_offset,
+        document_self_allowed=torch.zeros(total_rows, dtype=torch.bool, device=device),
+        forward_descriptors=empty_descriptors,
+        backward_descriptors=empty_descriptors,
+        sentence_stream=empty_stream,
+        section_prefix_stream=empty_stream,
+        document_prefix_stream=empty_stream,
+        section_self_indices=empty_int,
+        document_self_indices=empty_int,
+    )
+
+
 def schedule_to_attend_mask(schedule: HSASchedule) -> torch.Tensor:
     """Expand an `HSASchedule` back into the exact dense bool attention mask."""
     bsz, seqlen = schedule.batch_size, schedule.seqlen

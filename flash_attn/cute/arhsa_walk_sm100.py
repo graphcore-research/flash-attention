@@ -139,6 +139,44 @@ def build_query_leaf_csr(leaf_query_index: torch.Tensor, *, n_queries: int) -> t
     )
 
 
+def _level_bounds_as_ints(level_bounds: torch.Tensor | None) -> list[int]:
+    if level_bounds is None or level_bounds.numel() == 0:
+        return []
+    if level_bounds.ndim != 1:
+        raise ValueError(f"level_bounds must be 1D, got {tuple(level_bounds.shape)}")
+    bounds = [int(value) for value in level_bounds.detach().cpu().tolist()]
+    if len(bounds) < 2:
+        raise ValueError("level_bounds must contain at least two entries")
+    if bounds[0] != 0:
+        raise ValueError("level_bounds must start at 0")
+    if any(next_bound < bound for bound, next_bound in zip(bounds, bounds[1:])):
+        raise ValueError("level_bounds must be nondecreasing")
+    return bounds
+
+
+def _level_node_range(bounds: list[int], level_idx: int) -> tuple[int, int]:
+    level_idx = _level_clamped_index(bounds, level_idx)
+    start = int(bounds[level_idx])
+    end = int(bounds[level_idx + 1])
+    return start, end - start
+
+
+def _level_clamped_index(bounds: list[int], level_idx: int) -> int:
+    return max(0, min(int(level_idx), len(bounds) - 2))
+
+
+def _level_forward_dst_range(bounds: list[int], iter_idx: int) -> tuple[int, int]:
+    return _level_node_range(bounds, int(iter_idx) + 1)
+
+
+def _level_forward_carry_sinks(bounds: list[int], iter_idx: int) -> bool:
+    return _level_clamped_index(bounds, int(iter_idx) + 1) == _level_clamped_index(bounds, int(iter_idx))
+
+
+def _level_backward_src_range(bounds: list[int], iter_idx: int) -> tuple[int, int]:
+    return _level_node_range(bounds, int(iter_idx))
+
+
 def build_leaf_entry_value_packs(
     leaf_value_index: torch.Tensor,
     *,
@@ -515,6 +553,77 @@ class ARHSAMarkovIncomingPackedStepSm100:
             head_idx = task_idx - node_idx * num_heads
             acc = Float32.zero
             if mNodeIsSink[node_idx]:
+                acc = Float32(mP[node_idx, head_idx])
+            start = Int32(mDstRowPtr[node_idx])
+            end = Int32(mDstRowPtr[node_idx + 1])
+            for ptr in cutlass.range(start, end, unroll=1):
+                src_idx = Int32(mIncomingSrc[ptr])
+                acc += Float32(mP[src_idx, head_idx]) * Float32(mIncomingEdgeProb[ptr, head_idx])
+            mPNext[node_idx, head_idx] = acc.to(mPNext.element_type)
+
+
+class ARHSAMarkovIncomingPackedRangeStepSm100:
+    """Destination-side Markov step over a contiguous destination-node range."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 96):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mP: cute.Tensor,
+        mIncomingEdgeProb: cute.Tensor,
+        mIncomingSrc: cute.Tensor,
+        mDstRowPtr: cute.Tensor,
+        mNodeIsSink: cute.Tensor,
+        mPNext: cute.Tensor,
+        node_offset: Int32,
+        carry_sinks: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mP,
+            mIncomingEdgeProb,
+            mIncomingSrc,
+            mDstRowPtr,
+            mNodeIsSink,
+            mPNext,
+            node_offset,
+            carry_sinks,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mP: cute.Tensor,
+        mIncomingEdgeProb: cute.Tensor,
+        mIncomingSrc: cute.Tensor,
+        mDstRowPtr: cute.Tensor,
+        mNodeIsSink: cute.Tensor,
+        mPNext: cute.Tensor,
+        node_offset: Int32,
+        carry_sinks: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mP.shape[1])
+            local_node_idx = task_idx // num_heads
+            node_idx = node_offset + local_node_idx
+            head_idx = task_idx - local_node_idx * num_heads
+            acc = Float32.zero
+            if carry_sinks != Int32(0) and mNodeIsSink[node_idx]:
                 acc = Float32(mP[node_idx, head_idx])
             start = Int32(mDstRowPtr[node_idx])
             end = Int32(mDstRowPtr[node_idx + 1])
@@ -1094,6 +1203,142 @@ class ARHSALeafReadoutQueryWarpSm100:
                         weight = Float32(mP[node_idx, head_idx]) * inv_denom
                         acc += weight * Float32(mValue[value_idx, head_idx, dim_idx])
                     mReadout[query_idx, head_idx, dim_idx] = acc.to(mReadout.element_type)
+
+
+class ARHSALeafReadoutQueryValuePackD64Sm100:
+    """Pack-owned D=64 readout for dense 16-query x 8-value qv packs."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128, write_denom: bool = False):
+        self.num_threads = num_threads
+        self.write_denom = write_denom
+
+    @cute.jit
+    def __call__(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mPackQueryIndex: cute.Tensor,
+        mPackValueIndex: cute.Tensor,
+        mPackLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mReadout: cute.Tensor,
+        mDenom: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mP,
+            mLeafNodeIndex,
+            mPackQueryIndex,
+            mPackValueIndex,
+            mPackLeafEntryIndex,
+            mValue,
+            mReadout,
+            mDenom,
+            total_tasks,
+        ).launch(
+            grid=[total_tasks, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mPackQueryIndex: cute.Tensor,
+        mPackValueIndex: cute.Tensor,
+        mPackLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mReadout: cute.Tensor,
+        mDenom: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = Int32(block_idx)
+        active = task_idx < total_tasks
+        num_heads = Int32(mP.shape[1])
+        pack_idx = Int32(0)
+        head_idx = Int32(0)
+        if active:
+            pack_idx = task_idx // num_heads
+            head_idx = task_idx - pack_idx * num_heads
+
+        smem = cutlass.utils.SmemAllocator()
+        sMass = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((16, 8)),
+            byte_alignment=16,
+        )
+        sInvDenom = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((16,)),
+            byte_alignment=16,
+        )
+
+        for elem_idx in cutlass.range(tidx, Int32(16) * Int32(8), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(8)
+            value_slot = elem_idx - row_idx * Int32(8)
+            mass = Float32.zero
+            if active and Int32(mPackQueryIndex[pack_idx, row_idx]) >= Int32(0):
+                leaf_entry = Int32(mPackLeafEntryIndex[pack_idx, row_idx, value_slot])
+                if leaf_entry >= Int32(0):
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    mass = Float32(mP[node_idx, head_idx])
+            sMass[row_idx, value_slot] = mass
+        cute.arch.barrier()
+
+        if tidx < Int32(16):
+            row_idx = Int32(tidx)
+            denom = Float32.zero
+            for value_slot in cutlass.range(Int32(0), Int32(8), unroll=1):
+                denom += Float32(sMass[row_idx, value_slot])
+            if denom < Float32(1.0e-8):
+                denom = Float32(1.0e-8)
+            sInvDenom[row_idx] = Float32(1.0) / denom
+            if cutlass.const_expr(self.write_denom):
+                if active:
+                    query_idx = Int32(mPackQueryIndex[pack_idx, row_idx])
+                    if query_idx >= Int32(0):
+                        mDenom[query_idx, head_idx] = denom.to(mDenom.element_type)
+        cute.arch.barrier()
+
+        for elem_idx in cutlass.range(tidx, Int32(16) * Int32(8), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(8)
+            value_slot = elem_idx - row_idx * Int32(8)
+            sMass[row_idx, value_slot] = Float32(sMass[row_idx, value_slot]) * Float32(sInvDenom[row_idx])
+        cute.arch.barrier()
+
+        if active:
+            for elem_idx in cutlass.range(tidx, Int32(16) * Int32(16), self.num_threads, unroll=1):
+                row_idx = elem_idx // Int32(16)
+                dim_group = elem_idx - row_idx * Int32(16)
+                query_idx = Int32(mPackQueryIndex[pack_idx, row_idx])
+                if query_idx >= Int32(0):
+                    dim0 = dim_group * Int32(4)
+                    dim1 = dim0 + Int32(1)
+                    dim2 = dim0 + Int32(2)
+                    dim3 = dim0 + Int32(3)
+                    acc0 = Float32.zero
+                    acc1 = Float32.zero
+                    acc2 = Float32.zero
+                    acc3 = Float32.zero
+                    for value_slot in cutlass.range(Int32(0), Int32(8), unroll=1):
+                        weight = Float32(sMass[row_idx, value_slot])
+                        if weight != Float32.zero:
+                            value_idx = Int32(mPackValueIndex[pack_idx, value_slot])
+                            acc0 += weight * Float32(mValue[value_idx, head_idx, dim0])
+                            acc1 += weight * Float32(mValue[value_idx, head_idx, dim1])
+                            acc2 += weight * Float32(mValue[value_idx, head_idx, dim2])
+                            acc3 += weight * Float32(mValue[value_idx, head_idx, dim3])
+                    mReadout[query_idx, head_idx, dim0] = acc0.to(mReadout.element_type)
+                    mReadout[query_idx, head_idx, dim1] = acc1.to(mReadout.element_type)
+                    mReadout[query_idx, head_idx, dim2] = acc2.to(mReadout.element_type)
+                    mReadout[query_idx, head_idx, dim3] = acc3.to(mReadout.element_type)
 
 
 class ARHSAPackLeafValuesSm100:
@@ -2930,6 +3175,11 @@ class ARHSALeafReadoutBackwardScatterFromQueryValuePackD64Sm100:
             cute.make_layout((16, 2)),
             byte_alignment=16,
         )
+        sAttn = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((16, 8)),
+            byte_alignment=16,
+        )
 
         if tidx < Int32(16):
             row_idx = Int32(tidx)
@@ -2954,6 +3204,18 @@ class ARHSALeafReadoutBackwardScatterFromQueryValuePackD64Sm100:
                     weighted_grad_mean = weighted_grad_sum * inv_denom
             sStats[row_idx, Int32(0)] = inv_denom
             sStats[row_idx, Int32(1)] = weighted_grad_mean
+        cute.arch.barrier()
+
+        for elem_idx in cutlass.range(tidx, Int32(16) * Int32(8), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(8)
+            value_slot = elem_idx - row_idx * Int32(8)
+            attn = Float32.zero
+            if active and Int32(mPackQueryIndex[pack_idx, row_idx]) >= Int32(0):
+                leaf_entry = Int32(mPackLeafEntryIndex[pack_idx, row_idx, value_slot])
+                if leaf_entry >= Int32(0):
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    attn = Float32(mP[node_idx, head_idx]) * Float32(sStats[row_idx, Int32(0)])
+            sAttn[row_idx, value_slot] = attn
         cute.arch.barrier()
 
         if active:
@@ -2988,9 +3250,7 @@ class ARHSALeafReadoutBackwardScatterFromQueryValuePackD64Sm100:
                     leaf_entry = Int32(mPackLeafEntryIndex[pack_idx, row_idx, value_slot])
                     if leaf_entry >= Int32(0):
                         query_idx = Int32(mPackQueryIndex[pack_idx, row_idx])
-                        node_idx = Int32(mLeafNodeIndex[leaf_entry])
-                        mass = Float32(mP[node_idx, head_idx])
-                        attn = mass * Float32(sStats[row_idx, Int32(0)])
+                        attn = Float32(sAttn[row_idx, value_slot])
                         grad_value0 += attn * Float32(mGradReadout[query_idx, head_idx, dim0])
                         grad_value1 += attn * Float32(mGradReadout[query_idx, head_idx, dim1])
                         grad_value2 += attn * Float32(mGradReadout[query_idx, head_idx, dim2])
@@ -3351,6 +3611,91 @@ class ARHSAMarkovBackwardStepSm100:
             mGradPPrev[src_idx, head_idx] = acc.to(mGradPPrev.element_type)
 
 
+class ARHSAMarkovBackwardRangeStepSm100:
+    """Reverse Markov step over a contiguous source-node range."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64, accumulate_grad_edge_prob: bool = True):
+        self.num_threads = num_threads
+        self.accumulate_grad_edge_prob = accumulate_grad_edge_prob
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradPNext: cute.Tensor,
+        mPPrev: cute.Tensor,
+        mEdgeProb: cute.Tensor,
+        mSrcRowPtr: cute.Tensor,
+        mSrcEdgeIndex: cute.Tensor,
+        mDst: cute.Tensor,
+        mNodeIsSink: cute.Tensor,
+        mGradEdgeProb: cute.Tensor,
+        mGradPPrev: cute.Tensor,
+        node_offset: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mGradPNext,
+            mPPrev,
+            mEdgeProb,
+            mSrcRowPtr,
+            mSrcEdgeIndex,
+            mDst,
+            mNodeIsSink,
+            mGradEdgeProb,
+            mGradPPrev,
+            node_offset,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradPNext: cute.Tensor,
+        mPPrev: cute.Tensor,
+        mEdgeProb: cute.Tensor,
+        mSrcRowPtr: cute.Tensor,
+        mSrcEdgeIndex: cute.Tensor,
+        mDst: cute.Tensor,
+        mNodeIsSink: cute.Tensor,
+        mGradEdgeProb: cute.Tensor,
+        mGradPPrev: cute.Tensor,
+        node_offset: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mGradPNext.shape[1])
+            local_src_idx = task_idx // num_heads
+            src_idx = node_offset + local_src_idx
+            head_idx = task_idx - local_src_idx * num_heads
+            acc = Float32.zero
+            if mNodeIsSink[src_idx]:
+                acc = Float32(mGradPNext[src_idx, head_idx])
+            start = Int32(mSrcRowPtr[src_idx])
+            end = Int32(mSrcRowPtr[src_idx + 1])
+            p_prev = Float32(mPPrev[src_idx, head_idx])
+            for ptr in cutlass.range(start, end, unroll=1):
+                edge_idx = Int32(mSrcEdgeIndex[ptr])
+                dst_idx = Int32(mDst[edge_idx])
+                grad_next = Float32(mGradPNext[dst_idx, head_idx])
+                acc += grad_next * Float32(mEdgeProb[edge_idx, head_idx])
+                grad_edge_prob = p_prev * grad_next
+                if cutlass.const_expr(self.accumulate_grad_edge_prob):
+                    grad_edge_prob += Float32(mGradEdgeProb[edge_idx, head_idx])
+                mGradEdgeProb[edge_idx, head_idx] = grad_edge_prob.to(mGradEdgeProb.element_type)
+            mGradPPrev[src_idx, head_idx] = acc.to(mGradPPrev.element_type)
+
+
 def run_arhsa_markov_incoming_step(
     p: torch.Tensor,
     edge_prob: torch.Tensor,
@@ -3540,6 +3885,87 @@ def run_arhsa_markov_incoming_packed_step(
         dst_row_ptr,
         node_is_sink,
         p_next,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return p_next
+
+
+def run_arhsa_markov_incoming_packed_range_step(
+    p: torch.Tensor,
+    incoming_edge_prob: torch.Tensor,
+    incoming_src: torch.Tensor,
+    dst_row_ptr: torch.Tensor,
+    node_is_sink: torch.Tensor,
+    *,
+    node_start: int,
+    node_count: int,
+    carry_sinks: bool = True,
+    p_next: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one packed Markov step over a contiguous destination-node range."""
+    _require_cute_runtime()
+    if p.device.type != "cuda":
+        raise ValueError("p must be a CUDA tensor")
+    if p.ndim != 2:
+        raise ValueError(f"p must have shape [n_nodes, n_heads], got {tuple(p.shape)}")
+    if incoming_edge_prob.ndim != 2 or incoming_edge_prob.shape[1] != p.shape[1]:
+        raise ValueError("incoming_edge_prob must have shape [n_edges, n_heads] with matching head count")
+    if incoming_src.ndim != 1 or incoming_src.shape[0] != incoming_edge_prob.shape[0]:
+        raise ValueError("incoming_src must have shape [n_edges]")
+    node_start = int(node_start)
+    node_count = int(node_count)
+    if node_start < 0 or node_count < 0 or node_start + node_count > int(p.shape[0]):
+        raise ValueError(
+            f"invalid node range start={node_start} count={node_count} for n_nodes={int(p.shape[0])}"
+        )
+    if p_next is None:
+        p_next = torch.empty_like(p)
+    if p_next.shape != p.shape:
+        raise ValueError(f"p_next shape mismatch: {tuple(p_next.shape)} vs {tuple(p.shape)}")
+
+    p = p.contiguous()
+    incoming_edge_prob = incoming_edge_prob.contiguous()
+    incoming_src = incoming_src.to(device=p.device, dtype=torch.int32).contiguous()
+    dst_row_ptr = dst_row_ptr.to(device=p.device, dtype=torch.int32).contiguous()
+    node_is_sink = node_is_sink.to(device=p.device, dtype=torch.bool).contiguous()
+    total_tasks = int(node_count * p.shape[1])
+    if total_tasks == 0:
+        return p_next
+
+    compile_key = (
+        "arhsa_markov_incoming_packed_range_step",
+        p.dtype,
+        incoming_edge_prob.dtype,
+        p.shape[1],
+        torch.cuda.get_device_capability(p.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_markov_incoming_packed_range_step.compile_cache:
+        op = ARHSAMarkovIncomingPackedRangeStepSm100()
+        run_arhsa_markov_incoming_packed_range_step.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(p),
+            to_cute_tensor(incoming_edge_prob),
+            to_cute_tensor(incoming_src, assumed_align=4),
+            to_cute_tensor(dst_row_ptr, assumed_align=4),
+            to_cute_tensor(node_is_sink),
+            to_cute_tensor(p_next),
+            Int32(node_start),
+            Int32(1 if carry_sinks else 0),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_markov_incoming_packed_range_step.compile_cache[compile_key](
+        p,
+        incoming_edge_prob,
+        incoming_src,
+        dst_row_ptr,
+        node_is_sink,
+        p_next,
+        Int32(node_start),
+        Int32(1 if carry_sinks else 0),
         Int32(total_tasks),
         current_stream,
     )
@@ -3762,6 +4188,10 @@ def run_arhsa_leaf_readout(
     readout: torch.Tensor | None = None,
     denom: torch.Tensor | None = None,
     query_warp: bool = False,
+    query_value_pack: bool = False,
+    pack_query_index: torch.Tensor | None = None,
+    pack_value_index: torch.Tensor | None = None,
+    pack_query_value_leaf_entry: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the CuTe direct leaf normalization/readout kernel."""
     _require_cute_runtime()
@@ -3797,6 +4227,63 @@ def run_arhsa_leaf_readout(
         return readout
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if query_value_pack:
+        if value.shape[2] != 64:
+            raise ValueError("query_value_pack readout currently requires head_dim_v=64")
+        if pack_query_index is None or pack_value_index is None or pack_query_value_leaf_entry is None:
+            raise ValueError("query_value_pack readout requires pack_query_index, pack_value_index, and pack_query_value_leaf_entry")
+        pack_query_index = pack_query_index.to(device=p.device, dtype=torch.int32).contiguous()
+        pack_value_index = pack_value_index.to(device=p.device, dtype=torch.int32).contiguous()
+        pack_query_value_leaf_entry = pack_query_value_leaf_entry.to(device=p.device, dtype=torch.int32).contiguous()
+        if pack_query_index.ndim != 2 or pack_query_index.shape[1] != 16:
+            raise ValueError("pack_query_index must have shape [n_packs, 16]")
+        if pack_value_index.shape != (pack_query_index.shape[0], 8):
+            raise ValueError("pack_value_index must have shape [n_packs, 8]")
+        if pack_query_value_leaf_entry.shape != (pack_query_index.shape[0], 16, 8):
+            raise ValueError("pack_query_value_leaf_entry must have shape [n_packs, 16, 8]")
+        pack_tasks = int(pack_query_index.shape[0] * value.shape[1])
+        if pack_tasks == 0:
+            return readout
+        write_denom = denom is not None
+        denom_arg = denom if write_denom else readout
+        compile_key = (
+            "arhsa_leaf_readout_query_value_pack_d64",
+            p.dtype,
+            value.dtype,
+            value.shape[1],
+            write_denom,
+            torch.cuda.get_device_capability(p.device),
+        )
+        if compile_key not in run_arhsa_leaf_readout.compile_cache:
+            op = ARHSALeafReadoutQueryValuePackD64Sm100(write_denom=write_denom)
+            run_arhsa_leaf_readout.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(p),
+                to_cute_tensor(leaf_node_index, assumed_align=4),
+                to_cute_tensor(pack_query_index, assumed_align=4),
+                to_cute_tensor(pack_value_index, assumed_align=4),
+                to_cute_tensor(pack_query_value_leaf_entry, assumed_align=4),
+                to_cute_tensor(value),
+                to_cute_tensor(readout),
+                to_cute_tensor(denom_arg),
+                Int32(pack_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_leaf_readout.compile_cache[compile_key](
+            p,
+            leaf_node_index,
+            pack_query_index,
+            pack_value_index,
+            pack_query_value_leaf_entry,
+            value,
+            readout,
+            denom_arg,
+            Int32(pack_tasks),
+            current_stream,
+        )
+        return readout
+
     if query_warp:
         warp_tasks = int(n_queries * value.shape[1])
         write_denom = denom is not None
@@ -5984,6 +6471,105 @@ def run_arhsa_markov_backward_step(
     return grad_p_prev
 
 
+def run_arhsa_markov_backward_range_step(
+    grad_p_next: torch.Tensor,
+    p_prev: torch.Tensor,
+    edge_prob: torch.Tensor,
+    src_row_ptr: torch.Tensor,
+    src_edge_index: torch.Tensor,
+    dst: torch.Tensor,
+    node_is_sink: torch.Tensor,
+    grad_edge_prob: torch.Tensor,
+    *,
+    node_start: int,
+    node_count: int,
+    grad_p_prev: torch.Tensor | None = None,
+    accumulate_grad_edge_prob: bool = True,
+) -> torch.Tensor:
+    """Run one reverse Markov step over a contiguous source-node range."""
+    _require_cute_runtime()
+    if grad_p_next.device.type != "cuda":
+        raise ValueError("grad_p_next must be a CUDA tensor")
+    if grad_p_next.ndim != 2:
+        raise ValueError(f"grad_p_next must have shape [n_nodes, n_heads], got {tuple(grad_p_next.shape)}")
+    if p_prev.shape != grad_p_next.shape:
+        raise ValueError(f"p_prev shape mismatch: {tuple(p_prev.shape)} vs {tuple(grad_p_next.shape)}")
+    if edge_prob.ndim != 2 or edge_prob.shape[1] != grad_p_next.shape[1]:
+        raise ValueError("edge_prob must have shape [n_edges, n_heads] with matching head count")
+    if grad_edge_prob.shape != edge_prob.shape:
+        raise ValueError(f"grad_edge_prob shape mismatch: {tuple(grad_edge_prob.shape)} vs {tuple(edge_prob.shape)}")
+    node_start = int(node_start)
+    node_count = int(node_count)
+    if node_start < 0 or node_count < 0 or node_start + node_count > int(grad_p_next.shape[0]):
+        raise ValueError(
+            f"invalid node range start={node_start} count={node_count} for n_nodes={int(grad_p_next.shape[0])}"
+        )
+    if grad_p_prev is None:
+        grad_p_prev = torch.empty_like(grad_p_next)
+    if grad_p_prev.shape != grad_p_next.shape:
+        raise ValueError(f"grad_p_prev shape mismatch: {tuple(grad_p_prev.shape)} vs {tuple(grad_p_next.shape)}")
+
+    grad_p_next = grad_p_next.contiguous()
+    p_prev = p_prev.contiguous()
+    edge_prob = edge_prob.contiguous()
+    grad_edge_prob = grad_edge_prob.contiguous()
+    src_row_ptr = src_row_ptr.to(device=grad_p_next.device, dtype=torch.int32).contiguous()
+    src_edge_index = src_edge_index.to(device=grad_p_next.device, dtype=torch.int32).contiguous()
+    dst = dst.to(device=grad_p_next.device, dtype=torch.int32).contiguous()
+    node_is_sink = node_is_sink.to(device=grad_p_next.device, dtype=torch.bool).contiguous()
+    total_tasks = int(node_count * grad_p_next.shape[1])
+    if total_tasks == 0:
+        return grad_p_prev
+
+    compile_key = (
+        "arhsa_markov_backward_range_step",
+        grad_p_next.dtype,
+        p_prev.dtype,
+        edge_prob.dtype,
+        grad_edge_prob.dtype,
+        grad_p_prev.dtype,
+        grad_p_next.shape[1],
+        bool(accumulate_grad_edge_prob),
+        torch.cuda.get_device_capability(grad_p_next.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_markov_backward_range_step.compile_cache:
+        op = ARHSAMarkovBackwardRangeStepSm100(
+            accumulate_grad_edge_prob=bool(accumulate_grad_edge_prob),
+        )
+        run_arhsa_markov_backward_range_step.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_p_next),
+            to_cute_tensor(p_prev),
+            to_cute_tensor(edge_prob),
+            to_cute_tensor(src_row_ptr, assumed_align=4),
+            to_cute_tensor(src_edge_index, assumed_align=4),
+            to_cute_tensor(dst, assumed_align=4),
+            to_cute_tensor(node_is_sink),
+            to_cute_tensor(grad_edge_prob),
+            to_cute_tensor(grad_p_prev),
+            Int32(node_start),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_markov_backward_range_step.compile_cache[compile_key](
+        grad_p_next,
+        p_prev,
+        edge_prob,
+        src_row_ptr,
+        src_edge_index,
+        dst,
+        node_is_sink,
+        grad_edge_prob,
+        grad_p_prev,
+        Int32(node_start),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_p_prev
+
+
 def run_arhsa_markov_walk_fixed_iters(
     p0: torch.Tensor,
     edge_prob: torch.Tensor,
@@ -6201,6 +6787,10 @@ def run_arhsa_walk_readout_fixed_iters(
     p_scratch_b: torch.Tensor | None = None,
     readout: torch.Tensor | None = None,
     query_warp_readout: bool = False,
+    query_value_pack_readout: bool = False,
+    pack_query_index: torch.Tensor | None = None,
+    pack_value_index: torch.Tensor | None = None,
+    pack_query_value_leaf_entry: torch.Tensor | None = None,
     incoming_src: torch.Tensor | None = None,
     incoming_edge_prob: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
@@ -6242,6 +6832,10 @@ def run_arhsa_walk_readout_fixed_iters(
         n_queries=n_queries,
         readout=readout,
         query_warp=query_warp_readout,
+        query_value_pack=query_value_pack_readout,
+        pack_query_index=pack_query_index,
+        pack_value_index=pack_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
     )
     leaf_attn = None
     if return_leaf_attn:
@@ -6275,6 +6869,10 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
     p_scratch_b: torch.Tensor | None = None,
     readout: torch.Tensor | None = None,
     query_warp_readout: bool = False,
+    query_value_pack_readout: bool = False,
+    pack_query_index: torch.Tensor | None = None,
+    pack_value_index: torch.Tensor | None = None,
+    pack_query_value_leaf_entry: torch.Tensor | None = None,
     incoming_packed_step: bool = False,
     incoming_src: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
@@ -6321,6 +6919,10 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
         p_scratch_b=p_scratch_b,
         readout=readout,
         query_warp_readout=query_warp_readout,
+        query_value_pack_readout=query_value_pack_readout,
+        pack_query_index=pack_query_index,
+        pack_value_index=pack_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
         incoming_src=incoming_src if incoming_packed_step else None,
         incoming_edge_prob=incoming_edge_prob,
     )
@@ -6479,6 +7081,8 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     edge_prob: torch.Tensor | None = None,
     incoming_edge_prob: torch.Tensor | None = None,
     p_history: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+    level_bounds: torch.Tensor | None = None,
+    level_range_kernels: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CuTe-backed backward for fixed-iteration ARHSA direct-PV readout."""
     _require_cute_runtime()
@@ -6498,6 +7102,11 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     if n_iters < 0:
         raise ValueError("n_iters must be >= 0")
     n_nodes = int(p0.shape[0])
+    if level_range_kernels and not incoming_packed_step:
+        raise ValueError("level_range_kernels requires incoming_packed_step")
+    level_bounds_list = _level_bounds_as_ints(level_bounds) if level_range_kernels else []
+    if level_range_kernels and level_bounds_list[-1] != n_nodes:
+        raise ValueError(f"level_bounds must end at n_nodes={n_nodes}, got {level_bounds_list[-1]}")
 
     if (src_row_ptr is None) != (src_edge_index is None):
         raise ValueError("src_row_ptr and src_edge_index must be supplied together")
@@ -6561,14 +7170,28 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
         for iter_idx in range(n_iters):
             p_next = torch.empty_like(p0)
             if incoming_packed_step:
-                run_arhsa_markov_incoming_packed_step(
-                    p_history[-1],
-                    incoming_edge_prob,
-                    incoming_src,
-                    dst_row_ptr,
-                    node_is_sink,
-                    p_next,
-                )
+                if level_range_kernels:
+                    node_start, node_count = _level_forward_dst_range(level_bounds_list, iter_idx)
+                    run_arhsa_markov_incoming_packed_range_step(
+                        p_history[-1],
+                        incoming_edge_prob,
+                        incoming_src,
+                        dst_row_ptr,
+                        node_is_sink,
+                        node_start=node_start,
+                        node_count=node_count,
+                        carry_sinks=_level_forward_carry_sinks(level_bounds_list, iter_idx),
+                        p_next=p_next,
+                    )
+                else:
+                    run_arhsa_markov_incoming_packed_step(
+                        p_history[-1],
+                        incoming_edge_prob,
+                        incoming_src,
+                        dst_row_ptr,
+                        node_is_sink,
+                        p_next,
+                    )
             else:
                 run_arhsa_markov_incoming_step(
                     p_history[-1],
@@ -6621,20 +7244,44 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     grad_scratch = torch.empty_like(p0)
     dst = dst.to(device=p0.device, dtype=torch.int32).contiguous()
     for iter_idx in range(n_iters - 1, -1, -1):
-        run_arhsa_markov_backward_step(
-            grad_next,
-            p_history[iter_idx],
-            edge_prob,
-            src_row_ptr,
-            src_edge_index,
-            dst,
-            node_is_sink,
-            grad_edge_prob,
-            grad_scratch,
-            accumulate_grad_edge_prob=(iter_idx != n_iters - 1),
-        )
+        if level_range_kernels:
+            if n_iters < len(level_bounds_list) - 1 and iter_idx == n_iters - 1:
+                grad_edge_prob.zero_()
+            node_start, node_count = _level_backward_src_range(level_bounds_list, iter_idx)
+            run_arhsa_markov_backward_range_step(
+                grad_next,
+                p_history[iter_idx],
+                edge_prob,
+                src_row_ptr,
+                src_edge_index,
+                dst,
+                node_is_sink,
+                grad_edge_prob,
+                node_start=node_start,
+                node_count=node_count,
+                grad_p_prev=grad_scratch,
+                accumulate_grad_edge_prob=False,
+            )
+        else:
+            run_arhsa_markov_backward_step(
+                grad_next,
+                p_history[iter_idx],
+                edge_prob,
+                src_row_ptr,
+                src_edge_index,
+                dst,
+                node_is_sink,
+                grad_edge_prob,
+                grad_scratch,
+                accumulate_grad_edge_prob=(iter_idx != n_iters - 1),
+            )
         grad_next, grad_scratch = grad_scratch, grad_next
-    grad_p0 = grad_next
+    if level_range_kernels:
+        node_start, node_count = _level_node_range(level_bounds_list, 0)
+        grad_p0 = torch.zeros_like(grad_next)
+        grad_p0[node_start : node_start + node_count].copy_(grad_next[node_start : node_start + node_count])
+    else:
+        grad_p0 = grad_next
     grad_edge_scores = run_arhsa_outgoing_softmax_backward(
         edge_prob,
         grad_edge_prob,
@@ -6674,6 +7321,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         pack_query_index: torch.Tensor,
         pack_query_value_index: torch.Tensor,
         pack_query_value_leaf_entry: torch.Tensor,
+        level_bounds: torch.Tensor,
         n_queries: int,
         n_iters: int,
         use_cute_softmax: bool,
@@ -6681,8 +7329,10 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         leaf_major_stats: bool,
         query_warp_stats: bool,
         query_warp_readout: bool,
+        query_value_pack_readout: bool,
         incoming_packed_step: bool,
         save_forward_history: bool,
+        level_range_kernels: bool,
         query_warp_scatter: bool,
         query_warp_fused: bool,
         tensor_core_stats: bool,
@@ -6696,8 +7346,10 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.max_leaves_per_query = max_leaves_per_query
         ctx.leaf_major_stats = bool(leaf_major_stats)
         ctx.query_warp_stats = bool(query_warp_stats)
+        ctx.query_value_pack_readout = bool(query_value_pack_readout)
         ctx.incoming_packed_step = bool(incoming_packed_step)
-        ctx.save_forward_history = bool(save_forward_history)
+        ctx.level_range_kernels = bool(level_range_kernels)
+        ctx.save_forward_history = bool(save_forward_history) or ctx.level_range_kernels
         ctx.query_warp_scatter = bool(query_warp_scatter)
         ctx.query_warp_fused = bool(query_warp_fused)
         ctx.tensor_core_stats = bool(tensor_core_stats)
@@ -6705,6 +7357,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.tensor_core_packed = bool(tensor_core_packed)
         ctx.tensor_core_query_value_packed = bool(tensor_core_query_value_packed)
         ctx.query_value_pack_scatter = bool(query_value_pack_scatter)
+        if ctx.level_range_kernels and not ctx.incoming_packed_step:
+            raise ValueError("level_range_kernels requires incoming_packed_step")
+        level_bounds_list = _level_bounds_as_ints(level_bounds) if ctx.level_range_kernels else []
+        if ctx.level_range_kernels and level_bounds_list[-1] != int(p0.shape[0]):
+            raise ValueError(f"level_bounds must end at n_nodes={int(p0.shape[0])}, got {level_bounds_list[-1]}")
         with torch.no_grad():
             p_history: list[torch.Tensor] | None = None
             incoming_edge_prob = None
@@ -6730,17 +7387,31 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     incoming_edge_prob = run_arhsa_gather_edge_prob_by_index(edge_prob, dst_edge_index)
             if ctx.save_forward_history:
                 p_history = [p0]
-                for _ in range(ctx.n_iters):
+                for iter_idx in range(ctx.n_iters):
                     p_next = torch.empty_like(p0)
                     if ctx.incoming_packed_step:
-                        run_arhsa_markov_incoming_packed_step(
-                            p_history[-1],
-                            incoming_edge_prob,
-                            incoming_src,
-                            dst_row_ptr,
-                            node_is_sink,
-                            p_next,
-                        )
+                        if ctx.level_range_kernels:
+                            node_start, node_count = _level_forward_dst_range(level_bounds_list, iter_idx)
+                            run_arhsa_markov_incoming_packed_range_step(
+                                p_history[-1],
+                                incoming_edge_prob,
+                                incoming_src,
+                                dst_row_ptr,
+                                node_is_sink,
+                                node_start=node_start,
+                                node_count=node_count,
+                                carry_sinks=_level_forward_carry_sinks(level_bounds_list, iter_idx),
+                                p_next=p_next,
+                            )
+                        else:
+                            run_arhsa_markov_incoming_packed_step(
+                                p_history[-1],
+                                incoming_edge_prob,
+                                incoming_src,
+                                dst_row_ptr,
+                                node_is_sink,
+                                p_next,
+                            )
                     else:
                         run_arhsa_markov_incoming_step(
                             p_history[-1],
@@ -6761,6 +7432,41 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     value,
                     n_queries=ctx.n_queries,
                     query_warp=bool(query_warp_readout),
+                    query_value_pack=ctx.query_value_pack_readout,
+                    pack_query_index=pack_query_index,
+                    pack_value_index=pack_query_value_index,
+                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                )
+            elif ctx.level_range_kernels:
+                p_history_local = [p0]
+                for iter_idx in range(ctx.n_iters):
+                    p_next = torch.empty_like(p0)
+                    node_start, node_count = _level_forward_dst_range(level_bounds_list, iter_idx)
+                    run_arhsa_markov_incoming_packed_range_step(
+                        p_history_local[-1],
+                        incoming_edge_prob,
+                        incoming_src,
+                        dst_row_ptr,
+                        node_is_sink,
+                        node_start=node_start,
+                        node_count=node_count,
+                        carry_sinks=_level_forward_carry_sinks(level_bounds_list, iter_idx),
+                        p_next=p_next,
+                    )
+                    p_history_local.append(p_next)
+                readout = run_arhsa_leaf_readout(
+                    p_history_local[-1],
+                    leaf_node_index,
+                    leaf_value_index,
+                    query_leaf_row_ptr,
+                    query_leaf_entry_index,
+                    value,
+                    n_queries=ctx.n_queries,
+                    query_warp=bool(query_warp_readout),
+                    query_value_pack=ctx.query_value_pack_readout,
+                    pack_query_index=pack_query_index,
+                    pack_value_index=pack_query_value_index,
+                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                 )
             else:
                 readout, _, _ = run_arhsa_walk_readout_fixed_iters(
@@ -6780,6 +7486,10 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     query_leaf_entry_index=query_leaf_entry_index,
                     return_leaf_attn=False,
                     query_warp_readout=bool(query_warp_readout),
+                    query_value_pack_readout=ctx.query_value_pack_readout,
+                    pack_query_index=pack_query_index,
+                    pack_value_index=pack_query_value_index,
+                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                     incoming_src=incoming_src if ctx.incoming_packed_step else None,
                     incoming_edge_prob=incoming_edge_prob,
                 )
@@ -6807,6 +7517,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_index,
             pack_query_value_index,
             pack_query_value_leaf_entry,
+            level_bounds,
         ]
         if ctx.save_forward_history:
             if p_history is None:
@@ -6847,12 +7558,13 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_index,
             pack_query_value_index,
             pack_query_value_leaf_entry,
-        ) = ctx.saved_tensors[:23]
+            level_bounds,
+        ) = ctx.saved_tensors[:24]
         cached_edge_prob = None
         cached_incoming_edge_prob = None
         cached_p_history = None
         if ctx.save_forward_history:
-            cached = ctx.saved_tensors[23:]
+            cached = ctx.saved_tensors[24:]
             if len(cached) != ctx.n_iters + 2:
                 raise RuntimeError(
                     f"saved forward history has {len(cached)} tensors; expected {ctx.n_iters + 2}"
@@ -6891,6 +7603,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 edge_prob=cached_edge_prob,
                 incoming_edge_prob=cached_incoming_edge_prob,
                 p_history=cached_p_history,
+                level_bounds=level_bounds if ctx.level_range_kernels else None,
+                level_range_kernels=ctx.level_range_kernels,
                 query_leaf_row_ptr=query_leaf_row_ptr,
                 query_leaf_entry_index=query_leaf_entry_index,
                 max_leaves_per_query=ctx.max_leaves_per_query,
@@ -6931,7 +7645,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             grad_edge_scores = None
         if not ctx.needs_input_grad[8]:
             grad_value = None
-        return (grad_p0, grad_edge_scores, None, None, None, None, None, None, grad_value) + (None,) * 30
+        grads = [None] * len(ctx.needs_input_grad)
+        grads[0] = grad_p0
+        grads[1] = grad_edge_scores
+        grads[8] = grad_value
+        return tuple(grads)
 
 
 def arhsa_walk_readout_from_scores_fixed_iters_autograd(
@@ -6958,8 +7676,11 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     leaf_major_stats: bool = False,
     query_warp_stats: bool = False,
     query_warp_readout: bool = False,
+    query_value_pack_readout: bool = False,
     incoming_packed_step: bool = False,
     save_forward_history: bool = False,
+    level_bounds: torch.Tensor | list[int] | tuple[int, ...] | None = None,
+    level_range_kernels: bool = False,
     incoming_src: torch.Tensor | None = None,
     edge_incoming_index: torch.Tensor | None = None,
     query_warp_scatter: bool = False,
@@ -7012,6 +7733,20 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         pack_query_value_index = leaf_value_index.new_empty((0, 8), dtype=torch.int32)
     if pack_query_value_leaf_entry is None:
         pack_query_value_leaf_entry = leaf_value_index.new_empty((0, 16, 8), dtype=torch.int32)
+    if level_range_kernels:
+        if not incoming_packed_step:
+            raise ValueError("level_range_kernels requires incoming_packed_step")
+        if level_bounds is None:
+            raise ValueError("level_bounds must be supplied when level_range_kernels=True")
+        if torch.is_tensor(level_bounds):
+            level_bounds_tensor = level_bounds.detach().to(device="cpu", dtype=torch.int32).contiguous()
+        else:
+            level_bounds_tensor = torch.tensor(list(level_bounds), dtype=torch.int32)
+        level_bounds_list = _level_bounds_as_ints(level_bounds_tensor)
+        if level_bounds_list[-1] != n_nodes:
+            raise ValueError(f"level_bounds must end at n_nodes={n_nodes}, got {level_bounds_list[-1]}")
+    else:
+        level_bounds_tensor = torch.empty((0,), dtype=torch.int32)
     if incoming_packed_step:
         if incoming_src is None:
             incoming_src = src.to(device=p0.device, dtype=torch.int32)[dst_edge_index.to(dtype=torch.long)].contiguous()
@@ -7054,6 +7789,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         pack_query_index,
         pack_query_value_index,
         pack_query_value_leaf_entry,
+        level_bounds_tensor,
         int(n_queries),
         int(n_iters),
         bool(use_cute_softmax),
@@ -7061,8 +7797,10 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         bool(leaf_major_stats),
         bool(query_warp_stats),
         bool(query_warp_readout),
+        bool(query_value_pack_readout),
         bool(incoming_packed_step),
         bool(save_forward_history),
+        bool(level_range_kernels),
         bool(query_warp_scatter),
         bool(query_warp_fused),
         bool(tensor_core_stats),
@@ -7075,7 +7813,11 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
 
 run_arhsa_markov_incoming_step.compile_cache = get_jit_cache("arhsa_markov_incoming_step")
 run_arhsa_markov_incoming_packed_step.compile_cache = get_jit_cache("arhsa_markov_incoming_packed_step")
+run_arhsa_markov_incoming_packed_range_step.compile_cache = get_jit_cache(
+    "arhsa_markov_incoming_packed_range_step"
+)
 run_arhsa_markov_backward_step.compile_cache = get_jit_cache("arhsa_markov_backward_step")
+run_arhsa_markov_backward_range_step.compile_cache = get_jit_cache("arhsa_markov_backward_range_step")
 run_arhsa_gather_edge_prob_by_index.compile_cache = get_jit_cache("arhsa_gather_edge_prob_by_index")
 run_arhsa_outgoing_softmax.compile_cache = get_jit_cache("arhsa_outgoing_softmax")
 run_arhsa_outgoing_softmax_with_incoming.compile_cache = get_jit_cache("arhsa_outgoing_softmax_with_incoming")

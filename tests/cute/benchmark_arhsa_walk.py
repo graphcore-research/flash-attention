@@ -21,8 +21,10 @@ from flash_attn.cute.arhsa_walk_sm100 import (
     run_arhsa_leaf_readout,
     run_arhsa_leaf_readout_backward,
     run_arhsa_markov_backward_step,
+    run_arhsa_markov_backward_range_step,
     run_arhsa_markov_incoming_step,
     run_arhsa_markov_incoming_packed_step,
+    run_arhsa_markov_incoming_packed_range_step,
     run_arhsa_markov_walk_fixed_iters,
     run_arhsa_outgoing_softmax,
     run_arhsa_outgoing_softmax_with_incoming,
@@ -281,11 +283,22 @@ def _make_case(args):
         leaf_value_index = (query_block * args.leaves_per_query + leaf_slot) % args.n_nodes
     else:
         raise ValueError(f"unknown leaf value pattern: {args.leaf_value_pattern}")
+    if args.compact_value_rows:
+        if leaf_value_index.numel() == 0:
+            n_value_rows = 0
+        elif args.leaf_value_pattern == "shared-block16":
+            n_value_rows = int(leaf_value_index.max().item()) + 1
+        else:
+            _, inverse = torch.unique(leaf_value_index, sorted=True, return_inverse=True)
+            leaf_value_index = inverse
+            n_value_rows = int(leaf_value_index.max().item()) + 1
+    else:
+        n_value_rows = args.n_nodes
     leaf_query_index_i32 = leaf_query_index.to(dtype=torch.int32)
     leaf_node_index_i32 = leaf_node_index.to(dtype=torch.int32)
     leaf_value_index_i32 = leaf_value_index.to(dtype=torch.int32)
     value = torch.randn(
-        args.n_nodes,
+        n_value_rows,
         args.n_heads,
         args.head_dim_v,
         device=device,
@@ -377,6 +390,21 @@ def _check(case, args):
         torch.testing.assert_close(incoming_edge_prob, case["edge_prob"][case["dst_edge_index"].long()], atol=0, rtol=0)
         torch.testing.assert_close(got_packed_step, expected_step, atol=atol, rtol=rtol)
 
+    readout_pack_kwargs = {}
+    if args.query_value_pack_readout:
+        pack_query_index, pack_value_index, pack_query_value_leaf_entry = build_query_value_packs(
+            case["leaf_query_index_i32"],
+            case["leaf_value_index_i32"],
+            n_queries=args.n_queries,
+            packing_strategy=args.tensor_core_qv_pack_strategy,
+        )
+        readout_pack_kwargs = {
+            "query_value_pack": True,
+            "pack_query_index": pack_query_index,
+            "pack_value_index": pack_value_index,
+            "pack_query_value_leaf_entry": pack_query_value_leaf_entry,
+        }
+
     readout = run_arhsa_leaf_readout(
         got_step,
         case["leaf_node_index_i32"],
@@ -386,6 +414,7 @@ def _check(case, args):
         case["value"],
         n_queries=args.n_queries,
         query_warp=args.query_warp_readout,
+        **readout_pack_kwargs,
     )
     expected_readout, _ = readout_arhsa_leaf_attention(
         got_step,
@@ -472,6 +501,8 @@ def _forward_backward_numeric_summary(
         query_warp_readout=args.query_warp_readout,
         incoming_packed_step=args.incoming_packed_step,
         save_forward_history=args.save_forward_history,
+        level_bounds=case["level_bounds"],
+        level_range_kernels=args.level_range_kernels,
         incoming_src=case["incoming_src_i32"],
         edge_incoming_index=case["edge_incoming_index"],
         query_warp_scatter=args.query_warp_scatter,
@@ -510,7 +541,16 @@ def _forward_backward_numeric_summary(
 
     summary = {}
     summary.update(_tensor_delta("numeric_readout", readout_cute, readout_ref))
-    summary.update(_tensor_delta("numeric_grad_p0", p0_cute.grad, p0_ref.grad))
+    if args.level_range_kernels and case["level_bounds"] is not None:
+        p0_ref_grad = p0_ref.grad.clone()
+        p0_cute_grad = p0_cute.grad.clone()
+        level0_end = int(case["level_bounds"][1])
+        p0_ref_grad[level0_end:] = 0
+        p0_cute_grad[level0_end:] = 0
+    else:
+        p0_ref_grad = p0_ref.grad
+        p0_cute_grad = p0_cute.grad
+    summary.update(_tensor_delta("numeric_grad_p0", p0_cute_grad, p0_ref_grad))
     summary.update(_tensor_delta("numeric_grad_edge_scores", edge_scores_cute.grad, edge_scores_ref.grad))
     summary.update(_tensor_delta("numeric_grad_value", value_cute.grad, value_ref.grad))
     return summary
@@ -682,10 +722,20 @@ def main():
         help="Number of structured graph levels. 0 means n_iters + 1 for level_dag/structured_walk.",
     )
     parser.add_argument(
+        "--level-range-kernels",
+        action="store_true",
+        help="For level_dag, use range-limited Markov forward/backward kernels over the active level only.",
+    )
+    parser.add_argument(
         "--leaf-value-pattern",
         choices=("random", "shared-block16"),
         default="random",
         help="Synthetic leaf-value layout; shared-block16 makes each 16-query block share value columns.",
+    )
+    parser.add_argument(
+        "--compact-value-rows",
+        action="store_true",
+        help="Allocate/remap value rows to only rows referenced by leaf_value_index.",
     )
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--no-memory", action="store_true")
@@ -723,6 +773,11 @@ def main():
         "--query-warp-readout",
         action="store_true",
         help="Use one warp per query/head for the readout forward reduction.",
+    )
+    parser.add_argument(
+        "--query-value-pack-readout",
+        action="store_true",
+        help="Use qv-pack-owned D=64 readout forward when query/value packs are dense.",
     )
     parser.add_argument(
         "--incoming-packed-step",
@@ -845,6 +900,10 @@ def main():
         raise ValueError("--graph-levels must be >= 0")
     if args.graph_mode != "random" and args.graph_levels == 1:
         raise ValueError("structured graph modes require --graph-levels 0 or >= 2")
+    if args.level_range_kernels and args.graph_mode != "level_dag":
+        raise ValueError("--level-range-kernels currently requires --graph-mode level_dag")
+    if args.level_range_kernels and not args.incoming_packed_step:
+        raise ValueError("--level-range-kernels currently requires --incoming-packed-step")
     if args.fa4_n_heads is None:
         args.fa4_n_heads = args.n_heads
     if args.fa4_head_dim is None:
@@ -860,6 +919,8 @@ def main():
             raise ValueError("FA4 baseline currently requires float16/bfloat16-style inputs; use bfloat16")
     if args.auto_readout_bwd and args.head_dim_v != 64:
         raise ValueError("--auto-readout-bwd currently requires --head-dim-v 64")
+    if args.query_value_pack_readout and args.head_dim_v != 64:
+        raise ValueError("--query-value-pack-readout currently requires --head-dim-v 64")
     if args.auto_readout_bwd and any(
         (
             args.fused_readout_bwd,
@@ -1004,8 +1065,42 @@ def main():
             case["dst_edge_index"],
             torch.empty_like(case["edge_prob"]),
         )
+    use_level_range_kernels = bool(args.level_range_kernels)
+    level_bounds = case["level_bounds"] or []
 
-    def _markov_step(source_edge_prob, incoming_edge_prob, p_in, p_out):
+    def _level_range(level_idx: int) -> tuple[int, int]:
+        level_idx = max(0, min(int(level_idx), len(level_bounds) - 2))
+        start = int(level_bounds[level_idx])
+        end = int(level_bounds[level_idx + 1])
+        return start, end - start
+
+    def _level_idx(level_idx: int) -> int:
+        return max(0, min(int(level_idx), len(level_bounds) - 2))
+
+    def _forward_dst_range(iter_idx: int) -> tuple[int, int]:
+        return _level_range(int(iter_idx) + 1)
+
+    def _forward_carry_sinks(iter_idx: int) -> bool:
+        return _level_idx(int(iter_idx) + 1) == _level_idx(iter_idx)
+
+    def _backward_src_range(iter_idx: int) -> tuple[int, int]:
+        return _level_range(int(iter_idx))
+
+    def _markov_step(source_edge_prob, incoming_edge_prob, p_in, p_out, *, iter_idx: int | None = None):
+        if use_level_range_kernels and iter_idx is not None:
+            node_start, node_count = _forward_dst_range(iter_idx)
+            run_arhsa_markov_incoming_packed_range_step(
+                p_in,
+                incoming_edge_prob,
+                case["incoming_src_i32"],
+                case["dst_row_ptr"],
+                case["node_is_sink"],
+                node_start=node_start,
+                node_count=node_count,
+                carry_sinks=_forward_carry_sinks(iter_idx),
+                p_next=p_out,
+            )
+            return
         if args.incoming_packed_step:
             run_arhsa_markov_incoming_packed_step(
                 p_in,
@@ -1042,13 +1137,12 @@ def main():
         p_cur = case["p0"]
         for iter_idx in range(args.n_iters):
             p_out = scratch_a if iter_idx % 2 == 0 else scratch_b
-            run_arhsa_markov_incoming_packed_step(
-                p_cur,
+            _markov_step(
+                source_edge_prob,
                 incoming_edge_prob,
-                case["incoming_src_i32"],
-                case["dst_row_ptr"],
-                case["node_is_sink"],
+                p_cur,
                 p_out,
+                iter_idx=iter_idx,
             )
             p_cur = p_out
         return p_cur
@@ -1098,7 +1192,7 @@ def main():
         }
     auto_selected_readout_bwd = "explicit"
     tc_qv_output_util = 0.0
-    if args.tensor_core_query_value_packed_bwd or args.auto_readout_bwd:
+    if args.query_value_pack_readout or args.tensor_core_query_value_packed_bwd or args.auto_readout_bwd:
         tc_qv_pack_query_index, tc_qv_pack_value_index, tc_qv_pack_leaf_entry = build_query_value_packs(
             case["leaf_query_index_i32"],
             case["leaf_value_index_i32"],
@@ -1123,11 +1217,26 @@ def main():
     if args.auto_readout_bwd:
         if tc_qv_output_util >= float(args.auto_qv_output_util_threshold):
             args.tensor_core_query_value_packed_bwd = True
-            args.query_warp_scatter = True
-            auto_selected_readout_bwd = "tensor_core_query_value_packed"
+            if args.leaves_per_query <= 8:
+                args.tensor_core_qv_pack_scatter_bwd = True
+                auto_selected_readout_bwd = "tensor_core_query_value_packed_pack_scatter"
+            else:
+                args.query_warp_scatter = True
+                auto_selected_readout_bwd = "tensor_core_query_value_packed_query_warp_scatter"
         else:
             args.query_warp_fused_bwd = True
             auto_selected_readout_bwd = "query_warp_fused"
+
+    readout_pack_kwargs = {}
+    if args.query_value_pack_readout:
+        if tc_qv_pack_query_index is None or tc_qv_pack_value_index is None or tc_qv_pack_leaf_entry is None:
+            raise RuntimeError("query/value readout packs were not built")
+        readout_pack_kwargs = {
+            "query_value_pack": True,
+            "pack_query_index": tc_qv_pack_query_index,
+            "pack_value_index": tc_qv_pack_value_index,
+            "pack_query_value_leaf_entry": tc_qv_pack_leaf_entry,
+        }
 
     def _pack_leaf_values():
         run_arhsa_pack_leaf_values(
@@ -1162,8 +1271,11 @@ def main():
             leaf_major_stats=args.leaf_major_stats,
             query_warp_stats=args.query_warp_stats,
             query_warp_readout=args.query_warp_readout,
+            query_value_pack_readout=args.query_value_pack_readout,
             incoming_packed_step=args.incoming_packed_step,
             save_forward_history=args.save_forward_history,
+            level_bounds=case["level_bounds"],
+            level_range_kernels=args.level_range_kernels,
             incoming_src=case["incoming_src_i32"],
             edge_incoming_index=case["edge_incoming_index"],
             query_warp_scatter=args.query_warp_scatter,
@@ -1190,6 +1302,7 @@ def main():
                 edge_prob_incoming,
                 p_history[iter_idx],
                 p_history[iter_idx + 1],
+                iter_idx=iter_idx,
             )
         run_arhsa_leaf_readout(
             p_history[-1],
@@ -1202,6 +1315,7 @@ def main():
             readout=readout,
             denom=readout_bwd_denom if args.reuse_forward_denom else None,
             query_warp=args.query_warp_readout,
+            **readout_pack_kwargs,
         )
         if args.pack_leaf_values:
             _pack_leaf_values()
@@ -1246,18 +1360,37 @@ def main():
         grad_next = grad_p_final
         grad_scratch = grad_p_scratch
         for iter_idx in range(args.n_iters - 1, -1, -1):
-            run_arhsa_markov_backward_step(
-                grad_next,
-                p_history[iter_idx],
-                edge_prob,
-                case["src_row_ptr"],
-                case["src_edge_index"],
-                case["dst_i32"],
-                case["node_is_sink"],
-                grad_edge_prob,
-                grad_scratch,
-                accumulate_grad_edge_prob=(iter_idx != args.n_iters - 1),
-            )
+            if use_level_range_kernels:
+                if args.n_iters < len(level_bounds) - 1 and iter_idx == args.n_iters - 1:
+                    grad_edge_prob.zero_()
+                node_start, node_count = _backward_src_range(iter_idx)
+                run_arhsa_markov_backward_range_step(
+                    grad_next,
+                    p_history[iter_idx],
+                    edge_prob,
+                    case["src_row_ptr"],
+                    case["src_edge_index"],
+                    case["dst_i32"],
+                    case["node_is_sink"],
+                    grad_edge_prob,
+                    node_start=node_start,
+                    node_count=node_count,
+                    grad_p_prev=grad_scratch,
+                    accumulate_grad_edge_prob=False,
+                )
+            else:
+                run_arhsa_markov_backward_step(
+                    grad_next,
+                    p_history[iter_idx],
+                    edge_prob,
+                    case["src_row_ptr"],
+                    case["src_edge_index"],
+                    case["dst_i32"],
+                    case["node_is_sink"],
+                    grad_edge_prob,
+                    grad_scratch,
+                    accumulate_grad_edge_prob=(iter_idx != args.n_iters - 1),
+                )
             grad_next, grad_scratch = grad_scratch, grad_next
         run_arhsa_outgoing_softmax_backward(
             edge_prob,
@@ -1302,6 +1435,7 @@ def main():
                 readout=readout,
                 denom=readout_bwd_denom,
                 query_warp=args.query_warp_readout,
+                **readout_pack_kwargs,
             )
         run_arhsa_leaf_readout_backward(
             p_readout,
@@ -1358,6 +1492,7 @@ def main():
             n_queries=args.n_queries,
             readout=readout,
             query_warp=args.query_warp_readout,
+            **readout_pack_kwargs,
         )
 
     def _walk_readout_hot():
@@ -1377,6 +1512,7 @@ def main():
             n_queries=args.n_queries,
             readout=readout,
             query_warp=args.query_warp_readout,
+            **readout_pack_kwargs,
         )
 
     profile_targets = {
@@ -1430,6 +1566,7 @@ def main():
                 case_edge_prob_incoming,
                 case["p0"],
                 p_next,
+                iter_idx=0,
             ),
             iters=args.iters,
             warmup=args.warmup,
@@ -1466,6 +1603,7 @@ def main():
                 n_queries=args.n_queries,
                 readout=readout,
                 query_warp=args.query_warp_readout,
+                **readout_pack_kwargs,
             ),
             iters=args.iters,
             warmup=args.warmup,
@@ -1606,10 +1744,13 @@ def main():
             "graph_levels": (
                 len(case["level_bounds"]) - 1 if case["level_bounds"] is not None else 0
             ),
+            "level_range_kernels": args.level_range_kernels,
             "n_heads": args.n_heads,
             "n_queries": args.n_queries,
             "leaf_entries": args.n_queries * args.leaves_per_query,
             "head_dim_v": args.head_dim_v,
+            "value_rows": int(case["value"].shape[0]),
+            "compact_value_rows": args.compact_value_rows,
             "n_iters": args.n_iters,
             "dtype": args.dtype,
             "leaf_value_pattern": args.leaf_value_pattern,
@@ -1625,6 +1766,7 @@ def main():
             "pack_leaf_values": args.pack_leaf_values,
             "query_warp_stats": args.query_warp_stats,
             "query_warp_readout": args.query_warp_readout,
+            "query_value_pack_readout": args.query_value_pack_readout,
             "incoming_packed_step": args.incoming_packed_step,
             "save_forward_history": args.save_forward_history,
             "query_warp_scatter": args.query_warp_scatter,

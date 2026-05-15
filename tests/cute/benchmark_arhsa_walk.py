@@ -10,21 +10,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from flash_attn.cute.arhsa_walk_sm100 import (
     arhsa_walk_readout_from_scores_fixed_iters_autograd,
     build_incoming_edge_csr,
+    build_leaf_entry_value_packs,
     build_outgoing_edge_csr,
     build_query_leaf_csr,
+    build_query_value_packs,
     outgoing_softmax_from_scores,
     readout_arhsa_leaf_attention,
+    run_arhsa_gather_edge_prob_by_index,
     run_arhsa_pack_leaf_values,
     run_arhsa_leaf_readout,
     run_arhsa_leaf_readout_backward,
     run_arhsa_markov_backward_step,
     run_arhsa_markov_incoming_step,
+    run_arhsa_markov_incoming_packed_step,
     run_arhsa_markov_walk_fixed_iters,
     run_arhsa_outgoing_softmax,
+    run_arhsa_outgoing_softmax_with_incoming,
     run_arhsa_outgoing_softmax_backward,
     run_arhsa_walk_readout_fixed_iters,
     torch_arhsa_walk_readout_from_scores_fixed_iters,
 )
+
+
+def _unwrap_output(out):
+    return out[0] if isinstance(out, (tuple, list)) else out
 
 
 def _reference_step(p, edge_prob, src, dst, node_is_sink):
@@ -106,42 +115,172 @@ def _check_tolerances(dtype: torch.dtype) -> tuple[float, float]:
     return 1e-6, 1e-6
 
 
+def _tensor_delta(prefix: str, got: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    got_f = got.detach().float()
+    expected_f = expected.detach().float()
+    diff = got_f - expected_f
+    denom = expected_f.abs().clamp_min(1.0e-8)
+    l2_denom = expected_f.square().sum().sqrt().clamp_min(1.0e-8)
+    return {
+        f"{prefix}_max_abs": float(diff.abs().max().item()) if diff.numel() else 0.0,
+        f"{prefix}_mean_abs": float(diff.abs().mean().item()) if diff.numel() else 0.0,
+        f"{prefix}_l2_rel": float(diff.square().sum().sqrt().div(l2_denom).item()) if diff.numel() else 0.0,
+        f"{prefix}_max_rel": float((diff.abs() / denom).max().item()) if diff.numel() else 0.0,
+        f"{prefix}_mean_rel": float((diff.abs() / denom).mean().item()) if diff.numel() else 0.0,
+    }
+
+
+def _level_bounds(n_nodes: int, n_levels: int) -> list[int]:
+    if n_levels <= 1:
+        raise ValueError("structured graph modes require at least 2 levels")
+    if n_nodes < n_levels:
+        raise ValueError(f"n_nodes={n_nodes} must be >= graph_levels={n_levels}")
+    base = n_nodes // n_levels
+    rem = n_nodes % n_levels
+    bounds = [0]
+    for level_idx in range(n_levels):
+        bounds.append(bounds[-1] + base + (1 if level_idx < rem else 0))
+    return bounds
+
+
+def _random_dst_from_range(
+    *,
+    start: int,
+    end: int,
+    shape: tuple[int, ...],
+    device: torch.device,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if end <= start:
+        raise ValueError(f"empty destination range [{start}, {end})")
+    return torch.randint(
+        end - start,
+        shape,
+        device=device,
+        dtype=torch.int64,
+        generator=generator,
+    ) + int(start)
+
+
+def _make_level_graph_edges(args, device: torch.device, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    n_levels = int(args.graph_levels) if int(args.graph_levels) > 0 else int(args.n_iters) + 1
+    bounds = _level_bounds(int(args.n_nodes), n_levels)
+    src_parts = []
+    dst_parts = []
+
+    for level_idx in range(n_levels - 1):
+        start = bounds[level_idx]
+        end = bounds[level_idx + 1]
+        next_start = bounds[level_idx + 1]
+        next_end = bounds[level_idx + 2]
+        level_src = torch.arange(start, end, device=device, dtype=torch.int64).repeat_interleave(args.avg_out)
+        level_dst = _random_dst_from_range(
+            start=next_start,
+            end=next_end,
+            shape=(level_src.numel(),),
+            device=device,
+            generator=generator,
+        )
+        src_parts.append(level_src)
+        dst_parts.append(level_dst)
+
+    if args.graph_mode == "structured_walk":
+        back_out = max(1, int(args.avg_out) // 2)
+        for level_idx in range(1, n_levels - 1):
+            start = bounds[level_idx]
+            end = bounds[level_idx + 1]
+            prev_start = bounds[level_idx - 1]
+            prev_end = bounds[level_idx]
+            level_src = torch.arange(start, end, device=device, dtype=torch.int64).repeat_interleave(back_out)
+            level_dst = _random_dst_from_range(
+                start=prev_start,
+                end=prev_end,
+                shape=(level_src.numel(),),
+                device=device,
+                generator=generator,
+            )
+            src_parts.append(level_src)
+            dst_parts.append(level_dst)
+
+    if not src_parts:
+        raise ValueError("structured graph construction produced no edges")
+    return torch.cat(src_parts), torch.cat(dst_parts), bounds
+
+
 def _make_case(args):
     device = torch.device("cuda")
     dtype = _dtype_from_name(args.dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
 
-    n_edges = args.n_nodes * args.avg_out
     n_leaf_entries = args.n_queries * args.leaves_per_query
-    src = torch.arange(args.n_nodes, device=device, dtype=torch.int64).repeat_interleave(args.avg_out)
-    dst = torch.randint(args.n_nodes, (n_edges,), device=device, dtype=torch.int64, generator=generator)
+    level_bounds = None
+    if args.graph_mode == "random":
+        n_edges = args.n_nodes * args.avg_out
+        src = torch.arange(args.n_nodes, device=device, dtype=torch.int64).repeat_interleave(args.avg_out)
+        dst = torch.randint(args.n_nodes, (n_edges,), device=device, dtype=torch.int64, generator=generator)
+    else:
+        src, dst, level_bounds = _make_level_graph_edges(args, device, generator)
+        n_edges = int(src.numel())
     src_i32 = src.to(dtype=torch.int32)
     dst_i32 = dst.to(dtype=torch.int32)
     edge_scores = torch.randn(n_edges, args.n_heads, device=device, dtype=dtype, generator=generator)
     edge_prob = outgoing_softmax_from_scores(edge_scores, src, n_nodes=args.n_nodes)
-    node_is_sink = torch.rand(args.n_nodes, device=device, generator=generator) < args.sink_prob
+    if args.graph_mode == "random":
+        node_is_sink = torch.rand(args.n_nodes, device=device, generator=generator) < args.sink_prob
+    else:
+        node_is_sink = torch.zeros(args.n_nodes, device=device, dtype=torch.bool)
+        node_is_sink[level_bounds[-2] : level_bounds[-1]] = True
     p0 = torch.rand(args.n_nodes, args.n_heads, device=device, dtype=dtype, generator=generator)
+    if args.graph_mode != "random":
+        p0_mask = torch.zeros(args.n_nodes, 1, device=device, dtype=p0.dtype)
+        p0_mask[level_bounds[0] : level_bounds[1]] = 1
+        p0 = p0 * p0_mask
     src_row_ptr, src_edge_index = build_outgoing_edge_csr(src, n_nodes=args.n_nodes)
     dst_row_ptr, dst_edge_index = build_incoming_edge_csr(dst, n_nodes=args.n_nodes)
+    incoming_src_i32 = src_i32[dst_edge_index.to(dtype=torch.long)].contiguous()
+    edge_incoming_index = torch.empty_like(dst_edge_index)
+    edge_incoming_index[dst_edge_index.to(dtype=torch.long)] = torch.arange(
+        n_edges,
+        device=device,
+        dtype=torch.int32,
+    )
 
     leaf_query_index = torch.arange(args.n_queries, device=device, dtype=torch.int64).repeat_interleave(
         args.leaves_per_query
     )
-    leaf_node_index = torch.randint(
-        args.n_nodes,
-        (n_leaf_entries,),
-        device=device,
-        dtype=torch.int64,
-        generator=generator,
-    )
-    leaf_value_index = torch.randint(
-        args.n_nodes,
-        (n_leaf_entries,),
-        device=device,
-        dtype=torch.int64,
-        generator=generator,
-    )
+    if args.graph_mode == "random":
+        leaf_node_index = torch.randint(
+            args.n_nodes,
+            (n_leaf_entries,),
+            device=device,
+            dtype=torch.int64,
+            generator=generator,
+        )
+    else:
+        leaf_node_index = _random_dst_from_range(
+            start=level_bounds[-2],
+            end=level_bounds[-1],
+            shape=(n_leaf_entries,),
+            device=device,
+            generator=generator,
+        )
+    if args.leaf_value_pattern == "random":
+        leaf_value_index = torch.randint(
+            args.n_nodes,
+            (n_leaf_entries,),
+            device=device,
+            dtype=torch.int64,
+            generator=generator,
+        )
+    elif args.leaf_value_pattern == "shared-block16":
+        leaf_slot = torch.arange(args.leaves_per_query, device=device, dtype=torch.int64).repeat(args.n_queries)
+        query_block = torch.arange(args.n_queries, device=device, dtype=torch.int64).repeat_interleave(
+            args.leaves_per_query
+        ) // 16
+        leaf_value_index = (query_block * args.leaves_per_query + leaf_slot) % args.n_nodes
+    else:
+        raise ValueError(f"unknown leaf value pattern: {args.leaf_value_pattern}")
     leaf_query_index_i32 = leaf_query_index.to(dtype=torch.int32)
     leaf_node_index_i32 = leaf_node_index.to(dtype=torch.int32)
     leaf_value_index_i32 = leaf_value_index.to(dtype=torch.int32)
@@ -170,6 +309,8 @@ def _make_case(args):
         "src_edge_index": src_edge_index,
         "dst_row_ptr": dst_row_ptr,
         "dst_edge_index": dst_edge_index,
+        "incoming_src_i32": incoming_src_i32,
+        "edge_incoming_index": edge_incoming_index,
         "leaf_query_index": leaf_query_index,
         "leaf_node_index": leaf_node_index,
         "leaf_value_index": leaf_value_index,
@@ -179,6 +320,8 @@ def _make_case(args):
         "value": value,
         "query_leaf_row_ptr": query_leaf_row_ptr,
         "query_leaf_entry_index": query_leaf_entry_index,
+        "graph_mode": args.graph_mode,
+        "level_bounds": level_bounds,
     }
 
 
@@ -210,6 +353,29 @@ def _check(case, args):
         case["node_is_sink"],
     )
     torch.testing.assert_close(got_step, expected_step, atol=atol, rtol=rtol)
+    if args.incoming_packed_step:
+        got_edge_prob_again, got_incoming_from_softmax = run_arhsa_outgoing_softmax_with_incoming(
+            case["edge_scores"],
+            case["src_row_ptr"],
+            case["src_edge_index"],
+            case["edge_incoming_index"],
+            n_nodes=args.n_nodes,
+        )
+        incoming_edge_prob = run_arhsa_gather_edge_prob_by_index(
+            case["edge_prob"],
+            case["dst_edge_index"],
+        )
+        got_packed_step = run_arhsa_markov_incoming_packed_step(
+            case["p0"],
+            incoming_edge_prob,
+            case["incoming_src_i32"],
+            case["dst_row_ptr"],
+            case["node_is_sink"],
+        )
+        torch.testing.assert_close(got_edge_prob_again, case["edge_prob"], atol=atol, rtol=rtol)
+        torch.testing.assert_close(got_incoming_from_softmax, incoming_edge_prob, atol=atol, rtol=rtol)
+        torch.testing.assert_close(incoming_edge_prob, case["edge_prob"][case["dst_edge_index"].long()], atol=0, rtol=0)
+        torch.testing.assert_close(got_packed_step, expected_step, atol=atol, rtol=rtol)
 
     readout = run_arhsa_leaf_readout(
         got_step,
@@ -267,6 +433,225 @@ def _check(case, args):
     torch.testing.assert_close(got_full, expected_full, atol=atol, rtol=rtol)
 
 
+def _forward_backward_numeric_summary(
+    case,
+    args,
+    grad_readout,
+    *,
+    tc_pack_leaf_entry_index,
+    tc_pack_value_index,
+    tc_pack_value_slot,
+    tc_qv_pack_query_index,
+    tc_qv_pack_value_index,
+    tc_qv_pack_leaf_entry,
+) -> dict[str, float]:
+    p0_cute = case["p0"].detach().clone().requires_grad_(True)
+    edge_scores_cute = case["edge_scores"].detach().clone().requires_grad_(True)
+    value_cute = case["value"].detach().clone().requires_grad_(True)
+    readout_cute = arhsa_walk_readout_from_scores_fixed_iters_autograd(
+        p0_cute,
+        edge_scores_cute,
+        case["src_i32"],
+        case["dst_i32"],
+        case["node_is_sink"],
+        case["leaf_node_index_i32"],
+        case["leaf_query_index_i32"],
+        case["leaf_value_index_i32"],
+        value_cute,
+        n_queries=args.n_queries,
+        n_iters=args.n_iters,
+        src_row_ptr=case["src_row_ptr"],
+        src_edge_index=case["src_edge_index"],
+        dst_row_ptr=case["dst_row_ptr"],
+        dst_edge_index=case["dst_edge_index"],
+        query_leaf_row_ptr=case["query_leaf_row_ptr"],
+        query_leaf_entry_index=case["query_leaf_entry_index"],
+        max_leaves_per_query=args.leaves_per_query if args.fused_readout_bwd else None,
+        leaf_major_stats=args.leaf_major_stats,
+        query_warp_stats=args.query_warp_stats,
+        query_warp_readout=args.query_warp_readout,
+        incoming_packed_step=args.incoming_packed_step,
+        save_forward_history=args.save_forward_history,
+        incoming_src=case["incoming_src_i32"],
+        edge_incoming_index=case["edge_incoming_index"],
+        query_warp_scatter=args.query_warp_scatter,
+        query_warp_fused=args.query_warp_fused_bwd,
+        tensor_core_stats=args.tensor_core_stats_bwd,
+        tensor_core_fused=args.tensor_core_fused_bwd,
+        tensor_core_packed=args.tensor_core_packed_bwd,
+        tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
+        query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+        pack_leaf_entry_index=tc_pack_leaf_entry_index,
+        pack_value_index=tc_pack_value_index,
+        pack_value_slot=tc_pack_value_slot,
+        pack_query_index=tc_qv_pack_query_index,
+        pack_query_value_index=tc_qv_pack_value_index,
+        pack_query_value_leaf_entry=tc_qv_pack_leaf_entry,
+    )
+    readout_cute.backward(grad_readout)
+
+    p0_ref = case["p0"].detach().clone().requires_grad_(True)
+    edge_scores_ref = case["edge_scores"].detach().clone().requires_grad_(True)
+    value_ref = case["value"].detach().clone().requires_grad_(True)
+    readout_ref, _, _, _ = torch_arhsa_walk_readout_from_scores_fixed_iters(
+        p0_ref,
+        edge_scores_ref,
+        case["src"],
+        case["dst"],
+        case["node_is_sink"],
+        case["leaf_node_index"],
+        case["leaf_query_index"],
+        case["leaf_value_index"],
+        value_ref,
+        n_queries=args.n_queries,
+        n_iters=args.n_iters,
+    )
+    readout_ref.backward(grad_readout)
+
+    summary = {}
+    summary.update(_tensor_delta("numeric_readout", readout_cute, readout_ref))
+    summary.update(_tensor_delta("numeric_grad_p0", p0_cute.grad, p0_ref.grad))
+    summary.update(_tensor_delta("numeric_grad_edge_scores", edge_scores_cute.grad, edge_scores_ref.grad))
+    summary.update(_tensor_delta("numeric_grad_value", value_cute.grad, value_ref.grad))
+    return summary
+
+
+def _beam_prune_state(p: torch.Tensor, *, topk: int) -> tuple[torch.Tensor, float]:
+    topk = min(int(topk), int(p.shape[0]))
+    if topk <= 0 or topk >= int(p.shape[0]):
+        return p, 1.0
+    values, indices = torch.topk(p.float().abs(), k=topk, dim=0, sorted=False)
+    del values
+    pruned = torch.zeros_like(p)
+    pruned.scatter_(0, indices, p.gather(0, indices))
+    before = p.float().abs().sum().clamp_min(1.0e-8)
+    retained = pruned.float().abs().sum() / before
+    return pruned, float(retained.item())
+
+
+def _beam_numeric_summary(case, args, *, beam_topk: int) -> dict[str, float]:
+    with torch.no_grad():
+        exact_readout, _, exact_p, _ = torch_arhsa_walk_readout_from_scores_fixed_iters(
+            case["p0"],
+            case["edge_scores"],
+            case["src"],
+            case["dst"],
+            case["node_is_sink"],
+            case["leaf_node_index"],
+            case["leaf_query_index"],
+            case["leaf_value_index"],
+            case["value"],
+            n_queries=args.n_queries,
+            n_iters=args.n_iters,
+        )
+        p, retained = _beam_prune_state(case["p0"], topk=beam_topk)
+        retained_values = [retained]
+        for _ in range(args.n_iters):
+            p = _reference_step(
+                p,
+                case["edge_prob"],
+                case["src"],
+                case["dst"],
+                case["node_is_sink"],
+            )
+            p, retained = _beam_prune_state(p, topk=beam_topk)
+            retained_values.append(retained)
+        beam_readout, _ = readout_arhsa_leaf_attention(
+            p,
+            case["leaf_node_index"],
+            case["leaf_query_index"],
+            case["leaf_value_index"],
+            case["value"],
+            n_queries=args.n_queries,
+        )
+    summary = {
+        "beam_topk": float(beam_topk),
+        "beam_retained_abs_mass_min": min(retained_values),
+        "beam_retained_abs_mass_mean": sum(retained_values) / len(retained_values),
+    }
+    summary.update(_tensor_delta("beam_p_final", p, exact_p))
+    summary.update(_tensor_delta("beam_readout", beam_readout, exact_readout))
+    return summary
+
+
+def _measure_fa4_baseline(args) -> dict[str, float | str]:
+    try:
+        from flash_attn.cute import flash_attn_func
+    except Exception as exc:
+        return {"fa4_status": f"import_failed:{type(exc).__name__}:{exc}"}
+
+    dtype = _dtype_from_name(args.fa4_dtype or args.dtype)
+    device = torch.device("cuda")
+    q = torch.randn(
+        args.fa4_batch,
+        args.fa4_seqlen,
+        args.fa4_n_heads,
+        args.fa4_head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    window_size = (-1, -1)
+    label = "dense_causal"
+    if args.fa4_window_left >= 0:
+        window_size = (int(args.fa4_window_left), 0)
+        label = f"sliding_left_{args.fa4_window_left}"
+
+    def _forward():
+        return _unwrap_output(
+            flash_attn_func(
+                q,
+                k,
+                v,
+                causal=True,
+                window_size=window_size,
+            )
+        )
+
+    def _forward_grad():
+        q_run = q.detach().clone().requires_grad_(True)
+        k_run = k.detach().clone().requires_grad_(True)
+        v_run = v.detach().clone().requires_grad_(True)
+        out = _unwrap_output(
+            flash_attn_func(
+                q_run,
+                k_run,
+                v_run,
+                causal=True,
+                window_size=window_size,
+            )
+        )
+        out.backward(torch.ones_like(out))
+
+    result: dict[str, float | str] = {
+        "fa4_status": "measured",
+        "fa4_label": label,
+        "fa4_batch": float(args.fa4_batch),
+        "fa4_seqlen": float(args.fa4_seqlen),
+        "fa4_n_heads": float(args.fa4_n_heads),
+        "fa4_head_dim": float(args.fa4_head_dim),
+    }
+    try:
+        result["fa4_fwd_ms"] = _event_ms(
+            _forward,
+            iters=args.fa4_iters,
+            warmup=args.fa4_warmup,
+        )
+        result["fa4_fwd_bwd_ms"] = _event_ms(
+            _forward_grad,
+            iters=args.fa4_iters,
+            warmup=args.fa4_warmup,
+        )
+        result["fa4_bwd_ms"] = float(result["fa4_fwd_bwd_ms"]) - float(result["fa4_fwd_ms"])
+    except Exception as exc:
+        result = {
+            **result,
+            "fa4_status": f"failed:{type(exc).__name__}:{exc}",
+        }
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark exact fixed-iteration ARHSA walk kernels.")
     parser.add_argument("--n-nodes", type=int, default=4096)
@@ -281,6 +666,27 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--graph-mode",
+        choices=("random", "level_dag", "structured_walk"),
+        default="random",
+        help=(
+            "Synthetic graph geometry. random is the original arbitrary sparse graph; "
+            "level_dag only routes level l -> l+1; structured_walk adds adjacent-level back edges."
+        ),
+    )
+    parser.add_argument(
+        "--graph-levels",
+        type=int,
+        default=0,
+        help="Number of structured graph levels. 0 means n_iters + 1 for level_dag/structured_walk.",
+    )
+    parser.add_argument(
+        "--leaf-value-pattern",
+        choices=("random", "shared-block16"),
+        default="random",
+        help="Synthetic leaf-value layout; shared-block16 makes each 16-query block share value columns.",
+    )
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument(
@@ -319,6 +725,16 @@ def main():
         help="Use one warp per query/head for the readout forward reduction.",
     )
     parser.add_argument(
+        "--incoming-packed-step",
+        action="store_true",
+        help="Gather edge probabilities into incoming-CSR order and use the packed Markov forward step.",
+    )
+    parser.add_argument(
+        "--save-forward-history",
+        action="store_true",
+        help="Save edge probabilities and Markov states from autograd forward so backward skips recomputing them.",
+    )
+    parser.add_argument(
         "--query-warp-scatter",
         action="store_true",
         help="Use one warp per query/head for readout-backward scatter.",
@@ -339,6 +755,67 @@ def main():
         help="Use experimental fused tensor-core D=64 readout backward.",
     )
     parser.add_argument(
+        "--tensor-core-packed-bwd",
+        action="store_true",
+        help="Use experimental leaf-entry/value packed tensor-core D=64 readout backward stats.",
+    )
+    parser.add_argument(
+        "--tensor-core-query-value-packed-bwd",
+        action="store_true",
+        help="Use experimental query/value packed tensor-core D=64 readout backward stats.",
+    )
+    parser.add_argument(
+        "--tensor-core-qv-pack-scatter-bwd",
+        action="store_true",
+        help="Use pack-owned qv scatter after query/value packed tensor-core stats.",
+    )
+    parser.add_argument(
+        "--tensor-core-qv-pack-strategy",
+        choices=("lexicographic", "span", "overlap"),
+        default="overlap",
+        help="CPU grouping strategy for --tensor-core-query-value-packed-bwd metadata.",
+    )
+    parser.add_argument(
+        "--auto-readout-bwd",
+        action="store_true",
+        help="Choose qv tensor-core backward when qv packing is dense, otherwise use query-warp fused backward.",
+    )
+    parser.add_argument(
+        "--auto-qv-output-util-threshold",
+        type=float,
+        default=0.25,
+        help="Minimum qv pack output utilization for --auto-readout-bwd to select tensor-core qv.",
+    )
+    parser.add_argument(
+        "--report-numerics",
+        action="store_true",
+        help="Run one custom-vs-Torch forward/backward comparison and print numeric error metrics.",
+    )
+    parser.add_argument(
+        "--beam-topk",
+        type=int,
+        default=0,
+        help="Diagnostic only: prune the Torch walk state to top-k nodes per head after each step and report error.",
+    )
+    parser.add_argument(
+        "--compare-fa4",
+        action="store_true",
+        help="Also time a dense/sliding causal FA4 baseline. This is not the same computation as ARHSA.",
+    )
+    parser.add_argument("--fa4-batch", type=int, default=1)
+    parser.add_argument("--fa4-seqlen", type=int, default=8192)
+    parser.add_argument("--fa4-n-heads", type=int, default=None)
+    parser.add_argument("--fa4-head-dim", type=int, default=None)
+    parser.add_argument("--fa4-dtype", choices=("bfloat16", "float32"), default=None)
+    parser.add_argument(
+        "--fa4-window-left",
+        type=int,
+        default=-1,
+        help="Use sliding-window FA4 with this left window; -1 means dense causal FA4.",
+    )
+    parser.add_argument("--fa4-iters", type=int, default=None)
+    parser.add_argument("--fa4-warmup", type=int, default=None)
+    parser.add_argument(
         "--profile-target",
         choices=(
             "cute_fwd_bwd",
@@ -351,12 +828,55 @@ def main():
         default=None,
     )
     parser.add_argument("--profile-repeat", type=int, default=3)
+    parser.add_argument(
+        "--profile-cuda-capture",
+        action="store_true",
+        help="Wrap --profile-target repeats in cudaProfilerStart/Stop for Nsight capture-range=cudaProfilerApi.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if args.dtype == "bfloat16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("bfloat16 CUDA support is required for --dtype=bfloat16")
+    if args.beam_topk < 0:
+        raise ValueError("--beam-topk must be >= 0")
+    if args.graph_levels < 0:
+        raise ValueError("--graph-levels must be >= 0")
+    if args.graph_mode != "random" and args.graph_levels == 1:
+        raise ValueError("structured graph modes require --graph-levels 0 or >= 2")
+    if args.fa4_n_heads is None:
+        args.fa4_n_heads = args.n_heads
+    if args.fa4_head_dim is None:
+        args.fa4_head_dim = args.head_dim_v
+    if args.fa4_iters is None:
+        args.fa4_iters = args.iters
+    if args.fa4_warmup is None:
+        args.fa4_warmup = args.warmup
+    if args.compare_fa4:
+        if args.fa4_batch <= 0 or args.fa4_seqlen <= 0 or args.fa4_n_heads <= 0 or args.fa4_head_dim <= 0:
+            raise ValueError("FA4 batch, seqlen, heads, and head dim must be positive")
+        if args.fa4_dtype == "float32":
+            raise ValueError("FA4 baseline currently requires float16/bfloat16-style inputs; use bfloat16")
+    if args.auto_readout_bwd and args.head_dim_v != 64:
+        raise ValueError("--auto-readout-bwd currently requires --head-dim-v 64")
+    if args.auto_readout_bwd and any(
+        (
+            args.fused_readout_bwd,
+            args.leaf_major_stats,
+            args.reuse_forward_denom,
+            args.pack_leaf_values,
+            args.query_warp_stats,
+            args.query_warp_scatter,
+            args.query_warp_fused_bwd,
+            args.tensor_core_stats_bwd,
+            args.tensor_core_fused_bwd,
+            args.tensor_core_packed_bwd,
+            args.tensor_core_query_value_packed_bwd,
+            args.tensor_core_qv_pack_scatter_bwd,
+        )
+    ):
+        raise ValueError("--auto-readout-bwd cannot be combined with explicit readout-backward mode flags")
     if args.reuse_forward_denom and not args.leaf_major_stats and not args.query_warp_fused_bwd:
         raise ValueError("--reuse-forward-denom requires --leaf-major-stats unless --query-warp-fused-bwd is set")
     if args.pack_leaf_values and not args.leaf_major_stats:
@@ -395,6 +915,42 @@ def main():
         raise ValueError("--tensor-core-fused-bwd cannot be combined with --pack-leaf-values")
     if args.tensor_core_fused_bwd and args.reuse_forward_denom:
         raise ValueError("--tensor-core-fused-bwd cannot be combined with --reuse-forward-denom")
+    if args.tensor_core_packed_bwd and args.head_dim_v != 64:
+        raise ValueError("--tensor-core-packed-bwd currently requires --head-dim-v 64")
+    if args.tensor_core_packed_bwd and args.tensor_core_stats_bwd:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --tensor-core-stats-bwd")
+    if args.tensor_core_packed_bwd and args.tensor_core_fused_bwd:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --tensor-core-fused-bwd")
+    if args.tensor_core_packed_bwd and args.query_warp_fused_bwd:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --query-warp-fused-bwd")
+    if args.tensor_core_packed_bwd and args.fused_readout_bwd:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --fused-readout-bwd")
+    if args.tensor_core_packed_bwd and args.pack_leaf_values:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --pack-leaf-values")
+    if args.tensor_core_packed_bwd and args.reuse_forward_denom:
+        raise ValueError("--tensor-core-packed-bwd cannot be combined with --reuse-forward-denom")
+    if args.tensor_core_query_value_packed_bwd and args.head_dim_v != 64:
+        raise ValueError("--tensor-core-query-value-packed-bwd currently requires --head-dim-v 64")
+    if args.tensor_core_query_value_packed_bwd and args.tensor_core_stats_bwd:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --tensor-core-stats-bwd")
+    if args.tensor_core_query_value_packed_bwd and args.tensor_core_fused_bwd:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --tensor-core-fused-bwd")
+    if args.tensor_core_query_value_packed_bwd and args.tensor_core_packed_bwd:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --tensor-core-packed-bwd")
+    if args.tensor_core_query_value_packed_bwd and args.query_warp_fused_bwd:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --query-warp-fused-bwd")
+    if args.tensor_core_query_value_packed_bwd and args.fused_readout_bwd:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --fused-readout-bwd")
+    if args.tensor_core_query_value_packed_bwd and args.pack_leaf_values:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --pack-leaf-values")
+    if args.tensor_core_query_value_packed_bwd and args.reuse_forward_denom:
+        raise ValueError("--tensor-core-query-value-packed-bwd cannot be combined with --reuse-forward-denom")
+    if args.tensor_core_qv_pack_scatter_bwd and not args.tensor_core_query_value_packed_bwd:
+        raise ValueError("--tensor-core-qv-pack-scatter-bwd requires --tensor-core-query-value-packed-bwd")
+    if args.tensor_core_qv_pack_scatter_bwd and args.query_warp_scatter:
+        raise ValueError("--tensor-core-qv-pack-scatter-bwd cannot be combined with --query-warp-scatter")
+    if args.tensor_core_qv_pack_scatter_bwd and args.leaves_per_query > 8:
+        raise ValueError("--tensor-core-qv-pack-scatter-bwd requires --leaves-per-query <= 8")
     case = _make_case(args)
     if not args.no_check:
         _check(case, args)
@@ -403,6 +959,7 @@ def main():
     p_scratch_a = torch.empty_like(case["p0"])
     p_scratch_b = torch.empty_like(case["p0"])
     edge_prob = torch.empty_like(case["edge_scores"])
+    edge_prob_incoming = torch.empty_like(case["edge_scores"])
     readout = torch.empty(
         args.n_queries,
         args.n_heads,
@@ -418,7 +975,7 @@ def main():
         device=case["p0"].device,
         dtype=case["value"].dtype,
     )
-    p_history = [torch.empty_like(case["p0"]) for _ in range(args.n_iters + 1)]
+    p_history = [case["p0"]] + [torch.empty_like(case["p0"]) for _ in range(args.n_iters)]
     backward_state_dtype = torch.float32 if args.fp32_backward_state else case["p0"].dtype
     grad_p_final = torch.empty_like(case["p0"], dtype=backward_state_dtype)
     grad_p_scratch = torch.empty_like(case["p0"], dtype=backward_state_dtype)
@@ -440,19 +997,137 @@ def main():
     )
     grad_p_accum = torch.empty_like(case["p0"], dtype=torch.float32)
     grad_value_accum = torch.empty_like(case["value"], dtype=torch.float32)
-    p_readout = run_arhsa_markov_walk_fixed_iters(
-        case["p0"],
-        case["edge_prob"],
-        case["src_i32"],
-        case["dst_row_ptr"],
-        case["dst_edge_index"],
-        case["node_is_sink"],
-        n_iters=args.n_iters,
-        scratch_a=p_scratch_a,
-        scratch_b=p_scratch_b,
-    )
+    case_edge_prob_incoming = None
+    if args.incoming_packed_step:
+        case_edge_prob_incoming = run_arhsa_gather_edge_prob_by_index(
+            case["edge_prob"],
+            case["dst_edge_index"],
+            torch.empty_like(case["edge_prob"]),
+        )
+
+    def _markov_step(source_edge_prob, incoming_edge_prob, p_in, p_out):
+        if args.incoming_packed_step:
+            run_arhsa_markov_incoming_packed_step(
+                p_in,
+                incoming_edge_prob,
+                case["incoming_src_i32"],
+                case["dst_row_ptr"],
+                case["node_is_sink"],
+                p_out,
+            )
+        else:
+            run_arhsa_markov_incoming_step(
+                p_in,
+                source_edge_prob,
+                case["src_i32"],
+                case["dst_row_ptr"],
+                case["dst_edge_index"],
+                case["node_is_sink"],
+                p_out,
+            )
+
+    def _markov_walk(source_edge_prob, incoming_edge_prob, scratch_a, scratch_b):
+        if not args.incoming_packed_step:
+            return run_arhsa_markov_walk_fixed_iters(
+                case["p0"],
+                source_edge_prob,
+                case["src_i32"],
+                case["dst_row_ptr"],
+                case["dst_edge_index"],
+                case["node_is_sink"],
+                n_iters=args.n_iters,
+                scratch_a=scratch_a,
+                scratch_b=scratch_b,
+            )
+        p_cur = case["p0"]
+        for iter_idx in range(args.n_iters):
+            p_out = scratch_a if iter_idx % 2 == 0 else scratch_b
+            run_arhsa_markov_incoming_packed_step(
+                p_cur,
+                incoming_edge_prob,
+                case["incoming_src_i32"],
+                case["dst_row_ptr"],
+                case["node_is_sink"],
+                p_out,
+            )
+            p_cur = p_out
+        return p_cur
+
+    def _softmax_for_walk():
+        if args.incoming_packed_step:
+            run_arhsa_outgoing_softmax_with_incoming(
+                case["edge_scores"],
+                case["src_row_ptr"],
+                case["src_edge_index"],
+                case["edge_incoming_index"],
+                n_nodes=args.n_nodes,
+                edge_prob=edge_prob,
+                incoming_edge_prob=edge_prob_incoming,
+            )
+        else:
+            run_arhsa_outgoing_softmax(
+                case["edge_scores"],
+                case["src_row_ptr"],
+                case["src_edge_index"],
+                n_nodes=args.n_nodes,
+                edge_prob=edge_prob,
+            )
+
+    p_readout = _markov_walk(case["edge_prob"], case_edge_prob_incoming, p_scratch_a, p_scratch_b)
     grad_p_readout = torch.empty_like(p_readout)
     grad_value = torch.empty_like(case["value"])
+    tc_pack_leaf_entry_index = None
+    tc_pack_value_index = None
+    tc_pack_value_slot = None
+    tc_qv_pack_query_index = None
+    tc_qv_pack_value_index = None
+    tc_qv_pack_leaf_entry = None
+    tc_pack_summary = {}
+    if args.tensor_core_packed_bwd:
+        tc_pack_leaf_entry_index, tc_pack_value_index, tc_pack_value_slot = build_leaf_entry_value_packs(
+            case["leaf_value_index_i32"],
+        )
+        tc_pack_valid_rows = int((tc_pack_leaf_entry_index >= 0).sum().item())
+        tc_pack_count = int(tc_pack_leaf_entry_index.shape[0])
+        tc_pack_summary = {
+            "tensor_core_pack_count": tc_pack_count,
+            "tensor_core_pack_fill": (tc_pack_valid_rows / (tc_pack_count * 16)) if tc_pack_count else 0.0,
+            "tensor_core_pack_output_util": (
+                tc_pack_valid_rows / (tc_pack_count * 16 * 8)
+            ) if tc_pack_count else 0.0,
+        }
+    auto_selected_readout_bwd = "explicit"
+    tc_qv_output_util = 0.0
+    if args.tensor_core_query_value_packed_bwd or args.auto_readout_bwd:
+        tc_qv_pack_query_index, tc_qv_pack_value_index, tc_qv_pack_leaf_entry = build_query_value_packs(
+            case["leaf_query_index_i32"],
+            case["leaf_value_index_i32"],
+            n_queries=args.n_queries,
+            packing_strategy=args.tensor_core_qv_pack_strategy,
+        )
+        tc_qv_pack_count = int(tc_qv_pack_query_index.shape[0])
+        tc_qv_valid_rows = int((tc_qv_pack_query_index >= 0).sum().item())
+        tc_qv_valid_outputs = int((tc_qv_pack_leaf_entry >= 0).sum().item())
+        tc_qv_used_value_cols = int((tc_qv_pack_leaf_entry >= 0).any(dim=1).sum().item())
+        tc_qv_output_util = (tc_qv_valid_outputs / (tc_qv_pack_count * 16 * 8)) if tc_qv_pack_count else 0.0
+        tc_pack_summary = {
+            "tensor_core_qv_pack_count": tc_qv_pack_count,
+            "tensor_core_qv_pack_row_fill": (
+                tc_qv_valid_rows / (tc_qv_pack_count * 16)
+            ) if tc_qv_pack_count else 0.0,
+            "tensor_core_qv_pack_value_fill": (
+                tc_qv_used_value_cols / (tc_qv_pack_count * 8)
+            ) if tc_qv_pack_count else 0.0,
+            "tensor_core_qv_pack_output_util": tc_qv_output_util,
+        }
+    if args.auto_readout_bwd:
+        if tc_qv_output_util >= float(args.auto_qv_output_util_threshold):
+            args.tensor_core_query_value_packed_bwd = True
+            args.query_warp_scatter = True
+            auto_selected_readout_bwd = "tensor_core_query_value_packed"
+        else:
+            args.query_warp_fused_bwd = True
+            auto_selected_readout_bwd = "query_warp_fused"
 
     def _pack_leaf_values():
         run_arhsa_pack_leaf_values(
@@ -487,30 +1162,33 @@ def main():
             leaf_major_stats=args.leaf_major_stats,
             query_warp_stats=args.query_warp_stats,
             query_warp_readout=args.query_warp_readout,
+            incoming_packed_step=args.incoming_packed_step,
+            save_forward_history=args.save_forward_history,
+            incoming_src=case["incoming_src_i32"],
+            edge_incoming_index=case["edge_incoming_index"],
             query_warp_scatter=args.query_warp_scatter,
             query_warp_fused=args.query_warp_fused_bwd,
             tensor_core_stats=args.tensor_core_stats_bwd,
             tensor_core_fused=args.tensor_core_fused_bwd,
+            tensor_core_packed=args.tensor_core_packed_bwd,
+            tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
+            query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            pack_leaf_entry_index=tc_pack_leaf_entry_index,
+            pack_value_index=tc_pack_value_index,
+            pack_value_slot=tc_pack_value_slot,
+            pack_query_index=tc_qv_pack_query_index,
+            pack_query_value_index=tc_qv_pack_value_index,
+            pack_query_value_leaf_entry=tc_qv_pack_leaf_entry,
         )
         out.backward(grad_readout)
 
     def _cute_forward_backward_prealloc():
-        run_arhsa_outgoing_softmax(
-            case["edge_scores"],
-            case["src_row_ptr"],
-            case["src_edge_index"],
-            n_nodes=args.n_nodes,
-            edge_prob=edge_prob,
-        )
-        p_history[0].copy_(case["p0"])
+        _softmax_for_walk()
         for iter_idx in range(args.n_iters):
-            run_arhsa_markov_incoming_step(
-                p_history[iter_idx],
+            _markov_step(
                 edge_prob,
-                case["src_i32"],
-                case["dst_row_ptr"],
-                case["dst_edge_index"],
-                case["node_is_sink"],
+                edge_prob_incoming,
+                p_history[iter_idx],
                 p_history[iter_idx + 1],
             )
         run_arhsa_leaf_readout(
@@ -553,8 +1231,18 @@ def main():
             query_warp_fused=args.query_warp_fused_bwd,
             tensor_core_stats=args.tensor_core_stats_bwd,
             tensor_core_fused=args.tensor_core_fused_bwd,
+            tensor_core_packed=args.tensor_core_packed_bwd,
+            tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
+            query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            pack_leaf_entry_index=tc_pack_leaf_entry_index,
+            pack_value_index=tc_pack_value_index,
+            pack_value_slot=tc_pack_value_slot,
+            pack_query_index=tc_qv_pack_query_index,
+            pack_query_value_index=tc_qv_pack_value_index,
+            pack_query_value_leaf_entry=tc_qv_pack_leaf_entry,
         )
-        grad_edge_prob.zero_()
+        if args.n_iters == 0:
+            grad_edge_prob.zero_()
         grad_next = grad_p_final
         grad_scratch = grad_p_scratch
         for iter_idx in range(args.n_iters - 1, -1, -1):
@@ -568,6 +1256,7 @@ def main():
                 case["node_is_sink"],
                 grad_edge_prob,
                 grad_scratch,
+                accumulate_grad_edge_prob=(iter_idx != args.n_iters - 1),
             )
             grad_next, grad_scratch = grad_scratch, grad_next
         run_arhsa_outgoing_softmax_backward(
@@ -640,36 +1329,54 @@ def main():
             query_warp_fused=args.query_warp_fused_bwd,
             tensor_core_stats=args.tensor_core_stats_bwd,
             tensor_core_fused=args.tensor_core_fused_bwd,
+            tensor_core_packed=args.tensor_core_packed_bwd,
+            tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
+            query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            pack_leaf_entry_index=tc_pack_leaf_entry_index,
+            pack_value_index=tc_pack_value_index,
+            pack_value_slot=tc_pack_value_slot,
+            pack_query_index=tc_qv_pack_query_index,
+            pack_query_value_index=tc_qv_pack_value_index,
+            pack_query_value_leaf_entry=tc_qv_pack_leaf_entry,
         )
 
     def _full_cute_hot():
-        run_arhsa_outgoing_softmax(
-            case["edge_scores"],
-            case["src_row_ptr"],
-            case["src_edge_index"],
-            n_nodes=args.n_nodes,
-            edge_prob=edge_prob,
-        )
-        run_arhsa_walk_readout_fixed_iters(
-            case["p0"],
+        _softmax_for_walk()
+        p_final = _markov_walk(
             edge_prob,
-            case["src_i32"],
-            case["dst_row_ptr"],
-            case["dst_edge_index"],
-            case["node_is_sink"],
+            edge_prob_incoming,
+            p_scratch_a,
+            p_scratch_b,
+        )
+        run_arhsa_leaf_readout(
+            p_final,
             case["leaf_node_index_i32"],
-            case["leaf_query_index_i32"],
             case["leaf_value_index_i32"],
-            case["value"],
-            n_queries=args.n_queries,
-            n_iters=args.n_iters,
             query_leaf_row_ptr=case["query_leaf_row_ptr"],
             query_leaf_entry_index=case["query_leaf_entry_index"],
-            return_leaf_attn=False,
-            p_scratch_a=p_scratch_a,
-            p_scratch_b=p_scratch_b,
+            value=case["value"],
+            n_queries=args.n_queries,
             readout=readout,
-            query_warp_readout=args.query_warp_readout,
+            query_warp=args.query_warp_readout,
+        )
+
+    def _walk_readout_hot():
+        p_final = _markov_walk(
+            case["edge_prob"],
+            case_edge_prob_incoming,
+            p_scratch_a,
+            p_scratch_b,
+        )
+        run_arhsa_leaf_readout(
+            p_final,
+            case["leaf_node_index_i32"],
+            case["leaf_value_index_i32"],
+            case["query_leaf_row_ptr"],
+            case["query_leaf_entry_index"],
+            case["value"],
+            n_queries=args.n_queries,
+            readout=readout,
+            query_warp=args.query_warp_readout,
         )
 
     profile_targets = {
@@ -685,11 +1392,15 @@ def main():
         for _ in range(args.warmup):
             target()
         torch.cuda.synchronize()
+        if args.profile_cuda_capture:
+            torch.cuda.cudart().cudaProfilerStart()
         for repeat_idx in range(int(args.profile_repeat)):
             torch.cuda.nvtx.range_push(f"{args.profile_target}_{repeat_idx}")
             target()
             torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
+        if args.profile_cuda_capture:
+            torch.cuda.cudart().cudaProfilerStop()
         return
 
     timings = {
@@ -714,13 +1425,10 @@ def main():
             warmup=args.warmup,
         ),
         "step_cute_ms": _event_ms(
-            lambda: run_arhsa_markov_incoming_step(
-                case["p0"],
+            lambda: _markov_step(
                 case["edge_prob"],
-                case["src_i32"],
-                case["dst_row_ptr"],
-                case["dst_edge_index"],
-                case["node_is_sink"],
+                case_edge_prob_incoming,
+                case["p0"],
                 p_next,
             ),
             iters=args.iters,
@@ -738,16 +1446,11 @@ def main():
             warmup=args.warmup,
         ),
         "walk_cute_ms": _event_ms(
-            lambda: run_arhsa_markov_walk_fixed_iters(
-                case["p0"],
+            lambda: _markov_walk(
                 case["edge_prob"],
-                case["src_i32"],
-                case["dst_row_ptr"],
-                case["dst_edge_index"],
-                case["node_is_sink"],
-                n_iters=args.n_iters,
-                scratch_a=p_scratch_a,
-                scratch_b=p_scratch_b,
+                case_edge_prob_incoming,
+                p_scratch_a,
+                p_scratch_b,
             ),
             iters=args.iters,
             warmup=args.warmup,
@@ -798,27 +1501,7 @@ def main():
             warmup=args.warmup,
         ),
         "walk_readout_hot_ms": _event_ms(
-            lambda: run_arhsa_walk_readout_fixed_iters(
-                case["p0"],
-                case["edge_prob"],
-                case["src_i32"],
-                case["dst_row_ptr"],
-                case["dst_edge_index"],
-                case["node_is_sink"],
-                case["leaf_node_index_i32"],
-                case["leaf_query_index_i32"],
-                case["leaf_value_index_i32"],
-                case["value"],
-                n_queries=args.n_queries,
-                n_iters=args.n_iters,
-                query_leaf_row_ptr=case["query_leaf_row_ptr"],
-                query_leaf_entry_index=case["query_leaf_entry_index"],
-                return_leaf_attn=False,
-                p_scratch_a=p_scratch_a,
-                p_scratch_b=p_scratch_b,
-                readout=readout,
-                query_warp_readout=args.query_warp_readout,
-            ),
+            _walk_readout_hot,
             iters=args.iters,
             warmup=args.warmup,
         ),
@@ -860,6 +1543,21 @@ def main():
             warmup=args.warmup,
         ),
     }
+    if args.incoming_packed_step:
+        timings["softmax_with_incoming_cute_ms"] = _event_ms(
+            _softmax_for_walk,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        timings["incoming_gather_cute_ms"] = _event_ms(
+            lambda: run_arhsa_gather_edge_prob_by_index(
+                case["edge_prob"],
+                case["dst_edge_index"],
+                edge_prob_incoming,
+            ),
+            iters=args.iters,
+            warmup=args.warmup,
+        )
     if args.pack_leaf_values:
         timings["pack_leaf_values_cute_ms"] = _event_ms(
             _pack_leaf_values,
@@ -880,17 +1578,46 @@ def main():
             "fwd_bwd_torch_temp_mib": torch_memory["temp_mib"],
             "fwd_bwd_torch_after_delta_mib": torch_memory["after_delta_mib"],
         }
+    numeric = {}
+    if args.report_numerics:
+        numeric = _forward_backward_numeric_summary(
+            case,
+            args,
+            grad_readout,
+            tc_pack_leaf_entry_index=tc_pack_leaf_entry_index,
+            tc_pack_value_index=tc_pack_value_index,
+            tc_pack_value_slot=tc_pack_value_slot,
+            tc_qv_pack_query_index=tc_qv_pack_query_index,
+            tc_qv_pack_value_index=tc_qv_pack_value_index,
+            tc_qv_pack_leaf_entry=tc_qv_pack_leaf_entry,
+        )
+    beam = {}
+    if args.beam_topk > 0:
+        beam = _beam_numeric_summary(case, args, beam_topk=args.beam_topk)
+    fa4 = {}
+    if args.compare_fa4:
+        fa4 = _measure_fa4_baseline(args)
 
     print(
         {
             "n_nodes": args.n_nodes,
-            "n_edges": args.n_nodes * args.avg_out,
+            "n_edges": int(case["edge_scores"].shape[0]),
+            "graph_mode": args.graph_mode,
+            "graph_levels": (
+                len(case["level_bounds"]) - 1 if case["level_bounds"] is not None else 0
+            ),
             "n_heads": args.n_heads,
             "n_queries": args.n_queries,
             "leaf_entries": args.n_queries * args.leaves_per_query,
             "head_dim_v": args.head_dim_v,
             "n_iters": args.n_iters,
             "dtype": args.dtype,
+            "leaf_value_pattern": args.leaf_value_pattern,
+            "auto_readout_bwd": args.auto_readout_bwd,
+            "auto_selected_readout_bwd": auto_selected_readout_bwd,
+            "auto_qv_output_util_threshold": args.auto_qv_output_util_threshold,
+            "report_numerics": args.report_numerics,
+            "compare_fa4": args.compare_fa4,
             "fused_readout_bwd": args.fused_readout_bwd,
             "leaf_major_stats": args.leaf_major_stats,
             "reuse_forward_denom": args.reuse_forward_denom,
@@ -898,12 +1625,25 @@ def main():
             "pack_leaf_values": args.pack_leaf_values,
             "query_warp_stats": args.query_warp_stats,
             "query_warp_readout": args.query_warp_readout,
+            "incoming_packed_step": args.incoming_packed_step,
+            "save_forward_history": args.save_forward_history,
             "query_warp_scatter": args.query_warp_scatter,
             "query_warp_fused_bwd": args.query_warp_fused_bwd,
             "tensor_core_stats_bwd": args.tensor_core_stats_bwd,
             "tensor_core_fused_bwd": args.tensor_core_fused_bwd,
+            "tensor_core_packed_bwd": args.tensor_core_packed_bwd,
+            "tensor_core_query_value_packed_bwd": args.tensor_core_query_value_packed_bwd,
+            "tensor_core_qv_pack_scatter_bwd": args.tensor_core_qv_pack_scatter_bwd,
+            "tensor_core_qv_pack_strategy": args.tensor_core_qv_pack_strategy,
+            **{key: round(value, 4) for key, value in tc_pack_summary.items()},
             **{key: round(value, 4) for key, value in timings.items()},
             **{key: round(value, 2) for key, value in memory.items()},
+            **{key: round(value, 6) for key, value in numeric.items()},
+            **{key: round(value, 6) for key, value in beam.items()},
+            **{
+                key: (round(value, 4) if isinstance(value, float) else value)
+                for key, value in fa4.items()
+            },
         }
     )
 

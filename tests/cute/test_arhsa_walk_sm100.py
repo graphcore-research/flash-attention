@@ -64,19 +64,38 @@ def test_outgoing_softmax_from_scores_matches_grouped_reference():
 def test_arhsa_outgoing_softmax_matches_torch_reference():
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (
+        build_incoming_edge_csr,
         build_outgoing_edge_csr,
         run_arhsa_outgoing_softmax,
+        run_arhsa_outgoing_softmax_with_incoming,
     )
 
     device = torch.device("cuda")
     src = torch.tensor([0, 0, 1, 2, 2, 2], dtype=torch.int64, device=device)
+    dst = torch.tensor([1, 2, 2, 3, 0, 1], dtype=torch.int64, device=device)
     edge_scores = torch.randn(6, 3, device=device, dtype=torch.float32)
     row_ptr, edge_idx = build_outgoing_edge_csr(src, n_nodes=4)
+    _, dst_edge_idx = build_incoming_edge_csr(dst, n_nodes=4)
+    edge_incoming_index = torch.empty_like(dst_edge_idx)
+    edge_incoming_index[dst_edge_idx.long()] = torch.arange(
+        src.numel(),
+        device=device,
+        dtype=torch.int32,
+    )
 
     got = run_arhsa_outgoing_softmax(edge_scores, row_ptr, edge_idx, n_nodes=4)
+    got_again, got_incoming = run_arhsa_outgoing_softmax_with_incoming(
+        edge_scores,
+        row_ptr,
+        edge_idx,
+        edge_incoming_index,
+        n_nodes=4,
+    )
     expected = _reference_outgoing_softmax(edge_scores, src, n_nodes=4)
 
     torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(got_again, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(got_incoming, expected[dst_edge_idx.long()], atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -109,7 +128,9 @@ def test_arhsa_markov_incoming_step_matches_torch_reference():
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (
         build_incoming_edge_csr,
+        run_arhsa_gather_edge_prob_by_index,
         run_arhsa_markov_incoming_step,
+        run_arhsa_markov_incoming_packed_step,
     )
 
     device = torch.device("cuda")
@@ -133,6 +154,19 @@ def test_arhsa_markov_incoming_step_matches_torch_reference():
     expected = _reference_step(p, edge_prob, src.long(), dst.long(), node_is_sink)
 
     torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
+
+    incoming_edge_prob = run_arhsa_gather_edge_prob_by_index(edge_prob, edge_idx)
+    incoming_src = src[edge_idx.long()].contiguous()
+    got_packed = run_arhsa_markov_incoming_packed_step(
+        p,
+        incoming_edge_prob,
+        incoming_src,
+        row_ptr,
+        node_is_sink,
+    )
+
+    torch.testing.assert_close(incoming_edge_prob, edge_prob[edge_idx.long()], atol=0, rtol=0)
+    torch.testing.assert_close(got_packed, expected, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -173,6 +207,22 @@ def test_arhsa_markov_backward_step_matches_torch_autograd():
 
     torch.testing.assert_close(got_p, p_prev_ref.grad, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(grad_edge_prob, edge_prob_ref.grad, atol=1e-6, rtol=1e-6)
+
+    grad_edge_prob_overwrite = torch.full_like(edge_prob_data, 123.0)
+    got_p_overwrite = run_arhsa_markov_backward_step(
+        grad_next,
+        p_prev_data,
+        edge_prob_data,
+        row_ptr,
+        edge_idx,
+        dst,
+        node_is_sink,
+        grad_edge_prob_overwrite,
+        accumulate_grad_edge_prob=False,
+    )
+
+    torch.testing.assert_close(got_p_overwrite, p_prev_ref.grad, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(grad_edge_prob_overwrite, edge_prob_ref.grad, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -905,6 +955,148 @@ def test_arhsa_leaf_readout_backward_tensor_core_fused_matches_torch_bfloat16():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_leaf_readout_backward_tensor_core_packed_matches_torch_bfloat16():
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 CUDA support required")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_leaf_entry_value_packs,
+        build_query_leaf_csr,
+        readout_arhsa_leaf_attention,
+        run_arhsa_leaf_readout_backward,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(63)
+    n_queries = 7
+    n_nodes = 23
+    n_heads = 3
+    leaves_per_query = 8
+    n_leaf_entries = n_queries * leaves_per_query
+    p_data = torch.rand(n_nodes, n_heads, device=device, dtype=torch.bfloat16)
+    leaf_query_index = torch.arange(n_queries, dtype=torch.int64, device=device).repeat_interleave(
+        leaves_per_query
+    )
+    leaf_node_index = torch.randint(n_nodes, (n_leaf_entries,), dtype=torch.int64, device=device)
+    leaf_value_index = (torch.arange(n_leaf_entries, dtype=torch.int64, device=device) % 8).roll(3)
+    value_data = torch.randn(n_nodes, n_heads, 64, device=device, dtype=torch.bfloat16)
+    grad_readout = torch.randn(n_queries, n_heads, 64, device=device, dtype=torch.bfloat16)
+    query_leaf_row_ptr, query_leaf_entry_index = build_query_leaf_csr(
+        leaf_query_index,
+        n_queries=n_queries,
+    )
+    pack_leaf_entry_index, pack_value_index, pack_value_slot = build_leaf_entry_value_packs(
+        leaf_value_index,
+    )
+
+    got_p, got_value = run_arhsa_leaf_readout_backward(
+        p_data,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value_data,
+        grad_readout,
+        n_queries=n_queries,
+        query_warp_scatter=True,
+        tensor_core_packed=True,
+        pack_leaf_entry_index=pack_leaf_entry_index,
+        pack_value_index=pack_value_index,
+        pack_value_slot=pack_value_slot,
+    )
+
+    p_ref = p_data.clone().requires_grad_()
+    value_ref = value_data.clone().requires_grad_()
+    readout_ref, _ = readout_arhsa_leaf_attention(
+        p_ref,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        value_ref,
+        n_queries=n_queries,
+    )
+    readout_ref.backward(grad_readout)
+
+    torch.testing.assert_close(got_p, p_ref.grad, atol=9e-2, rtol=9e-2)
+    torch.testing.assert_close(got_value, value_ref.grad, atol=7e-2, rtol=7e-2)
+
+
+@pytest.mark.parametrize("scatter_mode", ["generic", "query_warp", "qv_pack"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_leaf_readout_backward_tensor_core_query_value_packed_matches_torch_bfloat16(
+    scatter_mode,
+):
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 CUDA support required")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_query_leaf_csr,
+        build_query_value_packs,
+        readout_arhsa_leaf_attention,
+        run_arhsa_leaf_readout_backward,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(67)
+    n_queries = 16
+    n_nodes = 29
+    n_heads = 2
+    leaves_per_query = 8
+    n_leaf_entries = n_queries * leaves_per_query
+    p_data = torch.rand(n_nodes, n_heads, device=device, dtype=torch.bfloat16)
+    leaf_query_index = torch.arange(n_queries, dtype=torch.int64, device=device).repeat_interleave(
+        leaves_per_query
+    )
+    leaf_node_index = torch.randint(n_nodes, (n_leaf_entries,), dtype=torch.int64, device=device)
+    leaf_value_index = torch.arange(leaves_per_query, dtype=torch.int64, device=device).repeat(n_queries)
+    value_data = torch.randn(n_nodes, n_heads, 64, device=device, dtype=torch.bfloat16)
+    grad_readout = torch.randn(n_queries, n_heads, 64, device=device, dtype=torch.bfloat16)
+    query_leaf_row_ptr, query_leaf_entry_index = build_query_leaf_csr(
+        leaf_query_index,
+        n_queries=n_queries,
+    )
+    pack_query_index, pack_query_value_index, pack_query_value_leaf_entry = build_query_value_packs(
+        leaf_query_index,
+        leaf_value_index,
+        n_queries=n_queries,
+    )
+
+    got_p, got_value = run_arhsa_leaf_readout_backward(
+        p_data,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value_data,
+        grad_readout,
+        n_queries=n_queries,
+        query_warp_scatter=(scatter_mode == "query_warp"),
+        tensor_core_query_value_packed=True,
+        query_value_pack_scatter=(scatter_mode == "qv_pack"),
+        pack_query_index=pack_query_index,
+        pack_query_value_index=pack_query_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+    )
+
+    p_ref = p_data.clone().requires_grad_()
+    value_ref = value_data.clone().requires_grad_()
+    readout_ref, _ = readout_arhsa_leaf_attention(
+        p_ref,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        value_ref,
+        n_queries=n_queries,
+    )
+    readout_ref.backward(grad_readout)
+
+    torch.testing.assert_close(got_p, p_ref.grad, atol=9e-2, rtol=9e-2)
+    torch.testing.assert_close(got_value, value_ref.grad, atol=7e-2, rtol=7e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_arhsa_walk_readout_fixed_iters_matches_torch_reference():
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (
@@ -1211,7 +1403,9 @@ def test_arhsa_walk_readout_from_scores_matches_torch_reference_low_precision(dt
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_arhsa_walk_readout_autograd_backward_matches_torch_reference():
+@pytest.mark.parametrize("incoming_packed_step", [False, True])
+@pytest.mark.parametrize("save_forward_history", [False, True])
+def test_arhsa_walk_readout_autograd_backward_matches_torch_reference(incoming_packed_step, save_forward_history):
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (
         arhsa_walk_readout_from_scores_fixed_iters_autograd,
@@ -1250,6 +1444,8 @@ def test_arhsa_walk_readout_autograd_backward_matches_torch_reference():
         value_fast,
         n_queries=n_queries,
         n_iters=4,
+        incoming_packed_step=incoming_packed_step,
+        save_forward_history=save_forward_history,
     )
 
     p0_ref = p0_data.clone().requires_grad_()
@@ -1522,6 +1718,7 @@ def test_arhsa_walk_readout_autograd_fast_query_warp_path_matches_torch_bfloat16
         query_warp_readout=True,
         query_warp_scatter=True,
         query_warp_fused=True,
+        save_forward_history=True,
     )
     readout.backward(grad_readout)
 

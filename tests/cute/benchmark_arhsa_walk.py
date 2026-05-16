@@ -867,6 +867,16 @@ def main():
         help="Run one custom-vs-Torch forward/backward comparison and print numeric error metrics.",
     )
     parser.add_argument(
+        "--skip-torch",
+        action="store_true",
+        help="Skip original Torch ARHSA reference timings; useful when the reference OOMs at long sequence lengths.",
+    )
+    parser.add_argument(
+        "--skip-custom-fwd-bwd",
+        action="store_true",
+        help="Skip allocation-heavy custom autograd fwd+bwd timing; useful for very long preallocated runs.",
+    )
+    parser.add_argument(
         "--beam-topk",
         type=int,
         default=0,
@@ -1589,15 +1599,6 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
         ),
-        "softmax_torch_ms": _event_ms(
-            lambda: outgoing_softmax_from_scores(
-                case["edge_scores"],
-                case["src"],
-                n_nodes=args.n_nodes,
-            ),
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
         "step_cute_ms": _event_ms(
             lambda: _markov_step(
                 case["edge_prob"],
@@ -1605,17 +1606,6 @@ def main():
                 case["p0"],
                 p_next,
                 iter_idx=0,
-            ),
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
-        "step_torch_ms": _event_ms(
-            lambda: _reference_step(
-                case["p0"],
-                case["edge_prob"],
-                case["src"],
-                case["dst"],
-                case["node_is_sink"],
             ),
             iters=args.iters,
             warmup=args.warmup,
@@ -1646,33 +1636,8 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
         ),
-        "readout_torch_ms": _event_ms(
-            lambda: readout_arhsa_leaf_attention(
-                p_next,
-                case["leaf_node_index"],
-                case["leaf_query_index"],
-                case["leaf_value_index"],
-                case["value"],
-                n_queries=args.n_queries,
-            ),
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
         "readout_bwd_cute_ms": _event_ms(
             _readout_backward_cute,
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
-        "readout_bwd_torch_ms": _event_ms(
-            lambda: _torch_readout_backward_for_benchmark(
-                p_readout,
-                case["leaf_node_index"],
-                case["leaf_query_index"],
-                case["leaf_value_index"],
-                case["value"],
-                grad_readout,
-                n_queries=args.n_queries,
-            ),
             iters=args.iters,
             warmup=args.warmup,
         ),
@@ -1686,39 +1651,90 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
         ),
-        "full_torch_ms": _event_ms(
-            lambda: torch_arhsa_walk_readout_from_scores_fixed_iters(
-                case["p0"],
-                case["edge_scores"],
-                case["src"],
-                case["dst"],
-                case["node_is_sink"],
-                case["leaf_node_index"],
-                case["leaf_query_index"],
-                case["leaf_value_index"],
-                case["value"],
-                n_queries=args.n_queries,
-                n_iters=args.n_iters,
-            ),
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
-        "fwd_bwd_cute_custom_ms": _event_ms(
-            _cute_forward_backward,
-            iters=args.iters,
-            warmup=args.warmup,
-        ),
         "fwd_bwd_cute_prealloc_ms": _event_ms(
             _cute_forward_backward_prealloc,
             iters=args.iters,
             warmup=args.warmup,
         ),
-        "fwd_bwd_torch_autograd_ms": _event_ms(
-            _torch_forward_backward,
+    }
+    if not args.skip_custom_fwd_bwd:
+        timings["fwd_bwd_cute_custom_ms"] = _event_ms(
+            _cute_forward_backward,
             iters=args.iters,
             warmup=args.warmup,
-        ),
-    }
+        )
+    if not args.skip_torch:
+        timings.update(
+            {
+                "softmax_torch_ms": _event_ms(
+                    lambda: outgoing_softmax_from_scores(
+                        case["edge_scores"],
+                        case["src"],
+                        n_nodes=args.n_nodes,
+                    ),
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+                "step_torch_ms": _event_ms(
+                    lambda: _reference_step(
+                        case["p0"],
+                        case["edge_prob"],
+                        case["src"],
+                        case["dst"],
+                        case["node_is_sink"],
+                    ),
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+                "readout_torch_ms": _event_ms(
+                    lambda: readout_arhsa_leaf_attention(
+                        p_next,
+                        case["leaf_node_index"],
+                        case["leaf_query_index"],
+                        case["leaf_value_index"],
+                        case["value"],
+                        n_queries=args.n_queries,
+                    ),
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+                "readout_bwd_torch_ms": _event_ms(
+                    lambda: _torch_readout_backward_for_benchmark(
+                        p_readout,
+                        case["leaf_node_index"],
+                        case["leaf_query_index"],
+                        case["leaf_value_index"],
+                        case["value"],
+                        grad_readout,
+                        n_queries=args.n_queries,
+                    ),
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+                "full_torch_ms": _event_ms(
+                    lambda: torch_arhsa_walk_readout_from_scores_fixed_iters(
+                        case["p0"],
+                        case["edge_scores"],
+                        case["src"],
+                        case["dst"],
+                        case["node_is_sink"],
+                        case["leaf_node_index"],
+                        case["leaf_query_index"],
+                        case["leaf_value_index"],
+                        case["value"],
+                        n_queries=args.n_queries,
+                        n_iters=args.n_iters,
+                    ),
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+                "fwd_bwd_torch_autograd_ms": _event_ms(
+                    _torch_forward_backward,
+                    iters=args.iters,
+                    warmup=args.warmup,
+                ),
+            }
+        )
     if args.incoming_packed_step:
         timings["softmax_with_incoming_cute_ms"] = _event_ms(
             _softmax_for_walk,
@@ -1742,18 +1758,24 @@ def main():
         )
     memory = {}
     if not args.no_memory:
-        cute_memory = _peak_memory(_cute_forward_backward)
-        torch_memory = _peak_memory(_torch_forward_backward)
+        cute_memory_fn = _cute_forward_backward_prealloc if args.skip_custom_fwd_bwd else _cute_forward_backward
+        cute_memory = _peak_memory(cute_memory_fn)
         memory = {
             "setup_allocated_mib": _mib(torch.cuda.memory_allocated()),
             "setup_reserved_mib": _mib(torch.cuda.memory_reserved()),
             "fwd_bwd_cute_peak_mib": cute_memory["peak_mib"],
             "fwd_bwd_cute_temp_mib": cute_memory["temp_mib"],
             "fwd_bwd_cute_after_delta_mib": cute_memory["after_delta_mib"],
-            "fwd_bwd_torch_peak_mib": torch_memory["peak_mib"],
-            "fwd_bwd_torch_temp_mib": torch_memory["temp_mib"],
-            "fwd_bwd_torch_after_delta_mib": torch_memory["after_delta_mib"],
         }
+        if not args.skip_torch:
+            torch_memory = _peak_memory(_torch_forward_backward)
+            memory.update(
+                {
+                    "fwd_bwd_torch_peak_mib": torch_memory["peak_mib"],
+                    "fwd_bwd_torch_temp_mib": torch_memory["temp_mib"],
+                    "fwd_bwd_torch_after_delta_mib": torch_memory["after_delta_mib"],
+                }
+            )
     numeric = {}
     if args.report_numerics:
         numeric = _forward_backward_numeric_summary(

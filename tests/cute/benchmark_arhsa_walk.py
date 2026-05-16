@@ -396,10 +396,12 @@ def _check(case, args):
             case["leaf_query_index_i32"],
             case["leaf_value_index_i32"],
             n_queries=args.n_queries,
+            max_values=args.tensor_core_qv_pack_max_values,
             packing_strategy=args.tensor_core_qv_pack_strategy,
         )
         readout_pack_kwargs = {
             "query_value_pack": True,
+            "tensor_core_query_value_pack": args.tensor_core_qv_readout,
             "pack_query_index": pack_query_index,
             "pack_value_index": pack_value_index,
             "pack_query_value_leaf_entry": pack_query_value_leaf_entry,
@@ -512,6 +514,7 @@ def _forward_backward_numeric_summary(
         tensor_core_packed=args.tensor_core_packed_bwd,
         tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
         query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+        tensor_core_query_value_pack_scatter_dv=args.tensor_core_qv_pack_scatter_dv_bwd,
         pack_leaf_entry_index=tc_pack_leaf_entry_index,
         pack_value_index=tc_pack_value_index,
         pack_value_slot=tc_pack_value_slot,
@@ -780,6 +783,11 @@ def main():
         help="Use qv-pack-owned D=64 readout forward when query/value packs are dense.",
     )
     parser.add_argument(
+        "--tensor-core-qv-readout",
+        action="store_true",
+        help="Use tensor cores for --query-value-pack-readout.",
+    )
+    parser.add_argument(
         "--incoming-packed-step",
         action="store_true",
         help="Gather edge probabilities into incoming-CSR order and use the packed Markov forward step.",
@@ -825,10 +833,22 @@ def main():
         help="Use pack-owned qv scatter after query/value packed tensor-core stats.",
     )
     parser.add_argument(
+        "--tensor-core-qv-pack-scatter-dv-bwd",
+        action="store_true",
+        help="Use tensor cores for dV inside pack-owned qv scatter.",
+    )
+    parser.add_argument(
         "--tensor-core-qv-pack-strategy",
         choices=("lexicographic", "span", "overlap"),
         default="overlap",
         help="CPU grouping strategy for --tensor-core-query-value-packed-bwd metadata.",
+    )
+    parser.add_argument(
+        "--tensor-core-qv-pack-max-values",
+        type=int,
+        choices=(8, 16),
+        default=8,
+        help="Value columns per 16-query qv pack; 16 fills tensor-core MMA tiles when fanout allows it.",
     )
     parser.add_argument(
         "--auto-readout-bwd",
@@ -921,6 +941,12 @@ def main():
         raise ValueError("--auto-readout-bwd currently requires --head-dim-v 64")
     if args.query_value_pack_readout and args.head_dim_v != 64:
         raise ValueError("--query-value-pack-readout currently requires --head-dim-v 64")
+    if args.tensor_core_qv_readout and not args.query_value_pack_readout:
+        raise ValueError("--tensor-core-qv-readout requires --query-value-pack-readout")
+    if args.tensor_core_qv_readout and args.dtype != "bfloat16":
+        raise ValueError("--tensor-core-qv-readout currently requires --dtype=bfloat16")
+    if args.query_value_pack_readout and args.leaves_per_query > args.tensor_core_qv_pack_max_values:
+        raise ValueError("--query-value-pack-readout requires leaves_per_query <= --tensor-core-qv-pack-max-values")
     if args.auto_readout_bwd and any(
         (
             args.fused_readout_bwd,
@@ -1010,8 +1036,12 @@ def main():
         raise ValueError("--tensor-core-qv-pack-scatter-bwd requires --tensor-core-query-value-packed-bwd")
     if args.tensor_core_qv_pack_scatter_bwd and args.query_warp_scatter:
         raise ValueError("--tensor-core-qv-pack-scatter-bwd cannot be combined with --query-warp-scatter")
-    if args.tensor_core_qv_pack_scatter_bwd and args.leaves_per_query > 8:
-        raise ValueError("--tensor-core-qv-pack-scatter-bwd requires --leaves-per-query <= 8")
+    if args.tensor_core_qv_pack_scatter_bwd and args.leaves_per_query > args.tensor_core_qv_pack_max_values:
+        raise ValueError(
+            "--tensor-core-qv-pack-scatter-bwd requires leaves_per_query <= --tensor-core-qv-pack-max-values"
+        )
+    if args.tensor_core_qv_pack_scatter_dv_bwd and not args.tensor_core_qv_pack_scatter_bwd:
+        raise ValueError("--tensor-core-qv-pack-scatter-dv-bwd requires --tensor-core-qv-pack-scatter-bwd")
     case = _make_case(args)
     if not args.no_check:
         _check(case, args)
@@ -1197,27 +1227,30 @@ def main():
             case["leaf_query_index_i32"],
             case["leaf_value_index_i32"],
             n_queries=args.n_queries,
+            max_values=args.tensor_core_qv_pack_max_values,
             packing_strategy=args.tensor_core_qv_pack_strategy,
         )
         tc_qv_pack_count = int(tc_qv_pack_query_index.shape[0])
         tc_qv_valid_rows = int((tc_qv_pack_query_index >= 0).sum().item())
         tc_qv_valid_outputs = int((tc_qv_pack_leaf_entry >= 0).sum().item())
         tc_qv_used_value_cols = int((tc_qv_pack_leaf_entry >= 0).any(dim=1).sum().item())
-        tc_qv_output_util = (tc_qv_valid_outputs / (tc_qv_pack_count * 16 * 8)) if tc_qv_pack_count else 0.0
+        tc_qv_output_util = (
+            tc_qv_valid_outputs / (tc_qv_pack_count * 16 * args.tensor_core_qv_pack_max_values)
+        ) if tc_qv_pack_count else 0.0
         tc_pack_summary = {
             "tensor_core_qv_pack_count": tc_qv_pack_count,
             "tensor_core_qv_pack_row_fill": (
                 tc_qv_valid_rows / (tc_qv_pack_count * 16)
             ) if tc_qv_pack_count else 0.0,
             "tensor_core_qv_pack_value_fill": (
-                tc_qv_used_value_cols / (tc_qv_pack_count * 8)
+                tc_qv_used_value_cols / (tc_qv_pack_count * args.tensor_core_qv_pack_max_values)
             ) if tc_qv_pack_count else 0.0,
             "tensor_core_qv_pack_output_util": tc_qv_output_util,
         }
     if args.auto_readout_bwd:
         if tc_qv_output_util >= float(args.auto_qv_output_util_threshold):
             args.tensor_core_query_value_packed_bwd = True
-            if args.leaves_per_query <= 8:
+            if args.leaves_per_query <= args.tensor_core_qv_pack_max_values:
                 args.tensor_core_qv_pack_scatter_bwd = True
                 auto_selected_readout_bwd = "tensor_core_query_value_packed_pack_scatter"
             else:
@@ -1233,6 +1266,7 @@ def main():
             raise RuntimeError("query/value readout packs were not built")
         readout_pack_kwargs = {
             "query_value_pack": True,
+            "tensor_core_query_value_pack": args.tensor_core_qv_readout,
             "pack_query_index": tc_qv_pack_query_index,
             "pack_value_index": tc_qv_pack_value_index,
             "pack_query_value_leaf_entry": tc_qv_pack_leaf_entry,
@@ -1272,6 +1306,7 @@ def main():
             query_warp_stats=args.query_warp_stats,
             query_warp_readout=args.query_warp_readout,
             query_value_pack_readout=args.query_value_pack_readout,
+            tensor_core_query_value_pack_readout=args.tensor_core_qv_readout,
             incoming_packed_step=args.incoming_packed_step,
             save_forward_history=args.save_forward_history,
             level_bounds=case["level_bounds"],
@@ -1285,6 +1320,7 @@ def main():
             tensor_core_packed=args.tensor_core_packed_bwd,
             tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
             query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            tensor_core_query_value_pack_scatter_dv=args.tensor_core_qv_pack_scatter_dv_bwd,
             pack_leaf_entry_index=tc_pack_leaf_entry_index,
             pack_value_index=tc_pack_value_index,
             pack_value_slot=tc_pack_value_slot,
@@ -1348,6 +1384,7 @@ def main():
             tensor_core_packed=args.tensor_core_packed_bwd,
             tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
             query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            tensor_core_query_value_pack_scatter_dv=args.tensor_core_qv_pack_scatter_dv_bwd,
             pack_leaf_entry_index=tc_pack_leaf_entry_index,
             pack_value_index=tc_pack_value_index,
             pack_value_slot=tc_pack_value_slot,
@@ -1466,6 +1503,7 @@ def main():
             tensor_core_packed=args.tensor_core_packed_bwd,
             tensor_core_query_value_packed=args.tensor_core_query_value_packed_bwd,
             query_value_pack_scatter=args.tensor_core_qv_pack_scatter_bwd,
+            tensor_core_query_value_pack_scatter_dv=args.tensor_core_qv_pack_scatter_dv_bwd,
             pack_leaf_entry_index=tc_pack_leaf_entry_index,
             pack_value_index=tc_pack_value_index,
             pack_value_slot=tc_pack_value_slot,
@@ -1767,6 +1805,7 @@ def main():
             "query_warp_stats": args.query_warp_stats,
             "query_warp_readout": args.query_warp_readout,
             "query_value_pack_readout": args.query_value_pack_readout,
+            "tensor_core_qv_readout": args.tensor_core_qv_readout,
             "incoming_packed_step": args.incoming_packed_step,
             "save_forward_history": args.save_forward_history,
             "query_warp_scatter": args.query_warp_scatter,
@@ -1776,7 +1815,9 @@ def main():
             "tensor_core_packed_bwd": args.tensor_core_packed_bwd,
             "tensor_core_query_value_packed_bwd": args.tensor_core_query_value_packed_bwd,
             "tensor_core_qv_pack_scatter_bwd": args.tensor_core_qv_pack_scatter_bwd,
+            "tensor_core_qv_pack_scatter_dv_bwd": args.tensor_core_qv_pack_scatter_dv_bwd,
             "tensor_core_qv_pack_strategy": args.tensor_core_qv_pack_strategy,
+            "tensor_core_qv_pack_max_values": args.tensor_core_qv_pack_max_values,
             **{key: round(value, 4) for key, value in tc_pack_summary.items()},
             **{key: round(value, 4) for key, value in timings.items()},
             **{key: round(value, 2) for key, value in memory.items()},

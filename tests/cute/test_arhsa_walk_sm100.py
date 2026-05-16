@@ -379,7 +379,7 @@ def test_arhsa_leaf_readout_query_warp_matches_torch_reference(head_dim_v):
         n_queries=n_queries,
     )
     expected_denom = torch.zeros_like(denom)
-    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index])
+    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index].float())
 
     torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(denom, expected_denom.clamp(min=1e-8), atol=1e-6, rtol=1e-6)
@@ -441,10 +441,141 @@ def test_arhsa_leaf_readout_query_value_pack_matches_torch_reference():
         n_queries=n_queries,
     )
     expected_denom = torch.zeros_like(denom)
-    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index])
+    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index].float())
 
     torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(denom, expected_denom.clamp(min=1e-8), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_leaf_readout_query_value_pack_tensor_core_matches_torch_bfloat16():
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 CUDA support required")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_query_leaf_csr,
+        build_query_value_packs,
+        run_arhsa_leaf_readout,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(71)
+    n_queries = 17
+    n_nodes = 37
+    n_heads = 2
+    leaves_per_query = 8
+    leaf_query_index = torch.arange(n_queries, dtype=torch.int64, device=device).repeat_interleave(
+        leaves_per_query
+    )
+    leaf_node_index = torch.randint(n_nodes, (n_queries * leaves_per_query,), dtype=torch.int64, device=device)
+    leaf_value_index = torch.arange(leaves_per_query, dtype=torch.int64, device=device).repeat(n_queries)
+    p = torch.rand(n_nodes, n_heads, device=device, dtype=torch.bfloat16)
+    value = torch.randn(leaves_per_query, n_heads, 64, device=device, dtype=torch.bfloat16)
+    query_leaf_row_ptr, query_leaf_entry_index = build_query_leaf_csr(
+        leaf_query_index,
+        n_queries=n_queries,
+    )
+    pack_query_index, pack_value_index, pack_query_value_leaf_entry = build_query_value_packs(
+        leaf_query_index,
+        leaf_value_index,
+        n_queries=n_queries,
+    )
+    denom = torch.empty(n_queries, n_heads, device=device, dtype=torch.float32)
+
+    got = run_arhsa_leaf_readout(
+        p,
+        leaf_node_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value,
+        n_queries=n_queries,
+        denom=denom,
+        query_value_pack=True,
+        tensor_core_query_value_pack=True,
+        pack_query_index=pack_query_index,
+        pack_value_index=pack_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+    )
+    expected, _ = _reference_readout(
+        p,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        value,
+        n_queries=n_queries,
+    )
+    expected_denom = torch.zeros_like(denom)
+    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index].float())
+
+    torch.testing.assert_close(got, expected, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(denom, expected_denom.clamp(min=1e-8), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_leaf_readout_query_value_pack16_tensor_core_matches_torch_bfloat16():
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 CUDA support required")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_query_leaf_csr,
+        build_query_value_packs,
+        run_arhsa_leaf_readout,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(73)
+    n_queries = 16
+    n_nodes = 41
+    n_heads = 2
+    leaves_per_query = 16
+    leaf_query_index = torch.arange(n_queries, dtype=torch.int64, device=device).repeat_interleave(
+        leaves_per_query
+    )
+    leaf_node_index = torch.randint(n_nodes, (n_queries * leaves_per_query,), dtype=torch.int64, device=device)
+    leaf_value_index = torch.arange(leaves_per_query, dtype=torch.int64, device=device).repeat(n_queries)
+    p = torch.rand(n_nodes, n_heads, device=device, dtype=torch.bfloat16)
+    value = torch.randn(leaves_per_query, n_heads, 64, device=device, dtype=torch.bfloat16)
+    query_leaf_row_ptr, query_leaf_entry_index = build_query_leaf_csr(
+        leaf_query_index,
+        n_queries=n_queries,
+    )
+    pack_query_index, pack_value_index, pack_query_value_leaf_entry = build_query_value_packs(
+        leaf_query_index,
+        leaf_value_index,
+        n_queries=n_queries,
+        max_values=16,
+    )
+    denom = torch.empty(n_queries, n_heads, device=device, dtype=torch.float32)
+
+    got = run_arhsa_leaf_readout(
+        p,
+        leaf_node_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value,
+        n_queries=n_queries,
+        denom=denom,
+        query_value_pack=True,
+        tensor_core_query_value_pack=True,
+        pack_query_index=pack_query_index,
+        pack_value_index=pack_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+    )
+    expected, _ = _reference_readout(
+        p,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        value,
+        n_queries=n_queries,
+    )
+    expected_denom = torch.zeros_like(denom)
+    expected_denom.index_add_(0, leaf_query_index, p[leaf_node_index].float())
+
+    torch.testing.assert_close(got, expected, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(denom, expected_denom.clamp(min=1e-8), atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1100,7 +1231,7 @@ def test_arhsa_leaf_readout_backward_tensor_core_packed_matches_torch_bfloat16()
     torch.testing.assert_close(got_value, value_ref.grad, atol=7e-2, rtol=7e-2)
 
 
-@pytest.mark.parametrize("scatter_mode", ["generic", "query_warp", "qv_pack"])
+@pytest.mark.parametrize("scatter_mode", ["generic", "query_warp", "qv_pack", "qv_pack_tc_dv"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_arhsa_leaf_readout_backward_tensor_core_query_value_packed_matches_torch_bfloat16(
     scatter_mode,
@@ -1151,7 +1282,79 @@ def test_arhsa_leaf_readout_backward_tensor_core_query_value_packed_matches_torc
         n_queries=n_queries,
         query_warp_scatter=(scatter_mode == "query_warp"),
         tensor_core_query_value_packed=True,
-        query_value_pack_scatter=(scatter_mode == "qv_pack"),
+        query_value_pack_scatter=(scatter_mode in ("qv_pack", "qv_pack_tc_dv")),
+        tensor_core_query_value_pack_scatter_dv=(scatter_mode == "qv_pack_tc_dv"),
+        pack_query_index=pack_query_index,
+        pack_query_value_index=pack_query_value_index,
+        pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+    )
+
+    p_ref = p_data.clone().requires_grad_()
+    value_ref = value_data.clone().requires_grad_()
+    readout_ref, _ = readout_arhsa_leaf_attention(
+        p_ref,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        value_ref,
+        n_queries=n_queries,
+    )
+    readout_ref.backward(grad_readout)
+
+    torch.testing.assert_close(got_p, p_ref.grad, atol=9e-2, rtol=9e-2)
+    torch.testing.assert_close(got_value, value_ref.grad, atol=7e-2, rtol=7e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_leaf_readout_backward_query_value_pack16_tensor_core_matches_torch_bfloat16():
+    pytest.importorskip("cutlass")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("bfloat16 CUDA support required")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_query_leaf_csr,
+        build_query_value_packs,
+        readout_arhsa_leaf_attention,
+        run_arhsa_leaf_readout_backward,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(75)
+    n_queries = 16
+    n_nodes = 43
+    n_heads = 2
+    leaves_per_query = 16
+    n_leaf_entries = n_queries * leaves_per_query
+    p_data = torch.rand(n_nodes, n_heads, device=device, dtype=torch.bfloat16)
+    leaf_query_index = torch.arange(n_queries, dtype=torch.int64, device=device).repeat_interleave(
+        leaves_per_query
+    )
+    leaf_node_index = torch.randint(n_nodes, (n_leaf_entries,), dtype=torch.int64, device=device)
+    leaf_value_index = torch.arange(leaves_per_query, dtype=torch.int64, device=device).repeat(n_queries)
+    value_data = torch.randn(n_nodes, n_heads, 64, device=device, dtype=torch.bfloat16)
+    grad_readout = torch.randn(n_queries, n_heads, 64, device=device, dtype=torch.bfloat16)
+    query_leaf_row_ptr, query_leaf_entry_index = build_query_leaf_csr(
+        leaf_query_index,
+        n_queries=n_queries,
+    )
+    pack_query_index, pack_query_value_index, pack_query_value_leaf_entry = build_query_value_packs(
+        leaf_query_index,
+        leaf_value_index,
+        n_queries=n_queries,
+        max_values=16,
+    )
+    got_p, got_value = run_arhsa_leaf_readout_backward(
+        p_data,
+        leaf_node_index,
+        leaf_query_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value_data,
+        grad_readout,
+        n_queries=n_queries,
+        tensor_core_query_value_packed=True,
+        query_value_pack_scatter=True,
+        tensor_core_query_value_pack_scatter_dv=True,
         pack_query_index=pack_query_index,
         pack_query_value_index=pack_query_value_index,
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,

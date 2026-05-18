@@ -3193,6 +3193,11 @@ This is worse than the earlier must-win PTXAS snapshot (`224` / `396` / `572`), 
      - `PYTHONPATH=/workspace/codebases/fp4_matmul/flash-attention PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 240s /workspace/codebases/fp4_matmul/.venv/bin/python -m pytest -q tests/cute/test_fp4_flash_attn.py -k "fp4_pv_mxfp4_fake_compile_dense_forward or fp4_pv_fused_fake_compile_dense_forward or fp4_pv_fused_exact_lane_accepts_mxfp4_scale_config or fp4_pv_validation_errors or fp4_qk_validation_errors"`
    - expected cheap validation result:
      - focused test suite: `34 passed, 120 deselected`
+   - validation caveat from the final checkpoint instance:
+     - `git diff --check` passed
+     - `python -m py_compile ...` passed for the handoff command listed above
+     - the focused pytest command timed out after `240s` with no output in the final instance, despite previously completing as `34 passed, 120 deselected`
+     - if recreating progress, rerun the focused pytest command first and check for local environment stalls before trusting runtime benchmark noise
    - primary runtime probes:
      - use a quiet physical GPU; recent screens used physical device `2` exposed as benchmark device `0`
      - NVFP4 PV must-win smoke:

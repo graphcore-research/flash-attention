@@ -1215,6 +1215,134 @@ class ARHSASampledEdgeDstDotBackwardSm100:
                 )
 
 
+class ARHSAGroupedWeightedValueSm100:
+    """Reduce per-edge attention/value rows into grouped child-gat parent rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mAttn: cute.Tensor,
+        mValue: cute.Tensor,
+        mGroupEdgePtr: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mAttn,
+            mValue,
+            mGroupEdgePtr,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mAttn: cute.Tensor,
+        mValue: cute.Tensor,
+        mGroupEdgePtr: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mValue.shape[1])
+            head_dim = Int32(mValue.shape[2])
+            elems_per_group = num_heads * head_dim
+            group_idx = task_idx // elems_per_group
+            rem = task_idx - group_idx * elems_per_group
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            start = Int32(mGroupEdgePtr[group_idx])
+            end = Int32(mGroupEdgePtr[group_idx + Int32(1)])
+            acc = Float32.zero
+            for edge_idx in cutlass.range(start, end, unroll=1):
+                acc += Float32(mAttn[edge_idx, head_idx]) * Float32(
+                    mValue[edge_idx, head_idx, dim_idx]
+                )
+            mOut[group_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
+
+
+class ARHSAGroupedWeightedValueBackwardSm100:
+    """Backward for grouped weighted-value reduction."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mAttn: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mEdgeGroupIndex: cute.Tensor,
+        mGradAttn: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mAttn,
+            mValue,
+            mGradOut,
+            mEdgeGroupIndex,
+            mGradAttn,
+            mGradValue,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mAttn: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mEdgeGroupIndex: cute.Tensor,
+        mGradAttn: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mValue.shape[1])
+            head_dim = Int32(mValue.shape[2])
+            edge_idx = task_idx // num_heads
+            head_idx = task_idx - edge_idx * num_heads
+            group_idx = Int32(mEdgeGroupIndex[edge_idx])
+            attn = Float32(mAttn[edge_idx, head_idx])
+            grad_attn = Float32.zero
+            for dim_idx in cutlass.range(head_dim, unroll=16):
+                grad_out = Float32(mGradOut[group_idx, head_idx, dim_idx])
+                value = Float32(mValue[edge_idx, head_idx, dim_idx])
+                grad_attn += grad_out * value
+                mGradValue[edge_idx, head_idx, dim_idx] = (
+                    attn * grad_out
+                ).to(mGradValue.element_type)
+            mGradAttn[edge_idx, head_idx] = grad_attn.to(mGradAttn.element_type)
+
+
 class ARHSALeafReadoutSm100:
     """Normalize leaf mass and reduce values per query/head/value dimension."""
 
@@ -5326,6 +5454,167 @@ def run_arhsa_sampled_edge_dst_dot_backward(
     return grad_q, grad_row
 
 
+def run_arhsa_grouped_weighted_value(
+    attn: torch.Tensor,
+    value: torch.Tensor,
+    group_edge_ptr: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run grouped ``sum_edges attn * value`` for child-gat aggregation."""
+    _require_cute_runtime()
+    if attn.device.type != "cuda":
+        raise ValueError("attn must be a CUDA tensor")
+    if attn.ndim != 2:
+        raise ValueError(f"attn must have shape [n_edges, n_heads], got {tuple(attn.shape)}")
+    if value.ndim != 3:
+        raise ValueError(f"value must have shape [n_edges, n_heads, head_dim], got {tuple(value.shape)}")
+    if value.shape[:2] != attn.shape:
+        raise ValueError("attn and value edge/head dimensions must match")
+    if group_edge_ptr.ndim != 1:
+        raise ValueError(f"group_edge_ptr must be 1D, got {tuple(group_edge_ptr.shape)}")
+    if attn.dtype not in _CUTE_BACKWARD_DTYPES or value.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"attn/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    n_groups = int(group_edge_ptr.numel()) - 1
+    if n_groups < 0:
+        raise ValueError("group_edge_ptr must contain at least one entry")
+    if out is None:
+        out = torch.empty(
+            (n_groups, value.shape[1], value.shape[2]),
+            dtype=value.dtype,
+            device=value.device,
+        )
+    if out.shape != (n_groups, value.shape[1], value.shape[2]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    attn = attn.contiguous()
+    value = value.contiguous()
+    out = out.contiguous()
+    group_edge_ptr = group_edge_ptr.to(device=attn.device, dtype=torch.int32).contiguous()
+    total_tasks = int(n_groups * value.shape[1] * value.shape[2])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_grouped_weighted_value",
+        attn.dtype,
+        value.dtype,
+        out.dtype,
+        value.shape[1],
+        value.shape[2],
+        torch.cuda.get_device_capability(attn.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_grouped_weighted_value.compile_cache:
+        op = ARHSAGroupedWeightedValueSm100()
+        run_arhsa_grouped_weighted_value.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(attn),
+            to_cute_tensor(value),
+            to_cute_tensor(group_edge_ptr, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_grouped_weighted_value.compile_cache[compile_key](
+        attn,
+        value,
+        group_edge_ptr,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_grouped_weighted_value_backward(
+    attn: torch.Tensor,
+    value: torch.Tensor,
+    grad_out: torch.Tensor,
+    edge_group_index: torch.Tensor,
+    grad_attn: torch.Tensor | None = None,
+    grad_value: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for grouped weighted-value reduction."""
+    _require_cute_runtime()
+    if attn.device.type != "cuda":
+        raise ValueError("attn must be a CUDA tensor")
+    if attn.ndim != 2:
+        raise ValueError(f"attn must have shape [n_edges, n_heads], got {tuple(attn.shape)}")
+    if value.ndim != 3 or value.shape[:2] != attn.shape:
+        raise ValueError("value must have shape [n_edges, n_heads, head_dim] matching attn")
+    if grad_out.ndim != 3 or grad_out.shape[1:] != value.shape[1:]:
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    if edge_group_index.shape != (attn.shape[0],):
+        raise ValueError(f"edge_group_index shape mismatch: got {tuple(edge_group_index.shape)}")
+    if attn.dtype not in _CUTE_BACKWARD_DTYPES or value.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"attn/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {grad_out.dtype}")
+    if grad_attn is None:
+        grad_attn = (
+            torch.empty_like(attn)
+            if attn.dtype == torch.float32
+            else torch.empty_like(attn, dtype=torch.float32)
+        )
+    if grad_value is None:
+        grad_value = torch.empty_like(value)
+    if grad_attn.shape != attn.shape:
+        raise ValueError(f"grad_attn shape mismatch: got {tuple(grad_attn.shape)}")
+    if grad_value.shape != value.shape:
+        raise ValueError(f"grad_value shape mismatch: got {tuple(grad_value.shape)}")
+
+    attn = attn.contiguous()
+    value = value.contiguous()
+    grad_out = grad_out.contiguous()
+    grad_attn = grad_attn.contiguous()
+    grad_value = grad_value.contiguous()
+    edge_group_index = edge_group_index.to(device=attn.device, dtype=torch.int32).contiguous()
+    total_tasks = int(attn.shape[0] * attn.shape[1])
+    if total_tasks == 0:
+        return grad_attn, grad_value
+
+    compile_key = (
+        "arhsa_grouped_weighted_value_backward",
+        attn.dtype,
+        value.dtype,
+        grad_out.dtype,
+        grad_attn.dtype,
+        grad_value.dtype,
+        value.shape[1],
+        value.shape[2],
+        torch.cuda.get_device_capability(attn.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_grouped_weighted_value_backward.compile_cache:
+        op = ARHSAGroupedWeightedValueBackwardSm100()
+        run_arhsa_grouped_weighted_value_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(attn),
+            to_cute_tensor(value),
+            to_cute_tensor(grad_out),
+            to_cute_tensor(edge_group_index, assumed_align=4),
+            to_cute_tensor(grad_attn),
+            to_cute_tensor(grad_value),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_grouped_weighted_value_backward.compile_cache[compile_key](
+        attn,
+        value,
+        grad_out,
+        edge_group_index,
+        grad_attn,
+        grad_value,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_attn, grad_value
+
+
 def run_arhsa_leaf_readout(
     p: torch.Tensor,
     leaf_node_index: torch.Tensor,
@@ -9070,6 +9359,10 @@ run_arhsa_sampled_node_dot.compile_cache = get_jit_cache("arhsa_sampled_node_dot
 run_arhsa_sampled_node_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_node_dot_backward")
 run_arhsa_sampled_edge_dst_dot.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot")
 run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot_backward")
+run_arhsa_grouped_weighted_value.compile_cache = get_jit_cache("arhsa_grouped_weighted_value")
+run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
+    "arhsa_grouped_weighted_value_backward"
+)
 run_arhsa_leaf_readout.compile_cache = get_jit_cache("arhsa_leaf_readout")
 run_arhsa_pack_leaf_values.compile_cache = get_jit_cache("arhsa_pack_leaf_values")
 run_arhsa_leaf_readout_backward_stats.compile_cache = get_jit_cache("arhsa_leaf_readout_backward_stats")

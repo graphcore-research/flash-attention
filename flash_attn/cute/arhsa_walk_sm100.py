@@ -893,6 +893,328 @@ class ARHSAOutgoingSoftmaxBackwardSm100:
                 mGradEdgeScores[edge_idx, head_idx] = grad_score.to(mGradEdgeScores.element_type)
 
 
+class ARHSASampledNodeDotSm100:
+    """Sample q[level] dot row_repr for per-query ARHSAv2 nodes."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            node_idx = task_idx // num_heads
+            head_idx = task_idx - node_idx * num_heads
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            partial = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                partial += (
+                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                    * Float32(mRowRepr[feature_row, head_idx, dim_idx])
+                )
+            acc = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[node_idx, head_idx] = (acc * scale).to(mOut.element_type)
+
+
+class ARHSASampledNodeDotBackwardSm100:
+    """Backward for sampled q[level] dot row_repr with FP32 gradient accumulation."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            node_idx = task_idx // num_heads
+            head_idx = task_idx - node_idx * num_heads
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            grad = Float32(mGradOut[node_idx, head_idx]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q = Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                row = Float32(mRowRepr[feature_row, head_idx, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad * row,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad * q,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim_idx)),
+                )
+
+
+class ARHSASampledEdgeDstDotSm100:
+    """Sample q[level(dst)] dot row_repr(dst) directly for ARHSAv2 edges."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mEdgeDstNodeIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mEdgeDstNodeIndex,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mEdgeDstNodeIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            edge_idx = task_idx // num_heads
+            head_idx = task_idx - edge_idx * num_heads
+            dst_node_idx = Int32(mEdgeDstNodeIndex[edge_idx])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[dst_node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[dst_node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            partial = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                partial += (
+                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                    * Float32(mRowRepr[feature_row, head_idx, dim_idx])
+                )
+            acc = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[edge_idx, head_idx] = (acc * scale).to(mOut.element_type)
+
+
+class ARHSASampledEdgeDstDotBackwardSm100:
+    """Backward for direct sampled edge-destination dot."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mEdgeDstNodeIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mEdgeDstNodeIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mEdgeDstNodeIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            edge_idx = task_idx // num_heads
+            head_idx = task_idx - edge_idx * num_heads
+            dst_node_idx = Int32(mEdgeDstNodeIndex[edge_idx])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[dst_node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[dst_node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            grad = Float32(mGradOut[edge_idx, head_idx]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q = Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                row = Float32(mRowRepr[feature_row, head_idx, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad * row,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad * q,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim_idx)),
+                )
+
+
 class ARHSALeafReadoutSm100:
     """Normalize leaf mass and reduce values per query/head/value dimension."""
 
@@ -4602,6 +4924,408 @@ def run_arhsa_outgoing_softmax_backward(
     return grad_edge_scores
 
 
+def run_arhsa_sampled_node_dot(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    query_node_feature_row_index: torch.Tensor,
+    query_node_query_index: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run fused sampled q[level] dot row_repr for 4-D per-head ARHSAv2 tensors."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3:
+        raise ValueError(f"row_repr must have shape [n_rows, n_heads, head_dim], got {tuple(row_repr.shape)}")
+    if q_levels.shape[2:] != row_repr.shape[1:]:
+        raise ValueError("q_levels and row_repr head dimensions must match")
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty(
+            (query_node_feature_row_index.numel(), row_repr.shape[1]),
+            dtype=row_repr.dtype,
+            device=row_repr.device,
+        )
+    if out.shape != (query_node_feature_row_index.numel(), row_repr.shape[1]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    out = out.contiguous()
+    feature_row_level = feature_row_level.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    query_node_feature_row_index = query_node_feature_row_index.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    total_tasks = int(query_node_feature_row_index.numel() * row_repr.shape[1])
+    if total_tasks == 0:
+        return out
+
+    scale = float(q_levels.shape[-1] ** 0.5)
+    compile_key = (
+        "arhsa_sampled_node_dot",
+        q_levels.dtype,
+        row_repr.dtype,
+        out.dtype,
+        q_levels.shape[2],
+        q_levels.shape[3],
+        torch.cuda.get_device_capability(q_levels.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_sampled_node_dot.compile_cache:
+        op = ARHSASampledNodeDotSm100()
+        run_arhsa_sampled_node_dot.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(q_levels),
+            to_cute_tensor(row_repr),
+            to_cute_tensor(feature_row_level, assumed_align=4),
+            to_cute_tensor(query_node_feature_row_index, assumed_align=4),
+            to_cute_tensor(query_node_query_index, assumed_align=4),
+            to_cute_tensor(out),
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_sampled_node_dot.compile_cache[compile_key](
+        q_levels,
+        row_repr,
+        feature_row_level,
+        query_node_feature_row_index,
+        query_node_query_index,
+        out,
+        Float32(scale),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_sampled_node_dot_backward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    grad_out: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    query_node_feature_row_index: torch.Tensor,
+    query_node_query_index: torch.Tensor,
+    grad_q: torch.Tensor | None = None,
+    grad_row: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run sampled-node-dot backward, accumulating in FP32 for BF16 inputs."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim] matching q_levels")
+    if grad_out.shape != (query_node_feature_row_index.numel(), row_repr.shape[1]):
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {grad_out.dtype}")
+
+    grad_q_out = grad_q
+    grad_row_out = grad_row
+    if grad_q is not None and grad_q.shape != q_levels.shape:
+        raise ValueError(f"grad_q shape mismatch: got {tuple(grad_q.shape)}")
+    if grad_row is not None and grad_row.shape != row_repr.shape:
+        raise ValueError(f"grad_row shape mismatch: got {tuple(grad_row.shape)}")
+    if q_levels.dtype == torch.float32:
+        grad_q = torch.zeros_like(q_levels) if grad_q is None else grad_q.zero_()
+    elif grad_q is not None and grad_q.dtype == torch.float32:
+        grad_q.zero_()
+    else:
+        grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
+    if row_repr.dtype == torch.float32:
+        grad_row = torch.zeros_like(row_repr) if grad_row is None else grad_row.zero_()
+    elif grad_row is not None and grad_row.dtype == torch.float32:
+        grad_row.zero_()
+    else:
+        grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    grad_out = grad_out.contiguous()
+    feature_row_level = feature_row_level.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    query_node_feature_row_index = query_node_feature_row_index.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    total_tasks = int(query_node_feature_row_index.numel() * row_repr.shape[1])
+    if total_tasks > 0:
+        scale = float(q_levels.shape[-1] ** 0.5)
+        compile_key = (
+            "arhsa_sampled_node_dot_backward",
+            q_levels.dtype,
+            row_repr.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            q_levels.shape[2],
+            q_levels.shape[3],
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_sampled_node_dot_backward.compile_cache:
+            op = ARHSASampledNodeDotBackwardSm100()
+            run_arhsa_sampled_node_dot_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(feature_row_level, assumed_align=4),
+                to_cute_tensor(query_node_feature_row_index, assumed_align=4),
+                to_cute_tensor(query_node_query_index, assumed_align=4),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                Float32(scale),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_sampled_node_dot_backward.compile_cache[compile_key](
+            q_levels,
+            row_repr,
+            grad_out,
+            feature_row_level,
+            query_node_feature_row_index,
+            query_node_query_index,
+            grad_q,
+            grad_row,
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    if grad_q_out is not None and grad_q_out.data_ptr() != grad_q.data_ptr():
+        grad_q_out.copy_(grad_q.to(dtype=grad_q_out.dtype))
+        grad_q = grad_q_out
+    elif grad_q_out is None and grad_q.dtype != q_levels.dtype:
+        grad_q = grad_q.to(dtype=q_levels.dtype)
+    if grad_row_out is not None and grad_row_out.data_ptr() != grad_row.data_ptr():
+        grad_row_out.copy_(grad_row.to(dtype=grad_row_out.dtype))
+        grad_row = grad_row_out
+    elif grad_row_out is None and grad_row.dtype != row_repr.dtype:
+        grad_row = grad_row.to(dtype=row_repr.dtype)
+    return grad_q, grad_row
+
+
+def run_arhsa_sampled_edge_dst_dot(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    query_node_feature_row_index: torch.Tensor,
+    query_node_query_index: torch.Tensor,
+    edge_dst_node_index: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run fused sampled q[level(dst)] dot row_repr(dst) for edge logits."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3:
+        raise ValueError(f"row_repr must have shape [n_rows, n_heads, head_dim], got {tuple(row_repr.shape)}")
+    if q_levels.shape[2:] != row_repr.shape[1:]:
+        raise ValueError("q_levels and row_repr head dimensions must match")
+    if edge_dst_node_index.ndim != 1:
+        raise ValueError(f"edge_dst_node_index must be 1D, got {tuple(edge_dst_node_index.shape)}")
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty(
+            (edge_dst_node_index.numel(), row_repr.shape[1]),
+            dtype=row_repr.dtype,
+            device=row_repr.device,
+        )
+    if out.shape != (edge_dst_node_index.numel(), row_repr.shape[1]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    out = out.contiguous()
+    feature_row_level = feature_row_level.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    query_node_feature_row_index = query_node_feature_row_index.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    edge_dst_node_index = edge_dst_node_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    total_tasks = int(edge_dst_node_index.numel() * row_repr.shape[1])
+    if total_tasks == 0:
+        return out
+
+    scale = float(q_levels.shape[-1] ** 0.5)
+    compile_key = (
+        "arhsa_sampled_edge_dst_dot",
+        q_levels.dtype,
+        row_repr.dtype,
+        out.dtype,
+        q_levels.shape[2],
+        q_levels.shape[3],
+        torch.cuda.get_device_capability(q_levels.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_sampled_edge_dst_dot.compile_cache:
+        op = ARHSASampledEdgeDstDotSm100()
+        run_arhsa_sampled_edge_dst_dot.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(q_levels),
+            to_cute_tensor(row_repr),
+            to_cute_tensor(feature_row_level, assumed_align=4),
+            to_cute_tensor(query_node_feature_row_index, assumed_align=4),
+            to_cute_tensor(query_node_query_index, assumed_align=4),
+            to_cute_tensor(edge_dst_node_index, assumed_align=4),
+            to_cute_tensor(out),
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_sampled_edge_dst_dot.compile_cache[compile_key](
+        q_levels,
+        row_repr,
+        feature_row_level,
+        query_node_feature_row_index,
+        query_node_query_index,
+        edge_dst_node_index,
+        out,
+        Float32(scale),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_sampled_edge_dst_dot_backward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    grad_out: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    query_node_feature_row_index: torch.Tensor,
+    query_node_query_index: torch.Tensor,
+    edge_dst_node_index: torch.Tensor,
+    grad_q: torch.Tensor | None = None,
+    grad_row: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for sampled edge-destination dot, accumulating in FP32."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim] matching q_levels")
+    if grad_out.shape != (edge_dst_node_index.numel(), row_repr.shape[1]):
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {grad_out.dtype}")
+
+    grad_q_out = grad_q
+    grad_row_out = grad_row
+    if grad_q is not None and grad_q.shape != q_levels.shape:
+        raise ValueError(f"grad_q shape mismatch: got {tuple(grad_q.shape)}")
+    if grad_row is not None and grad_row.shape != row_repr.shape:
+        raise ValueError(f"grad_row shape mismatch: got {tuple(grad_row.shape)}")
+    if q_levels.dtype == torch.float32:
+        grad_q = torch.zeros_like(q_levels) if grad_q is None else grad_q.zero_()
+    elif grad_q is not None and grad_q.dtype == torch.float32:
+        grad_q.zero_()
+    else:
+        grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
+    if row_repr.dtype == torch.float32:
+        grad_row = torch.zeros_like(row_repr) if grad_row is None else grad_row.zero_()
+    elif grad_row is not None and grad_row.dtype == torch.float32:
+        grad_row.zero_()
+    else:
+        grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    grad_out = grad_out.contiguous()
+    feature_row_level = feature_row_level.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    query_node_feature_row_index = query_node_feature_row_index.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    edge_dst_node_index = edge_dst_node_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    total_tasks = int(edge_dst_node_index.numel() * row_repr.shape[1])
+    if total_tasks > 0:
+        scale = float(q_levels.shape[-1] ** 0.5)
+        compile_key = (
+            "arhsa_sampled_edge_dst_dot_backward",
+            q_levels.dtype,
+            row_repr.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            q_levels.shape[2],
+            q_levels.shape[3],
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_sampled_edge_dst_dot_backward.compile_cache:
+            op = ARHSASampledEdgeDstDotBackwardSm100()
+            run_arhsa_sampled_edge_dst_dot_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(feature_row_level, assumed_align=4),
+                to_cute_tensor(query_node_feature_row_index, assumed_align=4),
+                to_cute_tensor(query_node_query_index, assumed_align=4),
+                to_cute_tensor(edge_dst_node_index, assumed_align=4),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                Float32(scale),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_sampled_edge_dst_dot_backward.compile_cache[compile_key](
+            q_levels,
+            row_repr,
+            grad_out,
+            feature_row_level,
+            query_node_feature_row_index,
+            query_node_query_index,
+            edge_dst_node_index,
+            grad_q,
+            grad_row,
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    if grad_q_out is not None and grad_q_out.data_ptr() != grad_q.data_ptr():
+        grad_q_out.copy_(grad_q.to(dtype=grad_q_out.dtype))
+        grad_q = grad_q_out
+    elif grad_q_out is None and grad_q.dtype != q_levels.dtype:
+        grad_q = grad_q.to(dtype=q_levels.dtype)
+    if grad_row_out is not None and grad_row_out.data_ptr() != grad_row.data_ptr():
+        grad_row_out.copy_(grad_row.to(dtype=grad_row_out.dtype))
+        grad_row = grad_row_out
+    elif grad_row_out is None and grad_row.dtype != row_repr.dtype:
+        grad_row = grad_row.to(dtype=row_repr.dtype)
+    return grad_q, grad_row
+
+
 def run_arhsa_leaf_readout(
     p: torch.Tensor,
     leaf_node_index: torch.Tensor,
@@ -7555,6 +8279,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     edge_prob: torch.Tensor | None = None,
     incoming_edge_prob: torch.Tensor | None = None,
     p_history: tuple[torch.Tensor, ...] | list[torch.Tensor] | None = None,
+    recompute_history: bool = False,
     level_bounds: torch.Tensor | None = None,
     level_range_kernels: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -7639,44 +8364,69 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
                 n_nodes=n_nodes,
             )
 
-    if p_history is None:
-        p_history = [p0]
-        for iter_idx in range(n_iters):
-            p_next = torch.empty_like(p0)
-            if incoming_packed_step:
-                if level_range_kernels:
-                    node_start, node_count = _level_forward_dst_range(level_bounds_list, iter_idx)
-                    run_arhsa_markov_incoming_packed_range_step(
-                        p_history[-1],
-                        incoming_edge_prob,
-                        incoming_src,
-                        dst_row_ptr,
-                        node_is_sink,
-                        node_start=node_start,
-                        node_count=node_count,
-                        carry_sinks=_level_forward_carry_sinks(level_bounds_list, iter_idx),
-                        p_next=p_next,
-                    )
-                else:
-                    run_arhsa_markov_incoming_packed_step(
-                        p_history[-1],
-                        incoming_edge_prob,
-                        incoming_src,
-                        dst_row_ptr,
-                        node_is_sink,
-                        p_next,
-                    )
-            else:
-                run_arhsa_markov_incoming_step(
-                    p_history[-1],
-                    edge_prob,
-                    src,
+    def run_forward_step(p_cur: torch.Tensor, p_next: torch.Tensor, iter_idx: int) -> None:
+        if incoming_packed_step:
+            if level_range_kernels:
+                node_start, node_count = _level_forward_dst_range(level_bounds_list, iter_idx)
+                run_arhsa_markov_incoming_packed_range_step(
+                    p_cur,
+                    incoming_edge_prob,
+                    incoming_src,
                     dst_row_ptr,
-                    dst_edge_index,
+                    node_is_sink,
+                    node_start=node_start,
+                    node_count=node_count,
+                    carry_sinks=_level_forward_carry_sinks(level_bounds_list, iter_idx),
+                    p_next=p_next,
+                )
+            else:
+                run_arhsa_markov_incoming_packed_step(
+                    p_cur,
+                    incoming_edge_prob,
+                    incoming_src,
+                    dst_row_ptr,
                     node_is_sink,
                     p_next,
                 )
+        else:
+            run_arhsa_markov_incoming_step(
+                p_cur,
+                edge_prob,
+                src,
+                dst_row_ptr,
+                dst_edge_index,
+                node_is_sink,
+                p_next,
+            )
+
+    recompute_a: torch.Tensor | None = None
+    recompute_b: torch.Tensor | None = None
+
+    def recompute_state(iter_count: int) -> torch.Tensor:
+        nonlocal recompute_a, recompute_b
+        iter_count = int(iter_count)
+        if iter_count == 0:
+            return p0
+        if recompute_a is None:
+            recompute_a = torch.empty_like(p0)
+        if recompute_b is None:
+            recompute_b = torch.empty_like(p0)
+        p_cur = p0
+        p_next = recompute_a
+        for iter_idx in range(iter_count):
+            run_forward_step(p_cur, p_next, iter_idx)
+            p_cur, p_next = p_next, recompute_b if p_next is recompute_a else recompute_a
+        return p_cur
+
+    if p_history is None and not recompute_history:
+        p_history = [p0]
+        for iter_idx in range(n_iters):
+            p_next = torch.empty_like(p0)
+            run_forward_step(p_history[-1], p_next, iter_idx)
             p_history.append(p_next)
+        p_readout = p_history[-1]
+    elif p_history is None:
+        p_readout = recompute_state(n_iters)
     else:
         if len(p_history) != n_iters + 1:
             raise ValueError(f"p_history must contain n_iters + 1 tensors, got {len(p_history)} for n_iters={n_iters}")
@@ -7685,9 +8435,10 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
                 raise ValueError(f"p_history[{idx}] shape mismatch: got {tuple(p_state.shape)} expected {tuple(p0.shape)}")
             if p_state.dtype != p0.dtype or p_state.device != p0.device:
                 raise ValueError("p_history tensors must match p0 dtype and device")
+        p_readout = p_history[-1]
 
     grad_p_final, grad_value = run_arhsa_leaf_readout_backward(
-        p_history[-1],
+        p_readout,
         leaf_node_index,
         leaf_query_index,
         leaf_value_index,
@@ -7719,13 +8470,14 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     grad_scratch = torch.empty_like(p0)
     dst = dst.to(device=p0.device, dtype=torch.int32).contiguous()
     for iter_idx in range(n_iters - 1, -1, -1):
+        p_prev = recompute_state(iter_idx) if p_history is None else p_history[iter_idx]
         if level_range_kernels:
             if n_iters < len(level_bounds_list) - 1 and iter_idx == n_iters - 1:
                 grad_edge_prob.zero_()
             node_start, node_count = _level_backward_src_range(level_bounds_list, iter_idx)
             run_arhsa_markov_backward_range_step(
                 grad_next,
-                p_history[iter_idx],
+                p_prev,
                 edge_prob,
                 src_row_ptr,
                 src_edge_index,
@@ -7740,7 +8492,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
         else:
             run_arhsa_markov_backward_step(
                 grad_next,
-                p_history[iter_idx],
+                p_prev,
                 edge_prob,
                 src_row_ptr,
                 src_edge_index,
@@ -7808,6 +8560,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         tensor_core_query_value_pack_readout: bool,
         incoming_packed_step: bool,
         save_forward_history: bool,
+        recompute_history: bool,
         level_range_kernels: bool,
         query_warp_scatter: bool,
         query_warp_fused: bool,
@@ -7828,6 +8581,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.incoming_packed_step = bool(incoming_packed_step)
         ctx.level_range_kernels = bool(level_range_kernels)
         ctx.save_forward_history = bool(save_forward_history) or ctx.level_range_kernels
+        ctx.recompute_history = bool(recompute_history) and not ctx.save_forward_history
         ctx.query_warp_scatter = bool(query_warp_scatter)
         ctx.query_warp_fused = bool(query_warp_fused)
         ctx.tensor_core_stats = bool(tensor_core_stats)
@@ -8085,6 +8839,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 edge_prob=cached_edge_prob,
                 incoming_edge_prob=cached_incoming_edge_prob,
                 p_history=cached_p_history,
+                recompute_history=ctx.recompute_history,
                 level_bounds=level_bounds if ctx.level_range_kernels else None,
                 level_range_kernels=ctx.level_range_kernels,
                 query_leaf_row_ptr=query_leaf_row_ptr,
@@ -8163,6 +8918,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     tensor_core_query_value_pack_readout: bool = False,
     incoming_packed_step: bool = False,
     save_forward_history: bool = False,
+    recompute_history: bool = False,
     level_bounds: torch.Tensor | list[int] | tuple[int, ...] | None = None,
     level_range_kernels: bool = False,
     incoming_src: torch.Tensor | None = None,
@@ -8286,6 +9042,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         bool(tensor_core_query_value_pack_readout),
         bool(incoming_packed_step),
         bool(save_forward_history),
+        bool(recompute_history),
         bool(level_range_kernels),
         bool(query_warp_scatter),
         bool(query_warp_fused),
@@ -8309,6 +9066,10 @@ run_arhsa_gather_edge_prob_by_index.compile_cache = get_jit_cache("arhsa_gather_
 run_arhsa_outgoing_softmax.compile_cache = get_jit_cache("arhsa_outgoing_softmax")
 run_arhsa_outgoing_softmax_with_incoming.compile_cache = get_jit_cache("arhsa_outgoing_softmax_with_incoming")
 run_arhsa_outgoing_softmax_backward.compile_cache = get_jit_cache("arhsa_outgoing_softmax_backward")
+run_arhsa_sampled_node_dot.compile_cache = get_jit_cache("arhsa_sampled_node_dot")
+run_arhsa_sampled_node_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_node_dot_backward")
+run_arhsa_sampled_edge_dst_dot.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot")
+run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot_backward")
 run_arhsa_leaf_readout.compile_cache = get_jit_cache("arhsa_leaf_readout")
 run_arhsa_pack_leaf_values.compile_cache = get_jit_cache("arhsa_pack_leaf_values")
 run_arhsa_leaf_readout_backward_stats.compile_cache = get_jit_cache("arhsa_leaf_readout_backward_stats")

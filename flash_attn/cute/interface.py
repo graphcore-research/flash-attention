@@ -50,6 +50,7 @@ from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     to_cute_tensor, to_cute_fp4_tensor, to_cute_fp4_tensor_qkfast, to_cute_fp4_vt_tensor, to_cute_aux_tensor, to_tvm_ffi_fp4x2_tensor,
+    to_tvm_ffi_float8_tensor,
     get_aux_tensor_metadata, get_broadcast_dims,
 )
 from flash_attn.cute.cute_dsl_utils_qkfast import (
@@ -262,6 +263,14 @@ def _get_fp4_qk_config(fp4_qk_format: Optional[str]) -> Optional[Tuple[str, int,
     return FP4_QK_FORMAT_CONFIG[fp4_qk_format]
 
 
+def _get_fp4_pv_config(fp4_qk_format: str, v_scale: Optional[torch.Tensor]) -> Tuple[str, int, torch.dtype]:
+    if v_scale is not None:
+        for sf_dtype, sf_vec_size, torch_dtype in FP4_QK_FORMAT_CONFIG.values():
+            if v_scale.dtype == torch_dtype:
+                return sf_dtype, sf_vec_size, torch_dtype
+    return _get_fp4_qk_config(fp4_qk_format)
+
+
 def _validate_fp4_qk_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -290,7 +299,7 @@ def _validate_fp4_qk_inputs(
     arch: int,
 ) -> Tuple[int, int]:
     _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
-    _, pv_sf_vec_size, pv_sf_dtype = _get_fp4_qk_config("nvfp4")
+    _, pv_sf_vec_size, pv_sf_dtype = _get_fp4_pv_config(fp4_qk_format, v_scale)
     head_dim = q.shape[-1] * 2
     head_dim_v = v.shape[-2] if use_fp4_pv else v.shape[-1]
     allow_fp4_pv_fused_lane = (
@@ -316,9 +325,9 @@ def _validate_fp4_qk_inputs(
         and learnable_sink is None
         and num_splits == 1
     )
-    if fp4_qk_format != "nvfp4":
+    if fp4_qk_format != "nvfp4" and not allow_fp4_pv_fused_lane:
         raise NotImplementedError(
-            "FP4 QK/PV bring-up currently only supports fp4_qk_format='nvfp4'. The narrow PV experiment uses NVFP4 for both QK and PV."
+            "FP4 QK/PV bring-up currently supports fp4_qk_format='nvfp4'. Experimental MXFP4 PV is selected from an E8M0 v_scale tensor."
         )
     if arch // 10 not in [10, 11]:
         raise NotImplementedError(
@@ -357,19 +366,19 @@ def _validate_fp4_qk_inputs(
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("Packed FP4 Q/K must have the same last dimension.")
     if use_fp4_pv:
-        if not allow_fp4_pv_fused_lane:
-            raise NotImplementedError(
-                "The exact Sage-style FP4 PV rewrite is currently scoped to dense fixed-length noncausal MHA with head_dim=head_dim_v in {64, 128} on SM100/SM110."
-            )
         seqlen_k_padded = math.ceil(k.shape[-3] / 128) * 128
         if v.dtype != torch.uint8:
             raise TypeError("FP4 PV expects packed uint8 Vt tensors.")
         if v_scale is None:
             raise ValueError("FP4 PV requires v_scale when use_fp4_pv=True.")
-        expected_v_sf_dtype = pv_sf_dtype if allow_fp4_pv_fused_lane else sf_dtype
+        expected_v_sf_dtype = pv_sf_dtype
         if v_scale.dtype != expected_v_sf_dtype:
             raise TypeError(
                 f"FP4 PV expects v_scale dtype {expected_v_sf_dtype} for this lane, got {v_scale.dtype}."
+            )
+        if not allow_fp4_pv_fused_lane:
+            raise NotImplementedError(
+                "The exact Sage-style FP4 PV rewrite is currently scoped to dense fixed-length noncausal MHA with head_dim=head_dim_v in {64, 128} on SM100/SM110."
             )
     else:
         if v.dtype != torch.bfloat16:
@@ -1638,7 +1647,7 @@ def _flash_attn_fwd(
     fp4_scale_runtime_helper = (
         to_tvm_ffi_float8_tensor_qkfast_legacy
         if is_fp4_nonpv_fast and getattr(cutlass, "__version__", None) == "overlay"
-        else (lambda t: t)
+        else (to_tvm_ffi_float8_tensor if is_fp4_qk else (lambda t: t))
     )
 
     # See get_broadcast_dims for why this is needed in compile key
@@ -1669,7 +1678,12 @@ def _flash_attn_fwd(
     v_scale_vt = None
     fp4_pv_direct_loader = _get_env_optional_bool("FLASH_ATTN_FP4_PV_DIRECT_LOADER") if is_fp4_pv else None
     fp4_pv_force_cta_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT") if is_fp4_pv else None
-    fp4_pv_exact_sfv_direct = _get_env_optional_bool("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT") if is_fp4_pv_fused_lane else None
+    fp4_pv_exact_sfv_direct_env = (
+        _get_env_optional_bool("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT") if is_fp4_pv_fused_lane else None
+    )
+    fp4_pv_exact_sfv_direct = (
+        True if is_fp4_pv_fused_lane and fp4_pv_exact_sfv_direct_env is not False else fp4_pv_exact_sfv_direct_env
+    )
     fp4_pv_encode_centric = _get_env_optional_bool("FLASH_ATTN_FP4_PV_ENCODE_CENTRIC") if is_fp4_pv else None
     fp4_pv_manual_direct_loader = bool(fp4_pv_direct_loader and fp4_pv_force_cta_direct) if is_fp4_pv else None
     if is_fp4_pv:
@@ -1728,6 +1742,7 @@ def _flash_attn_fwd(
         is_fp4_pv_fused_lane,
         get_broadcast_dims(q_scale) if is_fp4_qk else None,
         get_broadcast_dims(k_scale) if is_fp4_qk else None,
+        v_scale.dtype if is_fp4_pv and v_scale is not None else None,
         get_broadcast_dims(v_scale) if is_fp4_pv else None,
         "vt_packed_seq" if is_fp4_pv else None,
         q.shape[-3] if is_fp4_pv_fused_lane else None,
@@ -1849,7 +1864,7 @@ def _flash_attn_fwd(
                 pv_sf_vec_size = None
                 if is_fp4_pv:
                     if is_fp4_pv_fused_lane:
-                        pv_sf_dtype, pv_sf_vec_size, _ = _get_fp4_qk_config("nvfp4")
+                        pv_sf_dtype, pv_sf_vec_size, _ = _get_fp4_pv_config(fp4_qk_format, v_scale)
                         if FP4FlashAttentionForwardSm100PVFused is None:
                             raise RuntimeError("FP4 PV fused kernel import failed") from _fp4_flash_fwd_sm100_pvfused_import_error
                         fp4_kernel_cls = FP4FlashAttentionForwardSm100PVFused
@@ -2072,6 +2087,11 @@ def _flash_attn_fwd(
             q_scale_runtime = fp4_scale_runtime_helper(q_scale.detach()) if q_scale is not None else None
             k_scale_runtime = fp4_scale_runtime_helper(k_scale.detach()) if k_scale is not None else None
             v_runtime = to_tvm_ffi_fp4x2_tensor(v_packed_vt.detach()) if is_fp4_pv else v.detach()
+            v_scale_runtime = (
+                fp4_scale_runtime_helper((v_scale if is_fp4_pv_fused_lane else v_scale_vt).detach())
+                if is_fp4_pv and (v_scale if is_fp4_pv_fused_lane else v_scale_vt) is not None
+                else None
+            )
             if is_fp4_pv:
                 _flash_attn_fwd.compile_cache[compile_key](
                     q_runtime,
@@ -2095,7 +2115,7 @@ def _flash_attn_fwd(
                     aux_tensors,
                     q_scale_runtime,
                     k_scale_runtime,
-                    v_scale if is_fp4_pv_fused_lane else v_scale_vt,
+                    v_scale_runtime,
                 )
             elif is_fp4_nonpv_gqa_fast:
                 _flash_attn_fwd.compile_cache[compile_key](

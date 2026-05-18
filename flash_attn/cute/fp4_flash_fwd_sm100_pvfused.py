@@ -1,4 +1,4 @@
-"""Standalone fused NVFP4 PV forward experiment.
+"""Standalone fused FP4 PV forward experiment.
 
 This module is the active home for the narrow PV recurrence rewrite. It starts
 from the same dense MHA-only skeleton as the legacy Sage-inspired experiment,
@@ -76,12 +76,12 @@ def tile_atom_to_shape_sf_mn(shape, sf_vec_size: int):
 def tile_atom_to_shape_sfv_vt(shape, sf_vec_size: int):
     """Logical GMEM scale layout for transposed Vt = (D_v, S_k, H_k, B).
 
-    FP4 PV consumes V as operand-B with MN-major block scaling, so the V scales
-    must attach to 16-wide output-channel groups in transposed Vt rather than
-    following the Q/K K-major scale atom.
+    Public `SFVt` storage is swizzled like the standard block-scaled K-major
+    atom over logical `(D_v, S_k, H_k, B)`. The scale still applies along the
+    transposed sequence axis, not across output channels.
     """
     return cute.tile_to_shape(
-        bs_layout.BlockScaledBasicChunk(sf_vec_size, tcgen05.OperandMajorMode.MN).layout,
+        bs_layout.BlockScaledBasicChunk(sf_vec_size).layout,
         shape,
         (2, 1, 3, 4),
     )
@@ -228,6 +228,75 @@ def float_to_ue4m3_byte(x: Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def float_to_ue8m0_byte(x: Float32, *, loc=None, ip=None):
+    packed_i16 = llvm.inline_asm(
+        T.i16(),
+        [Float32(x).ir_value(loc=loc, ip=ip), Float32(0.0).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 out;\n\t"
+        "cvt.rp.satfinite.ue8m0x2.f32 out, $2, $1;\n\t"
+        "mov.b16 $0, out;\n\t"
+        "}\n",
+        "=h,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint8(
+        llvm.trunc(T.i8(), packed_i16, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def log2_to_ue8m0_byte_rp(x_log2: Float32, *, loc=None, ip=None):
+    """Encode an E8M0 scale from log2(scale) with the same round-up policy as PTX."""
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [Float32(x_log2).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .s32 exp;\n\t"
+        "cvt.rpi.s32.f32 exp, $1;\n\t"
+        "add.s32 exp, exp, 127;\n\t"
+        "max.s32 exp, exp, 0;\n\t"
+        "min.s32 exp, exp, 254;\n\t"
+        "mov.b32 $0, exp;\n\t"
+        "}\n",
+        "=r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint8(
+        llvm.trunc(T.i8(), packed_i32, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def log2_to_ue8m0_scale_log2_rp(x_log2: Float32, *, loc=None, ip=None):
+    """Return log2(actual E8M0 scale) after round-up and finite saturation."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x_log2).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .s32 exp;\n\t"
+            ".reg .s32 biased;\n\t"
+            "cvt.rpi.s32.f32 exp, $1;\n\t"
+            "add.s32 biased, exp, 127;\n\t"
+            "max.s32 biased, biased, 0;\n\t"
+            "min.s32 biased, biased, 254;\n\t"
+            "add.s32 exp, biased, -127;\n\t"
+            "cvt.rn.f32.s32 $0, exp;\n\t"
+            "}\n",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def pack_float8_to_e2m1_word(
     f0: Float32,
     f1: Float32,
@@ -265,6 +334,259 @@ def pack_float8_to_e2m1_word(
         "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
         "}\n",
         "=r,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(packed_i32)
+
+
+@dsl_user_op
+def exact_d128_dense_row_sum_delta(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(v0).ir_value(loc=loc, ip=ip),
+                Float32(v1).ir_value(loc=loc, ip=ip),
+                Float32(v2).ir_value(loc=loc, ip=ip),
+                Float32(v3).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .f32 e0;\n\t"
+            ".reg .f32 e1;\n\t"
+            ".reg .f32 e2;\n\t"
+            ".reg .f32 e3;\n\t"
+            ".reg .f32 acc;\n\t"
+            "ex2.approx.ftz.f32 e0, $1;\n\t"
+            "ex2.approx.ftz.f32 e1, $2;\n\t"
+            "ex2.approx.ftz.f32 e2, $3;\n\t"
+            "ex2.approx.ftz.f32 e3, $4;\n\t"
+            "add.f32 acc, e0, e1;\n\t"
+            "add.f32 acc, acc, e2;\n\t"
+            "add.f32 acc, acc, e3;\n\t"
+            "add.f32 $0, acc, 0f40800000;\n\t"
+            "}\n",
+            "=f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def exact_d128_dense_scale_u8(
+    group_max_log2: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    packed_i16 = llvm.inline_asm(
+        T.i16(),
+        [
+            Float32(group_max_log2).ir_value(loc=loc, ip=ip),
+            Float32(0.0).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .f32 s;\n\t"
+        ".reg .b16 out;\n\t"
+        "add.f32 s, $1, 0fC0257007;\n\t"
+        "ex2.approx.ftz.f32 s, s;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 out, $2, s;\n\t"
+        "mov.b16 $0, out;\n\t"
+        "}\n",
+        "=h,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint8(
+        llvm.trunc(T.i8(), packed_i16, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def exact_d128_dense_group_max_branchless(
+    row: Int32,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Int32(row).ir_value(loc=loc, ip=ip),
+                Float32(v0).ir_value(loc=loc, ip=ip),
+                Float32(v1).ir_value(loc=loc, ip=ip),
+                Float32(v2).ir_value(loc=loc, ip=ip),
+                Float32(v3).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 peer_row;\n\t"
+            ".reg .f32 acc;\n\t"
+            ".reg .f32 peer_val;\n\t"
+            "max.f32 acc, $2, $3;\n\t"
+            "max.f32 acc, acc, $4;\n\t"
+            "max.f32 acc, acc, $5;\n\t"
+            "max.f32 acc, acc, 0f00000000;\n\t"
+            "shfl.sync.bfly.b32 peer_row, $1, 1, 31, -1;\n\t"
+            "shfl.sync.bfly.b32 peer_val, acc, 1, 31, -1;\n\t"
+            "setp.eq.s32 p, $1, peer_row;\n\t"
+            "selp.f32 peer_val, peer_val, 0fFF800000, p;\n\t"
+            "max.f32 acc, acc, peer_val;\n\t"
+            "shfl.sync.bfly.b32 peer_row, $1, 2, 31, -1;\n\t"
+            "shfl.sync.bfly.b32 peer_val, acc, 2, 31, -1;\n\t"
+            "setp.eq.s32 p, $1, peer_row;\n\t"
+            "selp.f32 peer_val, peer_val, 0fFF800000, p;\n\t"
+            "max.f32 acc, acc, peer_val;\n\t"
+            "shfl.sync.bfly.b32 peer_row, $1, 4, 31, -1;\n\t"
+            "shfl.sync.bfly.b32 peer_val, acc, 4, 31, -1;\n\t"
+            "setp.eq.s32 p, $1, peer_row;\n\t"
+            "selp.f32 peer_val, peer_val, 0fFF800000, p;\n\t"
+            "max.f32 acc, acc, peer_val;\n\t"
+            "shfl.sync.bfly.b32 peer_row, $1, 8, 31, -1;\n\t"
+            "shfl.sync.bfly.b32 peer_val, acc, 8, 31, -1;\n\t"
+            "setp.eq.s32 p, $1, peer_row;\n\t"
+            "selp.f32 peer_val, peer_val, 0fFF800000, p;\n\t"
+            "max.f32 acc, acc, peer_val;\n\t"
+            "shfl.sync.bfly.b32 peer_row, $1, 16, 31, -1;\n\t"
+            "shfl.sync.bfly.b32 peer_val, acc, 16, 31, -1;\n\t"
+            "setp.eq.s32 p, $1, peer_row;\n\t"
+            "selp.f32 peer_val, peer_val, 0fFF800000, p;\n\t"
+            "max.f32 acc, acc, peer_val;\n\t"
+        "mov.f32 $0, acc;\n\t"
+        "}\n",
+        "=f,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    )
+
+
+@dsl_user_op
+def pack_exact_d128_dense_word(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    group_max_log2: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(group_max_log2).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        ".reg .b8 byte1;\n\t"
+        ".reg .b8 byte2;\n\t"
+        ".reg .b8 byte3;\n\t"
+        ".reg .f32 p0;\n\t"
+        ".reg .f32 p1;\n\t"
+        ".reg .f32 p2;\n\t"
+        ".reg .f32 p3;\n\t"
+        ".reg .f32 pt;\n\t"
+        ".reg .f32 tmp;\n\t"
+        "sub.f32 tmp, $1, $5;\n\t"
+        "add.f32 tmp, tmp, 0f40257007;\n\t"
+        "ex2.approx.ftz.f32 p0, tmp;\n\t"
+        "sub.f32 tmp, $2, $5;\n\t"
+        "add.f32 tmp, tmp, 0f40257007;\n\t"
+        "ex2.approx.ftz.f32 p1, tmp;\n\t"
+        "sub.f32 tmp, $3, $5;\n\t"
+        "add.f32 tmp, tmp, 0f40257007;\n\t"
+        "ex2.approx.ftz.f32 p2, tmp;\n\t"
+        "sub.f32 tmp, $4, $5;\n\t"
+        "add.f32 tmp, tmp, 0f40257007;\n\t"
+        "ex2.approx.ftz.f32 p3, tmp;\n\t"
+        "neg.f32 tmp, $5;\n\t"
+        "add.f32 tmp, tmp, 0f40257007;\n\t"
+        "ex2.approx.ftz.f32 pt, tmp;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, p1, p0;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, p3, p2;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte2, pt, pt;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte3, pt, pt;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(packed_i32)
+
+
+@dsl_user_op
+def pack_exact_d128_dense_word_scaled(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    scale_log2: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(scale_log2).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b8 byte0;\n\t"
+        ".reg .b8 byte1;\n\t"
+        ".reg .b8 byte2;\n\t"
+        ".reg .b8 byte3;\n\t"
+        ".reg .f32 p0;\n\t"
+        ".reg .f32 p1;\n\t"
+        ".reg .f32 p2;\n\t"
+        ".reg .f32 p3;\n\t"
+        ".reg .f32 pt;\n\t"
+        ".reg .f32 tmp;\n\t"
+        "sub.f32 tmp, $1, $5;\n\t"
+        "ex2.approx.ftz.f32 p0, tmp;\n\t"
+        "sub.f32 tmp, $2, $5;\n\t"
+        "ex2.approx.ftz.f32 p1, tmp;\n\t"
+        "sub.f32 tmp, $3, $5;\n\t"
+        "ex2.approx.ftz.f32 p2, tmp;\n\t"
+        "sub.f32 tmp, $4, $5;\n\t"
+        "ex2.approx.ftz.f32 p3, tmp;\n\t"
+        "neg.f32 tmp, $5;\n\t"
+        "ex2.approx.ftz.f32 pt, tmp;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, p1, p0;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, p3, p2;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte2, pt, pt;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 byte3, pt, pt;\n\t"
+        "mov.b32 $0, {byte0, byte1, byte2, byte3};\n\t"
+        "}\n",
+        "=r,f,f,f,f,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -311,8 +633,14 @@ class FP4FlashAttentionForwardSm100PVFused:
         self.use_fp4_qk = use_fp4_qk
         self.use_fp4_pv = use_fp4_pv
         assert self.use_fp4_qk and self.use_fp4_pv, "PVFused only supports the FP4 QK+PV path."
-        assert fp4_sf_dtype == "e4m3" and fp4_sf_vec_size == 16, "PVFused expects NVFP4 Q/K."
-        assert pv_sf_dtype == "e4m3" and pv_sf_vec_size == 16, "PVFused expects NVFP4 P/V."
+        assert (fp4_sf_dtype, fp4_sf_vec_size) in (
+            ("e4m3", 16),
+            ("e8m0", 32),
+        ), "PVFused expects NVFP4 or MXFP4 Q/K."
+        assert (pv_sf_dtype, pv_sf_vec_size) in (
+            ("e4m3", 16),
+            ("e8m0", 32),
+        ), "PVFused expects NVFP4 or MXFP4 P/V."
         assert head_dim in (64, 128), "PVFused currently only supports head_dim in {64, 128}."
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim_v == head_dim, "PVFused currently only supports head_dim_v == head_dim."
@@ -324,7 +652,10 @@ class FP4FlashAttentionForwardSm100PVFused:
         self.fp4_pv_direct_loader = os.getenv("FLASH_ATTN_FP4_PV_DIRECT_LOADER", "0") == "1"
         self.fp4_pv_force_cta_direct = os.getenv("FLASH_ATTN_FP4_PV_FORCE_CTA_DIRECT", "0") == "1"
         self.fp4_pv_manual_direct_loader = self.fp4_pv_direct_loader and self.fp4_pv_force_cta_direct
-        self.fp4_pv_exact_sfv_direct_requested = os.getenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "0") == "1"
+        fp4_pv_exact_sfv_direct_env = os.getenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT")
+        self.fp4_pv_exact_sfv_direct_requested = (
+            True if fp4_pv_exact_sfv_direct_env is None else fp4_pv_exact_sfv_direct_env == "1"
+        )
         # Keep the legacy env var name for the optional CTA-local P amax path.
         self.fp4_pv_cta_quant = os.getenv("FLASH_ATTN_FP4_PV_ENABLE_CTA_ENCODE", "0") == "1"
         self.fp4_pv_encode_centric_requested = (
@@ -447,14 +778,19 @@ class FP4FlashAttentionForwardSm100PVFused:
         self.use_exact_fp4_pv_p_ready_handoff = self.use_exact_fp4_pv_lane
         self.use_exact_fp4_pv_legacy_stats_pipeline = not self.use_exact_fp4_pv_lane
         if self.use_exact_fp4_pv_lane:
-            # The exact fused PV lane only runs q_stage=1 on the must-win row.
-            # Keep only the warps that actively participate in this path and
-            # compact their IDs so the CTA itself shrinks with the lane instead
-            # of carrying the broader FA4 warp map as empty baggage.
-            self.correction_warp_ids = (4, 5)
-            self.mma_warp_id = 6
-            self.epilogue_warp_ids = (7,)
-            self.load_warp_ids = (8,)
+            # Keep only the warps that actively participate in the exact lane.
+            # d64 can use the compact 2-warp correction tail, but d128 still
+            # needs the wider 4-warp correction footprint.
+            if self.head_dim_v_padded <= 64:
+                self.correction_warp_ids = (4, 5)
+                self.mma_warp_id = 6
+                self.epilogue_warp_ids = (7,)
+                self.load_warp_ids = (8,)
+            else:
+                self.correction_warp_ids = (4, 5, 6, 7)
+                self.mma_warp_id = 8
+                self.epilogue_warp_ids = (9,)
+                self.load_warp_ids = (10,)
             self.empty_warp_ids = ()
             self.softmax1_warp_ids = ()
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
@@ -554,6 +890,12 @@ class FP4FlashAttentionForwardSm100PVFused:
             else:
                 # self.num_regs_correction = 64
                 self.num_regs_correction = 80 if not paged_kv_non_tma else 64
+            if (
+                self.use_exact_fp4_pv_lane
+                and self.head_dim_v_padded >= 128
+                and not paged_kv_non_tma
+            ):
+                self.num_regs_correction = 72
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
@@ -645,6 +987,7 @@ class FP4FlashAttentionForwardSm100PVFused:
         # print("kv_stage", self.kv_stage)
         self.s_stage = 2
         assert self.s_stage >= self.q_stage
+
         # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
         # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
@@ -690,7 +1033,7 @@ class FP4FlashAttentionForwardSm100PVFused:
             kv_stage = min(kv_stage, int(forced_kv_stage))
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
-            kv_stage = 3
+             kv_stage = 3
         return kv_stage
 
     @cute.jit
@@ -2420,7 +2763,10 @@ class FP4FlashAttentionForwardSm100PVFused:
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
-        fp4_scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
+        qk_scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
+        pv_scale_vec = "4X" if self.pv_sf_vec_size == 16 else "2X"
+        qk_mma_kind = "mxf4nvf4" if self.fp4_sf_vec_size == 16 else "mxf4"
+        pv_mma_kind = "mxf4nvf4" if self.pv_sf_vec_size == 16 else "mxf4"
 
         if const_expr(self.use_fp4_qk):
             # FP4 block-scaled QK GEMM dispatch
@@ -2435,7 +2781,8 @@ class FP4FlashAttentionForwardSm100PVFused:
                     tmem_sa_addr=Int32(self.tmem_sfa_offset),
                     tmem_sb_addr=Int32(self.tmem_sfk_offset),
                     smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                    scale_vec=fp4_scale_vec,
+                    scale_vec=qk_scale_vec,
+                    mma_kind=qk_mma_kind,
                     zero_init=True,
                     cta_group=self.cta_group_size,
                 )
@@ -2466,7 +2813,8 @@ class FP4FlashAttentionForwardSm100PVFused:
                     tOrP[None, None, None, stage],
                     tmem_sa_addr=Int32(self.tmem_sfp_offset),
                     tmem_sb_addr=Int32(self.tmem_sfv_offset),
-                    scale_vec=fp4_scale_vec,
+                    scale_vec=pv_scale_vec,
+                    mma_kind=pv_mma_kind,
                     cta_group=self.cta_group_size,
                 )
                 for stage in range(self.q_stage)
@@ -3073,7 +3421,33 @@ class FP4FlashAttentionForwardSm100PVFused:
             cute.gemm(mma_atom, acc, tCrA[None, None, kblock_idx], tCrB_k, acc)
 
     @cute.jit
+    def float_to_pv_scale_byte(self, x: Float32):
+        if const_expr(self.pv_sf_vec_size == 32):
+            return float_to_ue8m0_byte(x)
+        else:
+            return float_to_ue4m3_byte(x)
+
+    @cute.jit
+    def log2_to_pv_scale_byte(self, scale_log2: Float32):
+        if const_expr(self.pv_sf_vec_size == 32):
+            return log2_to_ue8m0_byte_rp(scale_log2)
+        else:
+            return float_to_ue4m3_byte(cute.math.exp2(scale_log2, fastmath=True))
+
+    @cute.jit
+    def mx_pv_actual_scale_log2(self, scale_log2: Float32):
+        return log2_to_ue8m0_scale_log2_rp(scale_log2)
+
+    @cute.jit
     def load_scale_stage(self, gScale: cute.Tensor, sScale: cute.Tensor):
+        if const_expr(self.fp4_sf_vec_size == 32):
+            self.load_scale_stage_layout(
+                gScale,
+                sScale,
+                fill_rest=True,
+                scale_dtype=self.fp4_sf_dtype,
+            )
+            return
         gScale = cute.filter_zeros(gScale)
         sScale = cute.filter_zeros(sScale)
         gScale = cute.group_modes(gScale, 0, cute.rank(gScale))
@@ -3103,6 +3477,7 @@ class FP4FlashAttentionForwardSm100PVFused:
         sScale: cute.Tensor,
         *,
         fill_rest: cutlass.Constexpr[bool] = True,
+        scale_dtype = None,
     ):
         lane_idx = cute.arch.lane_idx()
         gScale = cute.filter_zeros(gScale)
@@ -3115,7 +3490,8 @@ class FP4FlashAttentionForwardSm100PVFused:
         for idx in cutlass.range(lane_idx, num_copy, cute.arch.WARP_SIZE, unroll=1):
             sScale[idx] = gScale[idx]
         if const_expr(fill_rest and num_dst > num_copy):
-            one = self.pv_sf_dtype(1.0)
+            scale_dtype = self.fp4_sf_dtype if const_expr(scale_dtype is None) else scale_dtype
+            one = scale_dtype(1.0)
             for idx in cutlass.range(lane_idx + num_copy, num_dst, cute.arch.WARP_SIZE, unroll=1):
                 sScale[idx] = one
         cute.arch.sync_warp()
@@ -3206,6 +3582,158 @@ class FP4FlashAttentionForwardSm100PVFused:
         return tP_conv_groups, tPc_conv_groups
 
     @cute.jit
+    def make_fp4_pv_grouped_values(
+        self,
+        tP_conv: cute.Tensor,
+    ):
+        return cute.group_modes(
+            cute.group_modes(cute.flatten(tP_conv), 0, 2),
+            1,
+            4,
+        )
+
+    @cute.jit
+    def fp4_pv_exact_group_coord(
+        self,
+        row_offset: Int32,
+        group_idx: int | Int32,
+    ):
+        # The exact fused softmax fragment exposes one grouped logical SFP slot
+        # per warp row; the grouped coordinate tensor is therefore just
+        # (row_offset + group_idx, 0) in the live layout.
+        return row_offset + Int32(group_idx), Int32(0)
+
+    @cute.jit
+    def pack_quantized_pv_exact_linear_range(
+        self,
+        tSrP_conv_quant_flat: cute.Tensor,
+        tSrP_r2t_words: cute.Tensor,
+        *,
+        group_start: cutlass.Constexpr[int],
+        group_count: cutlass.Constexpr[int],
+    ):
+        for group_offset in cutlass.range_constexpr(group_count):
+            group_idx = group_start + group_offset
+            base = group_idx * 8
+            tSrP_r2t_words[group_idx] = pack_float8_to_e2m1_word(
+                tSrP_conv_quant_flat[base + 0],
+                tSrP_conv_quant_flat[base + 1],
+                tSrP_conv_quant_flat[base + 2],
+                tSrP_conv_quant_flat[base + 3],
+                tSrP_conv_quant_flat[base + 4],
+                tSrP_conv_quant_flat[base + 5],
+                tSrP_conv_quant_flat[base + 6],
+                tSrP_conv_quant_flat[base + 7],
+            )
+
+    @cute.jit
+    def debug_compare_exact_packed_words(
+        self,
+        tSrP_r2t_words: cute.Tensor,
+        tSrP_debug_two_pass_words: cute.Tensor,
+        row_offset: Int32,
+    ):
+        num_groups = cute.size(tSrP_r2t_words.shape[0])
+        for group_idx in cutlass.range_constexpr(num_groups):
+            ref_word = tSrP_r2t_words[group_idx]
+            dbg_word = tSrP_debug_two_pass_words[group_idx]
+            if ref_word != dbg_word:
+                cute.printf(
+                    "ppack-mismatch gi={} ref_word={} two_pass_word={}\n",
+                    group_idx,
+                    ref_word,
+                    dbg_word,
+                )
+            elif row_offset == 0 and cute.arch.lane_idx() == 0 and group_idx < 4:
+                cute.printf(
+                    "ppack-match gi={} word={}\n",
+                    group_idx,
+                    ref_word,
+                )
+
+    @cute.jit
+    def debug_dump_exact_group_coords(
+        self,
+        tSrS_t2r: cute.Tensor,
+        tScS: cute.Tensor,
+        row_offset: Int32,
+    ):
+        conv_layout = convert_to_conversion_layout(tSrS_t2r.layout)
+        tScP_conv = cute.composition(tScS, conv_layout)
+        tScP_conv_groups = self.make_fp4_pv_grouped_values(tScP_conv)
+        num_groups = cute.size(tScP_conv_groups.shape[0])
+        for group_idx in cutlass.range_constexpr(num_groups):
+            row, col = self.fp4_pv_exact_group_coord(row_offset, group_idx)
+            coord = tScP_conv_groups[group_idx, 0]
+            debug_row = row_offset + Int32(coord[0])
+            debug_col = Int32(coord[1])
+            if debug_row != row or debug_col != col:
+                cute.printf(
+                    "pcoord-mismatch gi={} row={} ref_row={} col={} ref_col={}\n",
+                    group_idx,
+                    row,
+                    debug_row,
+                    col,
+                    debug_col,
+                )
+            elif row_offset == 0 and cute.arch.lane_idx() == 0 and group_idx < 4:
+                cute.printf(
+                    "pcoord-match gi={} row={} col={}\n",
+                    group_idx,
+                    row,
+                    col,
+                )
+                coord0 = tScP_conv_groups[group_idx, 0]
+                coord1 = tScP_conv_groups[group_idx, 1]
+                coord2 = tScP_conv_groups[group_idx, 2]
+                coord3 = tScP_conv_groups[group_idx, 3]
+                coord4 = tScP_conv_groups[group_idx, 4]
+                coord5 = tScP_conv_groups[group_idx, 5]
+                coord6 = tScP_conv_groups[group_idx, 6]
+                coord7 = tScP_conv_groups[group_idx, 7]
+                cute.printf(
+                    "pcoord-group gi={} "
+                    "c0=({}, {}) c1=({}, {}) c2=({}, {}) c3=({}, {}) "
+                    "c4=({}, {}) c5=({}, {}) c6=({}, {}) c7=({}, {})\n",
+                    group_idx,
+                    Int32(coord0[0]),
+                    Int32(coord0[1]),
+                    Int32(coord1[0]),
+                    Int32(coord1[1]),
+                    Int32(coord2[0]),
+                    Int32(coord2[1]),
+                    Int32(coord3[0]),
+                    Int32(coord3[1]),
+                    Int32(coord4[0]),
+                    Int32(coord4[1]),
+                    Int32(coord5[0]),
+                    Int32(coord5[1]),
+                    Int32(coord6[0]),
+                    Int32(coord6[1]),
+                    Int32(coord7[0]),
+                    Int32(coord7[1]),
+                )
+            if row_offset == 0 and cute.arch.lane_idx() < 4 and group_idx < 2:
+                coord0 = tScP_conv_groups[group_idx, 0]
+                coord1 = tScP_conv_groups[group_idx, 1]
+                coord2 = tScP_conv_groups[group_idx, 2]
+                coord3 = tScP_conv_groups[group_idx, 3]
+                cute.printf(
+                    "pcoord-lane lane={} gi={} "
+                    "c0=({}, {}) c1=({}, {}) c2=({}, {}) c3=({}, {})\n",
+                    cute.arch.lane_idx(),
+                    group_idx,
+                    Int32(coord0[0]),
+                    Int32(coord0[1]),
+                    Int32(coord1[0]),
+                    Int32(coord1[1]),
+                    Int32(coord2[0]),
+                    Int32(coord2[1]),
+                    Int32(coord3[0]),
+                    Int32(coord3[1]),
+                )
+
+    @cute.jit
     def reduce_fp4_pv_group_amax_masked(
         self,
         slot_ptr: cutlass.Int64,
@@ -3214,12 +3742,31 @@ class FP4FlashAttentionForwardSm100PVFused:
         """Reduce a masked FP4 PV block amax over all warp lanes sharing one logical scale slot."""
         reduced = group_max_log2
         has_masked_peer = group_max_log2 == -cutlass.Float32.inf
-        for peer_lane in cutlass.range_constexpr(cute.arch.WARP_SIZE):
-            peer_slot_ptr = cutlass.Int64(utils.shuffle_sync(slot_ptr, offset=peer_lane))
-            peer_max_log2 = utils.shuffle_sync(group_max_log2, offset=peer_lane)
-            if peer_slot_ptr == slot_ptr:
-                reduced = cute.arch.fmax(reduced, peer_max_log2)
-                has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        peer_slot_ptr = cutlass.Int64(cute.arch.shuffle_sync_bfly(slot_ptr, offset=1))
+        peer_max_log2 = cute.arch.shuffle_sync_bfly(group_max_log2, offset=1)
+        if peer_slot_ptr == slot_ptr:
+            reduced = cute.arch.fmax(reduced, peer_max_log2)
+            has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        peer_slot_ptr = cutlass.Int64(cute.arch.shuffle_sync_bfly(slot_ptr, offset=2))
+        peer_max_log2 = cute.arch.shuffle_sync_bfly(group_max_log2, offset=2)
+        if peer_slot_ptr == slot_ptr:
+            reduced = cute.arch.fmax(reduced, peer_max_log2)
+            has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        peer_slot_ptr = cutlass.Int64(cute.arch.shuffle_sync_bfly(slot_ptr, offset=4))
+        peer_max_log2 = cute.arch.shuffle_sync_bfly(group_max_log2, offset=4)
+        if peer_slot_ptr == slot_ptr:
+            reduced = cute.arch.fmax(reduced, peer_max_log2)
+            has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        peer_slot_ptr = cutlass.Int64(cute.arch.shuffle_sync_bfly(slot_ptr, offset=8))
+        peer_max_log2 = cute.arch.shuffle_sync_bfly(group_max_log2, offset=8)
+        if peer_slot_ptr == slot_ptr:
+            reduced = cute.arch.fmax(reduced, peer_max_log2)
+            has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
+        peer_slot_ptr = cutlass.Int64(cute.arch.shuffle_sync_bfly(slot_ptr, offset=16))
+        peer_max_log2 = cute.arch.shuffle_sync_bfly(group_max_log2, offset=16)
+        if peer_slot_ptr == slot_ptr:
+            reduced = cute.arch.fmax(reduced, peer_max_log2)
+            has_masked_peer = has_masked_peer or peer_max_log2 == -cutlass.Float32.inf
         return reduced, has_masked_peer
 
     @cute.jit
@@ -3234,12 +3781,12 @@ class FP4FlashAttentionForwardSm100PVFused:
         is_first: cutlass.Constexpr[bool],
         use_masked_exp_emu: cutlass.Constexpr[bool],
     ) -> Tuple[cute.Tensor, Float32]:
-        """Fused Sage-style online softmax + NVFP4 P quantization.
+        """Fused Sage-style online softmax + FP4 P quantization.
 
         This keeps the hot PV path in one recurrence:
         1. update row max / scores_scale
         2. convert the live softmax fragment into grouped pre-exp values
-        3. compute per-group NVFP4 scales and quantized P values
+        3. compute per-group FP4 scales and quantized P values
         4. update row_sum from the same pre-exp fragment
 
         The running O recurrence still lives in the MMA/TMEM path, but the
@@ -3300,8 +3847,9 @@ class FP4FlashAttentionForwardSm100PVFused:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=cutlass.Uint32),
             cute.make_layout((num_groups,)),
         )
-        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
+        one_scale_u8 = self.float_to_pv_scale_byte(Float32(1.0))
         fp4_max = Float32(6.0)
+        neg_log2_fp4_max = Float32(-math.log2(6.0))
 
         row_sum_new = Float32(0.0)
         for group_idx in cutlass.range_constexpr(num_groups):
@@ -3333,9 +3881,25 @@ class FP4FlashAttentionForwardSm100PVFused:
                 cute.arch.fmax(cute.arch.fmax(e4, e5), cute.arch.fmax(e6, e7)),
             )
             group_is_masked = group_max == 0.0
+            group_max_log2 = cute.arch.fmax(
+                cute.arch.fmax(cute.arch.fmax(v0, v1), cute.arch.fmax(v2, v3)),
+                cute.arch.fmax(cute.arch.fmax(v4, v5), cute.arch.fmax(v6, v7)),
+            )
             scale_f32 = Float32(1.0) if group_is_masked else group_max / fp4_max
-            scale_u8 = one_scale_u8 if group_is_masked else float_to_ue4m3_byte(scale_f32)
-            inv_scale = Float32(0.0) if group_is_masked else cute.arch.rcp_approx(scale_f32)
+            scale_u8 = one_scale_u8
+            inv_scale = Float32(0.0)
+            if not group_is_masked:
+                if const_expr(self.pv_sf_vec_size == 32):
+                    scale_log2 = group_max_log2 + neg_log2_fp4_max
+                    scale_u8 = self.log2_to_pv_scale_byte(scale_log2)
+                    actual_scale = cute.math.exp2(
+                        self.mx_pv_actual_scale_log2(scale_log2),
+                        fastmath=True,
+                    )
+                    inv_scale = cute.arch.rcp_approx(actual_scale)
+                else:
+                    scale_u8 = self.float_to_pv_scale_byte(scale_f32)
+                    inv_scale = cute.arch.rcp_approx(scale_f32)
             p0 = Float32(0.0)
             p1 = Float32(0.0)
             p2 = Float32(0.0)
@@ -3373,6 +3937,664 @@ class FP4FlashAttentionForwardSm100PVFused:
         return acc_scale
 
     @cute.jit
+    def online_softmax_with_quant_pv_exact(
+        self,
+        softmax: SoftmaxFusedNVFP4,
+        tSrS_t2r: cute.Tensor,
+        tSrP_r2t_f32: cute.Tensor,
+        tScS: cute.Tensor,
+        sSFP_stage: cute.Tensor,
+        row_offset: Int32,
+        *,
+        is_first: cutlass.Constexpr[bool],
+        use_masked_exp_emu: cutlass.Constexpr[bool],
+    ) -> Float32:
+        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        conv_layout = convert_to_conversion_layout(tSrS_t2r.layout)
+        tSrP_conv_preexp = cute.make_tensor(tSrS_t2r.iterator, conv_layout)
+        tSrP_conv_preexp_groups = self.make_fp4_pv_grouped_values(tSrP_conv_preexp)
+        num_groups = cute.size(tSrP_conv_preexp_groups.shape[0])
+        tSrP_r2t_words = cute.make_tensor(
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((num_groups,)),
+        )
+        sSFP_logical = cute.make_tensor(
+            sSFP_stage.iterator,
+            bs_layout.tile_atom_to_shape_SF(
+                (self.m_block_size, self.n_block_size, 1),
+                self.pv_sf_vec_size,
+            ),
+        )
+        sSFP_logical_u8 = cute.make_tensor(
+            cute.recast_ptr(sSFP_logical.iterator, dtype=cutlass.Uint8),
+            sSFP_logical.layout,
+        )
+        one_scale_u8 = self.float_to_pv_scale_byte(Float32(1.0))
+        log2_fp4_max = Float32(math.log2(6.0))
+        neg_log2_fp4_max = Float32(-math.log2(6.0))
+        debug_compare_pack = cutlass.const_expr(self.fp4_pv_debug_dump_pcoords)
+        tSrP_conv_quant_debug_flat = None
+        tSrP_debug_two_pass_words = None
+        if cutlass.const_expr(debug_compare_pack):
+            tSrP_conv_quant_debug_flat = cute.make_fragment(num_groups * 8, Float32)
+            tSrP_debug_two_pass_words = cute.make_fragment_like(tSrP_r2t_words, cutlass.Uint32)
+
+        row_sum_new = Float32(0.0)
+        if cutlass.const_expr(debug_compare_pack):
+            for group_idx in cutlass.range_constexpr(num_groups):
+                v0 = tSrP_conv_preexp_groups[group_idx, 0]
+                v1 = tSrP_conv_preexp_groups[group_idx, 1]
+                v2 = tSrP_conv_preexp_groups[group_idx, 2]
+                v3 = tSrP_conv_preexp_groups[group_idx, 3]
+                v4 = tSrP_conv_preexp_groups[group_idx, 4]
+                v5 = tSrP_conv_preexp_groups[group_idx, 5]
+                v6 = tSrP_conv_preexp_groups[group_idx, 6]
+                v7 = tSrP_conv_preexp_groups[group_idx, 7]
+                if row_offset == 0 and cute.arch.lane_idx() < 4 and group_idx < 2:
+                    cute.printf(
+                        "pval-lane lane={} gi={} "
+                        "v0={} v1={} v2={} v3={} v4={} v5={} v6={} v7={}\n",
+                        cute.arch.lane_idx(),
+                        group_idx,
+                        v0,
+                        v1,
+                        v2,
+                        v3,
+                        v4,
+                        v5,
+                        v6,
+                        v7,
+                    )
+
+                group_max_log2 = cute.arch.fmax(
+                    cute.arch.fmax(cute.arch.fmax(v0, v1), cute.arch.fmax(v2, v3)),
+                    cute.arch.fmax(cute.arch.fmax(v4, v5), cute.arch.fmax(v6, v7)),
+                )
+                row, col = self.fp4_pv_exact_group_coord(row_offset, group_idx)
+                if const_expr(use_masked_exp_emu):
+                    slot_ptr = utils.elem_pointer(
+                        sSFP_logical_u8,
+                        (row, col, Int32(0)),
+                    ).toint()
+                    exact_group_max_log2, slot_has_masked_peer = self.reduce_fp4_pv_group_amax_masked(
+                        slot_ptr,
+                        group_max_log2,
+                    )
+                    if slot_has_masked_peer:
+                        group_max_log2 = exact_group_max_log2
+                    else:
+                        if row == cute.arch.shuffle_sync_bfly(row, offset=1):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                            )
+                        if row == cute.arch.shuffle_sync_bfly(row, offset=2):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                            )
+                        if row == cute.arch.shuffle_sync_bfly(row, offset=4):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                            )
+                        if row == cute.arch.shuffle_sync_bfly(row, offset=8):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                            )
+                        if row == cute.arch.shuffle_sync_bfly(row, offset=16):
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                            )
+                else:
+                    if row == cute.arch.shuffle_sync_bfly(row, offset=1):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                        )
+                    if row == cute.arch.shuffle_sync_bfly(row, offset=2):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                        )
+                    if row == cute.arch.shuffle_sync_bfly(row, offset=4):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                        )
+                    if row == cute.arch.shuffle_sync_bfly(row, offset=8):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                        )
+                    if row == cute.arch.shuffle_sync_bfly(row, offset=16):
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                        )
+                group_is_masked = group_max_log2 == -cutlass.Float32.inf
+                group_max_safe = Float32(0.0) if group_is_masked else group_max_log2
+                scale_u8 = one_scale_u8
+                p0 = Float32(0.0)
+                p1 = Float32(0.0)
+                p2 = Float32(0.0)
+                p3 = Float32(0.0)
+                p4 = Float32(0.0)
+                p5 = Float32(0.0)
+                p6 = Float32(0.0)
+                p7 = Float32(0.0)
+                if not group_is_masked:
+                    scale_f32 = cute.math.exp2(group_max_safe + neg_log2_fp4_max, fastmath=True)
+                    scale_u8 = self.float_to_pv_scale_byte(scale_f32)
+                    row_sum_new = (
+                        (((row_sum_new + cute.math.exp2(v0, fastmath=True)) + cute.math.exp2(v1, fastmath=True))
+                         + cute.math.exp2(v2, fastmath=True))
+                        + (
+                            ((cute.math.exp2(v3, fastmath=True) + cute.math.exp2(v4, fastmath=True))
+                             + cute.math.exp2(v5, fastmath=True))
+                            + (cute.math.exp2(v6, fastmath=True) + cute.math.exp2(v7, fastmath=True))
+                        )
+                    )
+                    p0 = cute.math.exp2(v0 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p1 = cute.math.exp2(v1 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p2 = cute.math.exp2(v2 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p3 = cute.math.exp2(v3 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p4 = cute.math.exp2(v4 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p5 = cute.math.exp2(v5 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p6 = cute.math.exp2(v6 - group_max_safe + log2_fp4_max, fastmath=True)
+                    p7 = cute.math.exp2(v7 - group_max_safe + log2_fp4_max, fastmath=True)
+                if row_offset == 0:
+                    base = group_idx * 8
+                    tSrP_conv_quant_debug_flat[base + 0] = p0
+                    tSrP_conv_quant_debug_flat[base + 1] = p1
+                    tSrP_conv_quant_debug_flat[base + 2] = p2
+                    tSrP_conv_quant_debug_flat[base + 3] = p3
+                    tSrP_conv_quant_debug_flat[base + 4] = p4
+                    tSrP_conv_quant_debug_flat[base + 5] = p5
+                    tSrP_conv_quant_debug_flat[base + 6] = p6
+                    tSrP_conv_quant_debug_flat[base + 7] = p7
+                sSFP_logical_u8[row, col, 0] = scale_u8
+                tSrP_r2t_words[group_idx] = pack_float8_to_e2m1_word(
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    p4,
+                    p5,
+                    p6,
+                    p7,
+                )
+
+            if row_offset == 0:
+                self.pack_quantized_pv_exact_linear_range(
+                    tSrP_conv_quant_debug_flat,
+                    tSrP_debug_two_pass_words,
+                    group_start=0,
+                    group_count=num_groups,
+                )
+                self.debug_compare_exact_packed_words(
+                    tSrP_r2t_words,
+                    tSrP_debug_two_pass_words,
+                    row_offset,
+                )
+        else:
+            if cutlass.const_expr(num_groups == 32):
+                row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                    tSrP_conv_preexp_groups,
+                    tSrP_r2t_words,
+                    sSFP_logical_u8,
+                    row_offset,
+                    row_sum_new,
+                    one_scale_u8,
+                    log2_fp4_max,
+                    neg_log2_fp4_max,
+                    group_start=0,
+                    group_count=8,
+                    use_masked_exp_emu=use_masked_exp_emu,
+                )
+                row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                    tSrP_conv_preexp_groups,
+                    tSrP_r2t_words,
+                    sSFP_logical_u8,
+                    row_offset,
+                    row_sum_new,
+                    one_scale_u8,
+                    log2_fp4_max,
+                    neg_log2_fp4_max,
+                    group_start=8,
+                    group_count=8,
+                    use_masked_exp_emu=use_masked_exp_emu,
+                )
+                row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                    tSrP_conv_preexp_groups,
+                    tSrP_r2t_words,
+                    sSFP_logical_u8,
+                    row_offset,
+                    row_sum_new,
+                    one_scale_u8,
+                    log2_fp4_max,
+                    neg_log2_fp4_max,
+                    group_start=16,
+                    group_count=8,
+                    use_masked_exp_emu=use_masked_exp_emu,
+                )
+                row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                    tSrP_conv_preexp_groups,
+                    tSrP_r2t_words,
+                    sSFP_logical_u8,
+                    row_offset,
+                    row_sum_new,
+                    one_scale_u8,
+                    log2_fp4_max,
+                    neg_log2_fp4_max,
+                    group_start=24,
+                    group_count=8,
+                    use_masked_exp_emu=use_masked_exp_emu,
+                )
+            else:
+                row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                    tSrP_conv_preexp_groups,
+                    tSrP_r2t_words,
+                    sSFP_logical_u8,
+                    row_offset,
+                    row_sum_new,
+                    one_scale_u8,
+                    log2_fp4_max,
+                    neg_log2_fp4_max,
+                    group_start=0,
+                    group_count=num_groups,
+                    use_masked_exp_emu=use_masked_exp_emu,
+                )
+
+        if cutlass.const_expr(not is_first):
+            row_sum_new += softmax.row_sum[0] * acc_scale
+        softmax.row_sum[0] = row_sum_new
+
+        return acc_scale
+
+    @cute.jit
+    def online_softmax_with_quant_pv_exact_prod(
+        self,
+        softmax: SoftmaxFusedNVFP4,
+        tSrS_t2r: cute.Tensor,
+        tSrP_r2t_f32: cute.Tensor,
+        sSFP_stage: cute.Tensor,
+        row_offset: Int32,
+        *,
+        is_first: cutlass.Constexpr[bool],
+        use_masked_exp_emu: cutlass.Constexpr[bool],
+    ) -> Float32:
+        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        conv_layout = convert_to_conversion_layout(tSrS_t2r.layout)
+        tSrP_conv_preexp = cute.make_tensor(tSrS_t2r.iterator, conv_layout)
+        tSrP_conv_preexp_groups = self.make_fp4_pv_grouped_values(tSrP_conv_preexp)
+        num_groups = cute.size(tSrP_conv_preexp_groups.shape[0])
+        tSrP_r2t_words = cute.make_tensor(
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((num_groups,)),
+        )
+        sSFP_logical = cute.make_tensor(
+            sSFP_stage.iterator,
+            bs_layout.tile_atom_to_shape_SF(
+                (self.m_block_size, self.n_block_size, 1),
+                self.pv_sf_vec_size,
+            ),
+        )
+        sSFP_logical_u8 = cute.make_tensor(
+            cute.recast_ptr(sSFP_logical.iterator, dtype=cutlass.Uint8),
+            sSFP_logical.layout,
+        )
+        one_scale_u8 = self.float_to_pv_scale_byte(Float32(1.0))
+        log2_fp4_max = Float32(math.log2(6.0))
+        neg_log2_fp4_max = Float32(-math.log2(6.0))
+
+        row_sum_new = Float32(0.0)
+        if cutlass.const_expr(num_groups == 32):
+            row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                tSrP_conv_preexp_groups,
+                tSrP_r2t_words,
+                sSFP_logical_u8,
+                row_offset,
+                row_sum_new,
+                one_scale_u8,
+                log2_fp4_max,
+                neg_log2_fp4_max,
+                group_start=0,
+                group_count=8,
+                use_masked_exp_emu=use_masked_exp_emu,
+            )
+            row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                tSrP_conv_preexp_groups,
+                tSrP_r2t_words,
+                sSFP_logical_u8,
+                row_offset,
+                row_sum_new,
+                one_scale_u8,
+                log2_fp4_max,
+                neg_log2_fp4_max,
+                group_start=8,
+                group_count=8,
+                use_masked_exp_emu=use_masked_exp_emu,
+            )
+            row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                tSrP_conv_preexp_groups,
+                tSrP_r2t_words,
+                sSFP_logical_u8,
+                row_offset,
+                row_sum_new,
+                one_scale_u8,
+                log2_fp4_max,
+                neg_log2_fp4_max,
+                group_start=16,
+                group_count=8,
+                use_masked_exp_emu=use_masked_exp_emu,
+            )
+            row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                tSrP_conv_preexp_groups,
+                tSrP_r2t_words,
+                sSFP_logical_u8,
+                row_offset,
+                row_sum_new,
+                one_scale_u8,
+                log2_fp4_max,
+                neg_log2_fp4_max,
+                group_start=24,
+                group_count=8,
+                use_masked_exp_emu=use_masked_exp_emu,
+            )
+        else:
+            row_sum_new = self.online_softmax_with_quant_pv_exact_group_range(
+                tSrP_conv_preexp_groups,
+                tSrP_r2t_words,
+                sSFP_logical_u8,
+                row_offset,
+                row_sum_new,
+                one_scale_u8,
+                log2_fp4_max,
+                neg_log2_fp4_max,
+                group_start=0,
+                group_count=num_groups,
+                use_masked_exp_emu=use_masked_exp_emu,
+            )
+
+        if cutlass.const_expr(not is_first):
+            row_sum_new += softmax.row_sum[0] * acc_scale
+        softmax.row_sum[0] = row_sum_new
+
+        return acc_scale
+
+    @cute.jit
+    def online_softmax_with_quant_pv_exact_group_range(
+        self,
+        tSrP_conv_preexp_groups: cute.Tensor,
+        tSrP_r2t_words: cute.Tensor,
+        sSFP_logical_u8: cute.Tensor,
+        row_offset: Int32,
+        row_sum_new: Float32,
+        one_scale_u8: cutlass.Uint8,
+        log2_fp4_max: Float32,
+        neg_log2_fp4_max: Float32,
+        *,
+        group_start: cutlass.Constexpr[int],
+        group_count: cutlass.Constexpr[int],
+        use_masked_exp_emu: cutlass.Constexpr[bool],
+    ) -> Float32:
+        for group_offset in cutlass.range_constexpr(group_count):
+            group_idx = group_start + group_offset
+            v0 = tSrP_conv_preexp_groups[group_idx, 0]
+            v1 = tSrP_conv_preexp_groups[group_idx, 1]
+            v2 = tSrP_conv_preexp_groups[group_idx, 2]
+            v3 = tSrP_conv_preexp_groups[group_idx, 3]
+            v4 = tSrP_conv_preexp_groups[group_idx, 4]
+            v5 = tSrP_conv_preexp_groups[group_idx, 5]
+            v6 = tSrP_conv_preexp_groups[group_idx, 6]
+            v7 = tSrP_conv_preexp_groups[group_idx, 7]
+            row = row_offset + Int32(group_idx)
+            col = Int32(0)
+            if const_expr(not use_masked_exp_emu and self.head_dim_v_padded >= 128):
+                group_max_log2 = exact_d128_dense_group_max_branchless(
+                    row, v0, v1, v2, v3
+                )
+            else:
+                group_max_log2 = cute.arch.fmax(
+                    cute.arch.fmax(cute.arch.fmax(v0, v1), cute.arch.fmax(v2, v3)),
+                    cute.arch.fmax(cute.arch.fmax(v4, v5), cute.arch.fmax(v6, v7)),
+                )
+                if const_expr(use_masked_exp_emu):
+                    slot_ptr = utils.elem_pointer(
+                        sSFP_logical_u8,
+                        (row, col, Int32(0)),
+                    ).toint()
+                    exact_group_max_log2, slot_has_masked_peer = self.reduce_fp4_pv_group_amax_masked(
+                        slot_ptr,
+                        group_max_log2,
+                    )
+                    if slot_has_masked_peer:
+                        group_max_log2 = exact_group_max_log2
+                    else:
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+                        if row == partner_row:
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=2)
+                        if row == partner_row:
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=4)
+                        if row == partner_row:
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=8)
+                        if row == partner_row:
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                            )
+                        partner_row = cute.arch.shuffle_sync_bfly(row, offset=16)
+                        if row == partner_row:
+                            group_max_log2 = cute.arch.fmax(
+                                group_max_log2,
+                                cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                            )
+                else:
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+                    if row == partner_row:
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=2)
+                    if row == partner_row:
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=4)
+                    if row == partner_row:
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=8)
+                    if row == partner_row:
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                        )
+                    partner_row = cute.arch.shuffle_sync_bfly(row, offset=16)
+                    if row == partner_row:
+                        group_max_log2 = cute.arch.fmax(
+                            group_max_log2,
+                            cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                        )
+            group_is_masked = group_max_log2 == -cutlass.Float32.inf
+            group_max_safe = Float32(0.0) if group_is_masked else group_max_log2
+            scale_u8 = one_scale_u8
+            packed_word = cutlass.Uint32(0)
+            p0 = Float32(0.0)
+            p1 = Float32(0.0)
+            p2 = Float32(0.0)
+            p3 = Float32(0.0)
+            p4 = Float32(0.0)
+            p5 = Float32(0.0)
+            p6 = Float32(0.0)
+            p7 = Float32(0.0)
+            if not group_is_masked:
+                scale_log2 = group_max_safe + neg_log2_fp4_max
+                if const_expr(not use_masked_exp_emu and self.head_dim_v_padded >= 128):
+                    row_sum_new += exact_d128_dense_row_sum_delta(v0, v1, v2, v3)
+                    if const_expr(self.pv_sf_vec_size == 32):
+                        actual_scale_log2 = self.mx_pv_actual_scale_log2(scale_log2)
+                        packed_word = pack_exact_d128_dense_word_scaled(
+                            v0,
+                            v1,
+                            v2,
+                            v3,
+                            actual_scale_log2,
+                        )
+                        scale_u8 = self.log2_to_pv_scale_byte(scale_log2)
+                    else:
+                        scale_f32 = cute.math.exp2(scale_log2, fastmath=True)
+                        packed_word = pack_exact_d128_dense_word(v0, v1, v2, v3, group_max_safe)
+                        scale_u8 = self.float_to_pv_scale_byte(scale_f32)
+                else:
+                    e0 = cute.math.exp2(v0, fastmath=True)
+                    e1 = cute.math.exp2(v1, fastmath=True)
+                    e2 = cute.math.exp2(v2, fastmath=True)
+                    e3 = cute.math.exp2(v3, fastmath=True)
+                    e4 = cute.math.exp2(v4, fastmath=True)
+                    e5 = cute.math.exp2(v5, fastmath=True)
+                    e6 = cute.math.exp2(v6, fastmath=True)
+                    e7 = cute.math.exp2(v7, fastmath=True)
+                    row_sum_new = (
+                        ((((row_sum_new + e0) + e1) + e2) + e3)
+                        + (((e4 + e5) + e6) + e7)
+                    )
+                    if const_expr(self.pv_sf_vec_size == 32):
+                        actual_scale_log2 = self.mx_pv_actual_scale_log2(scale_log2)
+                        p0 = cute.math.exp2(v0 - actual_scale_log2, fastmath=True)
+                        p1 = cute.math.exp2(v1 - actual_scale_log2, fastmath=True)
+                        p2 = cute.math.exp2(v2 - actual_scale_log2, fastmath=True)
+                        p3 = cute.math.exp2(v3 - actual_scale_log2, fastmath=True)
+                        p4 = cute.math.exp2(v4 - actual_scale_log2, fastmath=True)
+                        p5 = cute.math.exp2(v5 - actual_scale_log2, fastmath=True)
+                        p6 = cute.math.exp2(v6 - actual_scale_log2, fastmath=True)
+                        p7 = cute.math.exp2(v7 - actual_scale_log2, fastmath=True)
+                        scale_u8 = self.log2_to_pv_scale_byte(scale_log2)
+                    else:
+                        scale_f32 = cute.math.exp2(scale_log2, fastmath=True)
+                        p0 = cute.math.exp2(v0 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p1 = cute.math.exp2(v1 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p2 = cute.math.exp2(v2 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p3 = cute.math.exp2(v3 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p4 = cute.math.exp2(v4 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p5 = cute.math.exp2(v5 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p6 = cute.math.exp2(v6 - group_max_safe + log2_fp4_max, fastmath=True)
+                        p7 = cute.math.exp2(v7 - group_max_safe + log2_fp4_max, fastmath=True)
+                        scale_u8 = self.float_to_pv_scale_byte(scale_f32)
+                    packed_word = pack_float8_to_e2m1_word(
+                        p0,
+                        p1,
+                        p2,
+                        p3,
+                        p4,
+                        p5,
+                        p6,
+                        p7,
+                    )
+            sSFP_logical_u8[row, col, 0] = scale_u8
+            tSrP_r2t_words[group_idx] = packed_word
+        return row_sum_new
+
+    @cute.jit
+    def online_softmax_with_quant_pv_exact_group_range_dense_d128(
+        self,
+        tSrP_conv_preexp_groups: cute.Tensor,
+        tSrP_r2t_words: cute.Tensor,
+        sSFP_logical_u8: cute.Tensor,
+        row_offset: Int32,
+        row_sum_new: Float32,
+        *,
+        group_start: cutlass.Constexpr[int],
+        group_count: cutlass.Constexpr[int],
+    ) -> Float32:
+        for group_offset in cutlass.range_constexpr(group_count):
+            group_idx = group_start + group_offset
+            v0 = tSrP_conv_preexp_groups[group_idx, 0]
+            v1 = tSrP_conv_preexp_groups[group_idx, 1]
+            v2 = tSrP_conv_preexp_groups[group_idx, 2]
+            v3 = tSrP_conv_preexp_groups[group_idx, 3]
+            row = row_offset + Int32(group_idx)
+            col = Int32(0)
+            group_max_log2 = cute.arch.fmax(
+                cute.arch.fmax(v0, v1),
+                cute.arch.fmax(v2, v3),
+            )
+            group_max_log2 = cute.arch.fmax(group_max_log2, Float32(0.0))
+            partner_row = cute.arch.shuffle_sync_bfly(row, offset=1)
+            if row == partner_row:
+                group_max_log2 = cute.arch.fmax(
+                    group_max_log2,
+                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=1),
+                )
+            partner_row = cute.arch.shuffle_sync_bfly(row, offset=2)
+            if row == partner_row:
+                group_max_log2 = cute.arch.fmax(
+                    group_max_log2,
+                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=2),
+                )
+            partner_row = cute.arch.shuffle_sync_bfly(row, offset=4)
+            if row == partner_row:
+                group_max_log2 = cute.arch.fmax(
+                    group_max_log2,
+                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=4),
+                )
+            partner_row = cute.arch.shuffle_sync_bfly(row, offset=8)
+            if row == partner_row:
+                group_max_log2 = cute.arch.fmax(
+                    group_max_log2,
+                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=8),
+                )
+            partner_row = cute.arch.shuffle_sync_bfly(row, offset=16)
+            if row == partner_row:
+                group_max_log2 = cute.arch.fmax(
+                    group_max_log2,
+                    cute.arch.shuffle_sync_bfly(group_max_log2, offset=16),
+                )
+            row_sum_new += exact_d128_dense_row_sum_delta(v0, v1, v2, v3)
+            if const_expr(self.pv_sf_vec_size == 16):
+                sSFP_logical_u8[row, col, 0] = exact_d128_dense_scale_u8(group_max_log2)
+                tSrP_r2t_words[group_idx] = pack_exact_d128_dense_word(
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                    group_max_log2,
+                )
+            else:
+                scale_log2 = group_max_log2 + Float32(-math.log2(6.0))
+                actual_scale_log2 = self.mx_pv_actual_scale_log2(scale_log2)
+                sSFP_logical_u8[row, col, 0] = self.log2_to_pv_scale_byte(scale_log2)
+                tSrP_r2t_words[group_idx] = pack_exact_d128_dense_word_scaled(
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                    actual_scale_log2,
+                )
+        return row_sum_new
+
+    @cute.jit
     def quantize_p_fragment_to_fp4(
         self,
         softmax: SoftmaxSm100,
@@ -3383,7 +4605,7 @@ class FP4FlashAttentionForwardSm100PVFused:
         *,
         use_masked_exp_emu: cutlass.Constexpr[bool],
     ) -> cute.Tensor:
-        """Quantize a probability fragment to NVFP4 using Sage-style grouped slots."""
+        """Quantize a probability fragment to FP4 using Sage-style grouped slots."""
         conv_layout = convert_to_conversion_layout(tSrS_t2r.layout)
         tSrP_conv_quant_f32 = cute.make_tensor(tSrP_r2t_f32.iterator, conv_layout)
         tSrP_conv_quant_f32_flat = cute.flatten(tSrP_conv_quant_f32)
@@ -3413,7 +4635,7 @@ class FP4FlashAttentionForwardSm100PVFused:
             cute.rank(sSFP_logical_u8),
         )
         num_packed_words = cute.size(tSrP_conv_quant_f32_flat) // 8
-        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
+        one_scale_u8 = self.float_to_pv_scale_byte(Float32(1.0))
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.p_dtype),
             conv_layout,
@@ -3478,7 +4700,7 @@ class FP4FlashAttentionForwardSm100PVFused:
                 group_is_zero = group_max == 0.0
                 scale_f32 = Float32(1.0) if group_is_zero else group_max / Float32(6.0)
                 if cutlass.const_expr(group_idx < cute.size(sSFP_logical_u8_flat.shape)):
-                    sSFP_logical_u8_flat[group_idx] = float_to_ue4m3_byte(scale_f32)
+                    sSFP_logical_u8_flat[group_idx] = self.float_to_pv_scale_byte(scale_f32)
                 if group_is_zero:
                     tSrP_conv_groups[0, group_idx] = Float32(0.0)
                     tSrP_conv_groups[1, group_idx] = Float32(0.0)
@@ -3518,7 +4740,7 @@ class FP4FlashAttentionForwardSm100PVFused:
                     if group_max == 0.0
                     else tSrP_conv_quant_f32_flat[idx] * inv_scale
                 )
-                sSFP_logical_u8[row, col, 0] = float_to_ue4m3_byte(scale_f32)
+                sSFP_logical_u8[row, col, 0] = self.float_to_pv_scale_byte(scale_f32)
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
@@ -3623,28 +4845,9 @@ class FP4FlashAttentionForwardSm100PVFused:
         tSrP_r2t_shape_exact = thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape
         tSrS_t2r_exact = None
         tSrP_r2t_f32_exact = None
-        sSFP_logical_u8_flat_exact = None
         if const_expr(self.use_exact_fp4_pv_lane):
             tSrS_t2r_exact = cute.make_fragment(tSrS_t2r_shape_exact, self.qk_acc_dtype)
             tSrP_r2t_f32_exact = cute.make_fragment(tSrP_r2t_shape_exact, Float32)
-            assert sSFP is not None
-            sSFP_stage_exact = sSFP[None, None, None, stage]
-            sSFP_logical_exact = cute.make_tensor(
-                sSFP_stage_exact.iterator,
-                bs_layout.tile_atom_to_shape_SF(
-                    (self.m_block_size, self.n_block_size, 1),
-                    self.pv_sf_vec_size,
-                ),
-            )
-            sSFP_logical_u8_exact = cute.make_tensor(
-                cute.recast_ptr(sSFP_logical_exact.iterator, dtype=cutlass.Uint8),
-                sSFP_logical_exact.layout,
-            )
-            sSFP_logical_u8_flat_exact = cute.group_modes(
-                cute.filter_zeros(sSFP_logical_u8_exact),
-                0,
-                cute.rank(sSFP_logical_u8_exact),
-            )
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -3765,9 +4968,6 @@ class FP4FlashAttentionForwardSm100PVFused:
                 thr_tmem_load=thr_tmem_load,
                 thr_tmem_store=thr_tmem_store,
                 thr_tmem_store_scale=thr_tmem_store_scale,
-                tScS_exact=tScS,
-                tSrS_t2r_shape_exact=tSrS_t2r_shape_exact,
-                tSrP_r2t_shape_exact=tSrP_r2t_shape_exact,
                 tSrS_t2r_exact=tSrS_t2r_exact,
                 tSrP_r2t_f32_exact=tSrP_r2t_f32_exact,
                 tStS_t2r=tStS_t2r,
@@ -3776,7 +4976,6 @@ class FP4FlashAttentionForwardSm100PVFused:
                 sScale=sScale,
                 sAccScale=sAccScale,
                 sSFP=sSFP,
-                sSFP_logical_u8_flat_exact=sSFP_logical_u8_flat_exact,
                 tiled_copy_s2t_sfp_exact=tiled_copy_s2t_sfp_exact,
                 tCsSFP_compact_s2t_exact=tCsSFP_compact_s2t_exact,
                 tCtSFP_compact_s2t_exact=tCtSFP_compact_s2t_exact,
@@ -3969,7 +5168,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         sScale: cute.Tensor,
         sAccScale: Optional[cute.Tensor],
         sSFP: Optional[cute.Tensor],
-        sSFP_logical_u8_flat_exact: cute.Tensor,
         tiled_copy_s2t_sfp_exact: Optional[cute.TiledCopy],
         tCsSFP_compact_s2t_exact: Optional[cute.Tensor],
         tCtSFP_compact_s2t_exact: Optional[cute.Tensor],
@@ -4075,9 +5273,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: cute.CopyAtom,
-        tScS_exact: cute.Tensor,
-        tSrS_t2r_shape_exact,
-        tSrP_r2t_shape_exact,
         tSrS_t2r_exact: cute.Tensor,
         tSrP_r2t_f32_exact: cute.Tensor,
         tStS_t2r: cute.Tensor,
@@ -4085,7 +5280,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         sScale: cute.Tensor,
         sAccScale: Optional[cute.Tensor],
         sSFP: Optional[cute.Tensor],
-        sSFP_logical_u8_flat_exact: Optional[cute.Tensor],
         tiled_copy_s2t_sfp_exact: Optional[cute.TiledCopy],
         tCsSFP_compact_s2t_exact: Optional[cute.Tensor],
         tCtSFP_compact_s2t_exact: Optional[cute.Tensor],
@@ -4130,22 +5324,45 @@ class FP4FlashAttentionForwardSm100PVFused:
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
         assert sSFP is not None
         pipeline_p_lastsplit.producer_acquire_w_index_phase(stage, p_ready_producer_phase)
-        acc_scale = self.online_softmax_with_quant_pv_flatview(
-            softmax,
-            tSrS_t2r_exact,
-            tSrP_r2t_f32_exact,
-            sSFP_logical_u8_flat_exact,
-            is_first=is_first,
-            use_masked_exp_emu=mask_fn is not None,
+        softmax_warp_idx = Int32(
+            cute.arch.make_warp_uniform(cute.arch.warp_idx()) - self.softmax0_warp_ids[0]
         )
-        thread_idx = thr_tmem_load.thr_idx
+        softmax_row_idx = Int32(softmax_warp_idx * cute.arch.WARP_SIZE + cute.arch.lane_idx())
+        row_offset = Int32(softmax_warp_idx * 32)
+        if const_expr(self.fp4_pv_debug_dump_pcoords):
+            tScS_debug = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+            tScS_debug = tScS_debug[(None, None), 0, 0]
+            self.debug_dump_exact_group_coords(tSrS_t2r_exact, tScS_debug, row_offset)
+        if const_expr(self.fp4_pv_debug_dump_pcoords):
+            tScS_debug = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+            tScS_debug = tScS_debug[(None, None), 0, 0]
+            acc_scale = self.online_softmax_with_quant_pv_exact(
+                softmax,
+                tSrS_t2r_exact,
+                tSrP_r2t_f32_exact,
+                tScS_debug,
+                sSFP[None, None, None, stage],
+                row_offset,
+                is_first=is_first,
+                use_masked_exp_emu=mask_fn is not None,
+            )
+        else:
+            acc_scale = self.online_softmax_with_quant_pv_exact_prod(
+                softmax,
+                tSrS_t2r_exact,
+                tSrP_r2t_f32_exact,
+                sSFP[None, None, None, stage],
+                row_offset,
+                is_first=is_first,
+                use_masked_exp_emu=mask_fn is not None,
+            )
         if const_expr(not is_first):
             assert sAccScale is not None
-            sAccScale[thread_idx + stage * self.m_block_size] = acc_scale
+            sAccScale[softmax_row_idx + stage * self.m_block_size] = acc_scale
         if write_final_stats:
-            sScale[thread_idx + stage * self.m_block_size] = softmax.row_sum[0]
+            sScale[softmax_row_idx + stage * self.m_block_size] = softmax.row_sum[0]
             sScale[
-                thread_idx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                softmax_row_idx + stage * self.m_block_size + self.q_stage * self.m_block_size
             ] = softmax.row_max[0]
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
@@ -4190,9 +5407,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: cute.CopyAtom,
         thr_tmem_store_scale: cute.CopyAtom,
-        tScS_exact: Optional[cute.Tensor],
-        tSrS_t2r_shape_exact,
-        tSrP_r2t_shape_exact,
         tSrS_t2r_exact: Optional[cute.Tensor],
         tSrP_r2t_f32_exact: Optional[cute.Tensor],
         tStS_t2r: cute.Tensor,
@@ -4201,7 +5415,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         sScale: cute.Tensor,
         sAccScale: Optional[cute.Tensor],
         sSFP: Optional[cute.Tensor],
-        sSFP_logical_u8_flat_exact: Optional[cute.Tensor],
         tiled_copy_s2t_sfp_exact: Optional[cute.TiledCopy],
         tCsSFP_compact_s2t_exact: Optional[cute.Tensor],
         tCtSFP_compact_s2t_exact: Optional[cute.Tensor],
@@ -4219,8 +5432,6 @@ class FP4FlashAttentionForwardSm100PVFused:
         write_final_stats: bool | Boolean = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         if const_expr(self.use_exact_fp4_pv_lane):
-            assert tScS_exact is not None
-            assert sSFP_logical_u8_flat_exact is not None
             assert tSrS_t2r_exact is not None and tSrP_r2t_f32_exact is not None
             return self.softmax_step_exact_pv(
                 mma_si_consumer_phase,
@@ -4234,9 +5445,6 @@ class FP4FlashAttentionForwardSm100PVFused:
                 pipeline_s0_s1_sequence,
                 thr_tmem_load,
                 thr_tmem_store,
-                tScS_exact,
-                tSrS_t2r_shape_exact,
-                tSrP_r2t_shape_exact,
                 tSrS_t2r_exact,
                 tSrP_r2t_f32_exact,
                 tStS_t2r,
@@ -4244,7 +5452,6 @@ class FP4FlashAttentionForwardSm100PVFused:
                 sScale,
                 sAccScale,
                 sSFP,
-                sSFP_logical_u8_flat_exact,
                 tiled_copy_s2t_sfp_exact,
                 tCsSFP_compact_s2t_exact,
                 tCtSFP_compact_s2t_exact,
@@ -5031,14 +6238,24 @@ class FP4FlashAttentionForwardSm100PVFused:
                 mLSE_cur = mLSE[None, q_head_idx, batch_idx]
                 m_tile_idx = m_block * self.cta_group_size + mma_tile_coord_v
                 LN2 = math.log(2.0)
-                lse = (
-                    (row_max * softmax_scale_log2_local + cute.math.log2(row_sum, fastmath=True)) * LN2
-                    if not acc_O_mn_row_is_zero_or_nan
-                    else -Float32.inf
-                )
                 gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                if tidx < seqlen.seqlen_q - m_tile_idx * self.m_block_size:
-                    gLSE[tidx] = lse
+                num_corr_threads = cute.arch.WARP_SIZE * len(self.correction_warp_ids)
+                for row_base in cutlass.range_constexpr(0, self.m_block_size, num_corr_threads):
+                    lse_tidx = tidx + row_base
+                    row_sum_lse = sScale[lse_tidx]
+                    row_max_lse = sScale[lse_tidx + self.m_block_size]
+                    row_is_zero_or_nan = row_sum_lse == 0.0 or row_sum_lse != row_sum_lse
+                    lse = (
+                        (
+                            row_max_lse * softmax_scale_log2_local
+                            + cute.math.log2(row_sum_lse, fastmath=True)
+                        )
+                        * LN2
+                        if not row_is_zero_or_nan
+                        else -Float32.inf
+                    )
+                    if lse_tidx < seqlen.seqlen_q - m_tile_idx * self.m_block_size:
+                        gLSE[lse_tidx] = lse
 
             o_corr_consumer_phase ^= 1
             corr_epi_producer_phase ^= 1
@@ -5430,9 +6647,13 @@ class FP4FlashAttentionForwardSm100PVFused:
         sSFV_logical_u8_flat = cute.group_modes(
             cute.filter_zeros(sSFV_logical_u8), 0, cute.rank(sSFV_logical_u8)
         )
-        one_scale_u8 = float_to_ue4m3_byte(Float32(1.0))
+        one_scale_u8 = self.float_to_pv_scale_byte(Float32(1.0))
+        tile_seq_base = block * self.n_block_size
+        tile_is_full = tile_seq_base + self.n_block_size <= seqlen_k
+        seq_groups_per_tile = self.n_block_size // self.pv_sf_vec_size
         for idx in cutlass.range(tidx, cute.size(sSFV_logical_u8_flat.shape), num_load_threads, unroll=1):
-            sSFV_logical_u8_flat[idx] = one_scale_u8
+            if not tile_is_full:
+                sSFV_logical_u8_flat[idx] = one_scale_u8
 
         num_d_groups = self.head_dim_v_padded // self.pv_sf_vec_size
         num_seq_groups = mV_scale.shape[3]
@@ -5445,25 +6666,49 @@ class FP4FlashAttentionForwardSm100PVFused:
             (mV_scale.shape[0] * num_heads_kv * self.head_dim_v_padded * num_seq_groups,),
         )
         slice_base = (batch_idx * num_heads_kv + kv_head_idx) * self.head_dim_v_padded * num_seq_groups
-        for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
-            row = idx // num_d_groups
-            d_group = idx - row * num_d_groups
-            seqlen_idx = block * self.n_block_size + row
-            if seqlen_idx < seqlen_k:
+        if tile_is_full:
+            seq_group_tile_base = block * seq_groups_per_tile
+            for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
+                row = idx // num_d_groups
+                d_group = idx - row * num_d_groups
                 d_idx = d_group * self.pv_sf_vec_size
-                seq_group = seqlen_idx // self.pv_sf_vec_size
-                tile_m = d_idx // 64
-                row_in_tile = d_idx - tile_m * 64
-                quad = row_in_tile // 16
-                row_mod16 = row_in_tile - quad * 16
-                raw_offset = (
-                    tile_m * 64 * num_seq_groups
-                    + (seq_group // 4) * 256
-                    + (seq_group % 4)
-                    + quad * 4
-                    + row_mod16 * 16
-                )
-                sSFV_logical_u8[d_idx, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
+                seq_group = seq_group_tile_base + row // self.pv_sf_vec_size
+                for d_inner in cutlass.range_constexpr(self.pv_sf_vec_size):
+                    d_coord = d_idx + d_inner
+                    tile_m = d_coord // 64
+                    row_in_tile = d_coord - tile_m * 64
+                    quad = row_in_tile // 16
+                    row_mod16 = row_in_tile - quad * 16
+                    raw_offset = (
+                        tile_m * 64 * num_seq_groups
+                        + (seq_group // 4) * 256
+                        + (seq_group % 4)
+                        + quad * 4
+                        + row_mod16 * 16
+                    )
+                    sSFV_logical_u8[d_coord, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
+        else:
+            for idx in cutlass.range(tidx, self.n_block_size * num_d_groups, num_load_threads, unroll=1):
+                row = idx // num_d_groups
+                d_group = idx - row * num_d_groups
+                seqlen_idx = tile_seq_base + row
+                if seqlen_idx < seqlen_k:
+                    d_idx = d_group * self.pv_sf_vec_size
+                    seq_group = seqlen_idx // self.pv_sf_vec_size
+                    for d_inner in cutlass.range_constexpr(self.pv_sf_vec_size):
+                        d_coord = d_idx + d_inner
+                        tile_m = d_coord // 64
+                        row_in_tile = d_coord - tile_m * 64
+                        quad = row_in_tile // 16
+                        row_mod16 = row_in_tile - quad * 16
+                        raw_offset = (
+                            tile_m * 64 * num_seq_groups
+                            + (seq_group // 4) * 256
+                            + (seq_group % 4)
+                            + quad * 4
+                            + row_mod16 * 16
+                        )
+                        sSFV_logical_u8[d_coord, row, 0, 0] = raw_scale_u8[slice_base + raw_offset]
 
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
@@ -5504,7 +6749,12 @@ class FP4FlashAttentionForwardSm100PVFused:
             cute.select(self.mma_tiler_pv, mode=[1, 2]),
             (0, block),
         )
-        self.load_scale_stage_layout(gSFV, sSFV_stage, fill_rest=False)
+        self.load_scale_stage_layout(
+            gSFV,
+            sSFV_stage,
+            fill_rest=False,
+            scale_dtype=self.pv_sf_dtype,
+        )
     @cute.jit
     def load_v_fp4_pv_stage_public(
         self,

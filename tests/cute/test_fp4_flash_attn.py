@@ -19,7 +19,11 @@ from flash_attn.cute.interface import (
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from tests.cute.benchmark_fp4_qk import _benchmark_case
-from tests.cute.benchmark_fp4_pv import _aggregate_benchmark_runs, _get_benchmark_device
+from tests.cute.benchmark_fp4_pv import (
+    _aggregate_benchmark_runs,
+    _choose_timing_launches_per_iter,
+    _get_benchmark_device,
+)
 
 
 FP4_GRID = torch.tensor(
@@ -71,6 +75,7 @@ def _install_fake_cuda_runtime(monkeypatch):
         return _kernel
 
     monkeypatch.setattr("flash_attn.cute.interface.cute.compile", fake_compile)
+    monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
     monkeypatch.setattr(
         "flash_attn.cute.interface.cuda.CUstream",
         lambda stream: stream,
@@ -117,6 +122,72 @@ def _make_fake_dense_inputs(
     k = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim_v, device="cuda", dtype=torch.bfloat16)
     return q, k, v
+
+
+def test_to_cute_tensor_float8_uses_uint8_storage_and_sets_cutlass_dtype(monkeypatch):
+    from flash_attn.cute import cute_dsl_utils
+
+    calls = []
+    fake_runtime_tensor = types.SimpleNamespace(element_type=None)
+    fake_runtime_tensor.mark_layout_dynamic = lambda leading_dim=None: (fake_runtime_tensor, leading_dim)
+
+    def fake_from_dlpack(arg, assumed_align=16, enable_tvm_ffi=True):
+        del assumed_align, enable_tvm_ffi
+        calls.append(arg)
+        return fake_runtime_tensor
+
+    monkeypatch.setattr(cute_dsl_utils, "from_dlpack", fake_from_dlpack)
+
+    tensor = torch.zeros((2, 3), dtype=torch.float8_e4m3fn)
+    result = cute_dsl_utils.to_cute_tensor(tensor, assumed_align=8, leading_dim=0)
+
+    assert len(calls) == 1
+    assert isinstance(calls[0], torch.Tensor)
+    assert calls[0].dtype == torch.uint8
+    assert fake_runtime_tensor.element_type == cute_dsl_utils._TORCH_TO_CUTLASS_FLOAT8[tensor.dtype]
+    assert result == (fake_runtime_tensor, 0)
+
+
+def test_to_tvm_ffi_float8_tensor_uses_uint8_view():
+    from flash_attn.cute import cute_dsl_utils
+
+    tensor = torch.arange(6, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(2, 3)
+    runtime_tensor = cute_dsl_utils.to_tvm_ffi_float8_tensor(tensor)
+
+    assert runtime_tensor.dtype == torch.uint8
+    assert runtime_tensor.shape == tensor.shape
+    assert torch.equal(runtime_tensor, tensor.view(torch.uint8))
+
+
+def test_qkfast_to_tvm_ffi_float8_tensor_uses_uint8_view():
+    from flash_attn.cute import cute_dsl_utils_qkfast
+
+    tensor = torch.arange(6, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(2, 3)
+    runtime_tensor = cute_dsl_utils_qkfast.to_tvm_ffi_float8_tensor(tensor)
+
+    assert runtime_tensor.dtype == torch.uint8
+    assert runtime_tensor.shape == tensor.shape
+    assert torch.equal(runtime_tensor, tensor.view(torch.uint8))
+
+
+def test_sm100_desc_layout_type_supports_mlir_swizzle_strings():
+    from flash_attn.cute import mma_sm100_desc
+
+    class FakeSwizzleType:
+        def __str__(self):
+            return '!cute.swizzle<"S<3,4,3>">'
+
+    assert mma_sm100_desc._layout_type(FakeSwizzleType()) == mma_sm100_desc.LayoutType.SWIZZLE_128B
+
+
+def test_cutlass_swizzle_type_has_legacy_num_attrs():
+    from cutlass._mlir import ir as mlir_ir
+
+    with mlir_ir.Context():
+        swizzle_type = mlir_ir.Type.parse('!cute.swizzle<"S<3,4,3>">')
+        assert swizzle_type.num_bits == 3
+        assert swizzle_type.num_base == 4
+        assert swizzle_type.num_shift == 3
 
 
 def _make_fake_fp4_dense_inputs(
@@ -168,7 +239,7 @@ def _make_fake_fp4_pv_dense_inputs(
     k = torch.empty(batch_size, seqlen_k, num_heads_kv, head_dim // 2, device="cuda", dtype=torch.uint8)
     # FP4 PV consumes pretransposed packed Vt / SFVt:
     # packed Vt  : (B, H_k, D_v, S_k_padded // 2)
-    # scale SFVt : (B, H_k, D_v, S_k_padded // 16) in transpose-colwise storage
+    # scale SFVt : (B, H_k, D_v, S_k_padded // fp4_pv_vec) in transpose-colwise storage
     v = torch.empty(batch_size, num_heads_kv, head_dim_v, seqlen_k_padded // 2, device="cuda", dtype=torch.uint8)
     q_scale = torch.empty(
         batch_size, seqlen_q, num_heads, head_dim // sf_vec, device="cuda", dtype=sf_dtype
@@ -508,8 +579,14 @@ def test_fp4_pv_fake_compile_dense_forward(
                 )
 
 
+@pytest.mark.parametrize(
+    ("fp4_qk_format", "fp4_pv_format", "pv_sf_dtype", "pv_sf_vec"),
+    [("nvfp4", "nvfp4", "e4m3", 16), ("nvfp4", "mxfp4", "e8m0", 32)],
+)
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch, head_dim):
+def test_fp4_pv_fused_fake_compile_dense_forward(
+    monkeypatch, head_dim, fp4_qk_format, fp4_pv_format, pv_sf_dtype, pv_sf_vec
+):
     _install_fake_cuda_runtime(monkeypatch)
     monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
     kernel_kwargs = {}
@@ -526,8 +603,8 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch, head_dim):
 
     with FakeTensorMode():
         q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
-            fp4_qk_format="nvfp4",
-            fp4_pv_format="nvfp4",
+            fp4_qk_format=fp4_qk_format,
+            fp4_pv_format=fp4_pv_format,
             head_dim=head_dim,
             head_dim_v=head_dim,
             num_heads=4,
@@ -541,7 +618,7 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch, head_dim):
             v,
             causal=False,
             _arch=100,
-            fp4_qk_format="nvfp4",
+            fp4_qk_format=fp4_qk_format,
             q_scale=q_scale,
             k_scale=k_scale,
             use_fp4_pv=True,
@@ -551,14 +628,58 @@ def test_fp4_pv_fused_fake_compile_dense_forward(monkeypatch, head_dim):
     assert kernel_kwargs["use_fp4_pv"] is True
     assert kernel_kwargs["fp4_sf_dtype"] == "e4m3"
     assert kernel_kwargs["fp4_sf_vec_size"] == 16
-    assert kernel_kwargs["pv_sf_dtype"] == "e4m3"
-    assert kernel_kwargs["pv_sf_vec_size"] == 16
+    assert kernel_kwargs["pv_sf_dtype"] == pv_sf_dtype
+    assert kernel_kwargs["pv_sf_vec_size"] == pv_sf_vec
     assert kernel_kwargs["qhead_per_kvhead"] == 1
     assert kernel_kwargs["pack_gqa"] is False
     assert kernel_kwargs["use_2cta_instrs"] is False
 
 
-def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, *, head_dim=128):
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fp4_pv_mxfp4_fake_compile_dense_forward(monkeypatch, head_dim):
+    compile_calls = _install_fake_cuda_runtime(monkeypatch)
+    monkeypatch.setattr("torch._subclasses.fake_tensor.init_gpu_context", lambda _device: None)
+
+    with FakeTensorMode():
+        q, k, v, q_scale, k_scale, v_scale = _make_fake_fp4_pv_dense_inputs(
+            fp4_qk_format="nvfp4",
+            fp4_pv_format="mxfp4",
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            num_heads=4,
+            num_heads_kv=4,
+            seqlen_q=512,
+            seqlen_k=512,
+        )
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            causal=False,
+            return_lse=True,
+            _arch=100,
+            fp4_qk_format="nvfp4",
+            q_scale=q_scale,
+            k_scale=k_scale,
+            use_fp4_pv=True,
+            v_scale=v_scale,
+        )
+
+    assert out.dtype == torch.bfloat16
+    assert lse.dtype == torch.float32
+    assert len(compile_calls) == 1
+    assert len(_flash_attn_fwd.compile_cache) == 1
+
+
+def _instantiate_fake_exact_fp4_pv_fused_kernel(
+    monkeypatch,
+    *,
+    head_dim=128,
+    fp4_sf_dtype="e4m3",
+    fp4_sf_vec_size=16,
+    pv_sf_dtype="e4m3",
+    pv_sf_vec_size=16,
+):
     _install_fake_cuda_runtime(monkeypatch)
     from flash_attn.cute.fp4_flash_fwd_sm100_pvfused import FP4FlashAttentionForwardSm100PVFused
 
@@ -583,18 +704,30 @@ def _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, *, head_dim=128):
         use_2cta_instrs=False,
         use_fp4_qk=True,
         use_fp4_pv=True,
-        fp4_sf_dtype="e4m3",
-        fp4_sf_vec_size=16,
-        pv_sf_dtype="e4m3",
-        pv_sf_vec_size=16,
+        fp4_sf_dtype=fp4_sf_dtype,
+        fp4_sf_vec_size=fp4_sf_vec_size,
+        pv_sf_dtype=pv_sf_dtype,
+        pv_sf_vec_size=pv_sf_vec_size,
         pack_gqa_local=False,
         group_qheads_by_kv=False,
         fp4_pv_fp32_online_rescale=False,
     )
 
 
-def test_fp4_pv_fused_exact_lane_uses_compact_warp_map(monkeypatch):
-    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+def test_fp4_pv_fused_exact_lane_accepts_mxfp4_scale_config(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(
+        monkeypatch,
+        fp4_sf_dtype="e4m3",
+        fp4_sf_vec_size=16,
+        pv_sf_dtype="e8m0",
+        pv_sf_vec_size=32,
+    )
+    assert kernel.fp4_sf_vec_size == 16
+    assert kernel.pv_sf_vec_size == 32
+
+
+def test_fp4_pv_fused_exact_lane_uses_compact_warp_map_for_d64(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=64)
     assert kernel.threads_per_cta == 288
     assert kernel.softmax0_warp_ids == (0, 1, 2, 3)
     assert kernel.softmax1_warp_ids == ()
@@ -603,6 +736,23 @@ def test_fp4_pv_fused_exact_lane_uses_compact_warp_map(monkeypatch):
     assert kernel.epilogue_warp_ids == (7,)
     assert kernel.load_warp_ids == (8,)
     assert kernel.empty_warp_ids == ()
+
+
+def test_fp4_pv_fused_exact_lane_keeps_wide_correction_map_for_d128(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=128)
+    assert kernel.threads_per_cta == 352
+    assert kernel.softmax0_warp_ids == (0, 1, 2, 3)
+    assert kernel.softmax1_warp_ids == ()
+    assert kernel.correction_warp_ids == (4, 5, 6, 7)
+    assert kernel.mma_warp_id == 8
+    assert kernel.epilogue_warp_ids == (9,)
+    assert kernel.load_warp_ids == (10,)
+    assert kernel.empty_warp_ids == ()
+
+
+def test_fp4_pv_fused_exact_lane_uses_tuned_d128_correction_regs(monkeypatch):
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=128)
+    assert kernel.num_regs_correction == 72
 
 
 def test_fp4_pv_fused_exact_lane_uses_split_handoffs(monkeypatch):
@@ -618,11 +768,17 @@ def test_fp4_pv_fused_exact_lane_skips_legacy_stats_pipeline(monkeypatch):
     assert kernel.use_exact_fp4_pv_legacy_stats_pipeline is False
 
 
-def test_fp4_pv_fused_exact_lane_supports_exact_sfv_direct_opt_in(monkeypatch):
-    monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "1")
+def test_fp4_pv_fused_exact_lane_defaults_exact_sfv_direct_on(monkeypatch):
     kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
     assert kernel.use_exact_fp4_pv_lane is True
     assert kernel.fp4_pv_exact_sfv_direct is True
+
+
+def test_fp4_pv_fused_exact_lane_supports_exact_sfv_direct_opt_out(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "0")
+    kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch)
+    assert kernel.use_exact_fp4_pv_lane is True
+    assert kernel.fp4_pv_exact_sfv_direct is False
 
 
 def test_fp4_pv_fused_exact_lane_caps_d64_kv_stage(monkeypatch):
@@ -636,6 +792,22 @@ def test_fp4_pv_fused_exact_lane_respects_forced_kv_stage(monkeypatch):
     monkeypatch.setenv("FLASH_ATTN_FP4_FORCE_KV_STAGE", "8")
     kernel = _instantiate_fake_exact_fp4_pv_fused_kernel(monkeypatch, head_dim=64)
     assert kernel._finalize_kv_stage(22) == 8
+
+
+def test_fp4_pv_benchmark_batches_short_kernel_timing(monkeypatch):
+    monkeypatch.setattr(
+        "tests.cute.benchmark_fp4_pv._time_ms_host_sync",
+        lambda fn, *, repeats: 0.1,
+    )
+    assert _choose_timing_launches_per_iter(lambda: None) == 200
+
+
+def test_fp4_pv_benchmark_keeps_single_launch_for_longer_rows(monkeypatch):
+    monkeypatch.setattr(
+        "tests.cute.benchmark_fp4_pv._time_ms_host_sync",
+        lambda fn, *, repeats: 25.0,
+    )
+    assert _choose_timing_launches_per_iter(lambda: None) == 1
 
 
 def test_fp4_pv_fused_dispatch_ignores_removed_legacy_selector(monkeypatch):
@@ -1223,7 +1395,7 @@ def test_fp4_compile_cache_separates_exact_sfv_direct_variants(monkeypatch):
             seqlen_q=512,
             seqlen_k=512,
         )
-        monkeypatch.delenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", raising=False)
+        monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "0")
         _flash_attn_fwd(
             q,
             k,
@@ -1236,7 +1408,7 @@ def test_fp4_compile_cache_separates_exact_sfv_direct_variants(monkeypatch):
             use_fp4_pv=True,
             v_scale=v_scale,
         )
-        monkeypatch.setenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", "1")
+        monkeypatch.delenv("FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT", raising=False)
         _flash_attn_fwd(
             q,
             k,
@@ -1784,9 +1956,7 @@ def test_fp4_qk_validation_errors(monkeypatch, kwargs, expected_error):
         ({"use_fp4_pv": True, "v_scale_dtype": torch.float16}, TypeError),
         ({"use_fp4_pv": True, "v_scale_shape_delta": 1}, ValueError),
         ({"use_fp4_pv": True, "fp4_qk_format": None}, ValueError),
-        ({"use_fp4_pv": True, "fp4_qk_format": "mxfp4", "head_dim": 64, "head_dim_v": 64}, NotImplementedError),
-        ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 128, "fp4_pv_format": "mxfp4"}, TypeError),
-        ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 128, "causal": True, "fp4_pv_format": "mxfp4"}, TypeError),
+        ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 128, "causal": True, "fp4_pv_format": "mxfp4"}, NotImplementedError),
         ({"use_fp4_pv": True, "head_dim": 128, "head_dim_v": 64}, NotImplementedError),
     ],
 )
@@ -2838,19 +3008,20 @@ def _run_fp4_runtime_case(
         )
 
 
-def _run_fp4_pv_probe(
+def _run_fp4_pv_probe_capture(
     script: str,
     *,
     direct_loader: bool,
     timeout_s: int = 180,
     extra_env: dict[str, str] | None = None,
-) -> None:
+) -> subprocess.CompletedProcess[str]:
     env = {}
     if direct_loader:
         env["FLASH_ATTN_FP4_PV_DIRECT_LOADER"] = "1"
     if extra_env is not None:
         env.update(extra_env)
-    env.setdefault("CUDA_VISIBLE_DEVICES", str(_get_benchmark_device()))
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        env.setdefault("CUDA_VISIBLE_DEVICES", str(_get_benchmark_device()))
     try:
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(script)],
@@ -2870,6 +3041,22 @@ def _run_fp4_pv_probe(
             f"FP4 PV probe failed for {loader_mode} loader.\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+    return result
+
+
+def _run_fp4_pv_probe(
+    script: str,
+    *,
+    direct_loader: bool,
+    timeout_s: int = 180,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    _run_fp4_pv_probe_capture(
+        script,
+        direct_loader=direct_loader,
+        timeout_s=timeout_s,
+        extra_env=extra_env,
+    )
 
 
 def _run_fp4_pv_cta_quant_compare_case(
@@ -3628,15 +3815,82 @@ def test_fp4_pv_probe_v_scale_axis_is_colwise(direct_loader):
         direct_loader=direct_loader,
     )
 
+def _exact_group_coord_probe_script() -> str:
+    return """
+    import torch
+    from flash_attn.cute.interface import _flash_attn_fwd
 
-@pytest.mark.parametrize("exact_sfv_direct", [False, True])
-def test_fp4_pv_probe_exact_lane_recompiles_across_seqlens(exact_sfv_direct):
-    _require_sm100()
-    extra_env = (
-        {"FLASH_ATTN_FP4_PV_EXACT_SFV_DIRECT": "1"}
-        if exact_sfv_direct
-        else None
+    def _swizzle_fp4_vt_scale(scale_vt):
+        batch_size, num_heads, head_dim, seqlen_groups = scale_vt.shape
+        out = torch.empty_like(scale_vt)
+        flat_in = scale_vt.reshape(batch_size, num_heads, head_dim, seqlen_groups)
+        flat_out = out.view(batch_size, num_heads, -1)
+        for d in range(head_dim):
+            tile_m, row_in_tile = divmod(d, 64)
+            quad, row_mod16 = divmod(row_in_tile, 16)
+            for seq_group in range(seqlen_groups):
+                offset = (
+                    tile_m * 64 * seqlen_groups
+                    + (seq_group // 4) * 256
+                    + (seq_group % 4)
+                    + quad * 4
+                    + row_mod16 * 16
+                )
+                flat_out[:, :, offset] = flat_in[:, :, d, seq_group]
+        return out
+
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 1, 128, 128, 1, 128
+    seqlen_k_padded = ((seqlen_k + 127) // 128) * 128
+    q = torch.zeros(batch_size, seqlen_q, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
+    k = torch.zeros(batch_size, seqlen_k, num_heads, head_dim // 2, device="cuda", dtype=torch.uint8)
+    v = torch.full((batch_size, num_heads, head_dim, seqlen_k_padded // 2), 0x22, device="cuda", dtype=torch.uint8)
+    q_scale = torch.ones(batch_size, seqlen_q, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    k_scale = torch.ones(batch_size, seqlen_k, num_heads, head_dim // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    v_scale = torch.ones(batch_size, num_heads, head_dim, seqlen_k_padded // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    v_scale = _swizzle_fp4_vt_scale(v_scale)
+
+    _flash_attn_fwd(
+        q,
+        k,
+        v,
+        causal=False,
+        return_lse=True,
+        fp4_qk_format="nvfp4",
+        q_scale=q_scale,
+        k_scale=k_scale,
+        use_fp4_pv=True,
+        v_scale=v_scale,
     )
+    torch.cuda.synchronize()
+    """
+
+
+@pytest.mark.parametrize("direct_loader", [False])
+def test_fp4_pv_probe_exact_group_coord_matches_live_layout(direct_loader):
+    _require_sm100()
+    result = _run_fp4_pv_probe_capture(
+        _exact_group_coord_probe_script(),
+        direct_loader=direct_loader,
+        extra_env={"FLASH_ATTN_FP4_PV_DEBUG_DUMP_PCOORDS": "1"},
+    )
+    assert "pcoord-mismatch" not in result.stdout
+    assert "pcoord-match gi=0 row=0 col=0" in result.stdout
+
+
+@pytest.mark.parametrize("direct_loader", [False])
+def test_fp4_pv_probe_exact_two_pass_pack_matches_one_pass(direct_loader):
+    _require_sm100()
+    result = _run_fp4_pv_probe_capture(
+        _exact_group_coord_probe_script(),
+        direct_loader=direct_loader,
+        extra_env={"FLASH_ATTN_FP4_PV_DEBUG_DUMP_PCOORDS": "1"},
+    )
+    assert "ppack-mismatch" not in result.stdout
+    assert "ppack-match gi=0 word=" in result.stdout
+
+
+def test_fp4_pv_probe_exact_lane_recompiles_across_seqlens():
+    _require_sm100()
     _run_fp4_pv_probe(
         """
         import torch
@@ -3693,5 +3947,36 @@ def test_fp4_pv_probe_exact_lane_recompiles_across_seqlens(exact_sfv_direct):
         """,
         direct_loader=False,
         timeout_s=300,
-        extra_env=extra_env,
+    )
+
+
+def test_fp4_pv_probe_exact_lane_general_shape_lse_stays_bounded():
+    _require_sm100()
+    _run_fp4_pv_probe(
+        """
+        import math
+        from tests.cute import benchmark_fp4_pv as bench
+
+        bench._BENCH_DEVICE = 0
+        for head_dim, seqlen in ((64, 512), (64, 1024), (128, 512), (128, 1024)):
+            result = bench._benchmark_case(
+                seqlen=seqlen,
+                head_dim=head_dim,
+                causal=False,
+                batch_size=2,
+                num_heads=4,
+                num_heads_kv=4,
+                warmup=0,
+                iters=1,
+                skip_baseline_check=True,
+                compare_mode="full",
+                device_idx=0,
+            )
+            assert math.isfinite(result["pv_fused_out_max"])
+            assert math.isfinite(result["pv_fused_lse_max"])
+            assert result["pv_fused_out_max"] < 0.2, result
+            assert result["pv_fused_lse_max"] < 1.5, result
+        """,
+        direct_loader=False,
+        timeout_s=420,
     )

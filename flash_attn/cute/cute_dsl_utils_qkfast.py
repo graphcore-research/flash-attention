@@ -198,25 +198,15 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
         getattr(torch, "float8_e5m2", None),
         getattr(torch, "float8_e5m2fnuz", None),
     }
-    use_legacy_float8_dlpack = is_float8_tensor and getattr(cutlass, "__version__", None) == "overlay"
-    if use_legacy_float8_dlpack:
+    if is_float8_tensor:
         tensor = from_dlpack(
             tensor_arg.view(torch.uint8),
             assumed_align=assumed_align,
             enable_tvm_ffi=enable_tvm_ffi,
         )
         tensor.element_type = _TORCH_TO_CUTLASS_FLOAT8[tensor_arg.dtype]
-        if fully_dynamic:
-            return tensor.mark_layout_dynamic()
-        if leading_dim == -1:
-            leading_dim = t.ndim - 1
-        return tensor.mark_layout_dynamic(leading_dim=leading_dim)
-    try:
+    else:
         tensor = from_dlpack(tensor_arg, assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
-    except Exception:
-        if not is_float8_tensor:
-            raise
-        tensor = from_dlpack(Float8Tensor(tensor_arg), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -300,5 +290,7 @@ def to_tvm_ffi_fp4x2_tensor(tensor: torch.Tensor) -> PackedFP4x2Tensor:
     return PackedFP4x2Tensor(tensor)
 
 
-def to_tvm_ffi_float8_tensor(tensor: torch.Tensor) -> Float8Tensor:
-    return Float8Tensor(tensor)
+def to_tvm_ffi_float8_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype in _TORCH_TO_CUTLASS_FLOAT8:
+        return tensor.view(torch.uint8)
+    return tensor

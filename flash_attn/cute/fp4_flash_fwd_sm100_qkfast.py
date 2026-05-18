@@ -1846,6 +1846,7 @@ class FP4FlashAttentionForwardSm100:
         if const_expr(self.use_fp4_qk):
             # FP4 block-scaled QK GEMM dispatch
             scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
+            mma_kind = "mxf4nvf4" if self.fp4_sf_vec_size == 16 else "mxf4"
             gemm_Si = [
                 partial(
                     sm100_utils.gemm_ptx_fp4_block_scaled,
@@ -1858,6 +1859,7 @@ class FP4FlashAttentionForwardSm100:
                     tmem_sb_addr=Int32(self.tmem_sfk_offset),
                     smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                     scale_vec=scale_vec,
+                    mma_kind=mma_kind,
                     zero_init=True,
                     cta_group=self.cta_group_size,
                 )

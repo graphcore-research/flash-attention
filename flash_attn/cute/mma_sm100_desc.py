@@ -3,6 +3,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/mma_traits_sm100.hpp
 
+import re
 from enum import IntEnum
 
 import cutlass
@@ -284,8 +285,21 @@ class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
 # ---------------------------------------------------------------------------
 
 
+_SWIZZLE_TRIPLE_RE = re.compile(r"S<(-?\d+),(-?\d+),(-?\d+)>")
+
+
+def _swizzle_params(swizzle) -> tuple[int, int, int]:
+    """Support both older `Swizzle` wrappers and newer MLIR `SwizzleType` objects."""
+    if all(hasattr(swizzle, attr) for attr in ("num_bits", "num_base", "num_shift")):
+        return swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+    match = _SWIZZLE_TRIPLE_RE.search(str(swizzle))
+    if match is not None:
+        return tuple(int(group) for group in match.groups())
+    raise TypeError(f"Unable to recover swizzle parameters from {swizzle!r}")
+
+
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
-    B, M, S = swizzle.num_bits, swizzle.num_base, swizzle.num_shift
+    B, M, S = _swizzle_params(swizzle)
 
     if M == 4:  # Swizzle<*,4,3>
         if S != 3:

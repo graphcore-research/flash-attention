@@ -6,6 +6,7 @@ import pathlib
 import statistics
 import subprocess
 import sys
+import time
 
 try:
     import cuda.bindings.driver as _pre_torch_cuda_driver
@@ -44,7 +45,13 @@ FP4_GRID = torch.tensor(
 DEFAULT_NUM_HEADS = 4
 DEFAULT_NUM_HEADS_KV = 4
 NVFP4_VEC_SIZE = 16
+FP4_FORMAT_CONFIG = {
+    "nvfp4": (16, torch.float8_e4m3fn),
+    "mxfp4": (32, torch.float8_e8m0fnu),
+}
 BOGUS_FAST_QKFAST_MS = 0.05
+PV_SANITY_OUT_MAX = 10.0
+PV_SANITY_LSE_MAX = 10.0
 _FLASH_ATTN_FWD = None
 _BENCH_DEVICE = None
 _CUDA_DRIVER = False
@@ -116,20 +123,29 @@ def _nearest_fp4_indices(values: torch.Tensor) -> torch.Tensor:
     return (values.unsqueeze(-1) - grid).abs().argmin(dim=-1).to(torch.uint8)
 
 
-def _nvfp4_scale_from_amax(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _fp4_scale_from_amax(amax: torch.Tensor, *, scale_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     scale_fp32 = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax))
-    scale_fp8 = scale_fp32.to(torch.float8_e4m3fn)
+    scale_fp8 = scale_fp32.to(scale_dtype)
     return scale_fp8, torch.where(amax > 0, scale_fp8.to(torch.float32), torch.ones_like(scale_fp32))
 
 
-def _quantize_nvfp4_lastdim(x: torch.Tensor, *, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_fp4_lastdim(
+    x: torch.Tensor,
+    *,
+    block_size: int,
+    scale_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % block_size != 0:
         raise ValueError(f"Expected last dim divisible by {block_size}, got {x.shape[-1]}.")
     blocks = x.to(torch.float32).unflatten(-1, (-1, block_size))
-    scale_fp8, scale_fp32 = _nvfp4_scale_from_amax(blocks.abs().amax(dim=-1))
+    scale_fp8, scale_fp32 = _fp4_scale_from_amax(blocks.abs().amax(dim=-1), scale_dtype=scale_dtype)
     quantized = blocks / scale_fp32.unsqueeze(-1)
     packed = _pack_fp4(_nearest_fp4_indices(quantized)).flatten(start_dim=-2)
     return packed.to(torch.uint8).contiguous(), scale_fp8.contiguous()
+
+
+def _quantize_nvfp4_lastdim(x: torch.Tensor, *, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return _quantize_fp4_lastdim(x, block_size=block_size, scale_dtype=torch.float8_e4m3fn)
 
 
 def _swizzle_fp4_vt_scale(scale_vt: torch.Tensor) -> torch.Tensor:
@@ -265,7 +281,15 @@ def _is_known_bogus_fast_qkfast(
     )
 
 
-def _make_inputs(*, seqlen: int, head_dim: int, batch_size: int, num_heads: int, num_heads_kv: int):
+def _make_inputs(
+    *,
+    seqlen: int,
+    head_dim: int,
+    batch_size: int,
+    num_heads: int,
+    num_heads_kv: int,
+    fp4_pv_format: str = "nvfp4",
+):
     seed = 31_000 + seqlen * 13 + head_dim * 101 + batch_size * 17
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -322,7 +346,12 @@ def _make_inputs(*, seqlen: int, head_dim: int, batch_size: int, num_heads: int,
         dtype=torch.float32,
     )
     v_vt[..., :seqlen] = v_bf16.permute(0, 2, 3, 1).to(torch.float32)
-    v_pv_packed, v_scale_logical = _quantize_nvfp4_lastdim(v_vt, block_size=NVFP4_VEC_SIZE)
+    pv_vec_size, pv_scale_dtype = FP4_FORMAT_CONFIG[fp4_pv_format]
+    v_pv_packed, v_scale_logical = _quantize_fp4_lastdim(
+        v_vt,
+        block_size=pv_vec_size,
+        scale_dtype=pv_scale_dtype,
+    )
     v_pv_scale = _swizzle_fp4_vt_scale(v_scale_logical)
 
     return {
@@ -346,20 +375,54 @@ def _get_flash_attn_fwd():
     return _FLASH_ATTN_FWD
 
 
-def _time_ms(fn, *, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
+def _time_ms_host_sync(fn, *, repeats: int) -> float:
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(repeats):
         fn()
     torch.cuda.synchronize()
+    return (time.perf_counter() - start) * 1000.0 / repeats
+
+
+def _choose_timing_launches_per_iter(fn) -> int:
+    # The short dense benchmark rows can underflow CUDA event timing when we
+    # time a single launch. Use a coarse host-synchronized probe only to choose
+    # a repeat count, then keep the actual benchmark on-device via CUDA events.
+    probe_repeats = 20
+    probe_ms = _time_ms_host_sync(fn, repeats=probe_repeats)
+    if not math.isfinite(probe_ms) or probe_ms <= 0.0:
+        return 1
+    target_batch_ms = 20.0
+    return max(1, min(200, math.ceil(target_batch_ms / probe_ms)))
+
+
+def _time_ms_event(fn, *, launches_per_iter: int, iters: int) -> float:
     times_ms = []
     for _ in range(iters):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn()
+        for _ in range(launches_per_iter):
+            fn()
         end.record()
         end.synchronize()
-        times_ms.append(start.elapsed_time(end))
+        times_ms.append(start.elapsed_time(end) / launches_per_iter)
     return statistics.median(times_ms)
+
+
+def _time_ms(fn, *, warmup: int, iters: int, launches_per_iter: int | None = None, use_event_timer: bool = False) -> float:
+    launches_per_iter = (
+        launches_per_iter if launches_per_iter is not None else _choose_timing_launches_per_iter(fn)
+    )
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    if use_event_timer:
+        return _time_ms_event(fn, launches_per_iter=launches_per_iter, iters=iters)
+    return statistics.median(
+        _time_ms_host_sync(fn, repeats=launches_per_iter)
+        for _ in range(iters)
+    )
 
 
 def _median_metric(samples: list[dict], key: str) -> float:
@@ -401,6 +464,7 @@ def _benchmark_case(
     compare_mode: str = "full",
     device_idx: int | None = None,
     pv_tile_mn: tuple[int, int] | None = None,
+    fp4_pv_format: str = "nvfp4",
 ):
     global _BENCH_DEVICE
     if device_idx is not None:
@@ -426,6 +490,7 @@ def _benchmark_case(
         batch_size=batch_size,
         num_heads=num_heads,
         num_heads_kv=num_heads_kv,
+        fp4_pv_format=fp4_pv_format,
     )
     flash_attn_fwd = _get_flash_attn_fwd()
     flash_attn_fwd.compile_cache.clear()
@@ -488,22 +553,39 @@ def _benchmark_case(
     if not torch.isfinite(lse_fp4.float()).all().item():
         raise RuntimeError(f"FP4 PV LSE contains NaN or Inf for d={head_dim}, s={seqlen}, causal={causal}.")
 
-    if include_bf16 and not skip_baseline_check:
-        torch.testing.assert_close(out_qkfast.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
-        torch.testing.assert_close(lse_qkfast.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
-        torch.testing.assert_close(out_fp4.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
-        torch.testing.assert_close(lse_fp4.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
+    qkfast_out_max = math.nan
+    qkfast_lse_max = math.nan
+    pv_fused_out_max = math.nan
+    pv_fused_lse_max = math.nan
+    if include_bf16:
+        qkfast_out_max = (out_qkfast.float() - out_bf16.float()).abs().max().item()
+        qkfast_lse_max = (lse_qkfast.float() - lse_bf16.float()).abs().max().item()
+        pv_fused_out_max = (out_fp4.float() - out_bf16.float()).abs().max().item()
+        pv_fused_lse_max = (lse_fp4.float() - lse_bf16.float()).abs().max().item()
+        if not skip_baseline_check:
+            torch.testing.assert_close(out_qkfast.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
+            torch.testing.assert_close(lse_qkfast.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
+            torch.testing.assert_close(out_fp4.float(), out_bf16.float(), atol=2e-1, rtol=5e-2)
+            torch.testing.assert_close(lse_fp4.float(), lse_bf16.float(), atol=2e-1, rtol=5e-2)
+        elif pv_fused_out_max > PV_SANITY_OUT_MAX or pv_fused_lse_max > PV_SANITY_LSE_MAX:
+            raise RuntimeError(
+                "FP4 PV sanity error exceeded loose bounds "
+                f"(out_max={pv_fused_out_max:.6f}, lse_max={pv_fused_lse_max:.6f}) "
+                f"for d={head_dim}, s={seqlen}, causal={causal}."
+            )
 
     if profile_exact and not skip_qkfast_profile_baseline:
         qkfast_ms = _time_ms(
             run_qkfast,
             warmup=EXACT_PROFILE_QKFAST_WARMUP,
             iters=EXACT_PROFILE_QKFAST_ITERS,
+            launches_per_iter=1,
+            use_event_timer=True,
         )
-        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1)
+        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1, launches_per_iter=1, use_event_timer=True)
     elif profile_exact:
         qkfast_ms = math.nan
-        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1)
+        fp4_ms = _time_ms(run_pv_fp4, warmup=1, iters=1, launches_per_iter=1, use_event_timer=True)
     else:
         qkfast_ms = _time_ms(run_qkfast, warmup=warmup, iters=iters)
         fp4_ms = _time_ms(run_pv_fp4, warmup=warmup, iters=iters)
@@ -532,19 +614,20 @@ def _benchmark_case(
         "d": head_dim,
         "causal": causal,
         "seqlen": seqlen,
+        "fp4_pv_format": fp4_pv_format,
         "qkfast_ms": qkfast_ms,
         "pv_fused_ms": fp4_ms,
         "bf16_ms": bf16_ms,
         "qkfast_over_bf16": qkfast_ms / bf16_ms if math.isfinite(qkfast_ms) and math.isfinite(bf16_ms) else math.nan,
         "pv_fused_over_qkfast": fp4_ms / qkfast_ms if math.isfinite(qkfast_ms) else math.nan,
         "pv_fused_over_bf16": fp4_ms / bf16_ms if math.isfinite(bf16_ms) else math.nan,
-        "qkfast_out_max": (out_qkfast.float() - out_bf16.float()).abs().max().item() if out_bf16 is not None else math.nan,
-        "qkfast_lse_max": (lse_qkfast.float() - lse_bf16.float()).abs().max().item() if lse_bf16 is not None else math.nan,
-        "pv_fused_out_max": (out_fp4.float() - out_bf16.float()).abs().max().item() if out_bf16 is not None else math.nan,
-        "pv_fused_lse_max": (lse_fp4.float() - lse_bf16.float()).abs().max().item() if lse_bf16 is not None else math.nan,
+        "qkfast_out_max": qkfast_out_max,
+        "qkfast_lse_max": qkfast_lse_max,
+        "pv_fused_out_max": pv_fused_out_max,
+        "pv_fused_lse_max": pv_fused_lse_max,
         "pv_fused_impl": "cute",
         "compare_mode": compare_mode,
-        "exact_sfv_direct": os.environ.get(EXACT_SFV_DIRECT_ENV) == "1",
+        "exact_sfv_direct": os.environ.get(EXACT_SFV_DIRECT_ENV, "1") != "0",
     }
     if profile_exact:
         result.update(_exact_profile_metadata(device_idx=_get_benchmark_device()))
@@ -565,6 +648,7 @@ def _aggregate_benchmark_runs(samples: list[dict], failures: list[dict] | None =
         "d": first["d"],
         "causal": first["causal"],
         "seqlen": first["seqlen"],
+        "fp4_pv_format": first.get("fp4_pv_format", "nvfp4"),
         "success_count": len(samples),
         "failure_count": len(failures),
         "qkfast_ms": _median_metric(samples, "qkfast_ms"),
@@ -601,6 +685,7 @@ def _run_row_fresh_processes(
     max_attempts: int,
     compare_mode: str,
     pv_tile_mn: tuple[int, int] | None = None,
+    fp4_pv_format: str = "nvfp4",
 ) -> dict:
     if compare_mode == "profile-exact":
         raise RuntimeError("profile-exact mode does not use the fresh-process row aggregator.")
@@ -631,6 +716,8 @@ def _run_row_fresh_processes(
             "--emit-json",
             "--compare-mode",
             compare_mode,
+            "--fp4-pv-format",
+            fp4_pv_format,
         ]
         if pv_tile_mn is not None:
             cmd.extend(
@@ -674,7 +761,7 @@ def _run_row_fresh_processes(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark isolated NVFP4 PV forward against QK-fast and BF16 Cute FA4.")
+    parser = argparse.ArgumentParser(description="Benchmark isolated FP4 PV forward against QK-fast and BF16 Cute FA4.")
     parser.add_argument("--head-dims", default="128", help="Comma-separated head dims.")
     parser.add_argument("--seqlens", default="512", help="Comma-separated sequence lengths.")
     parser.add_argument("--causal-values", default="false", help="Comma-separated causal flags.")
@@ -684,6 +771,12 @@ def main():
     parser.add_argument("--pv-tile-n", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--num-heads", type=int, default=DEFAULT_NUM_HEADS)
     parser.add_argument("--num-heads-kv", type=int, default=DEFAULT_NUM_HEADS_KV)
+    parser.add_argument(
+        "--fp4-pv-format",
+        choices=tuple(FP4_FORMAT_CONFIG),
+        default="nvfp4",
+        help="PV scale format. Q/K stay on the NVFP4 QK path in this benchmark.",
+    )
     parser.add_argument("--warmup", type=int, default=15)
     parser.add_argument("--iters", type=int, default=40)
     parser.add_argument("--fresh-runs", type=int, default=5, help="Required successful fresh-process runs per row.")
@@ -755,6 +848,7 @@ def main():
                     skip_baseline_check=args.skip_baseline_check,
                     compare_mode=args.compare_mode,
                     pv_tile_mn=pv_tile_mn,
+                    fp4_pv_format=args.fp4_pv_format,
                 )
             )
         )
@@ -764,7 +858,7 @@ def main():
     candidate_devices = [args.device] if args.device is not None else _enumerate_usable_devices()
     print(
         "device,kind,hq,hkv,d,causal,seqlen,pv_fused_impl,exact_sfv_direct,success_count,failure_count,"
-        "qkfast_ms,pv_fused_ms,bf16_ms,qkfast_over_bf16,pv_fused_over_qkfast,pv_fused_over_bf16,"
+        "fp4_pv_format,qkfast_ms,pv_fused_ms,bf16_ms,qkfast_over_bf16,pv_fused_over_qkfast,pv_fused_over_bf16,"
         "qkfast_out_max,qkfast_lse_max,pv_fused_out_max,pv_fused_lse_max"
     )
     saw_clean_device = False
@@ -788,6 +882,7 @@ def main():
                     max_attempts=args.max_attempts,
                     compare_mode=args.compare_mode,
                     pv_tile_mn=pv_tile_mn,
+                    fp4_pv_format=args.fp4_pv_format,
                 )
             except RuntimeError as exc:
                 if "bogus-fast" in str(exc):
@@ -799,7 +894,7 @@ def main():
             print(
                 f"{result['device']},{result['kind']},{result['hq']},{result['hkv']},{result['d']},"
                 f"{result['causal']},{result['seqlen']},{result['pv_fused_impl']},{result['exact_sfv_direct']},{result['success_count']},{result['failure_count']},"
-                f"{result['qkfast_ms']:.5f},{result['pv_fused_ms']:.5f},{result['bf16_ms']:.5f},"
+                f"{result['fp4_pv_format']},{result['qkfast_ms']:.5f},{result['pv_fused_ms']:.5f},{result['bf16_ms']:.5f},"
                 f"{result['qkfast_over_bf16']:.3f},{result['pv_fused_over_qkfast']:.3f},{result['pv_fused_over_bf16']:.3f},"
                 f"{result['qkfast_out_max']:.6f},{result['qkfast_lse_max']:.6f},{result['pv_fused_out_max']:.6f},{result['pv_fused_lse_max']:.6f}"
             )

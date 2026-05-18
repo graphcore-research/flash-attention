@@ -39,6 +39,19 @@ _PYTHONAPI = ctypes.pythonapi
 _PYTHONAPI.PyCapsule_GetPointer.restype = ctypes.c_void_p
 _PYTHONAPI.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 _FP4X2_DLPACK_DTYPE = DLDataType(17, 4, 2)
+_FLOAT8_DLPACK_DTYPE = DLDataType(2, 8, 1)
+
+
+_TORCH_TO_CUTLASS_FLOAT8 = {
+    torch_dtype: cutlass_dtype
+    for torch_dtype, cutlass_dtype in (
+        (getattr(torch, "float8_e4m3fn", None), getattr(cutlass, "Float8E4M3FN", None)),
+        (getattr(torch, "float8_e4m3fnuz", None), getattr(cutlass, "Float8E4M3B11FNUZ", None)),
+        (getattr(torch, "float8_e5m2", None), getattr(cutlass, "Float8E5M2", None)),
+        (getattr(torch, "float8_e5m2fnuz", None), getattr(cutlass, "Float8E5M2", None)),
+    )
+    if torch_dtype is not None and cutlass_dtype is not None
+}
 
 
 class PackedFP4x2Tensor:
@@ -57,6 +70,29 @@ class PackedFP4x2Tensor:
         ptr = _PYTHONAPI.PyCapsule_GetPointer(capsule, b"dltensor")
         managed = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor))
         managed.contents.dl_tensor.dtype = _FP4X2_DLPACK_DTYPE
+        self._capsules.append(capsule)
+        return capsule
+
+
+class Float8Tensor:
+    """Expose float8 storage to older TVM-FFI stacks via a patched DLPack dtype."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self._capsules = []
+        self._views = []
+
+    def __dlpack_device__(self):
+        return self.tensor.__dlpack_device__()
+
+    def __dlpack__(self, stream=None):
+        stream_arg = -1 if stream is None else stream
+        storage = self.tensor.view(torch.uint8)
+        capsule = storage.__dlpack__(stream=stream_arg)
+        ptr = _PYTHONAPI.PyCapsule_GetPointer(capsule, b"dltensor")
+        managed = ctypes.cast(ptr, ctypes.POINTER(_DLManagedTensor))
+        managed.contents.dl_tensor.dtype = _FLOAT8_DLPACK_DTYPE
+        self._views.append(storage)
         self._capsules.append(capsule)
         return capsule
 
@@ -159,7 +195,21 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    tensor_arg = t.detach()
+    is_float8_tensor = isinstance(tensor_arg, torch.Tensor) and tensor_arg.dtype in _TORCH_TO_CUTLASS_FLOAT8
+    if is_float8_tensor:
+        tensor = from_dlpack(
+            tensor_arg.view(torch.uint8),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        tensor.element_type = _TORCH_TO_CUTLASS_FLOAT8[tensor_arg.dtype]
+    else:
+        tensor = from_dlpack(
+            tensor_arg,
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
@@ -300,3 +350,9 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
 
 def to_tvm_ffi_fp4x2_tensor(tensor: torch.Tensor) -> PackedFP4x2Tensor:
     return PackedFP4x2Tensor(tensor)
+
+
+def to_tvm_ffi_float8_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype in _TORCH_TO_CUTLASS_FLOAT8:
+        return tensor.view(torch.uint8)
+    return tensor

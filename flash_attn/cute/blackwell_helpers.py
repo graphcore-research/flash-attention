@@ -1128,6 +1128,7 @@ def gemm_ptx_fp4_block_scaled(
     tmem_sb_addr: Int32,           # TMEM address of B (K) scale factors
     smem_offset: int,
     scale_vec: str = "4X",         # "4X" for NVFP4 (block_size=16), "2X" for MXFP4 (block_size=32)
+    mma_kind: str = "mxf4nvf4",    # "mxf4nvf4" for NVFP4, "mxf4" for MXFP4
     zero_init: bool | Boolean = False,
     cta_group: int = 1,
 ) -> None:
@@ -1138,7 +1139,7 @@ def gemm_ptx_fp4_block_scaled(
     PTX with TMEM scale operands [tmem_sa] and [tmem_sb].
 
     Pattern per K-tile:
-        @leader_thread tcgen05.mma.cta_group::X.kind::mxf4nvf4.block_scale.scale_vec::YZ
+        @leader_thread tcgen05.mma.cta_group::X.kind::{mxf4nvf4|mxf4}.block_scale.scale_vec::YZ
             [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sa], [tmem_sb], p;
     """
     from flash_attn.cute.blackwell_helpers import i64_to_i32x2
@@ -1150,7 +1151,7 @@ def gemm_ptx_fp4_block_scaled(
     smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
 
-    ptx_kind = f"kind::mxf4nvf4.block_scale.scale_vec::{scale_vec}"
+    ptx_kind = f"kind::{mma_kind}.block_scale.scale_vec::{scale_vec}"
 
     llvm.inline_asm(
         None,
@@ -1219,6 +1220,7 @@ def gemm_ptx_fp4_block_scaled_partial(
     tmem_sb_addr: Int32,
     scale_factor_id: int = 0,
     scale_vec: str = "4X",
+    mma_kind: str = "mxf4nvf4",
     zero_init: bool | Boolean = False,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
@@ -1253,7 +1255,7 @@ def gemm_ptx_fp4_block_scaled_partial(
     )
     tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
-    ptx_kind = f"kind::mxf4nvf4.block_scale.scale_vec::{scale_vec}"
+    ptx_kind = f"kind::{mma_kind}.block_scale.scale_vec::{scale_vec}"
 
     llvm.inline_asm(
         None,

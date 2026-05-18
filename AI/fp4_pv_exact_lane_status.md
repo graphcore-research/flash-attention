@@ -3175,3 +3175,36 @@ This is worse than the earlier must-win PTXAS snapshot (`224` / `396` / `572`), 
      - reverted immediately
      - the generated-`SFP` `warpx2_0123` path is finite but slower in absolute fused time than the stable path
      - stock `warpx2` copy atoms are now rejected for both PV scale operands
+
+115. Instance handoff / recreation checkpoint for the pushed branch.
+   - checkpoint intent:
+     - this note is the durable restart point for the current `fp4-attention` branch state
+     - the live code includes the stable exact-lane FP4 PV implementation plus MXFP4 PV support and the scale-fill dtype cleanup from item `109`
+     - the later screens in items `110` through `114` are intentionally documented as rejected and reverted
+   - recreate the workspace state from a new instance:
+     - `cd /workspace/codebases/fp4_matmul/flash-attention`
+     - `git fetch origin`
+     - `git checkout fp4-attention`
+     - `git pull --ff-only origin fp4-attention`
+     - read this file from the top-level current-state summary and items `109` through `115`
+   - cheap validation commands:
+     - `git diff --check`
+     - `/workspace/codebases/fp4_matmul/.venv/bin/python -m py_compile flash_attn/cute/interface.py flash_attn/cute/fp4_flash_fwd_sm100_pvfused.py tests/cute/benchmark_fp4_pv.py tests/cute/test_fp4_flash_attn.py`
+     - `PYTHONPATH=/workspace/codebases/fp4_matmul/flash-attention PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 240s /workspace/codebases/fp4_matmul/.venv/bin/python -m pytest -q tests/cute/test_fp4_flash_attn.py -k "fp4_pv_mxfp4_fake_compile_dense_forward or fp4_pv_fused_fake_compile_dense_forward or fp4_pv_fused_exact_lane_accepts_mxfp4_scale_config or fp4_pv_validation_errors or fp4_qk_validation_errors"`
+   - expected cheap validation result:
+     - focused test suite: `34 passed, 120 deselected`
+   - primary runtime probes:
+     - use a quiet physical GPU; recent screens used physical device `2` exposed as benchmark device `0`
+     - NVFP4 PV must-win smoke:
+       - `CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/workspace/codebases/fp4_matmul/flash-attention PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 900s /workspace/codebases/fp4_matmul/.venv/bin/python tests/cute/benchmark_fp4_pv.py --device 0 --head-dims 128 --seqlens 512 --compare-mode full --fp4-pv-format nvfp4 --skip-baseline-check --fresh-runs 1 --max-attempts 3`
+     - MXFP4 PV must-win smoke:
+       - `CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/workspace/codebases/fp4_matmul/flash-attention PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 900s /workspace/codebases/fp4_matmul/.venv/bin/python tests/cute/benchmark_fp4_pv.py --device 0 --head-dims 128 --seqlens 512 --compare-mode full --fp4-pv-format mxfp4 --skip-baseline-check --fresh-runs 1 --max-attempts 3`
+     - broader fused-only shape refresh:
+       - `CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/workspace/codebases/fp4_matmul/flash-attention PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 timeout 1800s /workspace/codebases/fp4_matmul/.venv/bin/python tests/cute/benchmark_fp4_pv.py --device 0 --head-dims 64,128 --seqlens 512,1024,2048 --compare-mode fused-only --fp4-pv-format mxfp4 --skip-baseline-check --fresh-runs 1 --max-attempts 3`
+   - current performance boundary:
+     - the branch has not reproduced a robust speedup versus qkfast / FA4 under the fresh-process timer
+     - current stable `d128`, `S=512` ratios are still generally around `1.2x` over qkfast, with noise between individual fresh-process runs
+     - the target remains `pv_fused_over_qkfast < 1.0`
+   - next useful direction:
+     - do not reopen the reverted screens in items `110` through `114`
+     - the strongest remaining evidence still points at a true descriptor/control-path fix for exact `SFP` / `SFV` scale movement, not another source-level pack helper, register cap, stock S2T copy atom, or tile-size override

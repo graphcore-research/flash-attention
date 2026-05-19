@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -8,8 +9,11 @@ try:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import cutlass.pipeline as pipeline
+    import cutlass.utils as cutlass_utils
+    import cutlass.utils.blackwell_helpers as sm100_utils
     from cutlass import Float32, Int32
-    from cutlass.cute.nvgpu import warp
+    from cutlass.cute.nvgpu import cpasync, tcgen05, warp
     from quack import layout_utils
 
     from flash_attn.cute import ampere_helpers as sm80_utils
@@ -1050,6 +1054,1181 @@ class ARHSASampledNodeDotBackwardSm100:
                 )
 
 
+class ARHSASampledNodeDotH2Sm100:
+    """Sample q[level] dot row_repr for the common two-head ARHSAv3 case."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        node_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if node_idx < total_tasks:
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            partial0 = Float32.zero
+            partial1 = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                partial0 += (
+                    Float32(mQLevels[query_idx, level, 0, dim_idx])
+                    * Float32(mRowRepr[feature_row, 0, dim_idx])
+                )
+                partial1 += (
+                    Float32(mQLevels[query_idx, level, 1, dim_idx])
+                    * Float32(mRowRepr[feature_row, 1, dim_idx])
+                )
+            acc0 = cute_utils.warp_reduce(partial0, lambda a, b: a + b)
+            acc1 = cute_utils.warp_reduce(partial1, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[node_idx, 0] = (acc0 * scale).to(mOut.element_type)
+                mOut[node_idx, 1] = (acc1 * scale).to(mOut.element_type)
+
+
+class ARHSASampledNodeDotBackwardH2Sm100:
+    """Backward for the common two-head sampled-dot kernel."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        node_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if node_idx < total_tasks:
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            grad0 = Float32(mGradOut[node_idx, 0]) * scale
+            grad1 = Float32(mGradOut[node_idx, 1]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q0 = Float32(mQLevels[query_idx, level, 0, dim_idx])
+                row0 = Float32(mRowRepr[feature_row, 0, dim_idx])
+                q1 = Float32(mQLevels[query_idx, level, 1, dim_idx])
+                row1 = Float32(mRowRepr[feature_row, 1, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad0 * row0,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, 0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad0 * q0,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, 0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * row1,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, 1, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * q1,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, 1, dim_idx)),
+                )
+
+
+class ARHSASampledNodeDotBackwardH2D64VecSm100:
+    """Two-head D64 sampled-dot backward with CTA-local grad-q aggregation."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128, cta_reduce_grad_q: bool = True):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.cta_reduce_grad_q = cta_reduce_grad_q
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        node_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if node_idx < total_tasks:
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            head_idx = lane // Int32(16)
+            dim_group = lane - head_idx * Int32(16)
+            dim0 = dim_group * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            grad = Float32(mGradOut[node_idx, head_idx]) * scale
+            q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+            q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+            q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+            q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+            row0 = Float32(mRowRepr[feature_row, head_idx, dim0])
+            row1 = Float32(mRowRepr[feature_row, head_idx, dim1])
+            row2 = Float32(mRowRepr[feature_row, head_idx, dim2])
+            row3 = Float32(mRowRepr[feature_row, head_idx, dim3])
+            grad_q0 = grad * row0
+            grad_q1 = grad * row1
+            grad_q2 = grad * row2
+            grad_q3 = grad * row3
+            if cutlass.const_expr(self.cta_reduce_grad_q):
+                # Coalesce contiguous same-(query, level) starts inside this CTA before the grad-q atomic.
+                leader = warp_idx == Int32(0)
+                if warp_idx > Int32(0):
+                    prev_node_idx = node_idx - Int32(1)
+                    prev_feature_row = Int32(mQueryNodeFeatureRowIndex[prev_node_idx])
+                    prev_query_idx = Int32(mQueryNodeQueryIndex[prev_node_idx])
+                    prev_level = Int32(mFeatureRowLevel[prev_feature_row])
+                    leader = prev_query_idx != query_idx or prev_level != level
+                if leader:
+                    acc_q0 = grad_q0
+                    acc_q1 = grad_q1
+                    acc_q2 = grad_q2
+                    acc_q3 = grad_q3
+                    keep_reducing = True
+                    for other_warp in cutlass.range(warp_idx + Int32(1), Int32(self.warps_per_cta), unroll=1):
+                        if keep_reducing:
+                            other_node_idx = block_idx * Int32(self.warps_per_cta) + other_warp
+                            if other_node_idx < total_tasks:
+                                other_feature_row = Int32(mQueryNodeFeatureRowIndex[other_node_idx])
+                                other_query_idx = Int32(mQueryNodeQueryIndex[other_node_idx])
+                                other_level = Int32(mFeatureRowLevel[other_feature_row])
+                                if other_query_idx == query_idx and other_level == level:
+                                    other_grad = Float32(mGradOut[other_node_idx, head_idx]) * scale
+                                    acc_q0 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim0])
+                                    acc_q1 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim1])
+                                    acc_q2 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim2])
+                                    acc_q3 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim3])
+                                else:
+                                    keep_reducing = False
+                    copy_utils.atomic_add_fp32x4(
+                        acc_q0,
+                        acc_q1,
+                        acc_q2,
+                        acc_q3,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                    )
+            else:
+                copy_utils.atomic_add_fp32x4(
+                    grad_q0,
+                    grad_q1,
+                    grad_q2,
+                    grad_q3,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                )
+            copy_utils.atomic_add_fp32x4(
+                grad * q0,
+                grad * q1,
+                grad * q2,
+                grad * q3,
+                cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim0)),
+            )
+
+
+class ARHSAV3StartScoreGradRowOnlyH2Sm100:
+    """Per-start grad-row accumulation for packed v3 two-head start scores."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mGradOut,
+            mStartFeatureRows,
+            mStartQueryIndex,
+            mStartLevels,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        start_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if start_idx < total_tasks:
+            head_dim = Int32(mQLevels.shape[3])
+            feature_row = Int32(mStartFeatureRows[start_idx])
+            query_idx = Int32(mStartQueryIndex[start_idx])
+            level = Int32(mStartLevels[start_idx])
+            grad0 = Float32(mGradOut[start_idx, 0]) * scale
+            grad1 = Float32(mGradOut[start_idx, 1]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q0 = Float32(mQLevels[query_idx, level, 0, dim_idx])
+                q1 = Float32(mQLevels[query_idx, level, 1, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad0 * q0,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, 0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * q1,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, 1, dim_idx)),
+                )
+
+
+class ARHSAV3StartScoreGradQSegmentH2Sm100:
+    """Query-level segmented grad-q reduction for packed v3 two-head starts."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mGradQ: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mRowRepr,
+            mGradOut,
+            mStartFeatureRows,
+            mStartLevelBegin,
+            mStartLevelEnd,
+            mGradQ,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mGradQ: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            n_levels = Int32(mGradQ.shape[1])
+            head_dim = Int32(mGradQ.shape[3])
+            query_idx = task_idx // n_levels
+            level = task_idx - query_idx * n_levels
+            start = Int32(mStartLevelBegin[task_idx])
+            end = Int32(mStartLevelEnd[task_idx])
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                acc0 = Float32.zero
+                acc1 = Float32.zero
+                for ptr in cutlass.range(start, end, unroll=1):
+                    feature_row = Int32(mStartFeatureRows[ptr])
+                    grad0 = Float32(mGradOut[ptr, 0]) * scale
+                    grad1 = Float32(mGradOut[ptr, 1]) * scale
+                    acc0 += grad0 * Float32(mRowRepr[feature_row, 0, dim_idx])
+                    acc1 += grad1 * Float32(mRowRepr[feature_row, 1, dim_idx])
+                mGradQ[query_idx, level, 0, dim_idx] = acc0.to(mGradQ.element_type)
+                mGradQ[query_idx, level, 1, dim_idx] = acc1.to(mGradQ.element_type)
+
+
+class ARHSAV3OpenScoreH2Sm100:
+    """Fused ARHSAv3 open-gate score dot for the two-head benchmark path."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mUpBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mContinueRowIndex,
+            mContinueLevels,
+            mUpBias,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mUpBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            n_groups = Int32(mContinueRowIndex.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            query_idx = task_idx // n_groups
+            group_idx = task_idx - query_idx * n_groups
+            level = Int32(mContinueLevels[group_idx])
+            continue_row = Int32(mContinueRowIndex[query_idx, group_idx])
+            partial0 = Float32.zero
+            partial1 = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                key0 = Float32(mOpenKeyByLevel[level, 0, dim_idx])
+                key1 = Float32(mOpenKeyByLevel[level, 1, dim_idx])
+                if continue_row >= Int32(0):
+                    key0 = Float32(mRowRepr[continue_row, 0, dim_idx])
+                    key1 = Float32(mRowRepr[continue_row, 1, dim_idx])
+                partial0 += Float32(mQLevels[query_idx, level, 0, dim_idx]) * key0
+                partial1 += Float32(mQLevels[query_idx, level, 1, dim_idx]) * key1
+            acc0 = cute_utils.warp_reduce(partial0, lambda a, b: a + b)
+            acc1 = cute_utils.warp_reduce(partial1, lambda a, b: a + b)
+            if lane == Int32(0):
+                bias0 = Float32(mUpBias[0])
+                bias1 = bias0
+                if Int32(mUpBias.shape[0]) > Int32(1):
+                    bias1 = Float32(mUpBias[1])
+                mOut[query_idx, group_idx, 0] = (acc0 * scale + bias0).to(mOut.element_type)
+                mOut[query_idx, group_idx, 1] = (acc1 * scale + bias1).to(mOut.element_type)
+
+
+class ARHSAV3OpenScoreBackwardH2Sm100:
+    """Backward for the fused two-head ARHSAv3 open-gate score dot."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mGradOut,
+            mContinueRowIndex,
+            mContinueLevels,
+            mGradQ,
+            mGradRow,
+            mGradOpenKey,
+            mGradUpBias,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            n_groups = Int32(mContinueRowIndex.shape[1])
+            head_dim = Int32(mRowRepr.shape[2])
+            query_idx = task_idx // n_groups
+            group_idx = task_idx - query_idx * n_groups
+            level = Int32(mContinueLevels[group_idx])
+            continue_row = Int32(mContinueRowIndex[query_idx, group_idx])
+            grad0_raw = Float32(mGradOut[query_idx, group_idx, 0])
+            grad1_raw = Float32(mGradOut[query_idx, group_idx, 1])
+            grad0 = grad0_raw * scale
+            grad1 = grad1_raw * scale
+            if lane == Int32(0):
+                if Int32(mGradUpBias.shape[0]) > Int32(1):
+                    cute_utils.atomic_add_fp32(
+                        grad0_raw,
+                        cute_utils.elem_pointer(mGradUpBias, (0,)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1_raw,
+                        cute_utils.elem_pointer(mGradUpBias, (1,)),
+                    )
+                else:
+                    cute_utils.atomic_add_fp32(
+                        grad0_raw + grad1_raw,
+                        cute_utils.elem_pointer(mGradUpBias, (0,)),
+                    )
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q0 = Float32(mQLevels[query_idx, level, 0, dim_idx])
+                q1 = Float32(mQLevels[query_idx, level, 1, dim_idx])
+                key0 = Float32(mOpenKeyByLevel[level, 0, dim_idx])
+                key1 = Float32(mOpenKeyByLevel[level, 1, dim_idx])
+                if continue_row >= Int32(0):
+                    key0 = Float32(mRowRepr[continue_row, 0, dim_idx])
+                    key1 = Float32(mRowRepr[continue_row, 1, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad0 * key0,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, 0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * key1,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, 1, dim_idx)),
+                )
+                if continue_row >= Int32(0):
+                    cute_utils.atomic_add_fp32(
+                        grad0 * q0,
+                        cute_utils.elem_pointer(mGradRow, (continue_row, 0, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1 * q1,
+                        cute_utils.elem_pointer(mGradRow, (continue_row, 1, dim_idx)),
+                    )
+                else:
+                    cute_utils.atomic_add_fp32(
+                        grad0 * q0,
+                        cute_utils.elem_pointer(mGradOpenKey, (level, 0, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1 * q1,
+                        cute_utils.elem_pointer(mGradOpenKey, (level, 1, dim_idx)),
+                    )
+
+
+class ARHSAV3StartWeightForwardSm100:
+    """Packed v3 start-weight normalization over query-major start rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mStartMass: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mStartScores,
+            mOpenScores,
+            mStartMass,
+            mStartRowPtr,
+            mGroupIndex,
+            mIncludeOpen,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mStartMass: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mStartScores.shape[1])
+            n_groups = Int32(mOpenScores.shape[1])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            neg_inf = Float32(-3.4028234663852886e38)
+            max0 = neg_inf
+            max1 = neg_inf
+            max2 = neg_inf
+            max3 = neg_inf
+            has0 = Int32(0)
+            has1 = Int32(0)
+            has2 = Int32(0)
+            has3 = Int32(0)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    has0 = Int32(1)
+                    if score > max0:
+                        max0 = score
+                elif g == Int32(1):
+                    has1 = Int32(1)
+                    if score > max1:
+                        max1 = score
+                elif g == Int32(2):
+                    has2 = Int32(1)
+                    if score > max2:
+                        max2 = score
+                elif g == Int32(3):
+                    has3 = Int32(1)
+                    if score > max3:
+                        max3 = score
+
+            inc0 = has0 != Int32(0) and n_groups > Int32(0) and Int32(mIncludeOpen[0]) != Int32(0)
+            inc1 = has1 != Int32(0) and n_groups > Int32(1) and Int32(mIncludeOpen[1]) != Int32(0)
+            inc2 = has2 != Int32(0) and n_groups > Int32(2) and Int32(mIncludeOpen[2]) != Int32(0)
+            inc3 = has3 != Int32(0) and n_groups > Int32(3) and Int32(mIncludeOpen[3]) != Int32(0)
+            open0 = Float32.zero
+            open1 = Float32.zero
+            open2 = Float32.zero
+            open3 = Float32.zero
+            if n_groups > Int32(0):
+                open0 = Float32(mOpenScores[query_idx, 0, head_idx])
+                if inc0 and open0 > max0:
+                    max0 = open0
+            if n_groups > Int32(1):
+                open1 = Float32(mOpenScores[query_idx, 1, head_idx])
+                if inc1 and open1 > max1:
+                    max1 = open1
+            if n_groups > Int32(2):
+                open2 = Float32(mOpenScores[query_idx, 2, head_idx])
+                if inc2 and open2 > max2:
+                    max2 = open2
+            if n_groups > Int32(3):
+                open3 = Float32(mOpenScores[query_idx, 3, head_idx])
+                if inc3 and open3 > max3:
+                    max3 = open3
+
+            sum0 = Float32.zero
+            sum1 = Float32.zero
+            sum2 = Float32.zero
+            sum3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    sum0 += cute.math.exp2((score - max0) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(1):
+                    sum1 += cute.math.exp2((score - max1) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(2):
+                    sum2 += cute.math.exp2((score - max2) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(3):
+                    sum3 += cute.math.exp2((score - max3) * Float32(_LOG2_E), fastmath=True)
+
+            open_exp0 = Float32.zero
+            open_exp1 = Float32.zero
+            open_exp2 = Float32.zero
+            open_exp3 = Float32.zero
+            if inc0:
+                open_exp0 = cute.math.exp2((open0 - max0) * Float32(_LOG2_E), fastmath=True)
+            if inc1:
+                open_exp1 = cute.math.exp2((open1 - max1) * Float32(_LOG2_E), fastmath=True)
+            if inc2:
+                open_exp2 = cute.math.exp2((open2 - max2) * Float32(_LOG2_E), fastmath=True)
+            if inc3:
+                open_exp3 = cute.math.exp2((open3 - max3) * Float32(_LOG2_E), fastmath=True)
+            den0 = sum0 + open_exp0
+            den1 = sum1 + open_exp1
+            den2 = sum2 + open_exp2
+            den3 = sum3 + open_exp3
+            if den0 < Float32(1.0e-8):
+                den0 = Float32(1.0e-8)
+            if den1 < Float32(1.0e-8):
+                den1 = Float32(1.0e-8)
+            if den2 < Float32(1.0e-8):
+                den2 = Float32(1.0e-8)
+            if den3 < Float32(1.0e-8):
+                den3 = Float32(1.0e-8)
+            c0 = Float32(1.0)
+            c1 = Float32(1.0)
+            c2 = Float32(1.0)
+            c3 = Float32(1.0)
+            if has0 != Int32(0):
+                c0 = open_exp0 / den0
+            if has1 != Int32(0):
+                c1 = open_exp1 / den1
+            if has2 != Int32(0):
+                c2 = open_exp2 / den2
+            if has3 != Int32(0):
+                c3 = open_exp3 / den3
+            carry0 = Float32(1.0)
+            carry1 = c0
+            carry2 = c0 * c1
+            carry3 = c0 * c1 * c2
+            mass = Float32(mStartMass[query_idx, head_idx])
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                mOut[ptr, head_idx] = (mass * carry * prob).to(mOut.element_type)
+
+
+class ARHSAV3StartWeightBackwardSm100:
+    """Backward for packed v3 start-weight normalization."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mStartMass: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mGradStartScores: cute.Tensor,
+        mGradOpenScores: cute.Tensor,
+        mGradStartMass: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mStartScores,
+            mOpenScores,
+            mStartMass,
+            mGradOut,
+            mStartRowPtr,
+            mGroupIndex,
+            mIncludeOpen,
+            mGradStartScores,
+            mGradOpenScores,
+            mGradStartMass,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mStartMass: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mGradStartScores: cute.Tensor,
+        mGradOpenScores: cute.Tensor,
+        mGradStartMass: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mStartScores.shape[1])
+            n_groups = Int32(mOpenScores.shape[1])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            neg_inf = Float32(-3.4028234663852886e38)
+            max0 = neg_inf
+            max1 = neg_inf
+            max2 = neg_inf
+            max3 = neg_inf
+            has0 = Int32(0)
+            has1 = Int32(0)
+            has2 = Int32(0)
+            has3 = Int32(0)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    has0 = Int32(1)
+                    if score > max0:
+                        max0 = score
+                elif g == Int32(1):
+                    has1 = Int32(1)
+                    if score > max1:
+                        max1 = score
+                elif g == Int32(2):
+                    has2 = Int32(1)
+                    if score > max2:
+                        max2 = score
+                elif g == Int32(3):
+                    has3 = Int32(1)
+                    if score > max3:
+                        max3 = score
+            inc0 = has0 != Int32(0) and n_groups > Int32(0) and Int32(mIncludeOpen[0]) != Int32(0)
+            inc1 = has1 != Int32(0) and n_groups > Int32(1) and Int32(mIncludeOpen[1]) != Int32(0)
+            inc2 = has2 != Int32(0) and n_groups > Int32(2) and Int32(mIncludeOpen[2]) != Int32(0)
+            inc3 = has3 != Int32(0) and n_groups > Int32(3) and Int32(mIncludeOpen[3]) != Int32(0)
+            open0 = Float32.zero
+            open1 = Float32.zero
+            open2 = Float32.zero
+            open3 = Float32.zero
+            if n_groups > Int32(0):
+                open0 = Float32(mOpenScores[query_idx, 0, head_idx])
+                if inc0 and open0 > max0:
+                    max0 = open0
+            if n_groups > Int32(1):
+                open1 = Float32(mOpenScores[query_idx, 1, head_idx])
+                if inc1 and open1 > max1:
+                    max1 = open1
+            if n_groups > Int32(2):
+                open2 = Float32(mOpenScores[query_idx, 2, head_idx])
+                if inc2 and open2 > max2:
+                    max2 = open2
+            if n_groups > Int32(3):
+                open3 = Float32(mOpenScores[query_idx, 3, head_idx])
+                if inc3 and open3 > max3:
+                    max3 = open3
+            sum0 = Float32.zero
+            sum1 = Float32.zero
+            sum2 = Float32.zero
+            sum3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    sum0 += cute.math.exp2((score - max0) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(1):
+                    sum1 += cute.math.exp2((score - max1) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(2):
+                    sum2 += cute.math.exp2((score - max2) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(3):
+                    sum3 += cute.math.exp2((score - max3) * Float32(_LOG2_E), fastmath=True)
+            open_exp0 = Float32.zero
+            open_exp1 = Float32.zero
+            open_exp2 = Float32.zero
+            open_exp3 = Float32.zero
+            if inc0:
+                open_exp0 = cute.math.exp2((open0 - max0) * Float32(_LOG2_E), fastmath=True)
+            if inc1:
+                open_exp1 = cute.math.exp2((open1 - max1) * Float32(_LOG2_E), fastmath=True)
+            if inc2:
+                open_exp2 = cute.math.exp2((open2 - max2) * Float32(_LOG2_E), fastmath=True)
+            if inc3:
+                open_exp3 = cute.math.exp2((open3 - max3) * Float32(_LOG2_E), fastmath=True)
+            den0 = sum0 + open_exp0
+            den1 = sum1 + open_exp1
+            den2 = sum2 + open_exp2
+            den3 = sum3 + open_exp3
+            if den0 < Float32(1.0e-8):
+                den0 = Float32(1.0e-8)
+            if den1 < Float32(1.0e-8):
+                den1 = Float32(1.0e-8)
+            if den2 < Float32(1.0e-8):
+                den2 = Float32(1.0e-8)
+            if den3 < Float32(1.0e-8):
+                den3 = Float32(1.0e-8)
+            c0 = Float32(1.0)
+            c1 = Float32(1.0)
+            c2 = Float32(1.0)
+            c3 = Float32(1.0)
+            if has0 != Int32(0):
+                c0 = open_exp0 / den0
+            if has1 != Int32(0):
+                c1 = open_exp1 / den1
+            if has2 != Int32(0):
+                c2 = open_exp2 / den2
+            if has3 != Int32(0):
+                c3 = open_exp3 / den3
+            carry0 = Float32(1.0)
+            carry1 = c0
+            carry2 = c0 * c1
+            carry3 = c0 * c1 * c2
+            mass = Float32(mStartMass[query_idx, head_idx])
+            bar_mass = Float32.zero
+            bar_carry0 = Float32.zero
+            bar_carry1 = Float32.zero
+            bar_carry2 = Float32.zero
+            bar_carry3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad = Float32(mGradOut[ptr, head_idx])
+                bar_mass += grad * carry * prob
+                bar_carry = grad * mass * prob
+                if g == Int32(0):
+                    bar_carry0 += bar_carry
+                elif g == Int32(1):
+                    bar_carry1 += bar_carry
+                elif g == Int32(2):
+                    bar_carry2 += bar_carry
+                elif g == Int32(3):
+                    bar_carry3 += bar_carry
+            bar_c0 = Float32.zero
+            bar_c1 = Float32.zero
+            bar_c2 = Float32.zero
+            bar_c3 = Float32.zero
+            if n_groups > Int32(3):
+                bar_c2 += bar_carry3 * carry2
+                bar_carry2 += bar_carry3 * c2
+            if n_groups > Int32(2):
+                bar_c1 += bar_carry2 * carry1
+                bar_carry1 += bar_carry2 * c1
+            if n_groups > Int32(1):
+                bar_c0 += bar_carry1 * carry0
+                bar_carry0 += bar_carry1 * c0
+            dot0 = bar_c0 * c0
+            dot1 = bar_c1 * c1
+            dot2 = bar_c2 * c2
+            dot3 = bar_c3 * c3
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                dot = dot0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                    dot = dot1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                    dot = dot2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                    dot = dot3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad_prob = Float32(mGradOut[ptr, head_idx]) * mass * carry
+                if g == Int32(0):
+                    dot0 += grad_prob * prob
+                elif g == Int32(1):
+                    dot1 += grad_prob * prob
+                elif g == Int32(2):
+                    dot2 += grad_prob * prob
+                elif g == Int32(3):
+                    dot3 += grad_prob * prob
+            open_grad0 = Float32.zero
+            open_grad1 = Float32.zero
+            open_grad2 = Float32.zero
+            open_grad3 = Float32.zero
+            if inc0:
+                open_grad0 = c0 * (bar_c0 - dot0)
+            if inc1:
+                open_grad1 = c1 * (bar_c1 - dot1)
+            if inc2:
+                open_grad2 = c2 * (bar_c2 - dot2)
+            if inc3:
+                open_grad3 = c3 * (bar_c3 - dot3)
+            if n_groups > Int32(0):
+                mGradOpenScores[query_idx, 0, head_idx] = open_grad0.to(mGradOpenScores.element_type)
+            if n_groups > Int32(1):
+                mGradOpenScores[query_idx, 1, head_idx] = open_grad1.to(mGradOpenScores.element_type)
+            if n_groups > Int32(2):
+                mGradOpenScores[query_idx, 2, head_idx] = open_grad2.to(mGradOpenScores.element_type)
+            if n_groups > Int32(3):
+                mGradOpenScores[query_idx, 3, head_idx] = open_grad3.to(mGradOpenScores.element_type)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                dot = dot0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                    dot = dot1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                    dot = dot2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                    dot = dot3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad_prob = Float32(mGradOut[ptr, head_idx]) * mass * carry
+                mGradStartScores[ptr, head_idx] = (prob * (grad_prob - dot)).to(
+                    mGradStartScores.element_type
+                )
+            mGradStartMass[query_idx, head_idx] = bar_mass.to(mGradStartMass.element_type)
+
+
 class ARHSASampledEdgeDstDotSm100:
     """Sample q[level(dst)] dot row_repr(dst) directly for ARHSAv2 edges."""
 
@@ -1341,6 +2520,1257 @@ class ARHSAGroupedWeightedValueBackwardSm100:
                     attn * grad_out
                 ).to(mGradValue.element_type)
             mGradAttn[edge_idx, head_idx] = grad_attn.to(mGradAttn.element_type)
+
+
+class ARHSARowGather2DSm100:
+    """Gather rows from a 2-D state tensor."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrc: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrc,
+            mRowIndex,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrc: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mSrc.shape[1])
+            gather_row = task_idx // n_cols
+            col_idx = task_idx - gather_row * n_cols
+            src_row = Int32(mRowIndex[gather_row])
+            mOut[gather_row, col_idx] = mSrc[src_row, col_idx]
+
+
+class ARHSARowGather2DBackwardSm100:
+    """Backward scatter for ``ARHSARowGather2DSm100``."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradOut: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mGradSrc: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mGradOut,
+            mRowIndex,
+            mGradSrc,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradOut: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mGradSrc: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mGradOut.shape[1])
+            gather_row = task_idx // n_cols
+            col_idx = task_idx - gather_row * n_cols
+            src_row = Int32(mRowIndex[gather_row])
+            cute_utils.atomic_add_fp32(
+                Float32(mGradOut[gather_row, col_idx]),
+                cute_utils.elem_pointer(mGradSrc, (src_row, col_idx)),
+            )
+
+
+class ARHSARowWrite2DSm100:
+    """Write rows into a 2-D state tensor."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mTarget: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mTarget,
+            mRowIndex,
+            mValue,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mTarget: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mTarget.shape[1])
+            value_row = task_idx // n_cols
+            col_idx = task_idx - value_row * n_cols
+            target_row = Int32(mRowIndex[value_row])
+            mTarget[target_row, col_idx] = mValue[value_row, col_idx]
+
+
+class ARHSAChildGATStateForwardSm100:
+    """Forward bucketed child-GAT state update.
+
+    This is intentionally scalar per parent group. It removes the PyTorch
+    operator launches from the experimental fused boundary while preserving the
+    exact tensors needed by the existing backward.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mBase: cute.Tensor,
+        mQ: cute.Tensor,
+        mChildNormWeight: cute.Tensor,
+        mChildNormBias: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mChildXHat: cute.Tensor,
+        mChildRstd: cute.Tensor,
+        mChildNorm: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        child_norm_eps: Float32,
+        key_norm_eps: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mRawNodeRepr,
+            mNodeRepr,
+            mNodeReprNormalizedFlat,
+            mParentRows,
+            mChildRows,
+            mChildMask,
+            mBase,
+            mQ,
+            mChildNormWeight,
+            mChildNormBias,
+            mKWeight,
+            mVWeight,
+            mOutWeight,
+            mOutBias,
+            mKeyProjWeight,
+            mKeyProjBias,
+            mKeyNormWeight,
+            mKeyNormBias,
+            mChildXHat,
+            mChildRstd,
+            mChildNorm,
+            mK,
+            mV,
+            mAttn,
+            mAttended,
+            mParentRaw,
+            mKeyXHat,
+            mKeyRstd,
+            mProjRows,
+            mNormalizedRows,
+            mNormDenom,
+            child_norm_eps,
+            key_norm_eps,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mBase: cute.Tensor,
+        mQ: cute.Tensor,
+        mChildNormWeight: cute.Tensor,
+        mChildNormBias: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mChildXHat: cute.Tensor,
+        mChildRstd: cute.Tensor,
+        mChildNorm: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        child_norm_eps: Float32,
+        key_norm_eps: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        group_idx = block_idx * self.num_threads + tidx
+        if group_idx < total_tasks:
+            bucket_size = Int32(mChildMask.shape[1])
+            num_heads = Int32(mQ.shape[0])
+            head_dim = Int32(mQ.shape[1])
+            d_model = Int32(mRawNodeRepr.shape[1])
+            inv_d = Float32(1.0) / Float32(d_model)
+
+            for child_slot in cutlass.range(bucket_size, unroll=1):
+                flat_child = group_idx * bucket_size + child_slot
+                src_row = Int32(mChildRows[flat_child])
+                mean = Float32.zero
+                for dim_idx in cutlass.range(d_model, unroll=16):
+                    mean += Float32(mRawNodeRepr[src_row, dim_idx])
+                mean = mean * inv_d
+                var = Float32.zero
+                for dim_idx in cutlass.range(d_model, unroll=16):
+                    centered = Float32(mRawNodeRepr[src_row, dim_idx]) - mean
+                    var += centered * centered
+                rstd = Float32(
+                    cute.math.rsqrt(var * inv_d + child_norm_eps, fastmath=True)
+                )
+                mChildRstd[flat_child, 0] = rstd.to(mChildRstd.element_type)
+                for dim_idx in cutlass.range(d_model, unroll=16):
+                    x_hat = (Float32(mRawNodeRepr[src_row, dim_idx]) - mean) * rstd
+                    normed = (
+                        x_hat * Float32(mChildNormWeight[dim_idx])
+                        + Float32(mChildNormBias[dim_idx])
+                    )
+                    mChildXHat[flat_child, dim_idx] = x_hat.to(mChildXHat.element_type)
+                    mChildNorm[flat_child, dim_idx] = normed.to(mChildNorm.element_type)
+
+                for out_dim in cutlass.range(d_model, unroll=16):
+                    k_acc = Float32.zero
+                    v_acc = Float32.zero
+                    for in_dim in cutlass.range(d_model, unroll=16):
+                        child_val = Float32(mChildNorm[flat_child, in_dim])
+                        k_acc += Float32(mKWeight[out_dim, in_dim]) * child_val
+                        v_acc += Float32(mVWeight[out_dim, in_dim]) * child_val
+                    head_idx = out_dim // head_dim
+                    dim_in_head = out_dim - head_idx * head_dim
+                    mK[group_idx, child_slot, head_idx, dim_in_head] = k_acc.to(mK.element_type)
+                    mV[group_idx, child_slot, head_idx, dim_in_head] = v_acc.to(mV.element_type)
+
+            scale = Float32(cute.math.rsqrt(Float32(head_dim), fastmath=True))
+            for head_idx in cutlass.range(num_heads, unroll=1):
+                row_max = Float32(-3.4028234663852886e38)
+                for child_slot in cutlass.range(bucket_size, unroll=1):
+                    score = Float32(-3.4028234663852886e38)
+                    if mChildMask[group_idx, child_slot]:
+                        score = Float32.zero
+                        for dim_idx in cutlass.range(head_dim, unroll=16):
+                            score += (
+                                Float32(mK[group_idx, child_slot, head_idx, dim_idx])
+                                * Float32(mQ[head_idx, dim_idx])
+                            )
+                        score = score * scale
+                    if score > row_max:
+                        row_max = score
+                row_sum = Float32.zero
+                for child_slot in cutlass.range(bucket_size, unroll=1):
+                    prob = Float32.zero
+                    if mChildMask[group_idx, child_slot]:
+                        score = Float32.zero
+                        for dim_idx in cutlass.range(head_dim, unroll=16):
+                            score += (
+                                Float32(mK[group_idx, child_slot, head_idx, dim_idx])
+                                * Float32(mQ[head_idx, dim_idx])
+                            )
+                        score = score * scale
+                        prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True)
+                    row_sum += prob
+                    mAttn[group_idx, child_slot, head_idx] = prob.to(mAttn.element_type)
+                if row_sum < Float32(1.0e-8):
+                    row_sum = Float32(1.0e-8)
+                inv_sum = Float32(1.0) / row_sum
+                for child_slot in cutlass.range(bucket_size, unroll=1):
+                    prob = Float32(mAttn[group_idx, child_slot, head_idx]) * inv_sum
+                    mAttn[group_idx, child_slot, head_idx] = prob.to(mAttn.element_type)
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    acc = Float32.zero
+                    for child_slot in cutlass.range(bucket_size, unroll=1):
+                        acc += (
+                            Float32(mAttn[group_idx, child_slot, head_idx])
+                            * Float32(mV[group_idx, child_slot, head_idx, dim_idx])
+                        )
+                    out_dim = head_idx * head_dim + dim_idx
+                    mAttended[group_idx, out_dim] = acc.to(mAttended.element_type)
+
+            parent_row = Int32(mParentRows[group_idx])
+            for out_dim in cutlass.range(d_model, unroll=16):
+                acc = Float32(mOutBias[out_dim])
+                for in_dim in cutlass.range(d_model, unroll=16):
+                    acc += Float32(mOutWeight[out_dim, in_dim]) * Float32(mAttended[group_idx, in_dim])
+                parent_val = Float32(mBase[out_dim]) + acc
+                mParentRaw[group_idx, out_dim] = parent_val.to(mParentRaw.element_type)
+                mRawNodeRepr[parent_row, out_dim] = parent_val.to(mRawNodeRepr.element_type)
+
+            key_mean = Float32.zero
+            for out_dim in cutlass.range(d_model, unroll=16):
+                acc = Float32(mKeyProjBias[out_dim])
+                for in_dim in cutlass.range(d_model, unroll=16):
+                    acc += Float32(mKeyProjWeight[out_dim, in_dim]) * Float32(mParentRaw[group_idx, in_dim])
+                mProjRows[group_idx, out_dim] = acc.to(mProjRows.element_type)
+                key_mean += acc
+            key_mean = key_mean * inv_d
+            key_var = Float32.zero
+            for dim_idx in cutlass.range(d_model, unroll=16):
+                centered = Float32(mProjRows[group_idx, dim_idx]) - key_mean
+                key_var += centered * centered
+            key_rstd = Float32(
+                cute.math.rsqrt(key_var * inv_d + key_norm_eps, fastmath=True)
+            )
+            mKeyRstd[group_idx, 0] = key_rstd.to(mKeyRstd.element_type)
+
+            for dim_idx in cutlass.range(d_model, unroll=16):
+                x_hat = (Float32(mProjRows[group_idx, dim_idx]) - key_mean) * key_rstd
+                proj = (
+                    x_hat * Float32(mKeyNormWeight[dim_idx])
+                    + Float32(mKeyNormBias[dim_idx])
+                )
+                mKeyXHat[group_idx, dim_idx] = x_hat.to(mKeyXHat.element_type)
+                mProjRows[group_idx, dim_idx] = proj.to(mProjRows.element_type)
+                mNodeRepr[parent_row, dim_idx] = proj.to(mNodeRepr.element_type)
+
+            for head_idx in cutlass.range(num_heads, unroll=1):
+                denom_sq = Float32.zero
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    out_dim = head_idx * head_dim + dim_idx
+                    proj = Float32(mProjRows[group_idx, out_dim])
+                    denom_sq += proj * proj
+                denom = Float32(cute.math.sqrt(denom_sq, fastmath=True))
+                if denom < Float32(1.0e-12):
+                    denom = Float32(1.0e-12)
+                mNormDenom[group_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+                inv_denom = Float32(1.0) / denom
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    out_dim = head_idx * head_dim + dim_idx
+                    norm_val = Float32(mProjRows[group_idx, out_dim]) * inv_denom
+                    mNormalizedRows[group_idx, head_idx, dim_idx] = norm_val.to(mNormalizedRows.element_type)
+                    mNodeReprNormalizedFlat[parent_row, out_dim] = norm_val.to(mNodeReprNormalizedFlat.element_type)
+
+
+class ARHSADenseGemm128Sm100:
+    """Narrow SM100 GEMM for AR-HSA child-GAT projections.
+
+    Computes ``C[M, 128] = A[M, 128] @ B[128, 128].T`` for contiguous tensors.
+    This is the hot K/V projection shape in the Gutenberg v3 bucket layout.
+    """
+
+    arch = 100
+
+    def __init__(self):
+        self.mma_tiler_mn = (128, 128)
+        self.mma_inst_tile_k = 4
+        self.ab_stages = 4
+        self.acc_stages = 1
+        self.threads_per_cta = 128
+        self.cta_group = tcgen05.CtaGroup.ONE
+        self.acc_dtype = cutlass.Float32
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        a_dtype = mA.element_type
+        b_dtype = mB.element_type
+        c_dtype = mC.element_type
+        if cutlass.const_expr(a_dtype != b_dtype):
+            raise TypeError(
+                f"ARHSA dense GEMM requires matching A/B dtypes: {a_dtype} != {b_dtype}"
+            )
+
+        a_major_mode = cutlass_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+        b_major_mode = cutlass_utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+        c_layout = cutlass_utils.LayoutEnum.from_tensor(mC)
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            a_dtype,
+            a_major_mode,
+            b_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler_mn,
+        )
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+        mma_tiler_mnk = (
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            mma_inst_shape_k * self.mma_inst_tile_k,
+        )
+        cta_tile_shape_mnk = mma_tiler_mnk
+
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            mma_tiler_mnk,
+            a_dtype,
+            self.ab_stages,
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            mma_tiler_mnk,
+            b_dtype,
+            self.ab_stages,
+        )
+        a_smem_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
+        b_smem_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
+
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_op,
+            mA,
+            a_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if a_dtype is cutlass.Float32 else None,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op,
+            mB,
+            b_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if b_dtype is cutlass.Float32 else None,
+        )
+
+        epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            cta_tile_shape_mnk,
+            False,
+            c_layout,
+            c_dtype,
+        )
+        tmem_load_atom = sm100_utils.get_tmem_load_op(
+            cta_tile_shape_mnk,
+            c_layout,
+            c_dtype,
+            self.acc_dtype,
+            epi_tile,
+            False,
+        )
+        grid = (
+            cute.ceil_div(mC.layout.shape[0], cta_tile_shape_mnk[0]),
+            cute.ceil_div(mC.layout.shape[1], cta_tile_shape_mnk[1]),
+            1,
+        )
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            mC,
+            a_smem_layout,
+            b_smem_layout,
+            tmem_load_atom,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            mma_tiler_mnk,
+            epi_tile,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        mC_mn: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        tmem_load_atom: cute.CopyAtom,
+        a_dtype: cutlass.Constexpr,
+        b_dtype: cutlass.Constexpr,
+        c_dtype: cutlass.Constexpr,
+        mma_tiler_mnk: cutlass.Constexpr,
+        epi_tile: cute.Tile,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        bidx, bidy, _ = cute.arch.block_idx()
+        mma_coord_mnk = (bidx, bidy, None)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
+            tmem_holding_buf: cutlass.Int32
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = smem.allocate_tensor(
+            element_type=a_dtype,
+            layout=a_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout.inner,
+        )
+        sB = smem.allocate_tensor(
+            element_type=b_dtype,
+            layout=b_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout.inner,
+        )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.threads_per_cta,
+        )
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+        )
+        tmem.allocate(512)
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+
+        a_copy_size = cute.size_in_bytes(
+            a_dtype,
+            cute.select(a_smem_layout, mode=[0, 1, 2]),
+        )
+        b_copy_size = cute.size_in_bytes(
+            b_dtype,
+            cute.select(b_smem_layout, mode=[0, 1, 2]),
+        )
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=self.ab_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            tx_count=a_copy_size + b_copy_size,
+            barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        ).make_participants()
+        acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=self.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads_per_cta,
+            ),
+            barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        ).make_participants()
+
+        gA = cute.local_tile(
+            mA_mk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, None, 1),
+        )
+        gB = cute.local_tile(
+            mB_nk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(None, 1, 1),
+        )
+        gC = cute.local_tile(
+            mC_mn,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, 1, None),
+        )
+        thr_mma = tiled_mma.get_slice(0)
+        tCgA = thr_mma.partition_A(gA)
+        tCgB = thr_mma.partition_B(gB)
+        tCgC = thr_mma.partition_C(gC)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(tCgA, 0, 3),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tAcc_epi[(None, None, 0, 0)],
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            self.acc_dtype,
+        )
+        tTR_rC = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            c_dtype,
+        )
+        simt_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            c_dtype,
+        )
+
+        num_k_tiles = cute.size(gA, mode=[2])
+        if warp_idx == 0:
+            acc_empty = acc_producer.acquire_and_advance()
+            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=self.ab_stages - 2):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, ab_empty.count)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[k_block_coord],
+                        tCrB[k_block_coord],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                ab_full.release()
+            acc_empty.commit()
+
+        tmem.relinquish_alloc_permit()
+        acc_full = acc_consumer.wait_and_advance()
+
+        for subtile_idx in cutlass.range(cute.size(tTR_tAcc, mode=[3])):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, subtile_idx)],
+                tTR_rAcc,
+            )
+            tTR_rC.store(tTR_rAcc.load().to(c_dtype))
+            cute.copy(
+                simt_atom,
+                tTR_rC,
+                tTR_gC[(None, None, None, subtile_idx)],
+            )
+        acc_full.release()
+
+        pipeline.sync(barrier_id=1)
+        tmem.free(tmem_ptr)
+
+
+class ARHSAChildGATKVGemmSm100:
+    """Dual-output K/V projection GEMM for child-GAT buckets.
+
+    Launches one kernel over ``grid=(ceil(M/128), 2, 1)``.  The Y dimension
+    selects K or V, avoiding two Python/CUDA launches while keeping each output
+    a normal contiguous ``[M, 128]`` tensor.
+    """
+
+    arch = 100
+
+    def __init__(self):
+        self.mma_tiler_mn = (128, 128)
+        self.mma_inst_tile_k = 4
+        self.ab_stages = 4
+        self.acc_stages = 1
+        self.threads_per_cta = 128
+        self.cta_group = tcgen05.CtaGroup.ONE
+        self.acc_dtype = cutlass.Float32
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mKOut: cute.Tensor,
+        mVOut: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        a_dtype = mA.element_type
+        b_dtype = mKWeight.element_type
+        c_dtype = mKOut.element_type
+        if cutlass.const_expr(a_dtype != b_dtype or b_dtype != mVWeight.element_type):
+            raise TypeError("ARHSA K/V GEMM requires matching A/K/V dtypes")
+        if cutlass.const_expr(c_dtype != mVOut.element_type):
+            raise TypeError("ARHSA K/V GEMM requires matching K/V output dtypes")
+
+        a_major_mode = cutlass_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+        b_major_mode = cutlass_utils.LayoutEnum.from_tensor(mKWeight).mma_major_mode()
+        c_layout = cutlass_utils.LayoutEnum.from_tensor(mKOut)
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            a_dtype,
+            a_major_mode,
+            b_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler_mn,
+        )
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+        mma_tiler_mnk = (
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            mma_inst_shape_k * self.mma_inst_tile_k,
+        )
+        cta_tile_shape_mnk = mma_tiler_mnk
+
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            mma_tiler_mnk,
+            a_dtype,
+            self.ab_stages,
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            mma_tiler_mnk,
+            b_dtype,
+            self.ab_stages,
+        )
+        a_smem_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
+        b_smem_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
+
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_op,
+            mA,
+            a_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if a_dtype is cutlass.Float32 else None,
+        )
+        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op,
+            mKWeight,
+            b_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if b_dtype is cutlass.Float32 else None,
+        )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op,
+            mVWeight,
+            b_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if b_dtype is cutlass.Float32 else None,
+        )
+
+        epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            cta_tile_shape_mnk,
+            False,
+            c_layout,
+            c_dtype,
+        )
+        tmem_load_atom = sm100_utils.get_tmem_load_op(
+            cta_tile_shape_mnk,
+            c_layout,
+            c_dtype,
+            self.acc_dtype,
+            epi_tile,
+            False,
+        )
+        grid = (
+            cute.ceil_div(mKOut.layout.shape[0], cta_tile_shape_mnk[0]),
+            2,
+            1,
+        )
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_k,
+            tma_tensor_k,
+            tma_atom_v,
+            tma_tensor_v,
+            mKOut,
+            mVOut,
+            a_smem_layout,
+            b_smem_layout,
+            tmem_load_atom,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            mma_tiler_mnk,
+            epi_tile,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+        mKWeight_nk: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        mVWeight_nk: cute.Tensor,
+        mKOut_mn: cute.Tensor,
+        mVOut_mn: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        tmem_load_atom: cute.CopyAtom,
+        a_dtype: cutlass.Constexpr,
+        b_dtype: cutlass.Constexpr,
+        c_dtype: cutlass.Constexpr,
+        mma_tiler_mnk: cutlass.Constexpr,
+        epi_tile: cute.Tile,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        bidx, bidy, _ = cute.arch.block_idx()
+        is_v_projection = bidy == 1
+        mma_coord_mnk = (bidx, 0, None)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
+            tmem_holding_buf: cutlass.Int32
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = smem.allocate_tensor(
+            element_type=a_dtype,
+            layout=a_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout.inner,
+        )
+        sB = smem.allocate_tensor(
+            element_type=b_dtype,
+            layout=b_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout.inner,
+        )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.threads_per_cta,
+        )
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+        )
+        tmem.allocate(512)
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_k)
+            cpasync.prefetch_descriptor(tma_atom_v)
+
+        a_copy_size = cute.size_in_bytes(
+            a_dtype,
+            cute.select(a_smem_layout, mode=[0, 1, 2]),
+        )
+        b_copy_size = cute.size_in_bytes(
+            b_dtype,
+            cute.select(b_smem_layout, mode=[0, 1, 2]),
+        )
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=self.ab_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            tx_count=a_copy_size + b_copy_size,
+            barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        ).make_participants()
+        acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=self.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads_per_cta,
+            ),
+            barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        ).make_participants()
+
+        gA = cute.local_tile(
+            mA_mk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, None, 1),
+        )
+        gKWeight = cute.local_tile(
+            mKWeight_nk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(None, 1, 1),
+        )
+        gVWeight = cute.local_tile(
+            mVWeight_nk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(None, 1, 1),
+        )
+        gKOut = cute.local_tile(
+            mKOut_mn,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, 1, None),
+        )
+        gVOut = cute.local_tile(
+            mVOut_mn,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, 1, None),
+        )
+        thr_mma = tiled_mma.get_slice(0)
+        tCgA = thr_mma.partition_A(gA)
+        tCgKWeight = thr_mma.partition_B(gKWeight)
+        tCgVWeight = thr_mma.partition_B(gVWeight)
+        tCgKOut = thr_mma.partition_C(gKOut)
+        tCgVOut = thr_mma.partition_C(gVOut)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(tCgA, 0, 3),
+        )
+        tKsB, tKgB = cpasync.tma_partition(
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgKWeight, 0, 3),
+        )
+        tVsB, tVgB = cpasync.tma_partition(
+            tma_atom_v,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgVWeight, 0, 3),
+        )
+
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tCgKOut_epi = cute.flat_divide(tCgKOut[((None, None), 0, 0)], epi_tile)
+        tCgVOut_epi = cute.flat_divide(tCgVOut[((None, None), 0, 0)], epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tAcc_epi[(None, None, 0, 0)],
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_gKOut = thr_copy_t2r.partition_D(tCgKOut_epi)
+        tTR_gVOut = thr_copy_t2r.partition_D(tCgVOut_epi)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        tTR_gKOut = cute.group_modes(tTR_gKOut, 3, cute.rank(tTR_gKOut))
+        tTR_gVOut = cute.group_modes(tTR_gVOut, 3, cute.rank(tTR_gVOut))
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gKOut[(None, None, None, 0)].shape,
+            self.acc_dtype,
+        )
+        tTR_rC = cute.make_rmem_tensor(
+            tTR_gKOut[(None, None, None, 0)].shape,
+            c_dtype,
+        )
+        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype)
+
+        num_k_tiles = cute.size(gA, mode=[2])
+        if warp_idx == 0:
+            acc_empty = acc_producer.acquire_and_advance()
+            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=self.ab_stages - 2):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                if is_v_projection:
+                    cute.copy(
+                        tma_atom_v,
+                        tVgB[(None, ab_empty.count)],
+                        tVsB[(None, ab_empty.index)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+                else:
+                    cute.copy(
+                        tma_atom_k,
+                        tKgB[(None, ab_empty.count)],
+                        tKsB[(None, ab_empty.index)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[k_block_coord],
+                        tCrB[k_block_coord],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                ab_full.release()
+            acc_empty.commit()
+
+        tmem.relinquish_alloc_permit()
+        acc_full = acc_consumer.wait_and_advance()
+
+        for subtile_idx in cutlass.range(cute.size(tTR_tAcc, mode=[3])):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, subtile_idx)],
+                tTR_rAcc,
+            )
+            tTR_rC.store(tTR_rAcc.load().to(c_dtype))
+            if is_v_projection:
+                cute.copy(
+                    simt_atom,
+                    tTR_rC,
+                    tTR_gVOut[(None, None, None, subtile_idx)],
+                )
+            else:
+                cute.copy(
+                    simt_atom,
+                    tTR_rC,
+                    tTR_gKOut[(None, None, None, subtile_idx)],
+                )
+        acc_full.release()
+
+        pipeline.sync(barrier_id=1)
+        tmem.free(tmem_ptr)
+
+
+class ARHSAChildGATScoreReduceSm100:
+    """Score, softmax, and reduce a dense child-GAT bucket.
+
+    One CTA owns one parent group.  For the Gutenberg hot path this means
+    bucket_size=32, n_heads=2, head_dim=64.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mQ: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        group_count: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mK,
+            mV,
+            mChildMask,
+            mQ,
+            mAttn,
+            mAttended,
+            group_count,
+        ).launch(
+            grid=[group_count, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mQ: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        group_count: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, _, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        bucket_size = Int32(mK.shape[1])
+        num_heads = Int32(mK.shape[2])
+        head_dim = Int32(mK.shape[3])
+        scale = Float32(1.0) / Float32(cute.math.sqrt(Float32(head_dim), fastmath=True))
+
+        smem = cutlass.utils.SmemAllocator()
+        sAttn = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((2, 32)),
+            byte_alignment=16,
+        )
+
+        if warp_idx < num_heads:
+            head_idx = warp_idx
+            child_idx = lane
+            valid = child_idx < bucket_size and mChildMask[group_idx, child_idx]
+            score = -Float32.inf
+            if valid:
+                dot = Float32.zero
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    dot += Float32(mK[group_idx, child_idx, head_idx, dim_idx]) * Float32(
+                        mQ[head_idx, dim_idx]
+                    )
+                score = dot * scale
+            max_score = cute_utils.warp_reduce(score, cute_utils.fmax, width=32)
+            exp_score = Float32.zero
+            if valid:
+                exp_score = Float32(cute.math.exp(score - max_score, fastmath=True))
+            sum_score = cute_utils.warp_reduce(exp_score, lambda a, b: a + b, width=32)
+            inv_sum = Float32.zero
+            if sum_score > Float32(1.0e-8):
+                inv_sum = Float32(1.0) / sum_score
+            attn_val = exp_score * inv_sum
+            sAttn[head_idx, child_idx] = attn_val
+            if child_idx < bucket_size:
+                mAttn[group_idx, child_idx, head_idx] = attn_val.to(mAttn.element_type)
+
+        cute.arch.barrier()
+
+        if tidx < num_heads * head_dim:
+            head_idx = tidx // head_dim
+            dim_idx = tidx - head_idx * head_dim
+            acc = Float32.zero
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                acc += sAttn[head_idx, child_idx] * Float32(
+                    mV[group_idx, child_idx, head_idx, dim_idx]
+                )
+            out_dim = head_idx * head_dim + dim_idx
+            mAttended[group_idx, out_dim] = acc.to(mAttended.element_type)
 
 
 class ARHSALeafReadoutSm100:
@@ -5092,23 +7522,40 @@ def run_arhsa_sampled_node_dot(
         dtype=torch.int32,
     ).contiguous()
     query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
-    total_tasks = int(query_node_feature_row_index.numel() * row_repr.shape[1])
+    use_head_pair = (
+        row_repr.shape[1] == 2
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR", "1")
+        not in {"0", "false", "False", ""}
+    )
+    total_tasks = int(
+        query_node_feature_row_index.numel()
+        if use_head_pair
+        else query_node_feature_row_index.numel() * row_repr.shape[1]
+    )
     if total_tasks == 0:
         return out
 
     scale = float(q_levels.shape[-1] ** 0.5)
+    num_threads = int(os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_THREADS", "128"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_SAMPLED_NODE_DOT_THREADS must be 128, 256, or 512")
     compile_key = (
-        "arhsa_sampled_node_dot",
+        "arhsa_sampled_node_dot_h2" if use_head_pair else "arhsa_sampled_node_dot",
         q_levels.dtype,
         row_repr.dtype,
         out.dtype,
         q_levels.shape[2],
         q_levels.shape[3],
+        num_threads,
         torch.cuda.get_device_capability(q_levels.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if compile_key not in run_arhsa_sampled_node_dot.compile_cache:
-        op = ARHSASampledNodeDotSm100()
+        op = (
+            ARHSASampledNodeDotH2Sm100(num_threads=num_threads)
+            if use_head_pair
+            else ARHSASampledNodeDotSm100(num_threads=num_threads)
+        )
         run_arhsa_sampled_node_dot.compile_cache[compile_key] = cute.compile(
             op,
             to_cute_tensor(q_levels),
@@ -5189,11 +7636,42 @@ def run_arhsa_sampled_node_dot_backward(
         dtype=torch.int32,
     ).contiguous()
     query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
-    total_tasks = int(query_node_feature_row_index.numel() * row_repr.shape[1])
+    use_head_pair = (
+        row_repr.shape[1] == 2
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR", "1")
+        not in {"0", "false", "False", ""}
+    )
+    use_head_pair_d64_vec = (
+        use_head_pair
+        and row_repr.shape[2] == 64
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_H2_D64_VEC", "1")
+        not in {"0", "false", "False", ""}
+    )
+    use_head_pair_d64_cta_reduce = (
+        use_head_pair_d64_vec
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_H2_D64_CTA_REDUCE", "1")
+        not in {"0", "false", "False", ""}
+    )
+    total_tasks = int(
+        query_node_feature_row_index.numel()
+        if use_head_pair
+        else query_node_feature_row_index.numel() * row_repr.shape[1]
+    )
     if total_tasks > 0:
         scale = float(q_levels.shape[-1] ** 0.5)
+        num_threads = int(os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_THREADS", "128"))
+        if num_threads not in {128, 256, 512}:
+            raise ValueError("HSA_CUTE_SAMPLED_NODE_DOT_THREADS must be 128, 256, or 512")
         compile_key = (
-            "arhsa_sampled_node_dot_backward",
+            (
+                "arhsa_sampled_node_dot_backward_h2_d64_vec"
+                if use_head_pair_d64_vec
+                else (
+                    "arhsa_sampled_node_dot_backward_h2"
+                    if use_head_pair
+                    else "arhsa_sampled_node_dot_backward"
+                )
+            ),
             q_levels.dtype,
             row_repr.dtype,
             grad_out.dtype,
@@ -5201,11 +7679,24 @@ def run_arhsa_sampled_node_dot_backward(
             grad_row.dtype,
             q_levels.shape[2],
             q_levels.shape[3],
+            num_threads,
+            use_head_pair_d64_cta_reduce,
             torch.cuda.get_device_capability(q_levels.device),
         )
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         if compile_key not in run_arhsa_sampled_node_dot_backward.compile_cache:
-            op = ARHSASampledNodeDotBackwardSm100()
+            op = (
+                ARHSASampledNodeDotBackwardH2D64VecSm100(
+                    num_threads=num_threads,
+                    cta_reduce_grad_q=use_head_pair_d64_cta_reduce,
+                )
+                if use_head_pair_d64_vec
+                else (
+                    ARHSASampledNodeDotBackwardH2Sm100(num_threads=num_threads)
+                    if use_head_pair
+                    else ARHSASampledNodeDotBackwardSm100(num_threads=num_threads)
+                )
+            )
             run_arhsa_sampled_node_dot_backward.compile_cache[compile_key] = cute.compile(
                 op,
                 to_cute_tensor(q_levels),
@@ -5246,6 +7737,592 @@ def run_arhsa_sampled_node_dot_backward(
     elif grad_row_out is None and grad_row.dtype != row_repr.dtype:
         grad_row = grad_row.to(dtype=row_repr.dtype)
     return grad_q, grad_row
+
+
+def run_arhsa_v3_start_score_backward_segmented(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    grad_out: torch.Tensor,
+    start_feature_rows: torch.Tensor,
+    start_query_index: torch.Tensor,
+    start_levels: torch.Tensor,
+    start_level_begin: torch.Tensor,
+    start_level_end: torch.Tensor,
+    grad_q: torch.Tensor | None = None,
+    grad_row: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed-v3 start-score backward with segmented grad-q reduction."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim] matching q_levels")
+    if row_repr.shape[1] != 2:
+        raise ValueError("segmented v3 start-score backward currently requires exactly two heads")
+    if grad_out.shape != (start_feature_rows.numel(), row_repr.shape[1]):
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    qlevel_tasks = int(q_levels.shape[0] * q_levels.shape[1])
+    if start_level_begin.shape != (qlevel_tasks,) or start_level_end.shape != (qlevel_tasks,):
+        raise ValueError(
+            "start_level_begin/end must have shape [n_queries * n_levels], "
+            f"got {tuple(start_level_begin.shape)} / {tuple(start_level_end.shape)}"
+        )
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {grad_out.dtype}")
+
+    grad_q_out = grad_q
+    grad_row_out = grad_row
+    if grad_q is not None and grad_q.shape != q_levels.shape:
+        raise ValueError(f"grad_q shape mismatch: got {tuple(grad_q.shape)}")
+    if grad_row is not None and grad_row.shape != row_repr.shape:
+        raise ValueError(f"grad_row shape mismatch: got {tuple(grad_row.shape)}")
+    if q_levels.dtype == torch.float32:
+        grad_q = torch.empty_like(q_levels) if grad_q is None else grad_q
+    elif grad_q is not None and grad_q.dtype == torch.float32:
+        pass
+    else:
+        grad_q = torch.empty_like(q_levels, dtype=torch.float32)
+    if row_repr.dtype == torch.float32:
+        grad_row = torch.zeros_like(row_repr) if grad_row is None else grad_row.zero_()
+    elif grad_row is not None and grad_row.dtype == torch.float32:
+        grad_row.zero_()
+    else:
+        grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    grad_out = grad_out.contiguous()
+    start_feature_rows = start_feature_rows.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    start_query_index = start_query_index.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    start_levels = start_levels.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    start_level_begin = start_level_begin.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    start_level_end = start_level_end.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    grad_q = grad_q.contiguous()
+    grad_row = grad_row.contiguous()
+
+    scale = float(q_levels.shape[-1] ** 0.5)
+    num_threads = int(os.environ.get("HSA_CUTE_V3_START_SCORE_SEG_THREADS", "128"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_V3_START_SCORE_SEG_THREADS must be 128, 256, or 512")
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    row_tasks = int(start_feature_rows.numel())
+    if row_tasks > 0:
+        row_key = (
+            "arhsa_v3_start_score_grad_row_only_h2",
+            q_levels.dtype,
+            grad_out.dtype,
+            grad_row.dtype,
+            q_levels.shape[2],
+            q_levels.shape[3],
+            num_threads,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        if row_key not in run_arhsa_v3_start_score_backward_segmented.compile_cache:
+            row_op = ARHSAV3StartScoreGradRowOnlyH2Sm100(num_threads=num_threads)
+            run_arhsa_v3_start_score_backward_segmented.compile_cache[row_key] = cute.compile(
+                row_op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(start_feature_rows, assumed_align=4),
+                to_cute_tensor(start_query_index, assumed_align=4),
+                to_cute_tensor(start_levels, assumed_align=4),
+                to_cute_tensor(grad_row),
+                Float32(scale),
+                Int32(row_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_start_score_backward_segmented.compile_cache[row_key](
+            q_levels,
+            grad_out,
+            start_feature_rows,
+            start_query_index,
+            start_levels,
+            grad_row,
+            Float32(scale),
+            Int32(row_tasks),
+            current_stream,
+        )
+
+    if qlevel_tasks > 0:
+        q_key = (
+            "arhsa_v3_start_score_grad_q_segment_h2",
+            row_repr.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            q_levels.shape[1],
+            q_levels.shape[2],
+            q_levels.shape[3],
+            num_threads,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        if q_key not in run_arhsa_v3_start_score_backward_segmented.compile_cache:
+            q_op = ARHSAV3StartScoreGradQSegmentH2Sm100(num_threads=num_threads)
+            run_arhsa_v3_start_score_backward_segmented.compile_cache[q_key] = cute.compile(
+                q_op,
+                to_cute_tensor(row_repr),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(start_feature_rows, assumed_align=4),
+                to_cute_tensor(start_level_begin, assumed_align=4),
+                to_cute_tensor(start_level_end, assumed_align=4),
+                to_cute_tensor(grad_q),
+                Float32(scale),
+                Int32(qlevel_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_start_score_backward_segmented.compile_cache[q_key](
+            row_repr,
+            grad_out,
+            start_feature_rows,
+            start_level_begin,
+            start_level_end,
+            grad_q,
+            Float32(scale),
+            Int32(qlevel_tasks),
+            current_stream,
+        )
+
+    if grad_q_out is not None and grad_q_out.data_ptr() != grad_q.data_ptr():
+        grad_q_out.copy_(grad_q.to(dtype=grad_q_out.dtype))
+        grad_q = grad_q_out
+    elif grad_q_out is None and grad_q.dtype != q_levels.dtype:
+        grad_q = grad_q.to(dtype=q_levels.dtype)
+    if grad_row_out is not None and grad_row_out.data_ptr() != grad_row.data_ptr():
+        grad_row_out.copy_(grad_row.to(dtype=grad_row_out.dtype))
+        grad_row = grad_row_out
+    elif grad_row_out is None and grad_row.dtype != row_repr.dtype:
+        grad_row = grad_row.to(dtype=row_repr.dtype)
+    return grad_q, grad_row
+
+
+def run_arhsa_v3_open_score_forward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    open_key_by_level: torch.Tensor,
+    continue_row_index: torch.Tensor,
+    continue_levels: torch.Tensor,
+    up_bias: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run fused two-head ARHSAv3 open-gate score dot."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4 or row_repr.ndim != 3 or open_key_by_level.ndim != 3:
+        raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
+    if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
+        raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
+    if int(row_repr.shape[1]) != 2:
+        raise ValueError("run_arhsa_v3_open_score_forward currently requires exactly two heads")
+    if continue_row_index.ndim != 2:
+        raise ValueError("continue_row_index must have shape [n_queries, n_groups]")
+    if continue_levels.shape != (continue_row_index.shape[1],):
+        raise ValueError(f"continue_levels shape mismatch: got {tuple(continue_levels.shape)}")
+    if continue_row_index.shape[0] != q_levels.shape[0]:
+        raise ValueError("continue_row_index query dimension must match q_levels")
+    if up_bias.reshape(-1).numel() not in {1, 2}:
+        raise ValueError("up_bias must be scalar or length two")
+    for tensor_name, tensor in (
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("open_key_by_level", open_key_by_level),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty(
+            (q_levels.shape[0], continue_row_index.shape[1], row_repr.shape[1]),
+            dtype=row_repr.dtype,
+            device=row_repr.device,
+        )
+    if out.shape != (q_levels.shape[0], continue_row_index.shape[1], row_repr.shape[1]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    open_key_by_level = open_key_by_level.contiguous()
+    continue_row_index = continue_row_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    continue_levels = continue_levels.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    up_bias = up_bias.reshape(-1).to(device=q_levels.device).contiguous()
+    out = out.contiguous()
+    total_tasks = int(continue_row_index.numel())
+    if total_tasks == 0:
+        return out
+
+    num_threads = int(os.environ.get("HSA_CUTE_V3_OPEN_SCORE_THREADS", "128"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_V3_OPEN_SCORE_THREADS must be 128, 256, or 512")
+    scale = float(q_levels.shape[-1] ** 0.5)
+    compile_key = (
+        "arhsa_v3_open_score_h2",
+        q_levels.dtype,
+        row_repr.dtype,
+        open_key_by_level.dtype,
+        up_bias.dtype,
+        out.dtype,
+        q_levels.shape[2],
+        q_levels.shape[3],
+        continue_row_index.shape[1],
+        up_bias.numel(),
+        num_threads,
+        torch.cuda.get_device_capability(q_levels.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_open_score_forward.compile_cache:
+        op = ARHSAV3OpenScoreH2Sm100(num_threads=num_threads)
+        run_arhsa_v3_open_score_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(q_levels),
+            to_cute_tensor(row_repr),
+            to_cute_tensor(open_key_by_level),
+            to_cute_tensor(continue_row_index, assumed_align=4),
+            to_cute_tensor(continue_levels, assumed_align=4),
+            to_cute_tensor(up_bias),
+            to_cute_tensor(out),
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_open_score_forward.compile_cache[compile_key](
+        q_levels,
+        row_repr,
+        open_key_by_level,
+        continue_row_index,
+        continue_levels,
+        up_bias,
+        out,
+        Float32(scale),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_v3_open_score_backward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    open_key_by_level: torch.Tensor,
+    grad_out: torch.Tensor,
+    continue_row_index: torch.Tensor,
+    continue_levels: torch.Tensor,
+    up_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for fused two-head ARHSAv3 open-gate score dot."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4 or row_repr.ndim != 3 or open_key_by_level.ndim != 3:
+        raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
+    if int(row_repr.shape[1]) != 2:
+        raise ValueError("run_arhsa_v3_open_score_backward currently requires exactly two heads")
+    if grad_out.shape != (q_levels.shape[0], continue_row_index.shape[1], row_repr.shape[1]):
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    for tensor_name, tensor in (
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("open_key_by_level", open_key_by_level),
+        ("grad_out", grad_out),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_q_out_dtype = q_levels.dtype
+    grad_row_out_dtype = row_repr.dtype
+    grad_open_key_out_dtype = open_key_by_level.dtype
+    grad_q = (
+        torch.zeros_like(q_levels)
+        if q_levels.dtype == torch.float32
+        else torch.zeros_like(q_levels, dtype=torch.float32)
+    )
+    grad_row = (
+        torch.zeros_like(row_repr)
+        if row_repr.dtype == torch.float32
+        else torch.zeros_like(row_repr, dtype=torch.float32)
+    )
+    grad_open_key = (
+        torch.zeros_like(open_key_by_level)
+        if open_key_by_level.dtype == torch.float32
+        else torch.zeros_like(open_key_by_level, dtype=torch.float32)
+    )
+    grad_up_bias = torch.zeros(
+        up_bias.reshape(-1).numel(),
+        device=q_levels.device,
+        dtype=torch.float32,
+    )
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    open_key_by_level = open_key_by_level.contiguous()
+    grad_out = grad_out.contiguous()
+    continue_row_index = continue_row_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    continue_levels = continue_levels.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    total_tasks = int(continue_row_index.numel())
+    if total_tasks > 0:
+        num_threads = int(os.environ.get("HSA_CUTE_V3_OPEN_SCORE_THREADS", "128"))
+        if num_threads not in {128, 256, 512}:
+            raise ValueError("HSA_CUTE_V3_OPEN_SCORE_THREADS must be 128, 256, or 512")
+        scale = float(q_levels.shape[-1] ** 0.5)
+        compile_key = (
+            "arhsa_v3_open_score_backward_h2",
+            q_levels.dtype,
+            row_repr.dtype,
+            open_key_by_level.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            grad_open_key.dtype,
+            grad_up_bias.dtype,
+            q_levels.shape[2],
+            q_levels.shape[3],
+            continue_row_index.shape[1],
+            grad_up_bias.numel(),
+            num_threads,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_open_score_backward.compile_cache:
+            op = ARHSAV3OpenScoreBackwardH2Sm100(num_threads=num_threads)
+            run_arhsa_v3_open_score_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(open_key_by_level),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(continue_row_index, assumed_align=4),
+                to_cute_tensor(continue_levels, assumed_align=4),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                to_cute_tensor(grad_open_key),
+                to_cute_tensor(grad_up_bias),
+                Float32(scale),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_open_score_backward.compile_cache[compile_key](
+            q_levels,
+            row_repr,
+            open_key_by_level,
+            grad_out,
+            continue_row_index,
+            continue_levels,
+            grad_q,
+            grad_row,
+            grad_open_key,
+            grad_up_bias,
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    if grad_q.dtype != grad_q_out_dtype:
+        grad_q = grad_q.to(dtype=grad_q_out_dtype)
+    if grad_row.dtype != grad_row_out_dtype:
+        grad_row = grad_row.to(dtype=grad_row_out_dtype)
+    if grad_open_key.dtype != grad_open_key_out_dtype:
+        grad_open_key = grad_open_key.to(dtype=grad_open_key_out_dtype)
+    return grad_q, grad_row, grad_open_key, grad_up_bias.to(dtype=up_bias.dtype).reshape_as(up_bias)
+
+
+def run_arhsa_v3_start_weight_forward(
+    start_scores: torch.Tensor,
+    open_scores: torch.Tensor,
+    start_mass: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    group_index: torch.Tensor,
+    include_open: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run packed ARHSAv3 start-weight normalization."""
+    _require_cute_runtime()
+    if start_scores.device.type != "cuda":
+        raise ValueError("start_scores must be a CUDA tensor")
+    if start_scores.ndim != 2:
+        raise ValueError(f"start_scores must have shape [n_starts, n_heads], got {tuple(start_scores.shape)}")
+    if open_scores.ndim != 3:
+        raise ValueError(f"open_scores must have shape [n_queries, n_groups, n_heads], got {tuple(open_scores.shape)}")
+    if start_mass.shape != (open_scores.shape[0], start_scores.shape[1]):
+        raise ValueError(f"start_mass shape mismatch: got {tuple(start_mass.shape)}")
+    if start_row_ptr.shape != (open_scores.shape[0] + 1,):
+        raise ValueError(f"start_row_ptr shape mismatch: got {tuple(start_row_ptr.shape)}")
+    if group_index.shape != (start_scores.shape[0],):
+        raise ValueError(f"group_index shape mismatch: got {tuple(group_index.shape)}")
+    if include_open.shape != (open_scores.shape[1],):
+        raise ValueError(f"include_open shape mismatch: got {tuple(include_open.shape)}")
+    for tensor_name, tensor in (
+        ("start_scores", start_scores),
+        ("open_scores", open_scores),
+        ("start_mass", start_mass),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty_like(start_scores)
+    if out.shape != start_scores.shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+
+    start_scores = start_scores.contiguous()
+    open_scores = open_scores.contiguous()
+    start_mass = start_mass.contiguous()
+    out = out.contiguous()
+    start_row_ptr = start_row_ptr.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    group_index = group_index.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    include_open = include_open.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    total_tasks = int(open_scores.shape[0] * start_scores.shape[1])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_v3_start_weight_forward",
+        start_scores.dtype,
+        open_scores.dtype,
+        start_mass.dtype,
+        out.dtype,
+        start_scores.shape[1],
+        open_scores.shape[1],
+        torch.cuda.get_device_capability(start_scores.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_weight_forward.compile_cache:
+        op = ARHSAV3StartWeightForwardSm100()
+        run_arhsa_v3_start_weight_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(start_scores),
+            to_cute_tensor(open_scores),
+            to_cute_tensor(start_mass),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(group_index, assumed_align=4),
+            to_cute_tensor(include_open, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_weight_forward.compile_cache[compile_key](
+        start_scores,
+        open_scores,
+        start_mass,
+        start_row_ptr,
+        group_index,
+        include_open,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_v3_start_weight_backward(
+    start_scores: torch.Tensor,
+    open_scores: torch.Tensor,
+    start_mass: torch.Tensor,
+    grad_out: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    group_index: torch.Tensor,
+    include_open: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for packed ARHSAv3 start-weight normalization."""
+    _require_cute_runtime()
+    if start_scores.device.type != "cuda":
+        raise ValueError("start_scores must be a CUDA tensor")
+    if start_scores.ndim != 2 or grad_out.shape != start_scores.shape:
+        raise ValueError("start_scores and grad_out must have matching [n_starts, n_heads] shapes")
+    if open_scores.ndim != 3 or open_scores.shape[2] != start_scores.shape[1]:
+        raise ValueError("open_scores must have shape [n_queries, n_groups, n_heads]")
+    if start_mass.shape != (open_scores.shape[0], start_scores.shape[1]):
+        raise ValueError(f"start_mass shape mismatch: got {tuple(start_mass.shape)}")
+    if start_row_ptr.shape != (open_scores.shape[0] + 1,):
+        raise ValueError(f"start_row_ptr shape mismatch: got {tuple(start_row_ptr.shape)}")
+    if group_index.shape != (start_scores.shape[0],):
+        raise ValueError(f"group_index shape mismatch: got {tuple(group_index.shape)}")
+    if include_open.shape != (open_scores.shape[1],):
+        raise ValueError(f"include_open shape mismatch: got {tuple(include_open.shape)}")
+    for tensor_name, tensor in (
+        ("start_scores", start_scores),
+        ("open_scores", open_scores),
+        ("start_mass", start_mass),
+        ("grad_out", grad_out),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_start_scores = torch.empty_like(start_scores)
+    grad_open_scores = torch.empty_like(open_scores)
+    grad_start_mass = torch.empty_like(start_mass)
+    start_scores = start_scores.contiguous()
+    open_scores = open_scores.contiguous()
+    start_mass = start_mass.contiguous()
+    grad_out = grad_out.contiguous()
+    start_row_ptr = start_row_ptr.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    group_index = group_index.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    include_open = include_open.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    total_tasks = int(open_scores.shape[0] * start_scores.shape[1])
+    if total_tasks == 0:
+        return grad_start_scores, grad_open_scores, grad_start_mass
+
+    compile_key = (
+        "arhsa_v3_start_weight_backward",
+        start_scores.dtype,
+        open_scores.dtype,
+        start_mass.dtype,
+        grad_out.dtype,
+        grad_start_scores.dtype,
+        grad_open_scores.dtype,
+        grad_start_mass.dtype,
+        start_scores.shape[1],
+        open_scores.shape[1],
+        torch.cuda.get_device_capability(start_scores.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_weight_backward.compile_cache:
+        op = ARHSAV3StartWeightBackwardSm100()
+        run_arhsa_v3_start_weight_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(start_scores),
+            to_cute_tensor(open_scores),
+            to_cute_tensor(start_mass),
+            to_cute_tensor(grad_out),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(group_index, assumed_align=4),
+            to_cute_tensor(include_open, assumed_align=4),
+            to_cute_tensor(grad_start_scores),
+            to_cute_tensor(grad_open_scores),
+            to_cute_tensor(grad_start_mass),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_weight_backward.compile_cache[compile_key](
+        start_scores,
+        open_scores,
+        start_mass,
+        grad_out,
+        start_row_ptr,
+        group_index,
+        include_open,
+        grad_start_scores,
+        grad_open_scores,
+        grad_start_mass,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_start_scores, grad_open_scores, grad_start_mass
 
 
 def run_arhsa_sampled_edge_dst_dot(
@@ -5613,6 +8690,682 @@ def run_arhsa_grouped_weighted_value_backward(
         current_stream,
     )
     return grad_attn, grad_value
+
+
+def run_arhsa_row_gather_2d(
+    src: torch.Tensor,
+    row_index: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a CuTe 2-D row gather, ``out[i] = src[row_index[i]]``."""
+    _require_cute_runtime()
+    if src.device.type != "cuda":
+        raise ValueError("src must be a CUDA tensor")
+    if src.ndim != 2:
+        raise ValueError(f"src must have shape [n_rows, n_cols], got {tuple(src.shape)}")
+    if row_index.ndim != 1:
+        raise ValueError(f"row_index must be 1D, got {tuple(row_index.shape)}")
+    if src.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"src dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty(
+            (row_index.numel(), src.shape[1]),
+            dtype=src.dtype,
+            device=src.device,
+        )
+    if out.shape != (row_index.numel(), src.shape[1]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype != src.dtype:
+        raise ValueError(f"out dtype must match src dtype, got {out.dtype} vs {src.dtype}")
+
+    src = src.contiguous()
+    out = out.contiguous()
+    row_index = row_index.to(device=src.device, dtype=torch.int32).contiguous()
+    total_tasks = int(row_index.numel() * src.shape[1])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_row_gather_2d",
+        src.dtype,
+        out.dtype,
+        src.shape[1],
+        torch.cuda.get_device_capability(src.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_gather_2d.compile_cache:
+        op = ARHSARowGather2DSm100()
+        run_arhsa_row_gather_2d.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(src),
+            to_cute_tensor(row_index, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_gather_2d.compile_cache[compile_key](
+        src,
+        row_index,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_row_gather_2d_backward(
+    grad_out: torch.Tensor,
+    row_index: torch.Tensor,
+    *,
+    n_src_rows: int,
+    src_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Backward for ``run_arhsa_row_gather_2d`` with FP32 accumulation."""
+    _require_cute_runtime()
+    if grad_out.device.type != "cuda":
+        raise ValueError("grad_out must be a CUDA tensor")
+    if grad_out.ndim != 2:
+        raise ValueError(f"grad_out must have shape [n_gather, n_cols], got {tuple(grad_out.shape)}")
+    if row_index.ndim != 1 or int(row_index.numel()) != int(grad_out.shape[0]):
+        raise ValueError("row_index must be 1D with length matching grad_out")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_src = torch.zeros(
+        (int(n_src_rows), int(grad_out.shape[1])),
+        dtype=torch.float32,
+        device=grad_out.device,
+    )
+    grad_out = grad_out.contiguous()
+    row_index = row_index.to(device=grad_out.device, dtype=torch.int32).contiguous()
+    total_tasks = int(row_index.numel() * grad_out.shape[1])
+    if total_tasks > 0:
+        compile_key = (
+            "arhsa_row_gather_2d_backward",
+            grad_out.dtype,
+            grad_src.dtype,
+            grad_out.shape[1],
+            torch.cuda.get_device_capability(grad_out.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_row_gather_2d_backward.compile_cache:
+            op = ARHSARowGather2DBackwardSm100()
+            run_arhsa_row_gather_2d_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(grad_out),
+                to_cute_tensor(row_index, assumed_align=4),
+                to_cute_tensor(grad_src),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_row_gather_2d_backward.compile_cache[compile_key](
+            grad_out,
+            row_index,
+            grad_src,
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    return grad_src if grad_src.dtype == src_dtype else grad_src.to(dtype=src_dtype)
+
+
+def run_arhsa_row_write_2d_(
+    target: torch.Tensor,
+    row_index: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run an in-place CuTe row write, ``target[row_index[i]] = value[i]``."""
+    _require_cute_runtime()
+    if target.device.type != "cuda":
+        raise ValueError("target must be a CUDA tensor")
+    if target.ndim != 2 or value.ndim != 2:
+        raise ValueError("target and value must both be 2D tensors")
+    if row_index.ndim != 1:
+        raise ValueError(f"row_index must be 1D, got {tuple(row_index.shape)}")
+    if value.shape != (row_index.numel(), target.shape[1]):
+        raise ValueError(f"value shape mismatch: got {tuple(value.shape)}")
+    if target.dtype not in _CUTE_BACKWARD_DTYPES or value.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"target/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if value.dtype != target.dtype:
+        value = value.to(dtype=target.dtype)
+
+    target = target.contiguous()
+    value = value.contiguous()
+    row_index = row_index.to(device=target.device, dtype=torch.int32).contiguous()
+    total_tasks = int(row_index.numel() * target.shape[1])
+    if total_tasks == 0:
+        return target
+
+    compile_key = (
+        "arhsa_row_write_2d",
+        target.dtype,
+        value.dtype,
+        target.shape[1],
+        torch.cuda.get_device_capability(target.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_write_2d_.compile_cache:
+        op = ARHSARowWrite2DSm100()
+        run_arhsa_row_write_2d_.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(target),
+            to_cute_tensor(row_index, assumed_align=4),
+            to_cute_tensor(value),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_write_2d_.compile_cache[compile_key](
+        target,
+        row_index,
+        value,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return target
+
+
+def _to_cute_gemm_2d(tensor: torch.Tensor) -> cute.Tensor:
+    return to_cute_tensor(
+        tensor,
+        assumed_align=16,
+        leading_dim=1,
+    ).mark_compact_shape_dynamic(
+        mode=1,
+        divisibility=int(tensor.shape[1]),
+    )
+
+
+def run_arhsa_dense_gemm_128(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the SM100 TMA/UMMA ``[M,128] x [128,128]^T`` GEMM."""
+    _require_cute_runtime()
+    if a.device.type != "cuda" or b.device.type != "cuda":
+        raise ValueError("ARHSA dense GEMM requires CUDA tensors")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("ARHSA dense GEMM expects 2D tensors")
+    if int(a.shape[1]) != 128 or tuple(b.shape) != (128, 128):
+        raise ValueError(
+            f"ARHSA dense GEMM expects A[M,128], B[128,128]; got {tuple(a.shape)}, {tuple(b.shape)}"
+        )
+    if int(a.shape[0]) % 128 != 0:
+        raise ValueError("ARHSA dense GEMM requires M to be a multiple of 128")
+    if a.dtype != b.dtype:
+        raise ValueError(f"ARHSA dense GEMM requires matching dtypes, got {a.dtype} and {b.dtype}")
+    if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"ARHSA dense GEMM does not support dtype {a.dtype}")
+
+    a = a.contiguous()
+    b = b.contiguous()
+    if out is None:
+        out = torch.empty((int(a.shape[0]), 128), dtype=a.dtype, device=a.device)
+    else:
+        if out.shape != (int(a.shape[0]), 128):
+            raise ValueError(f"out must have shape [{int(a.shape[0])}, 128], got {tuple(out.shape)}")
+        if out.dtype != a.dtype or out.device != a.device:
+            raise ValueError("out must match A dtype and device")
+        out = out.contiguous()
+
+    compile_key = (
+        "arhsa_dense_gemm_128",
+        a.dtype,
+        out.dtype,
+        int(a.shape[0]),
+        int(a.shape[1]),
+        int(b.shape[0]),
+        int(b.shape[1]),
+        torch.cuda.get_device_capability(a.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_dense_gemm_128.compile_cache:
+        op = ARHSADenseGemm128Sm100()
+        run_arhsa_dense_gemm_128.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(a),
+            _to_cute_gemm_2d(b),
+            _to_cute_gemm_2d(out),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_dense_gemm_128.compile_cache[compile_key](
+        a,
+        b,
+        out,
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_child_gat_kv_projection(
+    child_norm: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project normalized children to K/V with SM100 TMA/UMMA GEMMs."""
+    _require_cute_runtime()
+    if child_norm.device.type != "cuda" or k_weight.device.type != "cuda" or v_weight.device.type != "cuda":
+        raise ValueError("child-GAT K/V GEMM requires CUDA tensors")
+    if child_norm.ndim != 2:
+        raise ValueError("child_norm must be 2D")
+    k_flat = torch.empty((int(child_norm.shape[0]), 128), dtype=child_norm.dtype, device=child_norm.device)
+    v_flat = torch.empty_like(k_flat)
+
+    child_norm = child_norm.contiguous()
+    k_weight = k_weight.contiguous()
+    v_weight = v_weight.contiguous()
+    if tuple(child_norm.shape)[1:] != (128,) or tuple(k_weight.shape) != (128, 128) or tuple(v_weight.shape) != (128, 128):
+        raise ValueError("child-GAT K/V GEMM expects child_norm[M,128] and weights[128,128]")
+    if int(child_norm.shape[0]) % 128 != 0:
+        raise ValueError("child-GAT K/V GEMM requires M to be a multiple of 128")
+    if child_norm.dtype != k_weight.dtype or child_norm.dtype != v_weight.dtype:
+        raise ValueError("child-GAT K/V GEMM requires matching child/weight dtypes")
+
+    compile_key = (
+        "arhsa_child_gat_kv_gemm",
+        child_norm.dtype,
+        k_flat.dtype,
+        int(child_norm.shape[0]),
+        torch.cuda.get_device_capability(child_norm.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_kv_projection.compile_cache:
+        op = ARHSAChildGATKVGemmSm100()
+        run_arhsa_child_gat_kv_projection.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(child_norm),
+            _to_cute_gemm_2d(k_weight),
+            _to_cute_gemm_2d(v_weight),
+            _to_cute_gemm_2d(k_flat),
+            _to_cute_gemm_2d(v_flat),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_kv_projection.compile_cache[compile_key](
+        child_norm,
+        k_weight,
+        v_weight,
+        k_flat,
+        v_flat,
+        current_stream,
+    )
+    return k_flat, v_flat
+
+
+def run_arhsa_child_gat_score_reduce(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    child_mask: torch.Tensor,
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute child-GAT attention weights and attended rows in one CuTe kernel."""
+    _require_cute_runtime()
+    if k.device.type != "cuda" or v.device.type != "cuda" or q.device.type != "cuda":
+        raise ValueError("child-GAT score/reduce requires CUDA tensors")
+    if k.ndim != 4 or v.ndim != 4:
+        raise ValueError("k and v must have shape [group_count, bucket_size, n_heads, head_dim]")
+    if k.shape != v.shape:
+        raise ValueError("k and v must have matching shapes")
+    group_count = int(k.shape[0])
+    bucket_size = int(k.shape[1])
+    n_heads = int(k.shape[2])
+    head_dim = int(k.shape[3])
+    if bucket_size > 32:
+        raise ValueError("child-GAT score/reduce supports bucket_size <= 32")
+    if n_heads > 2:
+        raise ValueError("child-GAT score/reduce currently supports at most 2 heads")
+    if q.shape != (n_heads, head_dim):
+        raise ValueError(f"q must have shape [{n_heads}, {head_dim}], got {tuple(q.shape)}")
+    if child_mask.shape != (group_count, bucket_size):
+        raise ValueError(
+            f"child_mask must have shape [{group_count}, {bucket_size}], got {tuple(child_mask.shape)}"
+        )
+
+    k = k.contiguous()
+    v = v.contiguous()
+    child_mask = child_mask.to(device=k.device, dtype=torch.bool).contiguous()
+    q = q.to(device=k.device, dtype=k.dtype).contiguous()
+    attn = torch.empty((group_count, bucket_size, n_heads), dtype=torch.float32, device=k.device)
+    attended = torch.empty((group_count, n_heads * head_dim), dtype=k.dtype, device=k.device)
+    if group_count == 0:
+        return attn, attended
+
+    compile_key = (
+        "arhsa_child_gat_score_reduce",
+        k.dtype,
+        attn.dtype,
+        bucket_size,
+        n_heads,
+        head_dim,
+        torch.cuda.get_device_capability(k.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_score_reduce.compile_cache:
+        op = ARHSAChildGATScoreReduceSm100()
+
+        def cute_unaligned(t: torch.Tensor):
+            return to_cute_tensor(t, assumed_align=1)
+
+        run_arhsa_child_gat_score_reduce.compile_cache[compile_key] = cute.compile(
+            op,
+            cute_unaligned(k),
+            cute_unaligned(v),
+            cute_unaligned(child_mask),
+            cute_unaligned(q),
+            cute_unaligned(attn),
+            cute_unaligned(attended),
+            Int32(group_count),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_score_reduce.compile_cache[compile_key](
+        k,
+        v,
+        child_mask,
+        q,
+        attn,
+        attended,
+        Int32(group_count),
+        current_stream,
+    )
+    return attn, attended
+
+
+def run_arhsa_child_gat_state_forward(
+    raw_node_repr: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    parent_rows: torch.Tensor,
+    child_rows_flat: torch.Tensor,
+    child_mask: torch.Tensor,
+    base: torch.Tensor,
+    q: torch.Tensor,
+    child_norm_weight: torch.Tensor,
+    child_norm_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    out_bias: torch.Tensor,
+    key_proj_weight: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    *,
+    child_norm_eps: float,
+    key_norm_eps: float,
+) -> tuple[torch.Tensor, ...]:
+    """Run CuTe forward for one bucketed child-GAT state update.
+
+    Returns the intermediates required by the existing autograd backward.
+    ``raw_node_repr``, ``node_repr`` and ``node_repr_normalized_flat`` are
+    updated in-place at ``parent_rows``.
+    """
+    _require_cute_runtime()
+    if raw_node_repr.device.type != "cuda":
+        raise ValueError("child-GAT state forward requires CUDA tensors")
+    if raw_node_repr.ndim != 2 or node_repr.ndim != 2 or node_repr_normalized_flat.ndim != 2:
+        raise ValueError("state tensors must be 2D")
+    if raw_node_repr.shape != node_repr.shape or raw_node_repr.shape != node_repr_normalized_flat.shape:
+        raise ValueError("state tensors must have matching flattened shapes")
+    if child_mask.ndim != 2:
+        raise ValueError("child_mask must have shape [group_count, bucket_size]")
+    group_count = int(child_mask.shape[0])
+    bucket_size = int(child_mask.shape[1])
+    d_model = int(raw_node_repr.shape[1])
+    if int(parent_rows.numel()) != group_count:
+        raise ValueError("parent_rows length must match child_mask rows")
+    if int(child_rows_flat.numel()) != group_count * bucket_size:
+        raise ValueError("child_rows_flat length must equal group_count * bucket_size")
+    if q.ndim != 2 or int(q.shape[0] * q.shape[1]) != d_model:
+        raise ValueError("q must have shape [n_heads, head_dim] with product d_model")
+    for name, tensor in {
+        "base": base,
+        "child_norm_weight": child_norm_weight,
+        "child_norm_bias": child_norm_bias,
+        "out_bias": out_bias,
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tensor.shape != (d_model,):
+            raise ValueError(f"{name} must have shape [{d_model}], got {tuple(tensor.shape)}")
+    for name, tensor in {
+        "k_weight": k_weight,
+        "v_weight": v_weight,
+        "out_weight": out_weight,
+        "key_proj_weight": key_proj_weight,
+    }.items():
+        if tensor.shape != (d_model, d_model):
+            raise ValueError(f"{name} must have shape [{d_model}, {d_model}], got {tuple(tensor.shape)}")
+    if raw_node_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"state dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    raw_node_repr = raw_node_repr.contiguous()
+    node_repr = node_repr.contiguous()
+    node_repr_normalized_flat = node_repr_normalized_flat.contiguous()
+    parent_rows = parent_rows.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+    child_rows_flat = child_rows_flat.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+    child_mask = child_mask.to(device=raw_node_repr.device, dtype=torch.bool).contiguous()
+    base = base.to(device=raw_node_repr.device, dtype=raw_node_repr.dtype).contiguous()
+    q = q.to(device=raw_node_repr.device, dtype=raw_node_repr.dtype).contiguous()
+    child_norm_weight = child_norm_weight.contiguous()
+    child_norm_bias = child_norm_bias.contiguous()
+    k_weight = k_weight.contiguous()
+    v_weight = v_weight.contiguous()
+    out_weight = out_weight.contiguous()
+    out_bias = out_bias.contiguous()
+    key_proj_weight = key_proj_weight.contiguous()
+    key_proj_bias = key_proj_bias.contiguous()
+    key_norm_weight = key_norm_weight.contiguous()
+    key_norm_bias = key_norm_bias.contiguous()
+
+    child_x_hat = torch.empty((group_count * bucket_size, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    child_rstd = torch.empty((group_count * bucket_size, 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    child_norm = torch.empty((group_count * bucket_size, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    k = torch.empty((group_count, bucket_size, int(q.shape[0]), int(q.shape[1])), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    v = torch.empty_like(k)
+    attn = torch.empty((group_count, bucket_size, int(q.shape[0])), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    attended = torch.empty((group_count, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    parent_raw = torch.empty((group_count, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    key_x_hat = torch.empty((group_count, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    key_rstd = torch.empty((group_count, 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    proj_rows = torch.empty((group_count, d_model), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    normalized_rows = torch.empty((group_count, int(q.shape[0]), int(q.shape[1])), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    norm_denom = torch.empty((group_count, int(q.shape[0]), 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+
+    if group_count == 0:
+        return (
+            child_x_hat,
+            child_rstd,
+            child_norm,
+            k,
+            v,
+            attn,
+            attended,
+            parent_raw,
+            key_x_hat,
+            key_rstd,
+            proj_rows,
+            normalized_rows,
+            norm_denom,
+        )
+
+    compile_key = (
+        "arhsa_child_gat_state_forward",
+        raw_node_repr.dtype,
+        base.dtype,
+        q.dtype,
+        child_norm_weight.dtype,
+        k_weight.dtype,
+        out_weight.dtype,
+        key_proj_weight.dtype,
+        key_norm_weight.dtype,
+        raw_node_repr.shape[1],
+        bucket_size,
+        int(q.shape[0]),
+        int(q.shape[1]),
+        torch.cuda.get_device_capability(raw_node_repr.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_state_forward.compile_cache:
+        op = ARHSAChildGATStateForwardSm100()
+
+        def cute_unaligned(t: torch.Tensor):
+            return to_cute_tensor(t, assumed_align=1)
+
+        run_arhsa_child_gat_state_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            cute_unaligned(raw_node_repr),
+            cute_unaligned(node_repr),
+            cute_unaligned(node_repr_normalized_flat),
+            cute_unaligned(parent_rows),
+            cute_unaligned(child_rows_flat),
+            cute_unaligned(child_mask),
+            cute_unaligned(base),
+            cute_unaligned(q),
+            cute_unaligned(child_norm_weight),
+            cute_unaligned(child_norm_bias),
+            cute_unaligned(k_weight),
+            cute_unaligned(v_weight),
+            cute_unaligned(out_weight),
+            cute_unaligned(out_bias),
+            cute_unaligned(key_proj_weight),
+            cute_unaligned(key_proj_bias),
+            cute_unaligned(key_norm_weight),
+            cute_unaligned(key_norm_bias),
+            cute_unaligned(child_x_hat),
+            cute_unaligned(child_rstd),
+            cute_unaligned(child_norm),
+            cute_unaligned(k),
+            cute_unaligned(v),
+            cute_unaligned(attn),
+            cute_unaligned(attended),
+            cute_unaligned(parent_raw),
+            cute_unaligned(key_x_hat),
+            cute_unaligned(key_rstd),
+            cute_unaligned(proj_rows),
+            cute_unaligned(normalized_rows),
+            cute_unaligned(norm_denom),
+            Float32(float(child_norm_eps)),
+            Float32(float(key_norm_eps)),
+            Int32(group_count),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_state_forward.compile_cache[compile_key](
+        raw_node_repr,
+        node_repr,
+        node_repr_normalized_flat,
+        parent_rows,
+        child_rows_flat,
+        child_mask,
+        base,
+        q,
+        child_norm_weight,
+        child_norm_bias,
+        k_weight,
+        v_weight,
+        out_weight,
+        out_bias,
+        key_proj_weight,
+        key_proj_bias,
+        key_norm_weight,
+        key_norm_bias,
+        child_x_hat,
+        child_rstd,
+        child_norm,
+        k,
+        v,
+        attn,
+        attended,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+        Float32(float(child_norm_eps)),
+        Float32(float(key_norm_eps)),
+        Int32(group_count),
+        current_stream,
+    )
+    return (
+        child_x_hat,
+        child_rstd,
+        child_norm,
+        k,
+        v,
+        attn,
+        attended,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+    )
+
+
+class _ARHSARowGather2D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, src: torch.Tensor, row_index: torch.Tensor) -> torch.Tensor:
+        row_index_i32 = row_index.to(device=src.device, dtype=torch.int32).contiguous()
+        out = run_arhsa_row_gather_2d(src, row_index_i32)
+        ctx.save_for_backward(row_index_i32)
+        ctx.n_src_rows = int(src.shape[0])
+        ctx.src_dtype = src.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (row_index,) = ctx.saved_tensors
+        grad_src = run_arhsa_row_gather_2d_backward(
+            grad_out,
+            row_index,
+            n_src_rows=ctx.n_src_rows,
+            src_dtype=ctx.src_dtype,
+        )
+        return grad_src, None
+
+
+def arhsa_row_gather_2d_autograd(src: torch.Tensor, row_index: torch.Tensor) -> torch.Tensor:
+    """Autograd wrapper for CuTe row gather/scatter-backward."""
+    return _ARHSARowGather2D.apply(src, row_index)
+
+
+class _ARHSATrustedRowWrite2D(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, target: torch.Tensor, row_index: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        row_index_i32 = row_index.to(device=target.device, dtype=torch.int32).contiguous()
+        run_arhsa_row_write_2d_(target, row_index_i32, value)
+        ctx.save_for_backward(row_index_i32)
+        ctx.mark_dirty(target)
+        return target
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (row_index,) = ctx.saved_tensors
+        grad_value = run_arhsa_row_gather_2d(grad_out.contiguous(), row_index)
+        return grad_out, None, grad_value
+
+
+def arhsa_trusted_row_write_2d_autograd(
+    target: torch.Tensor,
+    row_index: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Trusted in-place row write with a CuTe gather backward for written values.
+
+    This assumes different calls write globally disjoint rows. Under that
+    invariant, passing ``grad_target`` through unchanged is equivalent to
+    zeroing written rows for earlier writes, because no earlier write owns those
+    rows.
+    """
+    return _ARHSATrustedRowWrite2D.apply(target, row_index, value)
 
 
 def run_arhsa_leaf_readout(
@@ -8879,6 +12632,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.tensor_core_query_value_packed = bool(tensor_core_query_value_packed)
         ctx.query_value_pack_scatter = bool(query_value_pack_scatter)
         ctx.tensor_core_query_value_pack_scatter_dv = bool(tensor_core_query_value_pack_scatter_dv)
+        ctx.no_edge_direct_readout = False
         if ctx.level_range_kernels and not ctx.incoming_packed_step:
             raise ValueError("level_range_kernels requires incoming_packed_step")
         level_bounds_list = _level_bounds_as_ints(level_bounds) if ctx.level_range_kernels else []
@@ -8887,7 +12641,26 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         with torch.no_grad():
             p_history: list[torch.Tensor] | None = None
             incoming_edge_prob = None
-            if bool(use_cute_softmax) and ctx.incoming_packed_step and edge_incoming_index.numel() > 0:
+            if int(edge_scores.numel()) == 0 and int(src.numel()) == 0 and int(dst.numel()) == 0:
+                ctx.no_edge_direct_readout = True
+                ctx.save_forward_history = False
+                ctx.recompute_history = False
+                readout = run_arhsa_leaf_readout(
+                    p0,
+                    leaf_node_index,
+                    leaf_value_index,
+                    query_leaf_row_ptr,
+                    query_leaf_entry_index,
+                    value,
+                    n_queries=ctx.n_queries,
+                    query_warp=bool(query_warp_readout),
+                    query_value_pack=ctx.query_value_pack_readout,
+                    tensor_core_query_value_pack=ctx.tensor_core_query_value_pack_readout,
+                    pack_query_index=pack_query_index,
+                    pack_value_index=pack_query_value_index,
+                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                )
+            elif bool(use_cute_softmax) and ctx.incoming_packed_step and edge_incoming_index.numel() > 0:
                 edge_prob, incoming_edge_prob = run_arhsa_outgoing_softmax_with_incoming(
                     edge_scores,
                     src_row_ptr,
@@ -8904,10 +12677,12 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 )
             else:
                 edge_prob = outgoing_softmax_from_scores(edge_scores, src, n_nodes=int(p0.shape[0]))
-            if ctx.incoming_packed_step:
+            if not ctx.no_edge_direct_readout and ctx.incoming_packed_step:
                 if incoming_edge_prob is None:
                     incoming_edge_prob = run_arhsa_gather_edge_prob_by_index(edge_prob, dst_edge_index)
-            if ctx.save_forward_history:
+            if ctx.no_edge_direct_readout:
+                pass
+            elif ctx.save_forward_history:
                 p_history = [p0]
                 for iter_idx in range(ctx.n_iters):
                     p_next = torch.empty_like(p0)
@@ -9085,6 +12860,47 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_value_leaf_entry,
             level_bounds,
         ) = ctx.saved_tensors[:24]
+        if getattr(ctx, "no_edge_direct_readout", False):
+            grad_p0, grad_value = run_arhsa_leaf_readout_backward(
+                p0,
+                leaf_node_index,
+                leaf_query_index,
+                leaf_value_index,
+                query_leaf_row_ptr,
+                query_leaf_entry_index,
+                value,
+                grad_readout,
+                n_queries=ctx.n_queries,
+                max_leaves_per_query=ctx.max_leaves_per_query,
+                leaf_major_stats=ctx.leaf_major_stats,
+                query_warp_stats=ctx.query_warp_stats,
+                query_warp_scatter=ctx.query_warp_scatter,
+                query_warp_fused=ctx.query_warp_fused,
+                tensor_core_stats=ctx.tensor_core_stats,
+                tensor_core_fused=ctx.tensor_core_fused,
+                tensor_core_packed=ctx.tensor_core_packed,
+                tensor_core_query_value_packed=ctx.tensor_core_query_value_packed,
+                query_value_pack_scatter=ctx.query_value_pack_scatter,
+                tensor_core_query_value_pack_scatter_dv=ctx.tensor_core_query_value_pack_scatter_dv,
+                pack_leaf_entry_index=pack_leaf_entry_index,
+                pack_value_index=pack_value_index,
+                pack_value_slot=pack_value_slot,
+                pack_query_index=pack_query_index,
+                pack_query_value_index=pack_query_value_index,
+                pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+            )
+            grad_edge_scores = torch.zeros_like(edge_scores)
+            if not ctx.needs_input_grad[0]:
+                grad_p0 = None
+            if not ctx.needs_input_grad[1]:
+                grad_edge_scores = None
+            if not ctx.needs_input_grad[8]:
+                grad_value = None
+            grads = [None] * len(ctx.needs_input_grad)
+            grads[0] = grad_p0
+            grads[1] = grad_edge_scores
+            grads[8] = grad_value
+            return tuple(grads)
         cached_edge_prob = None
         cached_incoming_edge_prob = None
         cached_p_history = None
@@ -9344,6 +13160,15 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     )
 
 
+def arhsa_v3_walk_readout_from_scores_fixed_iters_autograd(*args, **kwargs) -> torch.Tensor:
+    """ARHSAv3 downward-walk entry point.
+
+    V3 supplies its own multi-start/self-mass initial state and readout entries,
+    then reuses the fixed-iteration ARHSA CuTe walk/readout implementation.
+    """
+    return arhsa_walk_readout_from_scores_fixed_iters_autograd(*args, **kwargs)
+
+
 run_arhsa_markov_incoming_step.compile_cache = get_jit_cache("arhsa_markov_incoming_step")
 run_arhsa_markov_incoming_packed_step.compile_cache = get_jit_cache("arhsa_markov_incoming_packed_step")
 run_arhsa_markov_incoming_packed_range_step.compile_cache = get_jit_cache(
@@ -9357,12 +13182,34 @@ run_arhsa_outgoing_softmax_with_incoming.compile_cache = get_jit_cache("arhsa_ou
 run_arhsa_outgoing_softmax_backward.compile_cache = get_jit_cache("arhsa_outgoing_softmax_backward")
 run_arhsa_sampled_node_dot.compile_cache = get_jit_cache("arhsa_sampled_node_dot")
 run_arhsa_sampled_node_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_node_dot_backward")
+run_arhsa_v3_start_score_backward_segmented.compile_cache = get_jit_cache(
+    "arhsa_v3_start_score_backward_segmented"
+)
+run_arhsa_v3_open_score_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_open_score_forward"
+)
+run_arhsa_v3_open_score_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_open_score_backward"
+)
+run_arhsa_v3_start_weight_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_start_weight_forward"
+)
+run_arhsa_v3_start_weight_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_start_weight_backward"
+)
 run_arhsa_sampled_edge_dst_dot.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot")
 run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot_backward")
 run_arhsa_grouped_weighted_value.compile_cache = get_jit_cache("arhsa_grouped_weighted_value")
 run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_grouped_weighted_value_backward"
 )
+run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
+run_arhsa_row_gather_2d_backward.compile_cache = get_jit_cache("arhsa_row_gather_2d_backward")
+run_arhsa_row_write_2d_.compile_cache = get_jit_cache("arhsa_row_write_2d")
+run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128")
+run_arhsa_child_gat_kv_projection.compile_cache = get_jit_cache("arhsa_child_gat_kv_gemm")
+run_arhsa_child_gat_score_reduce.compile_cache = get_jit_cache("arhsa_child_gat_score_reduce")
+run_arhsa_child_gat_state_forward.compile_cache = get_jit_cache("arhsa_child_gat_state_forward")
 run_arhsa_leaf_readout.compile_cache = get_jit_cache("arhsa_leaf_readout")
 run_arhsa_pack_leaf_values.compile_cache = get_jit_cache("arhsa_pack_leaf_values")
 run_arhsa_leaf_readout_backward_stats.compile_cache = get_jit_cache("arhsa_leaf_readout_backward_stats")

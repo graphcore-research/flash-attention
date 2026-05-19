@@ -2570,6 +2570,68 @@ class ARHSARowGather2DSm100:
             mOut[gather_row, col_idx] = mSrc[src_row, col_idx]
 
 
+class ARHSARowGather2DTripleSm100:
+    """Gather the same rows from three 2-D state tensors in one launch."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrc0: cute.Tensor,
+        mSrc1: cute.Tensor,
+        mSrc2: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mOut0: cute.Tensor,
+        mOut1: cute.Tensor,
+        mOut2: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrc0,
+            mSrc1,
+            mSrc2,
+            mRowIndex,
+            mOut0,
+            mOut1,
+            mOut2,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrc0: cute.Tensor,
+        mSrc1: cute.Tensor,
+        mSrc2: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mOut0: cute.Tensor,
+        mOut1: cute.Tensor,
+        mOut2: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mSrc0.shape[1])
+            gather_row = task_idx // n_cols
+            col_idx = task_idx - gather_row * n_cols
+            src_row = Int32(mRowIndex[gather_row])
+            mOut0[gather_row, col_idx] = mSrc0[src_row, col_idx]
+            mOut1[gather_row, col_idx] = mSrc1[src_row, col_idx]
+            mOut2[gather_row, col_idx] = mSrc2[src_row, col_idx]
+
+
 class ARHSARowGather2DBackwardSm100:
     """Backward scatter for ``ARHSARowGather2DSm100``."""
 
@@ -2667,6 +2729,68 @@ class ARHSARowWrite2DSm100:
             col_idx = task_idx - value_row * n_cols
             target_row = Int32(mRowIndex[value_row])
             mTarget[target_row, col_idx] = mValue[value_row, col_idx]
+
+
+class ARHSARowWrite2DTripleSm100:
+    """Write rows into three 2-D state tensors in one launch."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mTarget0: cute.Tensor,
+        mTarget1: cute.Tensor,
+        mTarget2: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mValue0: cute.Tensor,
+        mValue1: cute.Tensor,
+        mValue2: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mTarget0,
+            mTarget1,
+            mTarget2,
+            mRowIndex,
+            mValue0,
+            mValue1,
+            mValue2,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mTarget0: cute.Tensor,
+        mTarget1: cute.Tensor,
+        mTarget2: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mValue0: cute.Tensor,
+        mValue1: cute.Tensor,
+        mValue2: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mTarget0.shape[1])
+            value_row = task_idx // n_cols
+            col_idx = task_idx - value_row * n_cols
+            target_row = Int32(mRowIndex[value_row])
+            mTarget0[target_row, col_idx] = mValue0[value_row, col_idx]
+            mTarget1[target_row, col_idx] = mValue1[value_row, col_idx]
+            mTarget2[target_row, col_idx] = mValue2[value_row, col_idx]
 
 
 class ARHSAChildGATStateForwardSm100:
@@ -8755,6 +8879,75 @@ def run_arhsa_row_gather_2d(
     return out
 
 
+def run_arhsa_row_gather_2d_triple(
+    src0: torch.Tensor,
+    src1: torch.Tensor,
+    src2: torch.Tensor,
+    row_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run three CuTe 2-D row gathers with shared row indices."""
+    _require_cute_runtime()
+    if src0.device.type != "cuda" or src1.device.type != "cuda" or src2.device.type != "cuda":
+        raise ValueError("sources must be CUDA tensors")
+    if src0.ndim != 2 or src1.ndim != 2 or src2.ndim != 2:
+        raise ValueError("sources must be 2D tensors")
+    if src0.shape != src1.shape or src0.shape != src2.shape:
+        raise ValueError("sources must have matching shapes")
+    if src0.dtype != src1.dtype or src0.dtype != src2.dtype:
+        raise ValueError("sources must have matching dtypes")
+    if row_index.ndim != 1:
+        raise ValueError(f"row_index must be 1D, got {tuple(row_index.shape)}")
+    if src0.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"source dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    src0 = src0.contiguous()
+    src1 = src1.contiguous()
+    src2 = src2.contiguous()
+    row_index = row_index.to(device=src0.device, dtype=torch.int32).contiguous()
+    out0 = torch.empty((row_index.numel(), src0.shape[1]), dtype=src0.dtype, device=src0.device)
+    out1 = torch.empty_like(out0)
+    out2 = torch.empty_like(out0)
+    total_tasks = int(row_index.numel() * src0.shape[1])
+    if total_tasks == 0:
+        return out0, out1, out2
+
+    compile_key = (
+        "arhsa_row_gather_2d_triple",
+        src0.dtype,
+        out0.dtype,
+        src0.shape[1],
+        torch.cuda.get_device_capability(src0.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_gather_2d_triple.compile_cache:
+        op = ARHSARowGather2DTripleSm100()
+        run_arhsa_row_gather_2d_triple.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(src0),
+            to_cute_tensor(src1),
+            to_cute_tensor(src2),
+            to_cute_tensor(row_index, assumed_align=4),
+            to_cute_tensor(out0),
+            to_cute_tensor(out1),
+            to_cute_tensor(out2),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_gather_2d_triple.compile_cache[compile_key](
+        src0,
+        src1,
+        src2,
+        row_index,
+        out0,
+        out1,
+        out2,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out0, out1, out2
+
+
 def run_arhsa_row_gather_2d_backward(
     grad_out: torch.Tensor,
     row_index: torch.Tensor,
@@ -8866,6 +9059,88 @@ def run_arhsa_row_write_2d_(
         current_stream,
     )
     return target
+
+
+def run_arhsa_row_write_2d_triple_(
+    target0: torch.Tensor,
+    target1: torch.Tensor,
+    target2: torch.Tensor,
+    row_index: torch.Tensor,
+    value0: torch.Tensor,
+    value1: torch.Tensor,
+    value2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run three in-place CuTe row writes with shared row indices."""
+    _require_cute_runtime()
+    if target0.device.type != "cuda" or target1.device.type != "cuda" or target2.device.type != "cuda":
+        raise ValueError("targets must be CUDA tensors")
+    if target0.ndim != 2 or target1.ndim != 2 or target2.ndim != 2:
+        raise ValueError("targets must be 2D tensors")
+    if target0.shape != target1.shape or target0.shape != target2.shape:
+        raise ValueError("targets must have matching shapes")
+    if target0.dtype != target1.dtype or target0.dtype != target2.dtype:
+        raise ValueError("targets must have matching dtypes")
+    if row_index.ndim != 1:
+        raise ValueError(f"row_index must be 1D, got {tuple(row_index.shape)}")
+    if value0.shape != (row_index.numel(), target0.shape[1]):
+        raise ValueError(f"value0 shape mismatch: got {tuple(value0.shape)}")
+    if value1.shape != value0.shape or value2.shape != value0.shape:
+        raise ValueError("values must have matching shapes")
+    if value0.dtype != target0.dtype:
+        value0 = value0.to(dtype=target0.dtype)
+    if value1.dtype != target1.dtype:
+        value1 = value1.to(dtype=target1.dtype)
+    if value2.dtype != target2.dtype:
+        value2 = value2.to(dtype=target2.dtype)
+    if target0.dtype not in _CUTE_BACKWARD_DTYPES or value0.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"target/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    target0 = target0.contiguous()
+    target1 = target1.contiguous()
+    target2 = target2.contiguous()
+    value0 = value0.contiguous()
+    value1 = value1.contiguous()
+    value2 = value2.contiguous()
+    row_index = row_index.to(device=target0.device, dtype=torch.int32).contiguous()
+    total_tasks = int(row_index.numel() * target0.shape[1])
+    if total_tasks == 0:
+        return target0, target1, target2
+
+    compile_key = (
+        "arhsa_row_write_2d_triple",
+        target0.dtype,
+        value0.dtype,
+        target0.shape[1],
+        torch.cuda.get_device_capability(target0.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_write_2d_triple_.compile_cache:
+        op = ARHSARowWrite2DTripleSm100()
+        run_arhsa_row_write_2d_triple_.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(target0),
+            to_cute_tensor(target1),
+            to_cute_tensor(target2),
+            to_cute_tensor(row_index, assumed_align=4),
+            to_cute_tensor(value0),
+            to_cute_tensor(value1),
+            to_cute_tensor(value2),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_write_2d_triple_.compile_cache[compile_key](
+        target0,
+        target1,
+        target2,
+        row_index,
+        value0,
+        value1,
+        value2,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return target0, target1, target2
 
 
 def _to_cute_gemm_2d(tensor: torch.Tensor) -> cute.Tensor:
@@ -13209,8 +13484,10 @@ run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_grouped_weighted_value_backward"
 )
 run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
+run_arhsa_row_gather_2d_triple.compile_cache = get_jit_cache("arhsa_row_gather_2d_triple")
 run_arhsa_row_gather_2d_backward.compile_cache = get_jit_cache("arhsa_row_gather_2d_backward")
 run_arhsa_row_write_2d_.compile_cache = get_jit_cache("arhsa_row_write_2d")
+run_arhsa_row_write_2d_triple_.compile_cache = get_jit_cache("arhsa_row_write_2d_triple")
 run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128")
 run_arhsa_child_gat_kv_projection.compile_cache = get_jit_cache("arhsa_child_gat_kv_gemm")
 run_arhsa_child_gat_score_reduce.compile_cache = get_jit_cache("arhsa_child_gat_score_reduce")

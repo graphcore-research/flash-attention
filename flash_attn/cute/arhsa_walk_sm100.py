@@ -3673,7 +3673,8 @@ class ARHSAChildGATScoreReduceSm100:
     """Score, softmax, and reduce a dense child-GAT bucket.
 
     One CTA owns one parent group.  For the Gutenberg hot path this means
-    bucket_size=32, n_heads=2, head_dim=64.
+    bucket_size<=32 and head_dim=64.  Two-head groups use 128 threads; four-head
+    groups use 256 threads so the value-reduce phase covers every output dim.
     """
 
     arch = 100
@@ -3730,7 +3731,7 @@ class ARHSAChildGATScoreReduceSm100:
         smem = cutlass.utils.SmemAllocator()
         sAttn = smem.allocate_tensor(
             cutlass.Float32,
-            cute.make_layout((2, 32)),
+            cute.make_layout((4, 32)),
             byte_alignment=16,
         )
 
@@ -9016,8 +9017,10 @@ def run_arhsa_child_gat_score_reduce(
     head_dim = int(k.shape[3])
     if bucket_size > 32:
         raise ValueError("child-GAT score/reduce supports bucket_size <= 32")
-    if n_heads > 2:
-        raise ValueError("child-GAT score/reduce currently supports at most 2 heads")
+    if n_heads > 4:
+        raise ValueError("child-GAT score/reduce currently supports at most 4 heads")
+    if head_dim != 64:
+        raise ValueError("child-GAT score/reduce currently supports head_dim=64")
     if q.shape != (n_heads, head_dim):
         raise ValueError(f"q must have shape [{n_heads}, {head_dim}], got {tuple(q.shape)}")
     if child_mask.shape != (group_count, bucket_size):
@@ -9034,6 +9037,7 @@ def run_arhsa_child_gat_score_reduce(
     if group_count == 0:
         return attn, attended
 
+    num_threads = 256 if n_heads > 2 else 128
     compile_key = (
         "arhsa_child_gat_score_reduce",
         k.dtype,
@@ -9041,11 +9045,12 @@ def run_arhsa_child_gat_score_reduce(
         bucket_size,
         n_heads,
         head_dim,
+        num_threads,
         torch.cuda.get_device_capability(k.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if compile_key not in run_arhsa_child_gat_score_reduce.compile_cache:
-        op = ARHSAChildGATScoreReduceSm100()
+        op = ARHSAChildGATScoreReduceSm100(num_threads=num_threads)
 
         def cute_unaligned(t: torch.Tensor):
             return to_cute_tensor(t, assumed_align=1)

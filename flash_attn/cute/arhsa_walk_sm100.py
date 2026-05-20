@@ -2160,10 +2160,17 @@ class ARHSAV3StartOpenScoresBackwardH2D64VecSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 128, accumulate_bias: bool = True):
+    def __init__(
+        self,
+        *,
+        num_threads: int = 128,
+        accumulate_bias: bool = True,
+        cta_reduce_grad_q: bool = True,
+    ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.accumulate_bias = accumulate_bias
+        self.cta_reduce_grad_q = cta_reduce_grad_q
 
     @cute.jit
     def __call__(
@@ -2281,13 +2288,53 @@ class ARHSAV3StartOpenScoresBackwardH2D64VecSm100:
                 row1 = Float32(mRowRepr[feature_row, head_idx, dim1])
                 row2 = Float32(mRowRepr[feature_row, head_idx, dim2])
                 row3 = Float32(mRowRepr[feature_row, head_idx, dim3])
-                copy_utils.atomic_add_fp32x4(
-                    grad * row0,
-                    grad * row1,
-                    grad * row2,
-                    grad * row3,
-                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
-                )
+                grad_q0 = grad * row0
+                grad_q1 = grad * row1
+                grad_q2 = grad * row2
+                grad_q3 = grad * row3
+                if cutlass.const_expr(self.cta_reduce_grad_q):
+                    leader = warp_idx == Int32(0)
+                    if warp_idx > Int32(0):
+                        prev_start_idx = start_idx - Int32(1)
+                        prev_query_idx = Int32(mStartQueryIndex[prev_start_idx])
+                        prev_level = Int32(mStartLevels[prev_start_idx])
+                        leader = prev_query_idx != query_idx or prev_level != level
+                    if leader:
+                        acc_q0 = grad_q0
+                        acc_q1 = grad_q1
+                        acc_q2 = grad_q2
+                        acc_q3 = grad_q3
+                        keep_reducing = True
+                        for other_warp in cutlass.range(warp_idx + Int32(1), Int32(self.warps_per_cta), unroll=1):
+                            if keep_reducing:
+                                other_start_idx = block_idx * Int32(self.warps_per_cta) + other_warp
+                                if other_start_idx < start_tasks:
+                                    other_query_idx = Int32(mStartQueryIndex[other_start_idx])
+                                    other_level = Int32(mStartLevels[other_start_idx])
+                                    if other_query_idx == query_idx and other_level == level:
+                                        other_feature_row = Int32(mStartFeatureRows[other_start_idx])
+                                        other_grad = Float32(mGradStart[other_start_idx, head_idx]) * scale
+                                        acc_q0 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim0])
+                                        acc_q1 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim1])
+                                        acc_q2 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim2])
+                                        acc_q3 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim3])
+                                    else:
+                                        keep_reducing = False
+                        copy_utils.atomic_add_fp32x4(
+                            acc_q0,
+                            acc_q1,
+                            acc_q2,
+                            acc_q3,
+                            cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                        )
+                else:
+                    copy_utils.atomic_add_fp32x4(
+                        grad_q0,
+                        grad_q1,
+                        grad_q2,
+                        grad_q3,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                    )
                 copy_utils.atomic_add_fp32x4(
                     grad * q0,
                     grad * q1,
@@ -12200,6 +12247,10 @@ def run_arhsa_v3_start_open_scores_backward(
         )
         bias_sum_requested = total_tasks >= bias_sum_threshold
     bias_sum_outside = use_vec_d64 and bias_sum_requested
+    cta_reduce_grad_q = (
+        use_vec_d64
+        and os.environ.get("HSA_CUTE_V3_START_OPEN_SCORE_BWD_CTA_REDUCE_Q", "0") != "0"
+    )
     if bias_sum_outside:
         if down_bias.reshape(-1).numel() > 1:
             grad_down_bias = grad_start.sum(dim=0, dtype=torch.float32).contiguous()
@@ -12244,6 +12295,7 @@ def run_arhsa_v3_start_open_scores_backward(
             grad_up_bias.numel(),
             num_threads,
             bias_sum_outside,
+            cta_reduce_grad_q,
             torch.cuda.get_device_capability(q_levels.device),
         )
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -12252,6 +12304,7 @@ def run_arhsa_v3_start_open_scores_backward(
                 op = ARHSAV3StartOpenScoresBackwardH2D64VecSm100(
                     num_threads=num_threads,
                     accumulate_bias=not bias_sum_outside,
+                    cta_reduce_grad_q=cta_reduce_grad_q,
                 )
             else:
                 op = ARHSAV3StartOpenScoresBackwardH2Sm100(num_threads=num_threads)

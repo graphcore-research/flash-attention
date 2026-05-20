@@ -3371,6 +3371,307 @@ class ARHSAV3StartInitialStateBackwardSm100:
             )
 
 
+class ARHSAV3SelfMassForwardH2D64Sm100:
+    """Compute ARHSAv3 leaf self-mass for the common two-head D64 path."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mInitialUpFeatureRows: cute.Tensor,
+        mInitialUpIsClosed: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mUpBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        leaf_level: Int32,
+        parent_level: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta * 2)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mInitialUpFeatureRows,
+            mInitialUpIsClosed,
+            mDownBias,
+            mUpBias,
+            mOut,
+            scale,
+            total_tasks,
+            leaf_level,
+            parent_level,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mInitialUpFeatureRows: cute.Tensor,
+        mInitialUpIsClosed: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mUpBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        leaf_level: Int32,
+        parent_level: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        half_warp = lane // Int32(16)
+        lane16 = lane - half_warp * Int32(16)
+        task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
+        if task_idx < total_tasks:
+            query_idx = task_idx // Int32(2)
+            head_idx = task_idx - query_idx * Int32(2)
+            dim0 = lane16 * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            up_row = Int32(mInitialUpFeatureRows[query_idx])
+            is_closed = Int32(mInitialUpIsClosed[query_idx]) != Int32(0)
+
+            leaf_q0 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim0])
+            leaf_q1 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim1])
+            leaf_q2 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim2])
+            leaf_q3 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim3])
+            leaf_k0 = Float32(mRowRepr[query_idx, head_idx, dim0])
+            leaf_k1 = Float32(mRowRepr[query_idx, head_idx, dim1])
+            leaf_k2 = Float32(mRowRepr[query_idx, head_idx, dim2])
+            leaf_k3 = Float32(mRowRepr[query_idx, head_idx, dim3])
+            parent_q0 = Float32(mQLevels[query_idx, parent_level, head_idx, dim0])
+            parent_q1 = Float32(mQLevels[query_idx, parent_level, head_idx, dim1])
+            parent_q2 = Float32(mQLevels[query_idx, parent_level, head_idx, dim2])
+            parent_q3 = Float32(mQLevels[query_idx, parent_level, head_idx, dim3])
+            parent_k0 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim0])
+            parent_k1 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim1])
+            parent_k2 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim2])
+            parent_k3 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim3])
+            if is_closed:
+                parent_k0 = Float32(mRowRepr[up_row, head_idx, dim0])
+                parent_k1 = Float32(mRowRepr[up_row, head_idx, dim1])
+                parent_k2 = Float32(mRowRepr[up_row, head_idx, dim2])
+                parent_k3 = Float32(mRowRepr[up_row, head_idx, dim3])
+
+            shadow_partial = (
+                leaf_q0 * leaf_k0
+                + leaf_q1 * leaf_k1
+                + leaf_q2 * leaf_k2
+                + leaf_q3 * leaf_k3
+            )
+            up_partial = (
+                parent_q0 * parent_k0
+                + parent_q1 * parent_k1
+                + parent_q2 * parent_k2
+                + parent_q3 * parent_k3
+            )
+            shadow_acc = cute_utils.warp_reduce(shadow_partial, lambda a, b: a + b, width=16)
+            up_acc = cute_utils.warp_reduce(up_partial, lambda a, b: a + b, width=16)
+            if lane16 == Int32(0):
+                down_bias = Float32(mDownBias[0])
+                up_bias = Float32(mUpBias[0])
+                if Int32(mDownBias.shape[0]) > Int32(1):
+                    down_bias = Float32(mDownBias[head_idx])
+                if Int32(mUpBias.shape[0]) > Int32(1):
+                    up_bias = Float32(mUpBias[head_idx])
+                shadow = Float32((shadow_acc * scale).to(mRowRepr.element_type)) + down_bias
+                up = Float32((up_acc * scale).to(mRowRepr.element_type)) + up_bias
+                diff = shadow - up
+                exp_neg = cute.math.exp2(-diff * Float32(_LOG2_E), fastmath=True)
+                mass = Float32(1.0) / (Float32(1.0) + exp_neg)
+                mOut[query_idx, head_idx] = mass.to(mOut.element_type)
+
+
+class ARHSAV3SelfMassBackwardH2D64Sm100:
+    """Backward for fused two-head D64 ARHSAv3 leaf self-mass."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mInitialUpFeatureRows: cute.Tensor,
+        mInitialUpIsClosed: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        leaf_level: Int32,
+        parent_level: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta * 2)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mSelfMass,
+            mGradOut,
+            mInitialUpFeatureRows,
+            mInitialUpIsClosed,
+            mGradQ,
+            mGradRow,
+            mGradOpenKey,
+            mGradDownBias,
+            mGradUpBias,
+            scale,
+            total_tasks,
+            leaf_level,
+            parent_level,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mInitialUpFeatureRows: cute.Tensor,
+        mInitialUpIsClosed: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        leaf_level: Int32,
+        parent_level: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        half_warp = lane // Int32(16)
+        lane16 = lane - half_warp * Int32(16)
+        task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
+        if task_idx < total_tasks:
+            query_idx = task_idx // Int32(2)
+            head_idx = task_idx - query_idx * Int32(2)
+            dim0 = lane16 * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            up_row = Int32(mInitialUpFeatureRows[query_idx])
+            is_closed = Int32(mInitialUpIsClosed[query_idx]) != Int32(0)
+            mass = Float32(mSelfMass[query_idx, head_idx])
+            grad_score = Float32(mGradOut[query_idx, head_idx]) * mass * (Float32(1.0) - mass)
+            grad = grad_score * scale
+
+            leaf_q0 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim0])
+            leaf_q1 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim1])
+            leaf_q2 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim2])
+            leaf_q3 = Float32(mQLevels[query_idx, leaf_level, head_idx, dim3])
+            leaf_k0 = Float32(mRowRepr[query_idx, head_idx, dim0])
+            leaf_k1 = Float32(mRowRepr[query_idx, head_idx, dim1])
+            leaf_k2 = Float32(mRowRepr[query_idx, head_idx, dim2])
+            leaf_k3 = Float32(mRowRepr[query_idx, head_idx, dim3])
+            parent_q0 = Float32(mQLevels[query_idx, parent_level, head_idx, dim0])
+            parent_q1 = Float32(mQLevels[query_idx, parent_level, head_idx, dim1])
+            parent_q2 = Float32(mQLevels[query_idx, parent_level, head_idx, dim2])
+            parent_q3 = Float32(mQLevels[query_idx, parent_level, head_idx, dim3])
+            parent_k0 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim0])
+            parent_k1 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim1])
+            parent_k2 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim2])
+            parent_k3 = Float32(mOpenKeyByLevel[parent_level, head_idx, dim3])
+            if is_closed:
+                parent_k0 = Float32(mRowRepr[up_row, head_idx, dim0])
+                parent_k1 = Float32(mRowRepr[up_row, head_idx, dim1])
+                parent_k2 = Float32(mRowRepr[up_row, head_idx, dim2])
+                parent_k3 = Float32(mRowRepr[up_row, head_idx, dim3])
+
+            copy_utils.atomic_add_fp32x4(
+                grad * leaf_k0,
+                grad * leaf_k1,
+                grad * leaf_k2,
+                grad * leaf_k3,
+                cute_utils.elem_pointer(mGradQ, (query_idx, leaf_level, head_idx, dim0)),
+            )
+            copy_utils.atomic_add_fp32x4(
+                grad * leaf_q0,
+                grad * leaf_q1,
+                grad * leaf_q2,
+                grad * leaf_q3,
+                cute_utils.elem_pointer(mGradRow, (query_idx, head_idx, dim0)),
+            )
+            neg_grad = -grad
+            copy_utils.atomic_add_fp32x4(
+                neg_grad * parent_k0,
+                neg_grad * parent_k1,
+                neg_grad * parent_k2,
+                neg_grad * parent_k3,
+                cute_utils.elem_pointer(mGradQ, (query_idx, parent_level, head_idx, dim0)),
+            )
+            if is_closed:
+                copy_utils.atomic_add_fp32x4(
+                    neg_grad * parent_q0,
+                    neg_grad * parent_q1,
+                    neg_grad * parent_q2,
+                    neg_grad * parent_q3,
+                    cute_utils.elem_pointer(mGradRow, (up_row, head_idx, dim0)),
+                )
+            else:
+                copy_utils.atomic_add_fp32x4(
+                    neg_grad * parent_q0,
+                    neg_grad * parent_q1,
+                    neg_grad * parent_q2,
+                    neg_grad * parent_q3,
+                    cute_utils.elem_pointer(mGradOpenKey, (parent_level, head_idx, dim0)),
+                )
+            if lane16 == Int32(0):
+                down_idx = head_idx
+                up_idx = head_idx
+                if Int32(mGradDownBias.shape[0]) <= Int32(1):
+                    down_idx = Int32(0)
+                if Int32(mGradUpBias.shape[0]) <= Int32(1):
+                    up_idx = Int32(0)
+                cute_utils.atomic_add_fp32(
+                    grad_score,
+                    cute_utils.elem_pointer(mGradDownBias, (down_idx,)),
+                )
+                cute_utils.atomic_add_fp32(
+                    -grad_score,
+                    cute_utils.elem_pointer(mGradUpBias, (up_idx,)),
+                )
+
+
 class ARHSASampledEdgeDstDotSm100:
     """Sample q[level(dst)] dot row_repr(dst) directly for ARHSAv2 edges."""
 
@@ -12520,6 +12821,273 @@ def run_arhsa_v3_start_initial_state_backward(
     return grad_start_scores, grad_open_scores, grad_self_mass
 
 
+def run_arhsa_v3_self_mass_forward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    open_key_by_level: torch.Tensor,
+    initial_up_feature_rows: torch.Tensor,
+    initial_up_is_closed: torch.Tensor,
+    down_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    leaf_level: int,
+    parent_level: int,
+) -> torch.Tensor:
+    """Compute ARHSAv3 self-mass for uniform parent-level two-head D64 batches."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4 or row_repr.ndim != 3 or open_key_by_level.ndim != 3:
+        raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
+    if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
+        raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
+    if int(q_levels.shape[2]) != 2 or int(q_levels.shape[3]) != 64:
+        raise ValueError("run_arhsa_v3_self_mass_forward requires two heads and head_dim=64")
+    n_queries = int(q_levels.shape[0])
+    if row_repr.shape[0] < n_queries:
+        raise ValueError("row_repr must contain leaf rows at positions [0:n_queries)")
+    if initial_up_feature_rows.shape != (n_queries,):
+        raise ValueError(f"initial_up_feature_rows shape mismatch: got {tuple(initial_up_feature_rows.shape)}")
+    if initial_up_is_closed.shape != (n_queries,):
+        raise ValueError(f"initial_up_is_closed shape mismatch: got {tuple(initial_up_is_closed.shape)}")
+    if down_bias.reshape(-1).numel() not in {1, 2}:
+        raise ValueError("down_bias must be scalar or length two")
+    if up_bias.reshape(-1).numel() not in {1, 2}:
+        raise ValueError("up_bias must be scalar or length two")
+    for tensor_name, tensor in (
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("open_key_by_level", open_key_by_level),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    open_key_by_level = open_key_by_level.contiguous()
+    initial_up_feature_rows = initial_up_feature_rows.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    initial_up_is_closed = initial_up_is_closed.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    out = torch.empty(
+        (n_queries, q_levels.shape[2]),
+        device=q_levels.device,
+        dtype=q_levels.dtype,
+    )
+    total_tasks = n_queries * int(q_levels.shape[2])
+    if total_tasks == 0:
+        return out
+    num_threads = int(os.environ.get("HSA_CUTE_V3_SELF_MASS_THREADS", "128"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_V3_SELF_MASS_THREADS must be 128, 256, or 512")
+    scale = float(q_levels.shape[-1] ** 0.5)
+    compile_key = (
+        "arhsa_v3_self_mass_forward_h2_d64",
+        q_levels.dtype,
+        row_repr.dtype,
+        open_key_by_level.dtype,
+        out.dtype,
+        down_bias.reshape(-1).numel(),
+        up_bias.reshape(-1).numel(),
+        int(leaf_level),
+        int(parent_level),
+        num_threads,
+        torch.cuda.get_device_capability(q_levels.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_self_mass_forward.compile_cache:
+        op = ARHSAV3SelfMassForwardH2D64Sm100(num_threads=num_threads)
+        run_arhsa_v3_self_mass_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(q_levels),
+            to_cute_tensor(row_repr),
+            to_cute_tensor(open_key_by_level),
+            to_cute_tensor(initial_up_feature_rows, assumed_align=4),
+            to_cute_tensor(initial_up_is_closed, assumed_align=4),
+            to_cute_tensor(down_bias.reshape(-1)),
+            to_cute_tensor(up_bias.reshape(-1)),
+            to_cute_tensor(out),
+            Float32(scale),
+            Int32(total_tasks),
+            Int32(int(leaf_level)),
+            Int32(int(parent_level)),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_self_mass_forward.compile_cache[compile_key](
+        q_levels,
+        row_repr,
+        open_key_by_level,
+        initial_up_feature_rows,
+        initial_up_is_closed,
+        down_bias.reshape(-1),
+        up_bias.reshape(-1),
+        out,
+        Float32(scale),
+        Int32(total_tasks),
+        Int32(int(leaf_level)),
+        Int32(int(parent_level)),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_v3_self_mass_backward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    open_key_by_level: torch.Tensor,
+    self_mass: torch.Tensor,
+    grad_out: torch.Tensor,
+    initial_up_feature_rows: torch.Tensor,
+    initial_up_is_closed: torch.Tensor,
+    down_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+    leaf_level: int,
+    parent_level: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for ARHSAv3 self-mass for uniform parent-level two-head D64 batches."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4 or row_repr.ndim != 3 or open_key_by_level.ndim != 3:
+        raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
+    if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
+        raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
+    if int(q_levels.shape[2]) != 2 or int(q_levels.shape[3]) != 64:
+        raise ValueError("run_arhsa_v3_self_mass_backward requires two heads and head_dim=64")
+    n_queries = int(q_levels.shape[0])
+    if self_mass.shape != (n_queries, q_levels.shape[2]):
+        raise ValueError(f"self_mass shape mismatch: got {tuple(self_mass.shape)}")
+    if grad_out.shape != self_mass.shape:
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    if initial_up_feature_rows.shape != (n_queries,):
+        raise ValueError(f"initial_up_feature_rows shape mismatch: got {tuple(initial_up_feature_rows.shape)}")
+    if initial_up_is_closed.shape != (n_queries,):
+        raise ValueError(f"initial_up_is_closed shape mismatch: got {tuple(initial_up_is_closed.shape)}")
+    for tensor_name, tensor in (
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("open_key_by_level", open_key_by_level),
+        ("self_mass", self_mass),
+        ("grad_out", grad_out),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_q_out_dtype = q_levels.dtype
+    grad_row_out_dtype = row_repr.dtype
+    grad_open_key_out_dtype = open_key_by_level.dtype
+    grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
+    grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+    grad_open_key = torch.zeros_like(open_key_by_level, dtype=torch.float32)
+    grad_down_bias = torch.zeros(
+        down_bias.reshape(-1).numel(),
+        device=q_levels.device,
+        dtype=torch.float32,
+    )
+    grad_up_bias = torch.zeros(
+        up_bias.reshape(-1).numel(),
+        device=q_levels.device,
+        dtype=torch.float32,
+    )
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    open_key_by_level = open_key_by_level.contiguous()
+    self_mass = self_mass.contiguous()
+    grad_out = grad_out.contiguous()
+    initial_up_feature_rows = initial_up_feature_rows.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    initial_up_is_closed = initial_up_is_closed.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    total_tasks = n_queries * int(q_levels.shape[2])
+    if total_tasks > 0:
+        num_threads = int(os.environ.get("HSA_CUTE_V3_SELF_MASS_THREADS", "128"))
+        if num_threads not in {128, 256, 512}:
+            raise ValueError("HSA_CUTE_V3_SELF_MASS_THREADS must be 128, 256, or 512")
+        scale = float(q_levels.shape[-1] ** 0.5)
+        compile_key = (
+            "arhsa_v3_self_mass_backward_h2_d64",
+            q_levels.dtype,
+            row_repr.dtype,
+            open_key_by_level.dtype,
+            self_mass.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            grad_open_key.dtype,
+            grad_down_bias.numel(),
+            grad_up_bias.numel(),
+            int(leaf_level),
+            int(parent_level),
+            num_threads,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_self_mass_backward.compile_cache:
+            op = ARHSAV3SelfMassBackwardH2D64Sm100(num_threads=num_threads)
+            run_arhsa_v3_self_mass_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(open_key_by_level),
+                to_cute_tensor(self_mass),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(initial_up_feature_rows, assumed_align=4),
+                to_cute_tensor(initial_up_is_closed, assumed_align=4),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                to_cute_tensor(grad_open_key),
+                to_cute_tensor(grad_down_bias),
+                to_cute_tensor(grad_up_bias),
+                Float32(scale),
+                Int32(total_tasks),
+                Int32(int(leaf_level)),
+                Int32(int(parent_level)),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_self_mass_backward.compile_cache[compile_key](
+            q_levels,
+            row_repr,
+            open_key_by_level,
+            self_mass,
+            grad_out,
+            initial_up_feature_rows,
+            initial_up_is_closed,
+            grad_q,
+            grad_row,
+            grad_open_key,
+            grad_down_bias,
+            grad_up_bias,
+            Float32(scale),
+            Int32(total_tasks),
+            Int32(int(leaf_level)),
+            Int32(int(parent_level)),
+            current_stream,
+        )
+
+    if grad_q.dtype != grad_q_out_dtype:
+        grad_q = grad_q.to(dtype=grad_q_out_dtype)
+    if grad_row.dtype != grad_row_out_dtype:
+        grad_row = grad_row.to(dtype=grad_row_out_dtype)
+    if grad_open_key.dtype != grad_open_key_out_dtype:
+        grad_open_key = grad_open_key.to(dtype=grad_open_key_out_dtype)
+    return (
+        grad_q,
+        grad_row,
+        grad_open_key,
+        grad_down_bias.to(dtype=down_bias.dtype).reshape_as(down_bias),
+        grad_up_bias.to(dtype=up_bias.dtype).reshape_as(up_bias),
+    )
+
+
 def run_arhsa_sampled_edge_dst_dot(
     q_levels: torch.Tensor,
     row_repr: torch.Tensor,
@@ -19145,6 +19713,12 @@ run_arhsa_v3_start_initial_state_forward.compile_cache = get_jit_cache(
 )
 run_arhsa_v3_start_initial_state_backward.compile_cache = get_jit_cache(
     "arhsa_v3_start_initial_state_backward"
+)
+run_arhsa_v3_self_mass_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_self_mass_forward_h2_d64"
+)
+run_arhsa_v3_self_mass_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_self_mass_backward_h2_d64"
 )
 run_arhsa_sampled_edge_dst_dot.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot")
 run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot_backward")

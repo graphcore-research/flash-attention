@@ -4627,6 +4627,127 @@ class ARHSAKeyNormBackward128Sm100:
                 )
 
 
+class ARHSAStackedQueryNormBackward128Sm100:
+    """Backward for stacked query LayerNorm when only normalized heads are consumed."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradNormalized: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mGradProjected: cute.Tensor,
+        mGradY: cute.Tensor,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mGradNormalized,
+            mNormalized,
+            mNormDenom,
+            mXHat,
+            mRstd,
+            mNormWeight,
+            mGradProjected,
+            mGradY,
+            total_rows,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradNormalized: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mGradProjected: cute.Tensor,
+        mGradY: cute.Tensor,
+        total_rows: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        if row_idx < total_rows:
+            n_levels = Int32(mGradNormalized.shape[1])
+            query_idx = row_idx // n_levels
+            level_idx = row_idx - query_idx * n_levels
+            dim0 = lane
+            dim1 = lane + Int32(32)
+            dim2 = lane + Int32(64)
+            dim3 = lane + Int32(96)
+
+            gn0 = Float32(mGradNormalized[query_idx, level_idx, 0, lane])
+            gn1 = Float32(
+                mGradNormalized[query_idx, level_idx, 0, lane + Int32(32)]
+            )
+            gn2 = Float32(mGradNormalized[query_idx, level_idx, 1, lane])
+            gn3 = Float32(
+                mGradNormalized[query_idx, level_idx, 1, lane + Int32(32)]
+            )
+            n0 = Float32(mNormalized[query_idx, level_idx, 0, lane])
+            n1 = Float32(mNormalized[query_idx, level_idx, 0, lane + Int32(32)])
+            n2 = Float32(mNormalized[query_idx, level_idx, 1, lane])
+            n3 = Float32(mNormalized[query_idx, level_idx, 1, lane + Int32(32)])
+            dot0 = cute_utils.warp_reduce(gn0 * n0 + gn1 * n1, lambda a, b: a + b)
+            dot1 = cute_utils.warp_reduce(gn2 * n2 + gn3 * n3, lambda a, b: a + b)
+
+            gy0 = (gn0 - n0 * dot0) / Float32(mNormDenom[query_idx, level_idx, 0, 0])
+            gy1 = (gn1 - n1 * dot0) / Float32(mNormDenom[query_idx, level_idx, 0, 0])
+            gy2 = (gn2 - n2 * dot1) / Float32(mNormDenom[query_idx, level_idx, 1, 0])
+            gy3 = (gn3 - n3 * dot1) / Float32(mNormDenom[query_idx, level_idx, 1, 0])
+            x0 = Float32(mXHat[query_idx, level_idx, dim0])
+            x1 = Float32(mXHat[query_idx, level_idx, dim1])
+            x2 = Float32(mXHat[query_idx, level_idx, dim2])
+            x3 = Float32(mXHat[query_idx, level_idx, dim3])
+            gxhat0 = gy0 * Float32(mNormWeight[dim0])
+            gxhat1 = gy1 * Float32(mNormWeight[dim1])
+            gxhat2 = gy2 * Float32(mNormWeight[dim2])
+            gxhat3 = gy3 * Float32(mNormWeight[dim3])
+            reduce_grad = cute_utils.warp_reduce(
+                gxhat0 + gxhat1 + gxhat2 + gxhat3,
+                lambda a, b: a + b,
+            )
+            reduce_grad_xhat = cute_utils.warp_reduce(
+                gxhat0 * x0 + gxhat1 * x1 + gxhat2 * x2 + gxhat3 * x3,
+                lambda a, b: a + b,
+            )
+            scale = Float32(mRstd[query_idx, level_idx, 0]) * Float32(0.0078125)
+            gp0 = (gxhat0 * Float32(128.0) - reduce_grad - x0 * reduce_grad_xhat) * scale
+            gp1 = (gxhat1 * Float32(128.0) - reduce_grad - x1 * reduce_grad_xhat) * scale
+            gp2 = (gxhat2 * Float32(128.0) - reduce_grad - x2 * reduce_grad_xhat) * scale
+            gp3 = (gxhat3 * Float32(128.0) - reduce_grad - x3 * reduce_grad_xhat) * scale
+
+            mGradProjected[query_idx, level_idx, dim0] = gp0.to(
+                mGradProjected.element_type
+            )
+            mGradProjected[query_idx, level_idx, dim1] = gp1.to(
+                mGradProjected.element_type
+            )
+            mGradProjected[query_idx, level_idx, dim2] = gp2.to(
+                mGradProjected.element_type
+            )
+            mGradProjected[query_idx, level_idx, dim3] = gp3.to(
+                mGradProjected.element_type
+            )
+            mGradY[query_idx, level_idx, dim0] = gy0.to(mGradY.element_type)
+            mGradY[query_idx, level_idx, dim1] = gy1.to(mGradY.element_type)
+            mGradY[query_idx, level_idx, dim2] = gy2.to(mGradY.element_type)
+            mGradY[query_idx, level_idx, dim3] = gy3.to(mGradY.element_type)
+
+
 class ARHSAChildGATStateForwardSm100:
     """Forward bucketed child-GAT state update.
 
@@ -6343,6 +6464,151 @@ class ARHSAProjectionNormPostprocessSm100:
         mNormalized[row_idx, head_idx, dim_in_head] = norm_val.to(
             mNormalized.element_type
         )
+
+
+class ARHSAStackedQueryNormalizeWarpSm100:
+    """Warp-level bias + LayerNorm + two-head normalization for stacked queries."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mProjected: cute.Tensor,
+        mBias: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mNormBias: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mProjected,
+            mBias,
+            mNormWeight,
+            mNormBias,
+            mXHat,
+            mRstd,
+            mNormalized,
+            mNormDenom,
+            eps,
+            total_rows,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mProjected: cute.Tensor,
+        mBias: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mNormBias: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        if row_idx < total_rows:
+            n_levels = Int32(mProjected.shape[1])
+            query_idx = row_idx // n_levels
+            level_idx = row_idx - query_idx * n_levels
+            dim0 = lane
+            dim1 = lane + Int32(32)
+            dim2 = lane + Int32(64)
+            dim3 = lane + Int32(96)
+
+            p0 = Float32(mProjected[query_idx, level_idx, dim0]) + Float32(
+                mBias[level_idx, dim0]
+            )
+            p1 = Float32(mProjected[query_idx, level_idx, dim1]) + Float32(
+                mBias[level_idx, dim1]
+            )
+            p2 = Float32(mProjected[query_idx, level_idx, dim2]) + Float32(
+                mBias[level_idx, dim2]
+            )
+            p3 = Float32(mProjected[query_idx, level_idx, dim3]) + Float32(
+                mBias[level_idx, dim3]
+            )
+            mean = cute_utils.warp_reduce(
+                p0 + p1 + p2 + p3,
+                lambda a, b: a + b,
+            ) * Float32(0.0078125)
+
+            c0 = p0 - mean
+            c1 = p1 - mean
+            c2 = p2 - mean
+            c3 = p3 - mean
+            var_sum = cute_utils.warp_reduce(
+                c0 * c0 + c1 * c1 + c2 * c2 + c3 * c3,
+                lambda a, b: a + b,
+            )
+            rstd = Float32(
+                cute.math.rsqrt(var_sum * Float32(0.0078125) + eps, fastmath=True)
+            )
+            x0 = c0 * rstd
+            x1 = c1 * rstd
+            x2 = c2 * rstd
+            x3 = c3 * rstd
+            o0 = x0 * Float32(mNormWeight[dim0]) + Float32(mNormBias[dim0])
+            o1 = x1 * Float32(mNormWeight[dim1]) + Float32(mNormBias[dim1])
+            o2 = x2 * Float32(mNormWeight[dim2]) + Float32(mNormBias[dim2])
+            o3 = x3 * Float32(mNormWeight[dim3]) + Float32(mNormBias[dim3])
+
+            denom0 = Float32(
+                cute.math.sqrt(
+                    cute_utils.warp_reduce(o0 * o0 + o1 * o1, lambda a, b: a + b),
+                    fastmath=True,
+                )
+            )
+            denom1 = Float32(
+                cute.math.sqrt(
+                    cute_utils.warp_reduce(o2 * o2 + o3 * o3, lambda a, b: a + b),
+                    fastmath=True,
+                )
+            )
+            if denom0 < Float32(1.0e-12):
+                denom0 = Float32(1.0e-12)
+            if denom1 < Float32(1.0e-12):
+                denom1 = Float32(1.0e-12)
+
+            mXHat[query_idx, level_idx, dim0] = x0.to(mXHat.element_type)
+            mXHat[query_idx, level_idx, dim1] = x1.to(mXHat.element_type)
+            mXHat[query_idx, level_idx, dim2] = x2.to(mXHat.element_type)
+            mXHat[query_idx, level_idx, dim3] = x3.to(mXHat.element_type)
+            mNormalized[query_idx, level_idx, 0, lane] = (o0 / denom0).to(
+                mNormalized.element_type
+            )
+            mNormalized[query_idx, level_idx, 0, lane + Int32(32)] = (
+                o1 / denom0
+            ).to(mNormalized.element_type)
+            mNormalized[query_idx, level_idx, 1, lane] = (o2 / denom1).to(
+                mNormalized.element_type
+            )
+            mNormalized[query_idx, level_idx, 1, lane + Int32(32)] = (
+                o3 / denom1
+            ).to(mNormalized.element_type)
+            if lane == Int32(0):
+                mRstd[query_idx, level_idx, 0] = rstd.to(mRstd.element_type)
+                mNormDenom[query_idx, level_idx, 0, 0] = denom0.to(
+                    mNormDenom.element_type
+                )
+                mNormDenom[query_idx, level_idx, 1, 0] = denom1.to(
+                    mNormDenom.element_type
+                )
 
 
 class ARHSAKeyProjectionNormWriteGemmSm100(ARHSADenseGemm128Sm100):
@@ -14261,6 +14527,101 @@ def run_arhsa_key_norm_backward_128(
     )
 
 
+def run_arhsa_stacked_query_norm_backward_128(
+    grad_normalized: torch.Tensor,
+    normalized: torch.Tensor,
+    norm_denom: torch.Tensor,
+    x_hat: torch.Tensor,
+    rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for stacked query normalize-only D=128/H=2 rows."""
+    _require_cute_runtime()
+    if grad_normalized.device.type != "cuda":
+        raise ValueError("grad_normalized must be a CUDA tensor")
+    if grad_normalized.ndim != 4 or grad_normalized.shape[2:] != (2, 64):
+        raise ValueError(
+            f"grad_normalized must have shape [N,L,2,64], got {tuple(grad_normalized.shape)}"
+        )
+    if normalized.shape != grad_normalized.shape:
+        raise ValueError(f"normalized shape mismatch: got {tuple(normalized.shape)}")
+    n_queries = int(grad_normalized.shape[0])
+    n_levels = int(grad_normalized.shape[1])
+    if norm_denom.shape != (n_queries, n_levels, 2, 1):
+        raise ValueError(f"norm_denom shape mismatch: got {tuple(norm_denom.shape)}")
+    if x_hat.shape != (n_queries, n_levels, 128):
+        raise ValueError(f"x_hat shape mismatch: got {tuple(x_hat.shape)}")
+    if rstd.shape != (n_queries, n_levels, 1):
+        raise ValueError(f"rstd shape mismatch: got {tuple(rstd.shape)}")
+    if norm_weight.shape != (128,):
+        raise ValueError(f"norm_weight must have shape [128], got {tuple(norm_weight.shape)}")
+    for name, tensor in (
+        ("grad_normalized", grad_normalized),
+        ("normalized", normalized),
+        ("norm_denom", norm_denom),
+        ("x_hat", x_hat),
+        ("rstd", rstd),
+        ("norm_weight", norm_weight),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_normalized = grad_normalized.contiguous()
+    normalized = normalized.contiguous()
+    norm_denom = norm_denom.contiguous()
+    x_hat = x_hat.contiguous()
+    rstd = rstd.contiguous()
+    norm_weight = norm_weight.contiguous()
+    grad_projected = torch.empty((n_queries, n_levels, 128), device=grad_normalized.device, dtype=torch.float32)
+    grad_y = torch.empty((n_queries, n_levels, 128), device=grad_normalized.device, dtype=torch.float32)
+    total_rows = n_queries * n_levels
+    if total_rows == 0:
+        return grad_projected, grad_y
+
+    compile_key = (
+        "arhsa_stacked_query_norm_backward_128_v2",
+        grad_normalized.dtype,
+        normalized.dtype,
+        norm_denom.dtype,
+        x_hat.dtype,
+        rstd.dtype,
+        norm_weight.dtype,
+        n_queries,
+        n_levels,
+        torch.cuda.get_device_capability(grad_normalized.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_stacked_query_norm_backward_128.compile_cache:
+        op = ARHSAStackedQueryNormBackward128Sm100()
+        run_arhsa_stacked_query_norm_backward_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_normalized, assumed_align=16),
+            to_cute_tensor(normalized, assumed_align=16),
+            to_cute_tensor(norm_denom),
+            to_cute_tensor(x_hat, assumed_align=16),
+            to_cute_tensor(rstd),
+            to_cute_tensor(norm_weight, assumed_align=16),
+            to_cute_tensor(grad_projected, assumed_align=16),
+            to_cute_tensor(grad_y, assumed_align=16),
+            Int32(total_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_stacked_query_norm_backward_128.compile_cache[compile_key](
+        grad_normalized,
+        normalized,
+        norm_denom,
+        x_hat,
+        rstd,
+        norm_weight,
+        grad_projected,
+        grad_y,
+        Int32(total_rows),
+        current_stream,
+    )
+    return grad_projected, grad_y
+
+
 def _to_cute_gemm_2d(tensor: torch.Tensor) -> cute.Tensor:
     return to_cute_tensor(
         tensor,
@@ -14517,6 +14878,90 @@ def run_arhsa_projection_norm_postprocess(
             current_stream,
         )
     return out, x_hat, rstd, normalized, norm_denom
+
+
+def run_arhsa_stacked_query_normalize_warp(
+    projected: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    *,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Warp-level stacked query ``bias + LayerNorm + per-head normalize``."""
+    _require_cute_runtime()
+    if projected.device.type != "cuda":
+        raise ValueError("ARHSA stacked query normalize requires CUDA tensors")
+    if projected.ndim != 3 or int(projected.shape[2]) != 128:
+        raise ValueError(f"projected must have shape [N,L,128], got {tuple(projected.shape)}")
+    n_queries = int(projected.shape[0])
+    n_levels = int(projected.shape[1])
+    if bias.shape != (n_levels, 128):
+        raise ValueError(f"bias must have shape [{n_levels},128], got {tuple(bias.shape)}")
+    if norm_weight.shape != (128,) or norm_bias.shape != (128,):
+        raise ValueError("norm_weight and norm_bias must have shape [128]")
+    if projected.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"ARHSA stacked query normalize does not support dtype {projected.dtype}")
+
+    projected = projected.contiguous()
+    bias = bias.to(device=projected.device, dtype=projected.dtype).contiguous()
+    norm_weight = norm_weight.to(device=projected.device, dtype=projected.dtype).contiguous()
+    norm_bias = norm_bias.to(device=projected.device, dtype=projected.dtype).contiguous()
+    x_hat = torch.empty_like(projected)
+    rstd = torch.empty((n_queries, n_levels, 1), dtype=projected.dtype, device=projected.device)
+    normalized = torch.empty(
+        (n_queries, n_levels, 2, 64),
+        dtype=projected.dtype,
+        device=projected.device,
+    )
+    norm_denom = torch.empty(
+        (n_queries, n_levels, 2, 1),
+        dtype=projected.dtype,
+        device=projected.device,
+    )
+    total_rows = n_queries * n_levels
+    if total_rows == 0:
+        return x_hat, rstd, normalized, norm_denom
+
+    compile_key = (
+        "arhsa_stacked_query_normalize_warp_v1",
+        projected.dtype,
+        n_queries,
+        n_levels,
+        torch.cuda.get_device_capability(projected.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_stacked_query_normalize_warp.compile_cache:
+        op = ARHSAStackedQueryNormalizeWarpSm100()
+        run_arhsa_stacked_query_normalize_warp.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(projected, assumed_align=16),
+            to_cute_tensor(bias, assumed_align=16),
+            to_cute_tensor(norm_weight, assumed_align=16),
+            to_cute_tensor(norm_bias, assumed_align=16),
+            to_cute_tensor(x_hat, assumed_align=16),
+            to_cute_tensor(rstd),
+            to_cute_tensor(normalized, assumed_align=16),
+            to_cute_tensor(norm_denom),
+            Float32(float(norm_eps)),
+            Int32(total_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_stacked_query_normalize_warp.compile_cache[compile_key](
+        projected,
+        bias,
+        norm_weight,
+        norm_bias,
+        x_hat,
+        rstd,
+        normalized,
+        norm_denom,
+        Float32(float(norm_eps)),
+        Int32(total_rows),
+        current_stream,
+    )
+    return x_hat, rstd, normalized, norm_denom
 
 
 def run_arhsa_key_projection_postprocess(
@@ -20072,10 +20517,16 @@ run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_key_norm_backward_128_v2"
 )
+run_arhsa_stacked_query_norm_backward_128.compile_cache = get_jit_cache(
+    "arhsa_stacked_query_norm_backward_128_v2"
+)
 run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128_v2")
 run_arhsa_out_projection_write.compile_cache = get_jit_cache("arhsa_out_projection_write_v3")
 run_arhsa_projection_norm_postprocess.compile_cache = get_jit_cache(
     "arhsa_projection_norm_postprocess_v1"
+)
+run_arhsa_stacked_query_normalize_warp.compile_cache = get_jit_cache(
+    "arhsa_stacked_query_normalize_warp_v1"
 )
 run_arhsa_key_projection_postprocess.compile_cache = get_jit_cache(
     "arhsa_key_projection_postprocess_v2"

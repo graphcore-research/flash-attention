@@ -4627,6 +4627,156 @@ class ARHSAKeyNormBackward128Sm100:
                 )
 
 
+class ARHSAChildGATGatherKeyNormBackward128Sm100:
+    """Gather child-GAT state grads and run key normalization backward."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradRawFlat: cute.Tensor,
+        mGradNodeFlat: cute.Tensor,
+        mGradNormFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mGradParentRaw: cute.Tensor,
+        mGradKeyProjected: cute.Tensor,
+        mGradKeyNormWeight: cute.Tensor,
+        mGradKeyNormBias: cute.Tensor,
+        mGradKeyProjBias: cute.Tensor,
+        n_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mGradRawFlat,
+            mGradNodeFlat,
+            mGradNormFlat,
+            mParentRows,
+            mNormalizedRows,
+            mNormDenom,
+            mKeyXHat,
+            mKeyRstd,
+            mKeyNormWeight,
+            mGradParentRaw,
+            mGradKeyProjected,
+            mGradKeyNormWeight,
+            mGradKeyNormBias,
+            mGradKeyProjBias,
+            n_rows,
+        ).launch(
+            grid=[n_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradRawFlat: cute.Tensor,
+        mGradNodeFlat: cute.Tensor,
+        mGradNormFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mGradParentRaw: cute.Tensor,
+        mGradKeyProjected: cute.Tensor,
+        mGradKeyNormWeight: cute.Tensor,
+        mGradKeyNormBias: cute.Tensor,
+        mGradKeyProjBias: cute.Tensor,
+        n_rows: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        if row_idx < n_rows:
+            parent_row = Int32(mParentRows[row_idx])
+            partial_dot0 = Float32.zero
+            partial_dot1 = Float32.zero
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                grad_norm = Float32(mGradNormFlat[parent_row, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                if head_idx == Int32(0):
+                    partial_dot0 += grad_norm * normalized
+                else:
+                    partial_dot1 += grad_norm * normalized
+            dot0 = cute_utils.warp_reduce(partial_dot0, lambda a, b: a + b)
+            dot1 = cute_utils.warp_reduce(partial_dot1, lambda a, b: a + b)
+
+            partial_grad = Float32.zero
+            partial_grad_xhat = Float32.zero
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                mGradParentRaw[row_idx, dim_idx] = Float32(
+                    mGradRawFlat[parent_row, dim_idx]
+                ).to(mGradParentRaw.element_type)
+                grad_norm = Float32(mGradNormFlat[parent_row, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                dot = dot0
+                if head_idx == Int32(1):
+                    dot = dot1
+                grad_from_normalize = (
+                    grad_norm - normalized * dot
+                ) / Float32(mNormDenom[row_idx, head_idx, 0])
+                grad_y = Float32(mGradNodeFlat[parent_row, dim_idx]) + grad_from_normalize
+                x_hat = Float32(mKeyXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mKeyNormWeight[dim_idx])
+                partial_grad += grad_xhat
+                partial_grad_xhat += grad_xhat * x_hat
+                cute_utils.atomic_add_fp32(
+                    grad_y * x_hat,
+                    cute_utils.elem_pointer(mGradKeyNormWeight, (dim_idx,)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad_y,
+                    cute_utils.elem_pointer(mGradKeyNormBias, (dim_idx,)),
+                )
+            reduce_grad = cute_utils.warp_reduce(partial_grad, lambda a, b: a + b)
+            reduce_grad_xhat = cute_utils.warp_reduce(partial_grad_xhat, lambda a, b: a + b)
+            scale = Float32(mKeyRstd[row_idx, 0]) * Float32(0.0078125)
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                grad_norm = Float32(mGradNormFlat[parent_row, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                dot = dot0
+                if head_idx == Int32(1):
+                    dot = dot1
+                grad_from_normalize = (
+                    grad_norm - normalized * dot
+                ) / Float32(mNormDenom[row_idx, head_idx, 0])
+                grad_y = Float32(mGradNodeFlat[parent_row, dim_idx]) + grad_from_normalize
+                x_hat = Float32(mKeyXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mKeyNormWeight[dim_idx])
+                grad_x = (
+                    grad_xhat * Float32(128.0)
+                    - reduce_grad
+                    - x_hat * reduce_grad_xhat
+                ) * scale
+                cute_utils.atomic_add_fp32(
+                    grad_x,
+                    cute_utils.elem_pointer(mGradKeyProjBias, (dim_idx,)),
+                )
+                mGradKeyProjected[row_idx, dim_idx] = grad_x.to(
+                    mGradKeyProjected.element_type
+                )
+
+
 class ARHSAStackedQueryNormBackward128Sm100:
     """Backward for stacked query LayerNorm when only normalized heads are consumed."""
 
@@ -14527,6 +14677,136 @@ def run_arhsa_key_norm_backward_128(
     )
 
 
+def run_arhsa_child_gat_gather_key_norm_backward_128(
+    grad_raw_flat: torch.Tensor,
+    grad_node_flat: torch.Tensor,
+    grad_norm_flat: torch.Tensor,
+    parent_rows: torch.Tensor,
+    normalized_rows: torch.Tensor,
+    norm_denom: torch.Tensor,
+    key_x_hat: torch.Tensor,
+    key_rstd: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse parent-row grad gathers with key norm backward for child-GAT."""
+    _require_cute_runtime()
+    if grad_raw_flat.device.type != "cuda":
+        raise ValueError("grad state tensors must be CUDA tensors")
+    if grad_raw_flat.ndim != 2 or int(grad_raw_flat.shape[1]) != 128:
+        raise ValueError(f"grad_raw_flat must have shape [N,128], got {tuple(grad_raw_flat.shape)}")
+    if grad_node_flat.shape != grad_raw_flat.shape or grad_norm_flat.shape != grad_raw_flat.shape:
+        raise ValueError("grad state tensors must have matching [N,128] shapes")
+    n_rows = int(parent_rows.numel())
+    if normalized_rows.shape != (n_rows, 2, 64):
+        raise ValueError(f"normalized_rows shape mismatch: got {tuple(normalized_rows.shape)}")
+    if norm_denom.shape != (n_rows, 2, 1):
+        raise ValueError(f"norm_denom shape mismatch: got {tuple(norm_denom.shape)}")
+    if key_x_hat.shape != (n_rows, 128):
+        raise ValueError(f"key_x_hat shape mismatch: got {tuple(key_x_hat.shape)}")
+    if key_rstd.shape != (n_rows, 1):
+        raise ValueError(f"key_rstd shape mismatch: got {tuple(key_rstd.shape)}")
+    if key_norm_weight.shape != (128,):
+        raise ValueError(f"key_norm_weight must have shape [128], got {tuple(key_norm_weight.shape)}")
+    for name, tensor in (
+        ("grad_raw_flat", grad_raw_flat),
+        ("grad_node_flat", grad_node_flat),
+        ("grad_norm_flat", grad_norm_flat),
+        ("normalized_rows", normalized_rows),
+        ("norm_denom", norm_denom),
+        ("key_x_hat", key_x_hat),
+        ("key_rstd", key_rstd),
+        ("key_norm_weight", key_norm_weight),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_raw_flat = grad_raw_flat.contiguous()
+    grad_node_flat = grad_node_flat.contiguous()
+    grad_norm_flat = grad_norm_flat.contiguous()
+    parent_rows = parent_rows.to(device=grad_raw_flat.device, dtype=torch.int32).contiguous()
+    normalized_rows = normalized_rows.contiguous()
+    norm_denom = norm_denom.contiguous()
+    key_x_hat = key_x_hat.contiguous()
+    key_rstd = key_rstd.contiguous()
+    key_norm_weight = key_norm_weight.contiguous()
+    grad_parent_raw = torch.empty((n_rows, 128), device=grad_raw_flat.device, dtype=torch.float32)
+    grad_key_projected = torch.empty((n_rows, 128), device=grad_raw_flat.device, dtype=torch.float32)
+    grad_key_norm_weight = torch.zeros((128,), device=grad_raw_flat.device, dtype=torch.float32)
+    grad_key_norm_bias = torch.zeros((128,), device=grad_raw_flat.device, dtype=torch.float32)
+    grad_key_proj_bias = torch.zeros((128,), device=grad_raw_flat.device, dtype=torch.float32)
+    if n_rows == 0:
+        return (
+            grad_parent_raw,
+            grad_key_projected,
+            grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
+            grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+            grad_key_proj_bias.to(dtype=key_norm_weight.dtype),
+        )
+
+    compile_key = (
+        "arhsa_child_gat_gather_key_norm_backward_128_v1",
+        grad_raw_flat.dtype,
+        grad_node_flat.dtype,
+        grad_norm_flat.dtype,
+        normalized_rows.dtype,
+        norm_denom.dtype,
+        key_x_hat.dtype,
+        key_rstd.dtype,
+        key_norm_weight.dtype,
+        n_rows,
+        int(grad_raw_flat.shape[0]),
+        torch.cuda.get_device_capability(grad_raw_flat.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_gather_key_norm_backward_128.compile_cache:
+        op = ARHSAChildGATGatherKeyNormBackward128Sm100()
+        run_arhsa_child_gat_gather_key_norm_backward_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_raw_flat),
+            to_cute_tensor(grad_node_flat),
+            to_cute_tensor(grad_norm_flat),
+            to_cute_tensor(parent_rows, assumed_align=4),
+            to_cute_tensor(normalized_rows),
+            to_cute_tensor(norm_denom),
+            to_cute_tensor(key_x_hat),
+            to_cute_tensor(key_rstd),
+            to_cute_tensor(key_norm_weight),
+            to_cute_tensor(grad_parent_raw),
+            to_cute_tensor(grad_key_projected),
+            to_cute_tensor(grad_key_norm_weight),
+            to_cute_tensor(grad_key_norm_bias),
+            to_cute_tensor(grad_key_proj_bias),
+            Int32(n_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_gather_key_norm_backward_128.compile_cache[compile_key](
+        grad_raw_flat,
+        grad_node_flat,
+        grad_norm_flat,
+        parent_rows,
+        normalized_rows,
+        norm_denom,
+        key_x_hat,
+        key_rstd,
+        key_norm_weight,
+        grad_parent_raw,
+        grad_key_projected,
+        grad_key_norm_weight,
+        grad_key_norm_bias,
+        grad_key_proj_bias,
+        Int32(n_rows),
+        current_stream,
+    )
+    return (
+        grad_parent_raw,
+        grad_key_projected,
+        grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
+        grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+        grad_key_proj_bias.to(dtype=key_norm_weight.dtype),
+    )
+
+
 def run_arhsa_stacked_query_norm_backward_128(
     grad_normalized: torch.Tensor,
     normalized: torch.Tensor,
@@ -20516,6 +20796,9 @@ run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
 )
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_key_norm_backward_128_v2"
+)
+run_arhsa_child_gat_gather_key_norm_backward_128.compile_cache = get_jit_cache(
+    "arhsa_child_gat_gather_key_norm_backward_128_v1"
 )
 run_arhsa_stacked_query_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_stacked_query_norm_backward_128_v2"

@@ -1961,6 +1961,405 @@ class ARHSAV3OpenScoreBackwardH2Sm100:
                     )
 
 
+class ARHSAV3StartOpenScoresBackwardH2Sm100:
+    """Backward for fused two-head ARHSAv3 start/open score dots."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradStart: cute.Tensor,
+        mGradOpen: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        start_tasks: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mGradStart,
+            mGradOpen,
+            mStartFeatureRows,
+            mStartQueryIndex,
+            mStartLevels,
+            mContinueRowIndex,
+            mContinueLevels,
+            mGradQ,
+            mGradRow,
+            mGradOpenKey,
+            mGradDownBias,
+            mGradUpBias,
+            scale,
+            start_tasks,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradStart: cute.Tensor,
+        mGradOpen: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        start_tasks: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            head_dim = Int32(mRowRepr.shape[2])
+            if task_idx < start_tasks:
+                start_idx = task_idx
+                feature_row = Int32(mStartFeatureRows[start_idx])
+                query_idx = Int32(mStartQueryIndex[start_idx])
+                level = Int32(mStartLevels[start_idx])
+                grad0_raw = Float32(mGradStart[start_idx, 0])
+                grad1_raw = Float32(mGradStart[start_idx, 1])
+                grad0 = grad0_raw * scale
+                grad1 = grad1_raw * scale
+                if lane == Int32(0):
+                    if Int32(mGradDownBias.shape[0]) > Int32(1):
+                        cute_utils.atomic_add_fp32(
+                            grad0_raw,
+                            cute_utils.elem_pointer(mGradDownBias, (0,)),
+                        )
+                        cute_utils.atomic_add_fp32(
+                            grad1_raw,
+                            cute_utils.elem_pointer(mGradDownBias, (1,)),
+                        )
+                    else:
+                        cute_utils.atomic_add_fp32(
+                            grad0_raw + grad1_raw,
+                            cute_utils.elem_pointer(mGradDownBias, (0,)),
+                        )
+                for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                    q0 = Float32(mQLevels[query_idx, level, 0, dim_idx])
+                    q1 = Float32(mQLevels[query_idx, level, 1, dim_idx])
+                    row0 = Float32(mRowRepr[feature_row, 0, dim_idx])
+                    row1 = Float32(mRowRepr[feature_row, 1, dim_idx])
+                    cute_utils.atomic_add_fp32(
+                        grad0 * row0,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, 0, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1 * row1,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, 1, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad0 * q0,
+                        cute_utils.elem_pointer(mGradRow, (feature_row, 0, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1 * q1,
+                        cute_utils.elem_pointer(mGradRow, (feature_row, 1, dim_idx)),
+                    )
+            else:
+                open_task = task_idx - start_tasks
+                n_groups = Int32(mContinueRowIndex.shape[1])
+                query_idx = open_task // n_groups
+                group_idx = open_task - query_idx * n_groups
+                level = Int32(mContinueLevels[group_idx])
+                continue_row = Int32(mContinueRowIndex[query_idx, group_idx])
+                grad0_raw = Float32(mGradOpen[query_idx, group_idx, 0])
+                grad1_raw = Float32(mGradOpen[query_idx, group_idx, 1])
+                grad0 = grad0_raw * scale
+                grad1 = grad1_raw * scale
+                if lane == Int32(0):
+                    if Int32(mGradUpBias.shape[0]) > Int32(1):
+                        cute_utils.atomic_add_fp32(
+                            grad0_raw,
+                            cute_utils.elem_pointer(mGradUpBias, (0,)),
+                        )
+                        cute_utils.atomic_add_fp32(
+                            grad1_raw,
+                            cute_utils.elem_pointer(mGradUpBias, (1,)),
+                        )
+                    else:
+                        cute_utils.atomic_add_fp32(
+                            grad0_raw + grad1_raw,
+                            cute_utils.elem_pointer(mGradUpBias, (0,)),
+                        )
+                for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                    q0 = Float32(mQLevels[query_idx, level, 0, dim_idx])
+                    q1 = Float32(mQLevels[query_idx, level, 1, dim_idx])
+                    key0 = Float32(mOpenKeyByLevel[level, 0, dim_idx])
+                    key1 = Float32(mOpenKeyByLevel[level, 1, dim_idx])
+                    if continue_row >= Int32(0):
+                        key0 = Float32(mRowRepr[continue_row, 0, dim_idx])
+                        key1 = Float32(mRowRepr[continue_row, 1, dim_idx])
+                    cute_utils.atomic_add_fp32(
+                        grad0 * key0,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, 0, dim_idx)),
+                    )
+                    cute_utils.atomic_add_fp32(
+                        grad1 * key1,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, 1, dim_idx)),
+                    )
+                    if continue_row >= Int32(0):
+                        cute_utils.atomic_add_fp32(
+                            grad0 * q0,
+                            cute_utils.elem_pointer(mGradRow, (continue_row, 0, dim_idx)),
+                        )
+                        cute_utils.atomic_add_fp32(
+                            grad1 * q1,
+                            cute_utils.elem_pointer(mGradRow, (continue_row, 1, dim_idx)),
+                        )
+                    else:
+                        cute_utils.atomic_add_fp32(
+                            grad0 * q0,
+                            cute_utils.elem_pointer(mGradOpenKey, (level, 0, dim_idx)),
+                        )
+                        cute_utils.atomic_add_fp32(
+                            grad1 * q1,
+                            cute_utils.elem_pointer(mGradOpenKey, (level, 1, dim_idx)),
+                        )
+
+
+class ARHSAV3StartOpenScoresBackwardH2D64VecSm100:
+    """D64 vectorized backward for fused two-head ARHSAv3 start/open score dots."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128, accumulate_bias: bool = True):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.accumulate_bias = accumulate_bias
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradStart: cute.Tensor,
+        mGradOpen: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        start_tasks: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mOpenKeyByLevel,
+            mGradStart,
+            mGradOpen,
+            mStartFeatureRows,
+            mStartQueryIndex,
+            mStartLevels,
+            mContinueRowIndex,
+            mContinueLevels,
+            mGradQ,
+            mGradRow,
+            mGradOpenKey,
+            mGradDownBias,
+            mGradUpBias,
+            scale,
+            start_tasks,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mOpenKeyByLevel: cute.Tensor,
+        mGradStart: cute.Tensor,
+        mGradOpen: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mContinueRowIndex: cute.Tensor,
+        mContinueLevels: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradOpenKey: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradUpBias: cute.Tensor,
+        scale: Float32,
+        start_tasks: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            head_idx = lane // Int32(16)
+            dim_group = lane - head_idx * Int32(16)
+            dim0 = dim_group * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            if task_idx < start_tasks:
+                start_idx = task_idx
+                feature_row = Int32(mStartFeatureRows[start_idx])
+                query_idx = Int32(mStartQueryIndex[start_idx])
+                level = Int32(mStartLevels[start_idx])
+                grad_raw = Float32(mGradStart[start_idx, head_idx])
+                grad = grad_raw * scale
+                if cutlass.const_expr(self.accumulate_bias):
+                    if lane == Int32(0):
+                        grad0_raw = Float32(mGradStart[start_idx, 0])
+                        grad1_raw = Float32(mGradStart[start_idx, 1])
+                        if Int32(mGradDownBias.shape[0]) > Int32(1):
+                            cute_utils.atomic_add_fp32(
+                                grad0_raw,
+                                cute_utils.elem_pointer(mGradDownBias, (0,)),
+                            )
+                            cute_utils.atomic_add_fp32(
+                                grad1_raw,
+                                cute_utils.elem_pointer(mGradDownBias, (1,)),
+                            )
+                        else:
+                            cute_utils.atomic_add_fp32(
+                                grad0_raw + grad1_raw,
+                                cute_utils.elem_pointer(mGradDownBias, (0,)),
+                            )
+                q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+                q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+                q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+                q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+                row0 = Float32(mRowRepr[feature_row, head_idx, dim0])
+                row1 = Float32(mRowRepr[feature_row, head_idx, dim1])
+                row2 = Float32(mRowRepr[feature_row, head_idx, dim2])
+                row3 = Float32(mRowRepr[feature_row, head_idx, dim3])
+                copy_utils.atomic_add_fp32x4(
+                    grad * row0,
+                    grad * row1,
+                    grad * row2,
+                    grad * row3,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                )
+                copy_utils.atomic_add_fp32x4(
+                    grad * q0,
+                    grad * q1,
+                    grad * q2,
+                    grad * q3,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim0)),
+                )
+            else:
+                open_task = task_idx - start_tasks
+                n_groups = Int32(mContinueRowIndex.shape[1])
+                query_idx = open_task // n_groups
+                group_idx = open_task - query_idx * n_groups
+                level = Int32(mContinueLevels[group_idx])
+                continue_row = Int32(mContinueRowIndex[query_idx, group_idx])
+                grad_raw = Float32(mGradOpen[query_idx, group_idx, head_idx])
+                grad = grad_raw * scale
+                if cutlass.const_expr(self.accumulate_bias):
+                    if lane == Int32(0):
+                        grad0_raw = Float32(mGradOpen[query_idx, group_idx, 0])
+                        grad1_raw = Float32(mGradOpen[query_idx, group_idx, 1])
+                        if Int32(mGradUpBias.shape[0]) > Int32(1):
+                            cute_utils.atomic_add_fp32(
+                                grad0_raw,
+                                cute_utils.elem_pointer(mGradUpBias, (0,)),
+                            )
+                            cute_utils.atomic_add_fp32(
+                                grad1_raw,
+                                cute_utils.elem_pointer(mGradUpBias, (1,)),
+                            )
+                        else:
+                            cute_utils.atomic_add_fp32(
+                                grad0_raw + grad1_raw,
+                                cute_utils.elem_pointer(mGradUpBias, (0,)),
+                            )
+                q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+                q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+                q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+                q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+                key0 = Float32(mOpenKeyByLevel[level, head_idx, dim0])
+                key1 = Float32(mOpenKeyByLevel[level, head_idx, dim1])
+                key2 = Float32(mOpenKeyByLevel[level, head_idx, dim2])
+                key3 = Float32(mOpenKeyByLevel[level, head_idx, dim3])
+                if continue_row >= Int32(0):
+                    key0 = Float32(mRowRepr[continue_row, head_idx, dim0])
+                    key1 = Float32(mRowRepr[continue_row, head_idx, dim1])
+                    key2 = Float32(mRowRepr[continue_row, head_idx, dim2])
+                    key3 = Float32(mRowRepr[continue_row, head_idx, dim3])
+                copy_utils.atomic_add_fp32x4(
+                    grad * key0,
+                    grad * key1,
+                    grad * key2,
+                    grad * key3,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                )
+                if continue_row >= Int32(0):
+                    copy_utils.atomic_add_fp32x4(
+                        grad * q0,
+                        grad * q1,
+                        grad * q2,
+                        grad * q3,
+                        cute_utils.elem_pointer(mGradRow, (continue_row, head_idx, dim0)),
+                    )
+                else:
+                    copy_utils.atomic_add_fp32x4(
+                        grad * q0,
+                        grad * q1,
+                        grad * q2,
+                        grad * q3,
+                        cute_utils.elem_pointer(mGradOpenKey, (level, head_idx, dim0)),
+                    )
+
+
 class ARHSAV3StartWeightForwardSm100:
     """Packed v3 start-weight normalization over query-major start rows."""
 
@@ -3657,6 +4056,220 @@ class ARHSARowWrite2DTripleSm100:
             mTarget0[target_row, col_idx] = mValue0[value_row, col_idx]
             mTarget1[target_row, col_idx] = mValue1[value_row, col_idx]
             mTarget2[target_row, col_idx] = mValue2[value_row, col_idx]
+
+
+class ARHSALayerNormBackward128Sm100:
+    """One-warp layer-norm backward for contiguous [M, 128] rows."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradY: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mWeight: cute.Tensor,
+        mGradX: cute.Tensor,
+        mGradWeight: cute.Tensor,
+        mGradBias: cute.Tensor,
+        n_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mGradY,
+            mXHat,
+            mRstd,
+            mWeight,
+            mGradX,
+            mGradWeight,
+            mGradBias,
+            n_rows,
+        ).launch(
+            grid=[n_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradY: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mWeight: cute.Tensor,
+        mGradX: cute.Tensor,
+        mGradWeight: cute.Tensor,
+        mGradBias: cute.Tensor,
+        n_rows: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        if row_idx < n_rows:
+            partial_grad = Float32.zero
+            partial_grad_xhat = Float32.zero
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                grad_y = Float32(mGradY[row_idx, dim_idx])
+                x_hat = Float32(mXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mWeight[dim_idx])
+                partial_grad += grad_xhat
+                partial_grad_xhat += grad_xhat * x_hat
+                cute_utils.atomic_add_fp32(
+                    grad_y * x_hat,
+                    cute_utils.elem_pointer(mGradWeight, (dim_idx,)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad_y,
+                    cute_utils.elem_pointer(mGradBias, (dim_idx,)),
+                )
+            reduce_grad = cute_utils.warp_reduce(partial_grad, lambda a, b: a + b)
+            reduce_grad_xhat = cute_utils.warp_reduce(partial_grad_xhat, lambda a, b: a + b)
+            scale = Float32(mRstd[row_idx, 0]) * Float32(0.0078125)
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                grad_y = Float32(mGradY[row_idx, dim_idx])
+                x_hat = Float32(mXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mWeight[dim_idx])
+                grad_x = (
+                    grad_xhat * Float32(128.0)
+                    - reduce_grad
+                    - x_hat * reduce_grad_xhat
+                ) * scale
+                mGradX[row_idx, dim_idx] = grad_x.to(mGradX.element_type)
+
+
+class ARHSAKeyNormBackward128Sm100:
+    """Fuse key L2-normalization backward with key layer-norm backward."""
+
+    arch = 100
+
+    def __init__(self):
+        self.num_threads = 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradProjRows: cute.Tensor,
+        mGradNormalized: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mGradKeyProjected: cute.Tensor,
+        mGradKeyNormWeight: cute.Tensor,
+        mGradKeyNormBias: cute.Tensor,
+        n_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mGradProjRows,
+            mGradNormalized,
+            mNormalizedRows,
+            mNormDenom,
+            mKeyXHat,
+            mKeyRstd,
+            mKeyNormWeight,
+            mGradKeyProjected,
+            mGradKeyNormWeight,
+            mGradKeyNormBias,
+            n_rows,
+        ).launch(
+            grid=[n_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradProjRows: cute.Tensor,
+        mGradNormalized: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mGradKeyProjected: cute.Tensor,
+        mGradKeyNormWeight: cute.Tensor,
+        mGradKeyNormBias: cute.Tensor,
+        n_rows: Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        if row_idx < n_rows:
+            partial_dot0 = Float32.zero
+            partial_dot1 = Float32.zero
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                grad_norm = Float32(mGradNormalized[row_idx, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                if head_idx == Int32(0):
+                    partial_dot0 += grad_norm * normalized
+                else:
+                    partial_dot1 += grad_norm * normalized
+            dot0 = cute_utils.warp_reduce(partial_dot0, lambda a, b: a + b)
+            dot1 = cute_utils.warp_reduce(partial_dot1, lambda a, b: a + b)
+
+            partial_grad = Float32.zero
+            partial_grad_xhat = Float32.zero
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                grad_norm = Float32(mGradNormalized[row_idx, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                dot = dot0
+                if head_idx == Int32(1):
+                    dot = dot1
+                grad_from_normalize = (
+                    grad_norm - normalized * dot
+                ) / Float32(mNormDenom[row_idx, head_idx, 0])
+                grad_y = Float32(mGradProjRows[row_idx, dim_idx]) + grad_from_normalize
+                x_hat = Float32(mKeyXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mKeyNormWeight[dim_idx])
+                partial_grad += grad_xhat
+                partial_grad_xhat += grad_xhat * x_hat
+                cute_utils.atomic_add_fp32(
+                    grad_y * x_hat,
+                    cute_utils.elem_pointer(mGradKeyNormWeight, (dim_idx,)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad_y,
+                    cute_utils.elem_pointer(mGradKeyNormBias, (dim_idx,)),
+                )
+            reduce_grad = cute_utils.warp_reduce(partial_grad, lambda a, b: a + b)
+            reduce_grad_xhat = cute_utils.warp_reduce(partial_grad_xhat, lambda a, b: a + b)
+            scale = Float32(mKeyRstd[row_idx, 0]) * Float32(0.0078125)
+            for dim_base in cutlass.range(Int32(0), Int32(128), Int32(32), unroll=4):
+                dim_idx = dim_base + lane
+                head_idx = dim_idx // Int32(64)
+                dim_in_head = dim_idx - head_idx * Int32(64)
+                grad_norm = Float32(mGradNormalized[row_idx, dim_idx])
+                normalized = Float32(mNormalizedRows[row_idx, head_idx, dim_in_head])
+                dot = dot0
+                if head_idx == Int32(1):
+                    dot = dot1
+                grad_from_normalize = (
+                    grad_norm - normalized * dot
+                ) / Float32(mNormDenom[row_idx, head_idx, 0])
+                grad_y = Float32(mGradProjRows[row_idx, dim_idx]) + grad_from_normalize
+                x_hat = Float32(mKeyXHat[row_idx, dim_idx])
+                grad_xhat = grad_y * Float32(mKeyNormWeight[dim_idx])
+                grad_x = (
+                    grad_xhat * Float32(128.0)
+                    - reduce_grad
+                    - x_hat * reduce_grad_xhat
+                ) * scale
+                mGradKeyProjected[row_idx, dim_idx] = grad_x.to(
+                    mGradKeyProjected.element_type
+                )
 
 
 class ARHSAChildGATStateForwardSm100:
@@ -11201,6 +11814,206 @@ def run_arhsa_v3_start_open_scores_forward(
     return start_out, open_out
 
 
+def run_arhsa_v3_start_open_scores_backward(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    open_key_by_level: torch.Tensor,
+    grad_start: torch.Tensor,
+    grad_open: torch.Tensor,
+    start_feature_rows: torch.Tensor,
+    start_query_index: torch.Tensor,
+    start_levels: torch.Tensor,
+    continue_row_index: torch.Tensor,
+    continue_levels: torch.Tensor,
+    down_bias: torch.Tensor,
+    up_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run packed ARHSAv3 start/open score backward in one launch."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4 or row_repr.ndim != 3 or open_key_by_level.ndim != 3:
+        raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
+    if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
+        raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
+    if int(row_repr.shape[1]) != 2:
+        raise ValueError("run_arhsa_v3_start_open_scores_backward currently requires exactly two heads")
+    n_starts = int(start_feature_rows.numel())
+    if grad_start.shape != (n_starts, row_repr.shape[1]):
+        raise ValueError(f"grad_start shape mismatch: got {tuple(grad_start.shape)}")
+    if continue_row_index.ndim != 2:
+        raise ValueError("continue_row_index must have shape [n_queries, n_groups]")
+    if continue_row_index.shape[0] != q_levels.shape[0]:
+        raise ValueError("continue_row_index query dimension must match q_levels")
+    if grad_open.shape != (q_levels.shape[0], continue_row_index.shape[1], row_repr.shape[1]):
+        raise ValueError(f"grad_open shape mismatch: got {tuple(grad_open.shape)}")
+    if start_query_index.shape != (n_starts,) or start_levels.shape != (n_starts,):
+        raise ValueError("start_feature_rows, start_query_index, and start_levels must have matching 1D shapes")
+    if continue_levels.shape != (continue_row_index.shape[1],):
+        raise ValueError(f"continue_levels shape mismatch: got {tuple(continue_levels.shape)}")
+    if down_bias.reshape(-1).numel() not in {1, 2}:
+        raise ValueError("down_bias must be scalar or length two")
+    if up_bias.reshape(-1).numel() not in {1, 2}:
+        raise ValueError("up_bias must be scalar or length two")
+    for tensor_name, tensor in (
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("open_key_by_level", open_key_by_level),
+        ("grad_start", grad_start),
+        ("grad_open", grad_open),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_q_out_dtype = q_levels.dtype
+    grad_row_out_dtype = row_repr.dtype
+    grad_open_key_out_dtype = open_key_by_level.dtype
+    grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
+    grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+    grad_open_key = torch.zeros_like(open_key_by_level, dtype=torch.float32)
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    open_key_by_level = open_key_by_level.contiguous()
+    grad_start = grad_start.contiguous()
+    grad_open = grad_open.contiguous()
+    start_feature_rows = start_feature_rows.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    start_query_index = start_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    start_levels = start_levels.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    continue_row_index = continue_row_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    continue_levels = continue_levels.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    start_tasks = int(start_feature_rows.numel())
+    total_tasks = start_tasks + int(continue_row_index.numel())
+    use_vec_d64 = (
+        os.environ.get("HSA_CUTE_V3_START_OPEN_SCORE_BWD_VEC", "1") != "0"
+        and int(q_levels.shape[2]) == 2
+        and int(q_levels.shape[3]) == 64
+    )
+    bias_sum_mode = os.environ.get("HSA_CUTE_V3_START_OPEN_SCORE_BWD_BIAS_SUM", "auto").lower()
+    if bias_sum_mode in {"1", "true", "yes", "on"}:
+        bias_sum_requested = True
+    elif bias_sum_mode in {"0", "false", "no", "off"}:
+        bias_sum_requested = False
+    else:
+        bias_sum_threshold = int(
+            os.environ.get("HSA_CUTE_V3_START_OPEN_SCORE_BWD_BIAS_SUM_MIN_TASKS", "65536")
+        )
+        bias_sum_requested = total_tasks >= bias_sum_threshold
+    bias_sum_outside = use_vec_d64 and bias_sum_requested
+    if bias_sum_outside:
+        if down_bias.reshape(-1).numel() > 1:
+            grad_down_bias = grad_start.sum(dim=0, dtype=torch.float32).contiguous()
+        else:
+            grad_down_bias = grad_start.sum(dtype=torch.float32).reshape(1)
+        if up_bias.reshape(-1).numel() > 1:
+            grad_up_bias = grad_open.sum(dim=(0, 1), dtype=torch.float32).contiguous()
+        else:
+            grad_up_bias = grad_open.sum(dtype=torch.float32).reshape(1)
+    else:
+        grad_down_bias = torch.zeros(
+            down_bias.reshape(-1).numel(),
+            device=q_levels.device,
+            dtype=torch.float32,
+        )
+        grad_up_bias = torch.zeros(
+            up_bias.reshape(-1).numel(),
+            device=q_levels.device,
+            dtype=torch.float32,
+        )
+    if total_tasks > 0:
+        num_threads = int(os.environ.get("HSA_CUTE_V3_START_OPEN_SCORE_BWD_THREADS", "128"))
+        if num_threads not in {128, 256, 512}:
+            raise ValueError("HSA_CUTE_V3_START_OPEN_SCORE_BWD_THREADS must be 128, 256, or 512")
+        scale = float(q_levels.shape[-1] ** 0.5)
+        compile_key = (
+            "arhsa_v3_start_open_scores_backward_h2_d64_vec"
+            if use_vec_d64
+            else "arhsa_v3_start_open_scores_backward_h2",
+            q_levels.dtype,
+            row_repr.dtype,
+            open_key_by_level.dtype,
+            grad_start.dtype,
+            grad_open.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            grad_open_key.dtype,
+            q_levels.shape[2],
+            q_levels.shape[3],
+            continue_row_index.shape[1],
+            grad_down_bias.numel(),
+            grad_up_bias.numel(),
+            num_threads,
+            bias_sum_outside,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_start_open_scores_backward.compile_cache:
+            if use_vec_d64:
+                op = ARHSAV3StartOpenScoresBackwardH2D64VecSm100(
+                    num_threads=num_threads,
+                    accumulate_bias=not bias_sum_outside,
+                )
+            else:
+                op = ARHSAV3StartOpenScoresBackwardH2Sm100(num_threads=num_threads)
+            run_arhsa_v3_start_open_scores_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(open_key_by_level),
+                to_cute_tensor(grad_start),
+                to_cute_tensor(grad_open),
+                to_cute_tensor(start_feature_rows, assumed_align=4),
+                to_cute_tensor(start_query_index, assumed_align=4),
+                to_cute_tensor(start_levels, assumed_align=4),
+                to_cute_tensor(continue_row_index, assumed_align=4),
+                to_cute_tensor(continue_levels, assumed_align=4),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                to_cute_tensor(grad_open_key),
+                to_cute_tensor(grad_down_bias),
+                to_cute_tensor(grad_up_bias),
+                Float32(scale),
+                Int32(start_tasks),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_start_open_scores_backward.compile_cache[compile_key](
+            q_levels,
+            row_repr,
+            open_key_by_level,
+            grad_start,
+            grad_open,
+            start_feature_rows,
+            start_query_index,
+            start_levels,
+            continue_row_index,
+            continue_levels,
+            grad_q,
+            grad_row,
+            grad_open_key,
+            grad_down_bias,
+            grad_up_bias,
+            Float32(scale),
+            Int32(start_tasks),
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    if grad_q.dtype != grad_q_out_dtype:
+        grad_q = grad_q.to(dtype=grad_q_out_dtype)
+    if grad_row.dtype != grad_row_out_dtype:
+        grad_row = grad_row.to(dtype=grad_row_out_dtype)
+    if grad_open_key.dtype != grad_open_key_out_dtype:
+        grad_open_key = grad_open_key.to(dtype=grad_open_key_out_dtype)
+    return (
+        grad_q,
+        grad_row,
+        grad_open_key,
+        grad_down_bias.to(dtype=down_bias.dtype).reshape_as(down_bias),
+        grad_up_bias.to(dtype=up_bias.dtype).reshape_as(up_bias),
+    )
+
+
 def run_arhsa_v3_open_score_backward(
     q_levels: torch.Tensor,
     row_repr: torch.Tensor,
@@ -12475,6 +13288,187 @@ def run_arhsa_row_write_2d_triple_(
     return target0, target1, target2
 
 
+def run_arhsa_layer_norm_backward_128(
+    grad_y: torch.Tensor,
+    x_hat: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run one-warp CuTe layer-norm backward for [M, 128] rows."""
+    _require_cute_runtime()
+    if grad_y.device.type != "cuda":
+        raise ValueError("grad_y must be a CUDA tensor")
+    if grad_y.ndim != 2 or int(grad_y.shape[1]) != 128:
+        raise ValueError(f"grad_y must have shape [M,128], got {tuple(grad_y.shape)}")
+    if x_hat.shape != grad_y.shape:
+        raise ValueError(f"x_hat shape mismatch: got {tuple(x_hat.shape)}")
+    if rstd.shape != (grad_y.shape[0], 1):
+        raise ValueError(f"rstd shape mismatch: got {tuple(rstd.shape)}")
+    if weight.shape != (128,):
+        raise ValueError(f"weight must have shape [128], got {tuple(weight.shape)}")
+    for name, tensor in (("grad_y", grad_y), ("x_hat", x_hat), ("rstd", rstd), ("weight", weight)):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_y = grad_y.contiguous()
+    x_hat = x_hat.contiguous()
+    rstd = rstd.contiguous()
+    weight = weight.contiguous()
+    grad_x = torch.empty_like(grad_y, dtype=torch.float32)
+    grad_weight = torch.zeros((128,), device=grad_y.device, dtype=torch.float32)
+    grad_bias = torch.zeros((128,), device=grad_y.device, dtype=torch.float32)
+    n_rows = int(grad_y.shape[0])
+    if n_rows == 0:
+        return grad_x, grad_weight.to(dtype=weight.dtype), grad_bias.to(dtype=weight.dtype)
+
+    compile_key = (
+        "arhsa_layer_norm_backward_128_v1",
+        grad_y.dtype,
+        x_hat.dtype,
+        rstd.dtype,
+        weight.dtype,
+        grad_x.dtype,
+        torch.cuda.get_device_capability(grad_y.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_layer_norm_backward_128.compile_cache:
+        op = ARHSALayerNormBackward128Sm100()
+        run_arhsa_layer_norm_backward_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_y),
+            to_cute_tensor(x_hat),
+            to_cute_tensor(rstd),
+            to_cute_tensor(weight),
+            to_cute_tensor(grad_x),
+            to_cute_tensor(grad_weight),
+            to_cute_tensor(grad_bias),
+            Int32(n_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_layer_norm_backward_128.compile_cache[compile_key](
+        grad_y,
+        x_hat,
+        rstd,
+        weight,
+        grad_x,
+        grad_weight,
+        grad_bias,
+        Int32(n_rows),
+        current_stream,
+    )
+    return grad_x, grad_weight.to(dtype=weight.dtype), grad_bias.to(dtype=weight.dtype)
+
+
+def run_arhsa_key_norm_backward_128(
+    grad_proj_rows: torch.Tensor,
+    grad_normalized: torch.Tensor,
+    normalized_rows: torch.Tensor,
+    norm_denom: torch.Tensor,
+    key_x_hat: torch.Tensor,
+    key_rstd: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse key-row L2-normalization and layer-norm backward for [M, 128]."""
+    _require_cute_runtime()
+    if grad_proj_rows.device.type != "cuda":
+        raise ValueError("grad_proj_rows must be a CUDA tensor")
+    if grad_proj_rows.ndim != 2 or int(grad_proj_rows.shape[1]) != 128:
+        raise ValueError(f"grad_proj_rows must have shape [M,128], got {tuple(grad_proj_rows.shape)}")
+    if grad_normalized.shape != grad_proj_rows.shape:
+        raise ValueError(f"grad_normalized shape mismatch: got {tuple(grad_normalized.shape)}")
+    if normalized_rows.shape != (grad_proj_rows.shape[0], 2, 64):
+        raise ValueError(f"normalized_rows shape mismatch: got {tuple(normalized_rows.shape)}")
+    if norm_denom.shape != (grad_proj_rows.shape[0], 2, 1):
+        raise ValueError(f"norm_denom shape mismatch: got {tuple(norm_denom.shape)}")
+    if key_x_hat.shape != grad_proj_rows.shape:
+        raise ValueError(f"key_x_hat shape mismatch: got {tuple(key_x_hat.shape)}")
+    if key_rstd.shape != (grad_proj_rows.shape[0], 1):
+        raise ValueError(f"key_rstd shape mismatch: got {tuple(key_rstd.shape)}")
+    if key_norm_weight.shape != (128,):
+        raise ValueError(f"key_norm_weight must have shape [128], got {tuple(key_norm_weight.shape)}")
+    for name, tensor in (
+        ("grad_proj_rows", grad_proj_rows),
+        ("grad_normalized", grad_normalized),
+        ("normalized_rows", normalized_rows),
+        ("norm_denom", norm_denom),
+        ("key_x_hat", key_x_hat),
+        ("key_rstd", key_rstd),
+        ("key_norm_weight", key_norm_weight),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_proj_rows = grad_proj_rows.contiguous()
+    grad_normalized = grad_normalized.contiguous()
+    normalized_rows = normalized_rows.contiguous()
+    norm_denom = norm_denom.contiguous()
+    key_x_hat = key_x_hat.contiguous()
+    key_rstd = key_rstd.contiguous()
+    key_norm_weight = key_norm_weight.contiguous()
+    grad_key_projected = torch.empty_like(grad_proj_rows, dtype=torch.float32)
+    grad_key_norm_weight = torch.zeros((128,), device=grad_proj_rows.device, dtype=torch.float32)
+    grad_key_norm_bias = torch.zeros((128,), device=grad_proj_rows.device, dtype=torch.float32)
+    n_rows = int(grad_proj_rows.shape[0])
+    if n_rows == 0:
+        return (
+            grad_key_projected,
+            grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
+            grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+        )
+
+    compile_key = (
+        "arhsa_key_norm_backward_128_v1",
+        grad_proj_rows.dtype,
+        grad_normalized.dtype,
+        normalized_rows.dtype,
+        norm_denom.dtype,
+        key_x_hat.dtype,
+        key_rstd.dtype,
+        key_norm_weight.dtype,
+        grad_key_projected.dtype,
+        torch.cuda.get_device_capability(grad_proj_rows.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_key_norm_backward_128.compile_cache:
+        op = ARHSAKeyNormBackward128Sm100()
+        run_arhsa_key_norm_backward_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_proj_rows),
+            to_cute_tensor(grad_normalized),
+            to_cute_tensor(normalized_rows),
+            to_cute_tensor(norm_denom),
+            to_cute_tensor(key_x_hat),
+            to_cute_tensor(key_rstd),
+            to_cute_tensor(key_norm_weight),
+            to_cute_tensor(grad_key_projected),
+            to_cute_tensor(grad_key_norm_weight),
+            to_cute_tensor(grad_key_norm_bias),
+            Int32(n_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_key_norm_backward_128.compile_cache[compile_key](
+        grad_proj_rows,
+        grad_normalized,
+        normalized_rows,
+        norm_denom,
+        key_x_hat,
+        key_rstd,
+        key_norm_weight,
+        grad_key_projected,
+        grad_key_norm_weight,
+        grad_key_norm_bias,
+        Int32(n_rows),
+        current_stream,
+    )
+    return (
+        grad_key_projected,
+        grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
+        grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+    )
+
+
 def _to_cute_gemm_2d(tensor: torch.Tensor) -> cute.Tensor:
     return to_cute_tensor(
         tensor,
@@ -13101,7 +14095,7 @@ def run_arhsa_child_gat_state_forward_cta(
             raise ValueError(f"{name} must have shape [128,128], got {tuple(tensor.shape)}")
     if q.shape != (2, 64):
         raise ValueError(f"q must have shape [2,64], got {tuple(q.shape)}")
-    if raw_node_repr.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    if raw_node_repr.dtype not in _CUTE_BACKWARD_DTYPES:
         raise ValueError(f"CTA child-GAT state forward does not support dtype {raw_node_repr.dtype}")
     for name, tensor in {
         "base": base,
@@ -13117,9 +14111,9 @@ def run_arhsa_child_gat_state_forward_cta(
         "key_norm_weight": key_norm_weight,
         "key_norm_bias": key_norm_bias,
     }.items():
-        if tensor.dtype != raw_node_repr.dtype:
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
             raise ValueError(
-                f"{name} dtype must match state dtype {raw_node_repr.dtype}, got {tensor.dtype}"
+                f"{name} dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {tensor.dtype}"
             )
 
     raw_node_repr = raw_node_repr.contiguous()
@@ -13174,6 +14168,18 @@ def run_arhsa_child_gat_state_forward_cta(
     compile_key = (
         "arhsa_child_gat_state_forward_cta_v1",
         raw_node_repr.dtype,
+        base.dtype,
+        q.dtype,
+        child_norm_weight.dtype,
+        child_norm_bias.dtype,
+        k_weight.dtype,
+        v_weight.dtype,
+        out_weight.dtype,
+        out_bias.dtype,
+        key_proj_weight.dtype,
+        key_proj_bias.dtype,
+        key_norm_weight.dtype,
+        key_norm_bias.dtype,
         attn.dtype,
         int(raw_node_repr.shape[0]),
         group_count,
@@ -13669,7 +14675,7 @@ def run_arhsa_child_gat_state_forward_tma_pipeline(
         not in {"0", "false", "False"}
         and group_count
         <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_GROUPS", "64"))
-        and child_count
+        and bucket_size
         <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_CHILDREN", "4"))
         and int(raw_node_repr.shape[0])
         <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_STATE_ROWS", "8192"))
@@ -13677,21 +14683,21 @@ def run_arhsa_child_gat_state_forward_tma_pipeline(
         and int(n_heads) == 2
         and int(head_dim) == 64
         and raw_node_repr.shape == node_repr.shape == node_repr_normalized_flat.shape
-        and raw_node_repr.dtype
-        == node_repr.dtype
-        == node_repr_normalized_flat.dtype
-        == base.dtype
-        == q.dtype
-        == child_norm_weight.dtype
-        == child_norm_bias.dtype
-        == k_weight.dtype
-        == v_weight.dtype
-        == out_weight.dtype
-        == out_bias.dtype
-        == key_proj_weight.dtype
-        == key_proj_bias.dtype
-        == key_norm_weight.dtype
-        == key_norm_bias.dtype
+        and raw_node_repr.dtype in _CUTE_BACKWARD_DTYPES
+        and node_repr.dtype == raw_node_repr.dtype
+        and node_repr_normalized_flat.dtype == raw_node_repr.dtype
+        and base.dtype in _CUTE_BACKWARD_DTYPES
+        and q.dtype in _CUTE_BACKWARD_DTYPES
+        and child_norm_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and child_norm_bias.dtype in _CUTE_BACKWARD_DTYPES
+        and k_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and v_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and out_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and out_bias.dtype in _CUTE_BACKWARD_DTYPES
+        and key_proj_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and key_proj_bias.dtype in _CUTE_BACKWARD_DTYPES
+        and key_norm_weight.dtype in _CUTE_BACKWARD_DTYPES
+        and key_norm_bias.dtype in _CUTE_BACKWARD_DTYPES
         and child_norm_weight.shape == (128,)
         and child_norm_bias.shape == (128,)
         and k_weight.shape == (128, 128)
@@ -18122,6 +19128,9 @@ run_arhsa_v3_open_score_forward.compile_cache = get_jit_cache(
 run_arhsa_v3_start_open_scores_forward.compile_cache = get_jit_cache(
     "arhsa_v3_start_open_scores_forward"
 )
+run_arhsa_v3_start_open_scores_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_start_open_scores_backward"
+)
 run_arhsa_v3_open_score_backward.compile_cache = get_jit_cache(
     "arhsa_v3_open_score_backward"
 )
@@ -18149,6 +19158,12 @@ run_arhsa_row_gather_layer_norm.compile_cache = get_jit_cache("arhsa_row_gather_
 run_arhsa_row_gather_2d_backward.compile_cache = get_jit_cache("arhsa_row_gather_2d_backward")
 run_arhsa_row_write_2d_.compile_cache = get_jit_cache("arhsa_row_write_2d")
 run_arhsa_row_write_2d_triple_.compile_cache = get_jit_cache("arhsa_row_write_2d_triple")
+run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
+    "arhsa_layer_norm_backward_128"
+)
+run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
+    "arhsa_key_norm_backward_128"
+)
 run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128_v2")
 run_arhsa_out_projection_write.compile_cache = get_jit_cache("arhsa_out_projection_write_v3")
 run_arhsa_key_projection_postprocess.compile_cache = get_jit_cache(

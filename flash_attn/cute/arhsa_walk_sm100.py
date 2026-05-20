@@ -4511,6 +4511,7 @@ class ARHSAKeyNormBackward128Sm100:
         mGradKeyProjected: cute.Tensor,
         mGradKeyNormWeight: cute.Tensor,
         mGradKeyNormBias: cute.Tensor,
+        mGradKeyProjBias: cute.Tensor,
         n_rows: Int32,
         stream: cuda.CUstream,
     ):
@@ -4525,6 +4526,7 @@ class ARHSAKeyNormBackward128Sm100:
             mGradKeyProjected,
             mGradKeyNormWeight,
             mGradKeyNormBias,
+            mGradKeyProjBias,
             n_rows,
         ).launch(
             grid=[n_rows, 1, 1],
@@ -4545,6 +4547,7 @@ class ARHSAKeyNormBackward128Sm100:
         mGradKeyProjected: cute.Tensor,
         mGradKeyNormWeight: cute.Tensor,
         mGradKeyNormBias: cute.Tensor,
+        mGradKeyProjBias: cute.Tensor,
         n_rows: Int32,
     ):
         lane, _, _ = cute.arch.thread_idx()
@@ -4615,6 +4618,10 @@ class ARHSAKeyNormBackward128Sm100:
                     - reduce_grad
                     - x_hat * reduce_grad_xhat
                 ) * scale
+                cute_utils.atomic_add_fp32(
+                    grad_x,
+                    cute_utils.elem_pointer(mGradKeyProjBias, (dim_idx,)),
+                )
                 mGradKeyProjected[row_idx, dim_idx] = grad_x.to(
                     mGradKeyProjected.element_type
                 )
@@ -6176,6 +6183,165 @@ class ARHSAKeyProjectionPostprocessSm100:
         mNormalizedRows[row_idx, head_idx, dim_in_head] = norm_val.to(mNormalizedRows.element_type)
         mNodeReprNormalizedFlat[parent_row, tidx] = norm_val.to(
             mNodeReprNormalizedFlat.element_type
+        )
+
+
+class ARHSAProjectionNormPostprocessSm100:
+    """Apply projection bias, LayerNorm, and per-head normalization."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mProjected: cute.Tensor,
+        mBias: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mNormBias: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mOut: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mProjected,
+            mBias,
+            mNormWeight,
+            mNormBias,
+            mXHat,
+            mRstd,
+            mOut,
+            mNormalized,
+            mNormDenom,
+            eps,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mProjected: cute.Tensor,
+        mBias: cute.Tensor,
+        mNormWeight: cute.Tensor,
+        mNormBias: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        mOut: cute.Tensor,
+        mNormalized: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        head_dim = Int32(mNormalized.shape[2])
+        head_idx = tidx // head_dim
+        dim_in_head = tidx - head_idx * head_dim
+
+        smem = cutlass.utils.SmemAllocator()
+        sBuf = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sOut = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sDenom = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+
+        projected = Float32(mProjected[row_idx, tidx]) + Float32(mBias[tidx])
+        sBuf[tidx] = projected
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        mean = sBuf[0] * Float32(0.0078125)
+        centered = projected - mean
+        sBuf[tidx] = centered * centered
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        rstd = Float32(cute.math.rsqrt(sBuf[0] * Float32(0.0078125) + eps, fastmath=True))
+        x_hat = centered * rstd
+        out_val = x_hat * Float32(mNormWeight[tidx]) + Float32(mNormBias[tidx])
+        mXHat[row_idx, tidx] = x_hat.to(mXHat.element_type)
+        mOut[row_idx, tidx] = out_val.to(mOut.element_type)
+        sOut[tidx] = out_val
+        if tidx == Int32(0):
+            mRstd[row_idx, 0] = rstd.to(mRstd.element_type)
+        cute.arch.barrier()
+
+        if dim_in_head == Int32(0):
+            denom_sq = Float32.zero
+            for dim_idx in cutlass.range(head_dim, unroll=16):
+                proj_val = sOut[head_idx * head_dim + dim_idx]
+                denom_sq += proj_val * proj_val
+            denom = Float32(cute.math.sqrt(denom_sq, fastmath=True))
+            if denom < Float32(1.0e-12):
+                denom = Float32(1.0e-12)
+            sDenom[head_idx] = denom
+            mNormDenom[row_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+        cute.arch.barrier()
+
+        norm_val = out_val / sDenom[head_idx]
+        mNormalized[row_idx, head_idx, dim_in_head] = norm_val.to(
+            mNormalized.element_type
         )
 
 
@@ -13989,7 +14155,7 @@ def run_arhsa_key_norm_backward_128(
     key_x_hat: torch.Tensor,
     key_rstd: torch.Tensor,
     key_norm_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse key-row L2-normalization and layer-norm backward for [M, 128]."""
     _require_cute_runtime()
     if grad_proj_rows.device.type != "cuda":
@@ -14030,16 +14196,18 @@ def run_arhsa_key_norm_backward_128(
     grad_key_projected = torch.empty_like(grad_proj_rows, dtype=torch.float32)
     grad_key_norm_weight = torch.zeros((128,), device=grad_proj_rows.device, dtype=torch.float32)
     grad_key_norm_bias = torch.zeros((128,), device=grad_proj_rows.device, dtype=torch.float32)
+    grad_key_proj_bias = torch.zeros((128,), device=grad_proj_rows.device, dtype=torch.float32)
     n_rows = int(grad_proj_rows.shape[0])
     if n_rows == 0:
         return (
             grad_key_projected,
             grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
             grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+            grad_key_proj_bias.to(dtype=key_norm_weight.dtype),
         )
 
     compile_key = (
-        "arhsa_key_norm_backward_128_v1",
+        "arhsa_key_norm_backward_128_v2",
         grad_proj_rows.dtype,
         grad_normalized.dtype,
         normalized_rows.dtype,
@@ -14065,6 +14233,7 @@ def run_arhsa_key_norm_backward_128(
             to_cute_tensor(grad_key_projected),
             to_cute_tensor(grad_key_norm_weight),
             to_cute_tensor(grad_key_norm_bias),
+            to_cute_tensor(grad_key_proj_bias),
             Int32(n_rows),
             current_stream,
             options="--enable-tvm-ffi",
@@ -14080,6 +14249,7 @@ def run_arhsa_key_norm_backward_128(
         grad_key_projected,
         grad_key_norm_weight,
         grad_key_norm_bias,
+        grad_key_proj_bias,
         Int32(n_rows),
         current_stream,
     )
@@ -14087,6 +14257,7 @@ def run_arhsa_key_norm_backward_128(
         grad_key_projected,
         grad_key_norm_weight.to(dtype=key_norm_weight.dtype),
         grad_key_norm_bias.to(dtype=key_norm_weight.dtype),
+        grad_key_proj_bias.to(dtype=key_norm_weight.dtype),
     )
 
 
@@ -14236,6 +14407,116 @@ def run_arhsa_out_projection_write(
         current_stream,
     )
     return parent_raw
+
+
+def run_arhsa_projection_norm_postprocess(
+    projected: torch.Tensor,
+    bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    *,
+    norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse projection bias, LayerNorm, and per-head normalization."""
+    _require_cute_runtime()
+    if projected.device.type != "cuda":
+        raise ValueError("ARHSA projection postprocess requires CUDA tensors")
+    row_count = int(projected.shape[0])
+    d_model = int(projected.shape[1]) if projected.ndim == 2 else -1
+    if projected.ndim != 2 or d_model != 128:
+        raise ValueError(f"projected must have shape [M,128], got {tuple(projected.shape)}")
+    if int(n_heads) * int(head_dim) != d_model:
+        raise ValueError("n_heads * head_dim must equal 128")
+    if int(n_heads) > 8:
+        raise ValueError("projection postprocess supports at most 8 heads")
+    for name, tensor in {
+        "bias": bias,
+        "norm_weight": norm_weight,
+        "norm_bias": norm_bias,
+    }.items():
+        if tensor.shape != (128,):
+            raise ValueError(f"{name} must have shape [128], got {tuple(tensor.shape)}")
+    if projected.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"ARHSA projection postprocess does not support dtype {projected.dtype}")
+
+    projected = projected.contiguous()
+    bias = bias.to(device=projected.device, dtype=projected.dtype).contiguous()
+    norm_weight = norm_weight.to(device=projected.device, dtype=projected.dtype).contiguous()
+    norm_bias = norm_bias.to(device=projected.device, dtype=projected.dtype).contiguous()
+    x_hat = torch.empty_like(projected)
+    rstd = torch.empty((row_count, 1), dtype=projected.dtype, device=projected.device)
+    out = torch.empty_like(projected)
+    normalized = torch.empty(
+        (row_count, int(n_heads), int(head_dim)),
+        dtype=projected.dtype,
+        device=projected.device,
+    )
+    norm_denom = torch.empty(
+        (row_count, int(n_heads), 1),
+        dtype=projected.dtype,
+        device=projected.device,
+    )
+    if row_count == 0:
+        return out, x_hat, rstd, normalized, norm_denom
+
+    chunk_rows = int(os.environ.get("HSA_CUTE_PROJECTION_NORM_POSTPROCESS_CHUNK_M", "1024"))
+    if chunk_rows < 128 or chunk_rows % 128 != 0:
+        raise ValueError(
+            "HSA_CUTE_PROJECTION_NORM_POSTPROCESS_CHUNK_M must be a positive multiple of 128"
+        )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    for chunk_start in range(0, row_count, chunk_rows):
+        chunk_end = min(row_count, chunk_start + chunk_rows)
+        chunk_m = int(chunk_end - chunk_start)
+        projected_chunk = projected[chunk_start:chunk_end]
+        x_hat_chunk = x_hat[chunk_start:chunk_end]
+        rstd_chunk = rstd[chunk_start:chunk_end]
+        out_chunk = out[chunk_start:chunk_end]
+        normalized_chunk = normalized[chunk_start:chunk_end]
+        norm_denom_chunk = norm_denom[chunk_start:chunk_end]
+        compile_key = (
+            "arhsa_projection_norm_postprocess_v1",
+            projected.dtype,
+            chunk_m,
+            int(n_heads),
+            int(head_dim),
+            torch.cuda.get_device_capability(projected.device),
+        )
+        if compile_key not in run_arhsa_projection_norm_postprocess.compile_cache:
+            op = ARHSAProjectionNormPostprocessSm100()
+            run_arhsa_projection_norm_postprocess.compile_cache[compile_key] = cute.compile(
+                op,
+                _to_cute_gemm_2d(projected_chunk),
+                to_cute_tensor(bias, assumed_align=16),
+                to_cute_tensor(norm_weight, assumed_align=16),
+                to_cute_tensor(norm_bias, assumed_align=16),
+                _to_cute_gemm_2d(x_hat_chunk),
+                to_cute_tensor(rstd_chunk),
+                _to_cute_gemm_2d(out_chunk),
+                to_cute_tensor(normalized_chunk),
+                to_cute_tensor(norm_denom_chunk),
+                Float32(float(norm_eps)),
+                Int32(chunk_m),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_projection_norm_postprocess.compile_cache[compile_key](
+            projected_chunk,
+            bias,
+            norm_weight,
+            norm_bias,
+            x_hat_chunk,
+            rstd_chunk,
+            out_chunk,
+            normalized_chunk,
+            norm_denom_chunk,
+            Float32(float(norm_eps)),
+            Int32(chunk_m),
+            current_stream,
+        )
+    return out, x_hat, rstd, normalized, norm_denom
 
 
 def run_arhsa_key_projection_postprocess(
@@ -19789,10 +20070,13 @@ run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_layer_norm_backward_128"
 )
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
-    "arhsa_key_norm_backward_128"
+    "arhsa_key_norm_backward_128_v2"
 )
 run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128_v2")
 run_arhsa_out_projection_write.compile_cache = get_jit_cache("arhsa_out_projection_write_v3")
+run_arhsa_projection_norm_postprocess.compile_cache = get_jit_cache(
+    "arhsa_projection_norm_postprocess_v1"
+)
 run_arhsa_key_projection_postprocess.compile_cache = get_jit_cache(
     "arhsa_key_projection_postprocess_v2"
 )

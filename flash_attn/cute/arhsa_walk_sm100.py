@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 import os
 
@@ -73,6 +74,22 @@ _CUTE_BACKWARD_DTYPES = (torch.float32, torch.bfloat16)
 def _require_cute_runtime() -> None:
     if not _HAS_CUTE_RUNTIME:
         raise NotImplementedError("ARHSA walk kernels require CUDA/CuTe runtime")
+
+
+def _maybe_arhsa_benchmark_stage(name: str):
+    if os.environ.get("HSA_CUTE_CHILD_GAT_TMA_PIPELINE_PROFILE", "0") in {
+        "0",
+        "false",
+        "False",
+    }:
+        return nullcontext()
+    try:
+        from modules.benchmark_timing import benchmark_stage, get_benchmark_recorder
+    except Exception:
+        return nullcontext()
+    if get_benchmark_recorder() is None:
+        return nullcontext()
+    return benchmark_stage(name)
 
 
 def build_incoming_edge_csr(dst: torch.Tensor, *, n_nodes: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2632,6 +2649,129 @@ class ARHSARowGather2DTripleSm100:
             mOut2[gather_row, col_idx] = mSrc2[src_row, col_idx]
 
 
+class ARHSARowGatherLayerNormSm100:
+    """Gather 128-wide rows and apply LayerNorm in one CTA per row."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrc: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mWeight: cute.Tensor,
+        mBias: cute.Tensor,
+        mOut: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mSrc,
+            mRowIndex,
+            mWeight,
+            mBias,
+            mOut,
+            mXHat,
+            mRstd,
+            eps,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrc: cute.Tensor,
+        mRowIndex: cute.Tensor,
+        mWeight: cute.Tensor,
+        mBias: cute.Tensor,
+        mOut: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        src_row = Int32(mRowIndex[row_idx])
+
+        smem = cutlass.utils.SmemAllocator()
+        sBuf = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+
+        x = Float32(mSrc[src_row, tidx])
+        sBuf[tidx] = x
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        mean = sBuf[0] * Float32(0.0078125)
+        centered = x - mean
+        sBuf[tidx] = centered * centered
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        rstd = Float32(cute.math.rsqrt(sBuf[0] * Float32(0.0078125) + eps, fastmath=True))
+        x_hat = centered * rstd
+        mXHat[row_idx, tidx] = x_hat.to(mXHat.element_type)
+        mOut[row_idx, tidx] = (
+            x_hat * Float32(mWeight[tidx]) + Float32(mBias[tidx])
+        ).to(mOut.element_type)
+        if tidx == Int32(0):
+            mRstd[row_idx, 0] = rstd.to(mRstd.element_type)
+
+
 class ARHSARowGather2DBackwardSm100:
     """Backward scatter for ``ARHSARowGather2DSm100``."""
 
@@ -3070,6 +3210,436 @@ class ARHSAChildGATStateForwardSm100:
                     mNodeReprNormalizedFlat[parent_row, out_dim] = norm_val.to(mNodeReprNormalizedFlat.element_type)
 
 
+class ARHSAChildGATStateForwardCtaSm100:
+    """CTA-parallel fused child-GAT state update for small/upper buckets.
+
+    One CTA owns one parent group.  The 128 lanes cover the model dimension,
+    while child slots are looped inside the CTA.  This keeps the full child-GAT
+    forward pipeline in one launch for small buckets without the one-thread
+    bottleneck in ``ARHSAChildGATStateForwardSm100``.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mBase: cute.Tensor,
+        mQ: cute.Tensor,
+        mChildNormWeight: cute.Tensor,
+        mChildNormBias: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mChildXHat: cute.Tensor,
+        mChildRstd: cute.Tensor,
+        mChildNorm: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        child_norm_eps: Float32,
+        key_norm_eps: Float32,
+        group_count: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mRawNodeRepr,
+            mNodeRepr,
+            mNodeReprNormalizedFlat,
+            mParentRows,
+            mChildRows,
+            mChildMask,
+            mBase,
+            mQ,
+            mChildNormWeight,
+            mChildNormBias,
+            mKWeight,
+            mVWeight,
+            mOutWeight,
+            mOutBias,
+            mKeyProjWeight,
+            mKeyProjBias,
+            mKeyNormWeight,
+            mKeyNormBias,
+            mChildXHat,
+            mChildRstd,
+            mChildNorm,
+            mK,
+            mV,
+            mAttn,
+            mAttended,
+            mParentRaw,
+            mKeyXHat,
+            mKeyRstd,
+            mProjRows,
+            mNormalizedRows,
+            mNormDenom,
+            child_norm_eps,
+            key_norm_eps,
+            group_count,
+        ).launch(
+            grid=[group_count, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mBase: cute.Tensor,
+        mQ: cute.Tensor,
+        mChildNormWeight: cute.Tensor,
+        mChildNormBias: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mChildXHat: cute.Tensor,
+        mChildRstd: cute.Tensor,
+        mChildNorm: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mAttn: cute.Tensor,
+        mAttended: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        child_norm_eps: Float32,
+        key_norm_eps: Float32,
+        group_count: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, _, _ = cute.arch.block_idx()
+        bucket_size = Int32(mChildMask.shape[1])
+        num_heads = Int32(mQ.shape[0])
+        head_dim = Int32(mQ.shape[1])
+        d_model = Int32(128)
+        inv_d = Float32(0.0078125)
+
+        smem = cutlass.utils.SmemAllocator()
+        sBuf = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sScore = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((2, 64)),
+            byte_alignment=16,
+        )
+        sAttn = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((2, 64)),
+            byte_alignment=16,
+        )
+
+        for child_slot in cutlass.range(bucket_size, unroll=1):
+            flat_child = group_idx * bucket_size + child_slot
+            src_row = Int32(mChildRows[flat_child])
+            x = Float32(mRawNodeRepr[src_row, tidx])
+            sBuf[tidx] = x
+            cute.arch.barrier()
+
+            if tidx < Int32(64):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+            cute.arch.barrier()
+            if tidx < Int32(32):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+            cute.arch.barrier()
+            if tidx < Int32(16):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+            cute.arch.barrier()
+            if tidx < Int32(8):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+            cute.arch.barrier()
+            if tidx < Int32(4):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+            cute.arch.barrier()
+            if tidx < Int32(2):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+            cute.arch.barrier()
+            if tidx < Int32(1):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+            cute.arch.barrier()
+
+            mean = sBuf[0] * inv_d
+            centered = x - mean
+            sBuf[tidx] = centered * centered
+            cute.arch.barrier()
+
+            if tidx < Int32(64):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+            cute.arch.barrier()
+            if tidx < Int32(32):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+            cute.arch.barrier()
+            if tidx < Int32(16):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+            cute.arch.barrier()
+            if tidx < Int32(8):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+            cute.arch.barrier()
+            if tidx < Int32(4):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+            cute.arch.barrier()
+            if tidx < Int32(2):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+            cute.arch.barrier()
+            if tidx < Int32(1):
+                sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+            cute.arch.barrier()
+
+            rstd = Float32(cute.math.rsqrt(sBuf[0] * inv_d + child_norm_eps, fastmath=True))
+            x_hat = centered * rstd
+            child_norm = (
+                x_hat * Float32(mChildNormWeight[tidx])
+                + Float32(mChildNormBias[tidx])
+            )
+            mChildXHat[flat_child, tidx] = x_hat.to(mChildXHat.element_type)
+            mChildNorm[flat_child, tidx] = child_norm.to(mChildNorm.element_type)
+            if tidx == Int32(0):
+                mChildRstd[flat_child, 0] = rstd.to(mChildRstd.element_type)
+            cute.arch.barrier()
+
+            k_acc = Float32.zero
+            v_acc = Float32.zero
+            for in_dim in cutlass.range(Int32(128), unroll=16):
+                child_val = Float32(mChildNorm[flat_child, in_dim])
+                k_acc += Float32(mKWeight[tidx, in_dim]) * child_val
+                v_acc += Float32(mVWeight[tidx, in_dim]) * child_val
+            head_idx = tidx // head_dim
+            dim_in_head = tidx - head_idx * head_dim
+            mK[group_idx, child_slot, head_idx, dim_in_head] = k_acc.to(mK.element_type)
+            mV[group_idx, child_slot, head_idx, dim_in_head] = v_acc.to(mV.element_type)
+            cute.arch.barrier()
+
+        scale = Float32(1.0) / Float32(cute.math.sqrt(Float32(head_dim), fastmath=True))
+        if tidx < num_heads * bucket_size:
+            head_idx = tidx // bucket_size
+            child_slot = tidx - head_idx * bucket_size
+            score = -Float32.inf
+            if mChildMask[group_idx, child_slot]:
+                dot = Float32.zero
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    dot += (
+                        Float32(mK[group_idx, child_slot, head_idx, dim_idx])
+                        * Float32(mQ[head_idx, dim_idx])
+                    )
+                score = dot * scale
+            sScore[head_idx, child_slot] = score
+        cute.arch.barrier()
+
+        if tidx < num_heads:
+            head_idx = tidx
+            row_max = -Float32.inf
+            for child_slot in cutlass.range(bucket_size, unroll=1):
+                score = sScore[head_idx, child_slot]
+                if score > row_max:
+                    row_max = score
+            row_sum = Float32.zero
+            for child_slot in cutlass.range(bucket_size, unroll=1):
+                exp_score = Float32.zero
+                if mChildMask[group_idx, child_slot]:
+                    exp_score = Float32(
+                        cute.math.exp(sScore[head_idx, child_slot] - row_max, fastmath=True)
+                    )
+                row_sum += exp_score
+                sAttn[head_idx, child_slot] = exp_score
+            inv_sum = Float32.zero
+            if row_sum > Float32(1.0e-8):
+                inv_sum = Float32(1.0) / row_sum
+            for child_slot in cutlass.range(bucket_size, unroll=1):
+                attn_val = sAttn[head_idx, child_slot] * inv_sum
+                sAttn[head_idx, child_slot] = attn_val
+                mAttn[group_idx, child_slot, head_idx] = attn_val.to(mAttn.element_type)
+        cute.arch.barrier()
+
+        if tidx < num_heads * head_dim:
+            head_idx = tidx // head_dim
+            dim_idx = tidx - head_idx * head_dim
+            acc = Float32.zero
+            for child_slot in cutlass.range(bucket_size, unroll=1):
+                acc += (
+                    sAttn[head_idx, child_slot]
+                    * Float32(mV[group_idx, child_slot, head_idx, dim_idx])
+                )
+            out_dim = head_idx * head_dim + dim_idx
+            mAttended[group_idx, out_dim] = acc.to(mAttended.element_type)
+        cute.arch.barrier()
+
+        out_acc = Float32(mOutBias[tidx])
+        for in_dim in cutlass.range(Int32(128), unroll=16):
+            out_acc += (
+                Float32(mOutWeight[tidx, in_dim])
+                * Float32(mAttended[group_idx, in_dim])
+            )
+        parent_raw = out_acc + Float32(mBase[tidx])
+        parent_row = Int32(mParentRows[group_idx])
+        mParentRaw[group_idx, tidx] = parent_raw.to(mParentRaw.element_type)
+        mRawNodeRepr[parent_row, tidx] = parent_raw.to(mRawNodeRepr.element_type)
+        cute.arch.barrier()
+
+        key_acc = Float32(mKeyProjBias[tidx])
+        for in_dim in cutlass.range(Int32(128), unroll=16):
+            key_acc += (
+                Float32(mKeyProjWeight[tidx, in_dim])
+                * Float32(mParentRaw[group_idx, in_dim])
+            )
+        mProjRows[group_idx, tidx] = key_acc.to(mProjRows.element_type)
+        sBuf[tidx] = key_acc
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        key_mean = sBuf[0] * inv_d
+        key_centered = key_acc - key_mean
+        sBuf[tidx] = key_centered * key_centered
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        key_rstd = Float32(cute.math.rsqrt(sBuf[0] * inv_d + key_norm_eps, fastmath=True))
+        key_x_hat = key_centered * key_rstd
+        proj = (
+            key_x_hat * Float32(mKeyNormWeight[tidx])
+            + Float32(mKeyNormBias[tidx])
+        )
+        mKeyXHat[group_idx, tidx] = key_x_hat.to(mKeyXHat.element_type)
+        mProjRows[group_idx, tidx] = proj.to(mProjRows.element_type)
+        mNodeRepr[parent_row, tidx] = proj.to(mNodeRepr.element_type)
+        if tidx == Int32(0):
+            mKeyRstd[group_idx, 0] = key_rstd.to(mKeyRstd.element_type)
+        sBuf[tidx] = proj * proj
+        cute.arch.barrier()
+
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(96)]
+            )
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(80)]
+            )
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(72)]
+            )
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(68)]
+            )
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(66)]
+            )
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+            sBuf[tidx + Int32(64)] = (
+                sBuf[tidx + Int32(64)] + sBuf[tidx + Int32(65)]
+            )
+        cute.arch.barrier()
+
+        head_idx = tidx // head_dim
+        dim_in_head = tidx - head_idx * head_dim
+        denom_sq = sBuf[head_idx * head_dim]
+        denom = Float32(cute.math.sqrt(denom_sq, fastmath=True))
+        if denom < Float32(1.0e-12):
+            denom = Float32(1.0e-12)
+        if dim_in_head == Int32(0):
+            mNormDenom[group_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+        norm_val = proj / denom
+        mNormalizedRows[group_idx, head_idx, dim_in_head] = norm_val.to(
+            mNormalizedRows.element_type
+        )
+        mNodeReprNormalizedFlat[parent_row, tidx] = norm_val.to(
+            mNodeReprNormalizedFlat.element_type
+        )
+
+
 class ARHSADenseGemm128Sm100:
     """Narrow SM100 GEMM for AR-HSA child-GAT projections.
 
@@ -3372,6 +3942,10 @@ class ARHSADenseGemm128Sm100:
                 num_k_blocks = cute.size(tCrA, mode=[2])
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                     k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        k_tile_idx != Int32(0) or k_block_idx != 0,
+                    )
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
@@ -3379,7 +3953,6 @@ class ARHSADenseGemm128Sm100:
                         tCrB[k_block_coord],
                         tCtAcc,
                     )
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 ab_full.release()
             acc_empty.commit()
 
@@ -3402,6 +3975,1243 @@ class ARHSADenseGemm128Sm100:
 
         pipeline.sync(barrier_id=1)
         tmem.free(tmem_ptr)
+
+
+class ARHSAOutProjectionWriteGemmSm100(ARHSADenseGemm128Sm100):
+    """SM100 GEMM with out-projection bias/base and raw-state write epilogue."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mBase: cute.Tensor,
+        mBias: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mRawNodeRepr: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        a_dtype = mA.element_type
+        b_dtype = mB.element_type
+        c_dtype = mParentRaw.element_type
+        if cutlass.const_expr(a_dtype != b_dtype):
+            raise TypeError("ARHSA out projection GEMM requires matching A/B dtypes")
+
+        a_major_mode = cutlass_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+        b_major_mode = cutlass_utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+        c_layout = cutlass_utils.LayoutEnum.from_tensor(mParentRaw)
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            a_dtype,
+            a_major_mode,
+            b_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler_mn,
+        )
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+        mma_tiler_mnk = (
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            mma_inst_shape_k * self.mma_inst_tile_k,
+        )
+        cta_tile_shape_mnk = mma_tiler_mnk
+
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            mma_tiler_mnk,
+            a_dtype,
+            self.ab_stages,
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            mma_tiler_mnk,
+            b_dtype,
+            self.ab_stages,
+        )
+        a_smem_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
+        b_smem_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
+
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_op,
+            mA,
+            a_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if a_dtype is cutlass.Float32 else None,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op,
+            mB,
+            b_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if b_dtype is cutlass.Float32 else None,
+        )
+
+        epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            cta_tile_shape_mnk,
+            False,
+            c_layout,
+            c_dtype,
+        )
+        tmem_load_atom = sm100_utils.get_tmem_load_op(
+            cta_tile_shape_mnk,
+            c_layout,
+            c_dtype,
+            self.acc_dtype,
+            epi_tile,
+            False,
+        )
+        grid = (
+            cute.ceil_div(mParentRaw.layout.shape[0], cta_tile_shape_mnk[0]),
+            1,
+            1,
+        )
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            mParentRows,
+            mBase,
+            mBias,
+            mParentRaw,
+            mRawNodeRepr,
+            a_smem_layout,
+            b_smem_layout,
+            tmem_load_atom,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            mma_tiler_mnk,
+            epi_tile,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mBase: cute.Tensor,
+        mBias: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mRawNodeRepr: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        tmem_load_atom: cute.CopyAtom,
+        a_dtype: cutlass.Constexpr,
+        b_dtype: cutlass.Constexpr,
+        c_dtype: cutlass.Constexpr,
+        mma_tiler_mnk: cutlass.Constexpr,
+        epi_tile: cute.Tile,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        bidx, _, _ = cute.arch.block_idx()
+        mma_coord_mnk = (bidx, 0, None)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
+            tmem_holding_buf: cutlass.Int32
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = smem.allocate_tensor(
+            element_type=a_dtype,
+            layout=a_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout.inner,
+        )
+        sB = smem.allocate_tensor(
+            element_type=b_dtype,
+            layout=b_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout.inner,
+        )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.threads_per_cta,
+        )
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+        )
+        tmem.allocate(512)
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+
+        a_copy_size = cute.size_in_bytes(
+            a_dtype,
+            cute.select(a_smem_layout, mode=[0, 1, 2]),
+        )
+        b_copy_size = cute.size_in_bytes(
+            b_dtype,
+            cute.select(b_smem_layout, mode=[0, 1, 2]),
+        )
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=self.ab_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            tx_count=a_copy_size + b_copy_size,
+            barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        ).make_participants()
+        acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=self.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads_per_cta,
+            ),
+            barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        ).make_participants()
+
+        gA = cute.local_tile(
+            mA_mk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, None, 1),
+        )
+        gB = cute.local_tile(
+            mB_nk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(None, 1, 1),
+        )
+        gC = cute.local_tile(
+            mParentRaw,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, 1, None),
+        )
+        cC = cute.make_identity_tensor((self.mma_tiler_mn[0], self.mma_tiler_mn[1]))
+        thr_mma = tiled_mma.get_slice(0)
+        tCgA = thr_mma.partition_A(gA)
+        tCgB = thr_mma.partition_B(gB)
+        tCgC = thr_mma.partition_C(gC)
+        tCcC = thr_mma.partition_C(cC)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(tCgA, 0, 3),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        tCcC_epi = cute.flat_divide(tCcC[((None, None), 0, 0)], epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tAcc_epi[(None, None, 0, 0)],
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
+        tTR_cC = thr_copy_t2r.partition_D(tCcC_epi)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+        tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            self.acc_dtype,
+        )
+        tTR_rC = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            c_dtype,
+        )
+        simt_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            c_dtype,
+        )
+
+        num_k_tiles = cute.size(gA, mode=[2])
+        if warp_idx == 0:
+            acc_empty = acc_producer.acquire_and_advance()
+            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=self.ab_stages - 2):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, ab_empty.count)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        k_tile_idx != Int32(0) or k_block_idx != 0,
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[k_block_coord],
+                        tCrB[k_block_coord],
+                        tCtAcc,
+                    )
+                ab_full.release()
+            acc_empty.commit()
+
+        tmem.relinquish_alloc_permit()
+        acc_full = acc_consumer.wait_and_advance()
+
+        for subtile_idx in cutlass.range(cute.size(tTR_tAcc, mode=[3])):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, subtile_idx)],
+                tTR_rAcc,
+            )
+            tTR_cC_sub = tTR_cC[(None, None, None, subtile_idx)]
+            for elem_idx in cutlass.range(cute.size(tTR_rAcc.shape), unroll_full=True):
+                row_local = Int32(tTR_cC_sub[elem_idx][0])
+                col_idx = Int32(tTR_cC_sub[elem_idx][1])
+                row_idx = bidx * Int32(128) + row_local
+                parent_row = Int32(mParentRows[row_idx])
+                value = (
+                    Float32(tTR_rAcc[elem_idx])
+                    + Float32(mBase[col_idx])
+                    + Float32(mBias[col_idx])
+                )
+                mParentRaw[row_idx, col_idx] = value.to(c_dtype)
+                mRawNodeRepr[parent_row, col_idx] = value.to(mRawNodeRepr.element_type)
+        acc_full.release()
+
+        pipeline.sync(barrier_id=1)
+        tmem.free(tmem_ptr)
+
+
+class ARHSAKeyProjectionPostprocessSm100:
+    """Apply key-projection bias, LayerNorm, per-head norm, and state writes."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mKeyProjected: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mKeyProjected,
+            mParentRows,
+            mKeyProjBias,
+            mKeyNormWeight,
+            mKeyNormBias,
+            mKeyXHat,
+            mKeyRstd,
+            mProjRows,
+            mNormalizedRows,
+            mNormDenom,
+            mNodeRepr,
+            mNodeReprNormalizedFlat,
+            eps,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mKeyProjected: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        parent_row = Int32(mParentRows[row_idx])
+        head_dim = Int32(mNormalizedRows.shape[2])
+        head_idx = tidx // head_dim
+        dim_in_head = tidx - head_idx * head_dim
+
+        smem = cutlass.utils.SmemAllocator()
+        sBuf = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sProj = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sDenom = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+
+        key_val = Float32(mKeyProjected[row_idx, tidx]) + Float32(mKeyProjBias[tidx])
+        sBuf[tidx] = key_val
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        mean = sBuf[0] * Float32(0.0078125)
+        centered = key_val - mean
+        sBuf[tidx] = centered * centered
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        rstd = Float32(cute.math.rsqrt(sBuf[0] * Float32(0.0078125) + eps, fastmath=True))
+        x_hat = centered * rstd
+        proj = x_hat * Float32(mKeyNormWeight[tidx]) + Float32(mKeyNormBias[tidx])
+        mKeyXHat[row_idx, tidx] = x_hat.to(mKeyXHat.element_type)
+        mProjRows[row_idx, tidx] = proj.to(mProjRows.element_type)
+        mNodeRepr[parent_row, tidx] = proj.to(mNodeRepr.element_type)
+        sProj[tidx] = proj
+        if tidx == Int32(0):
+            mKeyRstd[row_idx, 0] = rstd.to(mKeyRstd.element_type)
+        cute.arch.barrier()
+
+        if dim_in_head == Int32(0):
+            denom_sq = Float32.zero
+            for dim_idx in cutlass.range(head_dim, unroll=16):
+                proj_val = sProj[head_idx * head_dim + dim_idx]
+                denom_sq += proj_val * proj_val
+            denom = Float32(cute.math.sqrt(denom_sq, fastmath=True))
+            if denom < Float32(1.0e-12):
+                denom = Float32(1.0e-12)
+            sDenom[head_idx] = denom
+            mNormDenom[row_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+        cute.arch.barrier()
+
+        norm_val = proj / sDenom[head_idx]
+        mNormalizedRows[row_idx, head_idx, dim_in_head] = norm_val.to(mNormalizedRows.element_type)
+        mNodeReprNormalizedFlat[parent_row, tidx] = norm_val.to(
+            mNodeReprNormalizedFlat.element_type
+        )
+
+
+class ARHSAKeyProjectionNormWriteGemmSm100(ARHSADenseGemm128Sm100):
+    """SM100 key projection GEMM with LayerNorm and normalized state writes."""
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        a_dtype = mA.element_type
+        b_dtype = mB.element_type
+        c_dtype = mProjRows.element_type
+        if cutlass.const_expr(a_dtype != b_dtype):
+            raise TypeError("ARHSA key projection GEMM requires matching A/B dtypes")
+
+        a_major_mode = cutlass_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+        b_major_mode = cutlass_utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+        c_layout = cutlass_utils.LayoutEnum.from_tensor(mProjRows)
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            a_dtype,
+            a_major_mode,
+            b_major_mode,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler_mn,
+        )
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+        mma_tiler_mnk = (
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            mma_inst_shape_k * self.mma_inst_tile_k,
+        )
+        cta_tile_shape_mnk = mma_tiler_mnk
+
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            mma_tiler_mnk,
+            a_dtype,
+            self.ab_stages,
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            mma_tiler_mnk,
+            b_dtype,
+            self.ab_stages,
+        )
+        a_smem_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
+        b_smem_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
+
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_op,
+            mA,
+            a_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if a_dtype is cutlass.Float32 else None,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_op,
+            mB,
+            b_smem_one_stage,
+            mma_tiler_mnk,
+            tiled_mma,
+            internal_type=cutlass.TFloat32 if b_dtype is cutlass.Float32 else None,
+        )
+
+        epi_tile = sm100_utils.compute_epilogue_tile_shape(
+            cta_tile_shape_mnk,
+            False,
+            c_layout,
+            c_dtype,
+        )
+        tmem_load_atom = sm100_utils.get_tmem_load_op(
+            cta_tile_shape_mnk,
+            c_layout,
+            c_dtype,
+            self.acc_dtype,
+            epi_tile,
+            False,
+        )
+        grid = (
+            cute.ceil_div(mProjRows.layout.shape[0], cta_tile_shape_mnk[0]),
+            1,
+            1,
+        )
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            mParentRows,
+            mKeyProjBias,
+            mKeyNormWeight,
+            mKeyNormBias,
+            mKeyXHat,
+            mKeyRstd,
+            mProjRows,
+            mNormalizedRows,
+            mNormDenom,
+            mNodeRepr,
+            mNodeReprNormalizedFlat,
+            a_smem_layout,
+            b_smem_layout,
+            tmem_load_atom,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            mma_tiler_mnk,
+            epi_tile,
+            eps,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA_mk: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB_nk: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        tmem_load_atom: cute.CopyAtom,
+        a_dtype: cutlass.Constexpr,
+        b_dtype: cutlass.Constexpr,
+        c_dtype: cutlass.Constexpr,
+        mma_tiler_mnk: cutlass.Constexpr,
+        epi_tile: cute.Tile,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        bidx, _, _ = cute.arch.block_idx()
+        mma_coord_mnk = (bidx, 0, None)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stages * 2]
+            acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.acc_stages * 2]
+            tmem_holding_buf: cutlass.Int32
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = smem.allocate_tensor(
+            element_type=a_dtype,
+            layout=a_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=a_smem_layout.inner,
+        )
+        sB = smem.allocate_tensor(
+            element_type=b_dtype,
+            layout=b_smem_layout.outer,
+            byte_alignment=128,
+            swizzle=b_smem_layout.inner,
+        )
+        sKey = smem.allocate_tensor(
+            element_type=c_dtype,
+            layout=cute.make_layout((128, 128)),
+            byte_alignment=16,
+        )
+        sPart = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8, 16)),
+            byte_alignment=16,
+        )
+        sMean = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        sRstd = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        sDenom = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8, 8)),
+            byte_alignment=16,
+        )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.threads_per_cta,
+        )
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+        )
+        tmem.allocate(512)
+
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+
+        a_copy_size = cute.size_in_bytes(
+            a_dtype,
+            cute.select(a_smem_layout, mode=[0, 1, 2]),
+        )
+        b_copy_size = cute.size_in_bytes(
+            b_dtype,
+            cute.select(b_smem_layout, mode=[0, 1, 2]),
+        )
+        ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=self.ab_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            tx_count=a_copy_size + b_copy_size,
+            barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        ).make_participants()
+        acc_producer, acc_consumer = pipeline.PipelineUmmaAsync.create(
+            num_stages=self.acc_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads_per_cta,
+            ),
+            barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        ).make_participants()
+
+        gA = cute.local_tile(
+            mA_mk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, None, 1),
+        )
+        gB = cute.local_tile(
+            mB_nk,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(None, 1, 1),
+        )
+        gC = cute.local_tile(
+            mProjRows,
+            mma_tiler_mnk,
+            mma_coord_mnk,
+            proj=(1, 1, None),
+        )
+        thr_mma = tiled_mma.get_slice(0)
+        tCgA = thr_mma.partition_A(gA)
+        tCgB = thr_mma.partition_B(gB)
+        tCgC = thr_mma.partition_C(gC)
+        tCsKey = thr_mma.partition_C(sKey)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(tCgA, 0, 3),
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        tCsKey_epi = cute.flat_divide(tCsKey[((None, None), 0, 0)], epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            tmem_load_atom,
+            tAcc_epi[(None, None, 0, 0)],
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
+        tTR_sKey = thr_copy_t2r.partition_D(tCsKey_epi)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+        tTR_sKey = cute.group_modes(tTR_sKey, 3, cute.rank(tTR_sKey))
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            self.acc_dtype,
+        )
+        tTR_rC = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0)].shape,
+            c_dtype,
+        )
+        simt_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            c_dtype,
+        )
+
+        num_k_tiles = cute.size(gA, mode=[2])
+        if warp_idx == 0:
+            acc_empty = acc_producer.acquire_and_advance()
+            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=self.ab_stages - 2):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, ab_empty.count)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                )
+
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        k_tile_idx != Int32(0) or k_block_idx != 0,
+                    )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[k_block_coord],
+                        tCrB[k_block_coord],
+                        tCtAcc,
+                    )
+                ab_full.release()
+            acc_empty.commit()
+
+        tmem.relinquish_alloc_permit()
+        acc_full = acc_consumer.wait_and_advance()
+
+        for subtile_idx in cutlass.range(cute.size(tTR_tAcc, mode=[3])):
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, subtile_idx)],
+                tTR_rAcc,
+            )
+            cute.arch.fence_view_async_tmem_load()
+            tTR_rC.store(tTR_rAcc.load().to(c_dtype))
+            cute.copy(
+                simt_atom,
+                tTR_rC,
+                tTR_sKey[(None, None, None, subtile_idx)],
+            )
+        acc_full.release()
+
+        pipeline.sync(barrier_id=1)
+        tmem.free(tmem_ptr)
+        cute.arch.barrier()
+
+        lane16 = tidx % Int32(16)
+        row_group = tidx // Int32(16)
+        head_dim = Int32(mNormalizedRows.shape[2])
+        num_heads = Int32(mNormalizedRows.shape[1])
+        inv_d = Float32(0.0078125)
+
+        for row_wave in cutlass.range_constexpr(16):
+            row_local = row_wave * Int32(8) + row_group
+            row_idx = bidx * Int32(128) + row_local
+            parent_row = Int32(mParentRows[row_idx])
+
+            partial = Float32.zero
+            for dim_idx in cutlass.range(lane16, Int32(128), Int32(16), unroll=1):
+                partial += (
+                    Float32(sKey[row_local, dim_idx])
+                    + Float32(mKeyProjBias[dim_idx])
+                )
+            sPart[row_group, lane16] = partial
+            cute.arch.barrier()
+            if lane16 == Int32(0):
+                total = Float32.zero
+                for reduce_idx in cutlass.range_constexpr(16):
+                    total += sPart[row_group, reduce_idx]
+                sMean[row_group] = total * inv_d
+            cute.arch.barrier()
+            mean = sMean[row_group]
+
+            partial_var = Float32.zero
+            for dim_idx in cutlass.range(lane16, Int32(128), Int32(16), unroll=1):
+                key_val = (
+                    Float32(sKey[row_local, dim_idx])
+                    + Float32(mKeyProjBias[dim_idx])
+                )
+                centered = key_val - mean
+                partial_var += centered * centered
+            sPart[row_group, lane16] = partial_var
+            cute.arch.barrier()
+            if lane16 == Int32(0):
+                var_total = Float32.zero
+                for reduce_idx in cutlass.range_constexpr(16):
+                    var_total += sPart[row_group, reduce_idx]
+                rstd_lane0 = Float32(
+                    cute.math.rsqrt(var_total * inv_d + eps, fastmath=True)
+                )
+                sRstd[row_group] = rstd_lane0
+                mKeyRstd[row_idx, 0] = rstd_lane0.to(mKeyRstd.element_type)
+            cute.arch.barrier()
+            rstd = sRstd[row_group]
+
+            for dim_idx in cutlass.range(lane16, Int32(128), Int32(16), unroll=1):
+                key_val = (
+                    Float32(sKey[row_local, dim_idx])
+                    + Float32(mKeyProjBias[dim_idx])
+                )
+                x_hat = (key_val - mean) * rstd
+                proj = (
+                    x_hat * Float32(mKeyNormWeight[dim_idx])
+                    + Float32(mKeyNormBias[dim_idx])
+                )
+                mKeyXHat[row_idx, dim_idx] = x_hat.to(mKeyXHat.element_type)
+                mProjRows[row_idx, dim_idx] = proj.to(mProjRows.element_type)
+                mNodeRepr[parent_row, dim_idx] = proj.to(mNodeRepr.element_type)
+
+            for head_idx in cutlass.range(num_heads, unroll=1):
+                partial_denom = Float32.zero
+                for dim_in_head in cutlass.range(lane16, head_dim, Int32(16), unroll=1):
+                    out_dim = head_idx * head_dim + dim_in_head
+                    key_val = (
+                        Float32(sKey[row_local, out_dim])
+                        + Float32(mKeyProjBias[out_dim])
+                    )
+                    x_hat = (key_val - mean) * rstd
+                    proj_val = (
+                        x_hat * Float32(mKeyNormWeight[out_dim])
+                        + Float32(mKeyNormBias[out_dim])
+                    )
+                    partial_denom += proj_val * proj_val
+                sPart[row_group, lane16] = partial_denom
+                cute.arch.barrier()
+                if lane16 == Int32(0):
+                    denom_sq = Float32.zero
+                    for reduce_idx in cutlass.range_constexpr(16):
+                        denom_sq += sPart[row_group, reduce_idx]
+                    denom = Float32(cute.math.sqrt(denom_sq, fastmath=True))
+                    if denom < Float32(1.0e-12):
+                        denom = Float32(1.0e-12)
+                    sDenom[row_group, head_idx] = denom
+                    mNormDenom[row_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+                cute.arch.barrier()
+                inv_denom = Float32(1.0) / sDenom[row_group, head_idx]
+                for dim_in_head in cutlass.range(lane16, head_dim, Int32(16), unroll=1):
+                    out_dim = head_idx * head_dim + dim_in_head
+                    key_val = (
+                        Float32(sKey[row_local, out_dim])
+                        + Float32(mKeyProjBias[out_dim])
+                    )
+                    x_hat = (key_val - mean) * rstd
+                    proj_val = (
+                        x_hat * Float32(mKeyNormWeight[out_dim])
+                        + Float32(mKeyNormBias[out_dim])
+                    )
+                    norm_val = proj_val * inv_denom
+                    mNormalizedRows[row_idx, head_idx, dim_in_head] = norm_val.to(
+                        mNormalizedRows.element_type
+                    )
+                    mNodeReprNormalizedFlat[parent_row, out_dim] = norm_val.to(
+                        mNodeReprNormalizedFlat.element_type
+                    )
+
+
+class ARHSAProjectionNormWriteSmallSm100:
+    """Small-M projection, key LayerNorm, normalization and state write."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mAttended: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mBase: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        key_norm_eps: Float32,
+        group_count: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mAttended,
+            mOutWeight,
+            mOutBias,
+            mBase,
+            mKeyProjWeight,
+            mKeyProjBias,
+            mKeyNormWeight,
+            mKeyNormBias,
+            mParentRows,
+            mRawNodeRepr,
+            mNodeRepr,
+            mNodeReprNormalizedFlat,
+            mParentRaw,
+            mKeyXHat,
+            mKeyRstd,
+            mProjRows,
+            mNormalizedRows,
+            mNormDenom,
+            key_norm_eps,
+            group_count,
+        ).launch(
+            grid=[group_count, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mAttended: cute.Tensor,
+        mOutWeight: cute.Tensor,
+        mOutBias: cute.Tensor,
+        mBase: cute.Tensor,
+        mKeyProjWeight: cute.Tensor,
+        mKeyProjBias: cute.Tensor,
+        mKeyNormWeight: cute.Tensor,
+        mKeyNormBias: cute.Tensor,
+        mParentRows: cute.Tensor,
+        mRawNodeRepr: cute.Tensor,
+        mNodeRepr: cute.Tensor,
+        mNodeReprNormalizedFlat: cute.Tensor,
+        mParentRaw: cute.Tensor,
+        mKeyXHat: cute.Tensor,
+        mKeyRstd: cute.Tensor,
+        mProjRows: cute.Tensor,
+        mNormalizedRows: cute.Tensor,
+        mNormDenom: cute.Tensor,
+        key_norm_eps: Float32,
+        group_count: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, _, _ = cute.arch.block_idx()
+
+        smem = cutlass.utils.SmemAllocator()
+        sParent = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sProj = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+        sReduce = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((128,)),
+            byte_alignment=16,
+        )
+
+        parent_row = Int32(mParentRows[group_idx])
+        out_dim = tidx
+        acc = Float32(mOutBias[out_dim])
+        for in_dim in cutlass.range(Int32(128), unroll=16):
+            acc += Float32(mOutWeight[out_dim, in_dim]) * Float32(
+                mAttended[group_idx, in_dim]
+            )
+        parent_val = Float32(mBase[out_dim]) + acc
+        sParent[out_dim] = parent_val
+        mParentRaw[group_idx, out_dim] = parent_val.to(mParentRaw.element_type)
+        mRawNodeRepr[parent_row, out_dim] = parent_val.to(mRawNodeRepr.element_type)
+        cute.arch.barrier()
+
+        key_acc = Float32(mKeyProjBias[out_dim])
+        for in_dim in cutlass.range(Int32(128), unroll=16):
+            key_acc += Float32(mKeyProjWeight[out_dim, in_dim]) * sParent[in_dim]
+        sProj[out_dim] = key_acc
+        sReduce[out_dim] = key_acc
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        mean = sReduce[0] * Float32(0.0078125)
+        centered = sProj[out_dim] - mean
+        sReduce[out_dim] = centered * centered
+        cute.arch.barrier()
+
+        if tidx < Int32(64):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(64)]
+        cute.arch.barrier()
+        if tidx < Int32(32):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(32)]
+        cute.arch.barrier()
+        if tidx < Int32(16):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(16)]
+        cute.arch.barrier()
+        if tidx < Int32(8):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(8)]
+        cute.arch.barrier()
+        if tidx < Int32(4):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(4)]
+        cute.arch.barrier()
+        if tidx < Int32(2):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(2)]
+        cute.arch.barrier()
+        if tidx < Int32(1):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        rstd = Float32(
+            cute.math.rsqrt(
+                sReduce[0] * Float32(0.0078125) + key_norm_eps,
+                fastmath=True,
+            )
+        )
+        x_hat = centered * rstd
+        proj = x_hat * Float32(mKeyNormWeight[out_dim]) + Float32(
+            mKeyNormBias[out_dim]
+        )
+        sProj[out_dim] = proj
+        mKeyXHat[group_idx, out_dim] = x_hat.to(mKeyXHat.element_type)
+        mProjRows[group_idx, out_dim] = proj.to(mProjRows.element_type)
+        mNodeRepr[parent_row, out_dim] = proj.to(mNodeRepr.element_type)
+        if tidx == Int32(0):
+            mKeyRstd[group_idx, 0] = rstd.to(mKeyRstd.element_type)
+        cute.arch.barrier()
+
+        lane = tidx % Int32(64)
+        head_idx = tidx // Int32(64)
+        sReduce[tidx] = proj * proj
+        cute.arch.barrier()
+        if lane < Int32(32):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(32)]
+        cute.arch.barrier()
+        if lane < Int32(16):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(16)]
+        cute.arch.barrier()
+        if lane < Int32(8):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(8)]
+        cute.arch.barrier()
+        if lane < Int32(4):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(4)]
+        cute.arch.barrier()
+        if lane < Int32(2):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(2)]
+        cute.arch.barrier()
+        if lane < Int32(1):
+            sReduce[tidx] = sReduce[tidx] + sReduce[tidx + Int32(1)]
+        cute.arch.barrier()
+
+        denom_base = head_idx * Int32(64)
+        denom = Float32(cute.math.sqrt(sReduce[denom_base], fastmath=True))
+        if denom < Float32(1.0e-12):
+            denom = Float32(1.0e-12)
+        if lane == Int32(0):
+            mNormDenom[group_idx, head_idx, 0] = denom.to(mNormDenom.element_type)
+        norm_val = proj / denom
+        mNormalizedRows[group_idx, head_idx, lane] = norm_val.to(
+            mNormalizedRows.element_type
+        )
+        mNodeReprNormalizedFlat[parent_row, out_dim] = norm_val.to(
+            mNodeReprNormalizedFlat.element_type
+        )
 
 
 class ARHSAChildGATKVGemmSm100:
@@ -3754,6 +5564,10 @@ class ARHSAChildGATKVGemmSm100:
                 num_k_blocks = cute.size(tCrA, mode=[2])
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                     k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        k_tile_idx != Int32(0) or k_block_idx != 0,
+                    )
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
@@ -3761,7 +5575,6 @@ class ARHSAChildGATKVGemmSm100:
                         tCrB[k_block_coord],
                         tCtAcc,
                     )
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 ab_full.release()
             acc_empty.commit()
 
@@ -3793,12 +5606,67 @@ class ARHSAChildGATKVGemmSm100:
         tmem.free(tmem_ptr)
 
 
+class ARHSAChildGATKVProjectionSmallSm100:
+    """Small-M scalar K/V projection for upper-tree child-GAT buckets."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mChildNorm: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mKFlat: cute.Tensor,
+        mVFlat: cute.Tensor,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mChildNorm,
+            mKWeight,
+            mVWeight,
+            mKFlat,
+            mVFlat,
+            total_rows,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mChildNorm: cute.Tensor,
+        mKWeight: cute.Tensor,
+        mVWeight: cute.Tensor,
+        mKFlat: cute.Tensor,
+        mVFlat: cute.Tensor,
+        total_rows: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        out_dim = tidx
+        k_acc = Float32.zero
+        v_acc = Float32.zero
+        for in_dim in cutlass.range(Int32(128), unroll=16):
+            child_val = Float32(mChildNorm[row_idx, in_dim])
+            k_acc += Float32(mKWeight[out_dim, in_dim]) * child_val
+            v_acc += Float32(mVWeight[out_dim, in_dim]) * child_val
+        mKFlat[row_idx, out_dim] = k_acc.to(mKFlat.element_type)
+        mVFlat[row_idx, out_dim] = v_acc.to(mVFlat.element_type)
+
+
 class ARHSAChildGATScoreReduceSm100:
     """Score, softmax, and reduce a dense child-GAT bucket.
 
-    One CTA owns one parent group.  For the Gutenberg hot path this means
-    bucket_size<=32 and head_dim=64.  Two-head groups use 128 threads; four-head
-    groups use 256 threads so the value-reduce phase covers every output dim.
+    One CTA owns one parent group. The warp path handles bucket_size<=32;
+    the small upper-tree bucket_size=64 case uses CTA-local shared reductions
+    so the monolithic pipeline does not fall back to PyTorch.
     """
 
     arch = 100
@@ -3855,11 +5723,16 @@ class ARHSAChildGATScoreReduceSm100:
         smem = cutlass.utils.SmemAllocator()
         sAttn = smem.allocate_tensor(
             cutlass.Float32,
-            cute.make_layout((4, 32)),
+            cute.make_layout((4, 64)),
+            byte_alignment=16,
+        )
+        sScore = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((4, 64)),
             byte_alignment=16,
         )
 
-        if warp_idx < num_heads:
+        if bucket_size <= Int32(32) and warp_idx < num_heads:
             head_idx = warp_idx
             child_idx = lane
             valid = child_idx < bucket_size and mChildMask[group_idx, child_idx]
@@ -3884,6 +5757,46 @@ class ARHSAChildGATScoreReduceSm100:
             if child_idx < bucket_size:
                 mAttn[group_idx, child_idx, head_idx] = attn_val.to(mAttn.element_type)
 
+        if bucket_size > Int32(32) and tidx < num_heads * bucket_size:
+            head_idx = tidx // bucket_size
+            child_idx = tidx - head_idx * bucket_size
+            valid = mChildMask[group_idx, child_idx]
+            score = -Float32.inf
+            if valid:
+                dot = Float32.zero
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    dot += Float32(mK[group_idx, child_idx, head_idx, dim_idx]) * Float32(
+                        mQ[head_idx, dim_idx]
+                    )
+                score = dot * scale
+            sScore[head_idx, child_idx] = score
+
+        cute.arch.barrier()
+
+        if bucket_size > Int32(32) and tidx < num_heads:
+            head_idx = tidx
+            row_max = -Float32.inf
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                score = sScore[head_idx, child_idx]
+                if score > row_max:
+                    row_max = score
+            row_sum = Float32.zero
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                exp_score = Float32.zero
+                if mChildMask[group_idx, child_idx]:
+                    exp_score = Float32(
+                        cute.math.exp(sScore[head_idx, child_idx] - row_max, fastmath=True)
+                    )
+                row_sum += exp_score
+                sAttn[head_idx, child_idx] = exp_score
+            inv_sum = Float32.zero
+            if row_sum > Float32(1.0e-8):
+                inv_sum = Float32(1.0) / row_sum
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                attn_val = sAttn[head_idx, child_idx] * inv_sum
+                sAttn[head_idx, child_idx] = attn_val
+                mAttn[group_idx, child_idx, head_idx] = attn_val.to(mAttn.element_type)
+
         cute.arch.barrier()
 
         if tidx < num_heads * head_dim:
@@ -3896,6 +5809,172 @@ class ARHSAChildGATScoreReduceSm100:
                 )
             out_dim = head_idx * head_dim + dim_idx
             mAttended[group_idx, out_dim] = acc.to(mAttended.element_type)
+
+
+class ARHSAChildGATScoreReduceBackwardSm100:
+    """Backward for dense child-GAT score/reduce buckets.
+
+    Fuses the softmax Jacobian, dK/dV row writes, and tiny dQ reduction.  The
+    weight-gradient GEMMs remain in PyTorch/CUBLAS because those are normal
+    dense 128-wide products.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mQ: cute.Tensor,
+        mAttn: cute.Tensor,
+        mGradAttended: cute.Tensor,
+        mGradKFlat: cute.Tensor,
+        mGradVFlat: cute.Tensor,
+        mGradQ: cute.Tensor,
+        group_count: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mK,
+            mV,
+            mChildMask,
+            mQ,
+            mAttn,
+            mGradAttended,
+            mGradKFlat,
+            mGradVFlat,
+            mGradQ,
+            group_count,
+        ).launch(
+            grid=[group_count, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mChildMask: cute.Tensor,
+        mQ: cute.Tensor,
+        mAttn: cute.Tensor,
+        mGradAttended: cute.Tensor,
+        mGradKFlat: cute.Tensor,
+        mGradVFlat: cute.Tensor,
+        mGradQ: cute.Tensor,
+        group_count: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, _, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        bucket_size = Int32(mK.shape[1])
+        num_heads = Int32(mK.shape[2])
+        head_dim = Int32(mK.shape[3])
+        scale = Float32(1.0) / Float32(cute.math.sqrt(Float32(head_dim), fastmath=True))
+
+        smem = cutlass.utils.SmemAllocator()
+        sGradScore = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((4, 64)),
+            byte_alignment=16,
+        )
+        sGradAttn = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((4, 64)),
+            byte_alignment=16,
+        )
+
+        if bucket_size <= Int32(32) and warp_idx < num_heads:
+            head_idx = warp_idx
+            child_idx = lane
+            valid = child_idx < bucket_size and mChildMask[group_idx, child_idx]
+            attn_val = Float32.zero
+            grad_attn = Float32.zero
+            if valid:
+                attn_val = Float32(mAttn[group_idx, child_idx, head_idx])
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    grad_attn += Float32(
+                        mGradAttended[group_idx, head_idx, dim_idx]
+                    ) * Float32(mV[group_idx, child_idx, head_idx, dim_idx])
+            softmax_dot_part = Float32.zero
+            if valid:
+                softmax_dot_part = grad_attn * attn_val
+            softmax_dot = cute_utils.warp_reduce(
+                softmax_dot_part,
+                lambda a, b: a + b,
+                width=32,
+            )
+            grad_score = Float32.zero
+            if valid:
+                grad_score = attn_val * (grad_attn - softmax_dot) * scale
+            if child_idx < Int32(32):
+                sGradScore[head_idx, child_idx] = grad_score
+
+        if bucket_size > Int32(32) and tidx < num_heads * bucket_size:
+            head_idx = tidx // bucket_size
+            child_idx = tidx - head_idx * bucket_size
+            valid = mChildMask[group_idx, child_idx]
+            grad_attn = Float32.zero
+            if valid:
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    grad_attn += Float32(
+                        mGradAttended[group_idx, head_idx, dim_idx]
+                    ) * Float32(mV[group_idx, child_idx, head_idx, dim_idx])
+            sGradAttn[head_idx, child_idx] = grad_attn
+
+        cute.arch.barrier()
+
+        if bucket_size > Int32(32) and tidx < num_heads:
+            head_idx = tidx
+            softmax_dot = Float32.zero
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                if mChildMask[group_idx, child_idx]:
+                    softmax_dot += (
+                        sGradAttn[head_idx, child_idx]
+                        * Float32(mAttn[group_idx, child_idx, head_idx])
+                    )
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                grad_score = Float32.zero
+                if mChildMask[group_idx, child_idx]:
+                    attn_val = Float32(mAttn[group_idx, child_idx, head_idx])
+                    grad_score = (
+                        attn_val
+                        * (sGradAttn[head_idx, child_idx] - softmax_dot)
+                        * scale
+                    )
+                sGradScore[head_idx, child_idx] = grad_score
+
+        cute.arch.barrier()
+
+        if tidx < num_heads * head_dim:
+            head_idx = tidx // head_dim
+            dim_idx = tidx - head_idx * head_dim
+            out_dim = head_idx * head_dim + dim_idx
+            grad_attended = Float32(mGradAttended[group_idx, head_idx, dim_idx])
+            q_val = Float32(mQ[head_idx, dim_idx])
+            grad_q_acc = Float32.zero
+            for child_idx in cutlass.range(bucket_size, unroll=1):
+                row_idx = group_idx * bucket_size + child_idx
+                grad_score = sGradScore[head_idx, child_idx]
+                attn_val = Float32(mAttn[group_idx, child_idx, head_idx])
+                grad_k = grad_score * q_val
+                grad_v = attn_val * grad_attended
+                mGradKFlat[row_idx, out_dim] = grad_k.to(mGradKFlat.element_type)
+                mGradVFlat[row_idx, out_dim] = grad_v.to(mGradVFlat.element_type)
+                grad_q_acc += grad_score * Float32(
+                    mK[group_idx, child_idx, head_idx, dim_idx]
+                )
+            cute_utils.atomic_add_fp32(
+                grad_q_acc,
+                cute_utils.elem_pointer(mGradQ, (head_idx, dim_idx)),
+            )
 
 
 class ARHSALeafReadoutSm100:
@@ -8948,6 +11027,81 @@ def run_arhsa_row_gather_2d_triple(
     return out0, out1, out2
 
 
+def run_arhsa_row_gather_layer_norm(
+    src: torch.Tensor,
+    row_index: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather 128-wide rows and return LayerNorm output, x_hat, and rstd."""
+    _require_cute_runtime()
+    if src.device.type != "cuda":
+        raise ValueError("src must be a CUDA tensor")
+    if src.ndim != 2 or int(src.shape[1]) != 128:
+        raise ValueError(f"src must have shape [n_rows,128], got {tuple(src.shape)}")
+    if row_index.ndim != 1:
+        raise ValueError(f"row_index must be 1D, got {tuple(row_index.shape)}")
+    if weight.shape != (128,) or bias.shape != (128,):
+        raise ValueError("weight and bias must have shape [128]")
+    if src.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"src dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    src = src.contiguous()
+    row_index = row_index.to(device=src.device, dtype=torch.int32).contiguous()
+    out_dtype = torch.promote_types(src.dtype, weight.dtype)
+    out_dtype = torch.promote_types(out_dtype, bias.dtype)
+    if out_dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"output dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out_dtype}")
+    weight = weight.to(device=src.device, dtype=out_dtype).contiguous()
+    bias = bias.to(device=src.device, dtype=out_dtype).contiguous()
+    out = torch.empty((int(row_index.numel()), 128), dtype=out_dtype, device=src.device)
+    x_hat = torch.empty_like(out)
+    rstd = torch.empty((int(row_index.numel()), 1), dtype=out_dtype, device=src.device)
+    total_rows = int(row_index.numel())
+    if total_rows == 0:
+        return out, x_hat, rstd
+
+    compile_key = (
+        "arhsa_row_gather_layer_norm_v2",
+        src.dtype,
+        out.dtype,
+        total_rows,
+        int(src.shape[0]),
+        torch.cuda.get_device_capability(src.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_gather_layer_norm.compile_cache:
+        op = ARHSARowGatherLayerNormSm100()
+        run_arhsa_row_gather_layer_norm.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(src),
+            to_cute_tensor(row_index, assumed_align=4),
+            to_cute_tensor(weight),
+            to_cute_tensor(bias),
+            to_cute_tensor(out),
+            to_cute_tensor(x_hat),
+            to_cute_tensor(rstd),
+            Float32(eps),
+            Int32(total_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_gather_layer_norm.compile_cache[compile_key](
+        src,
+        row_index,
+        weight,
+        bias,
+        out,
+        x_hat,
+        rstd,
+        Float32(eps),
+        Int32(total_rows),
+        current_stream,
+    )
+    return out, x_hat, rstd
+
+
 def run_arhsa_row_gather_2d_backward(
     grad_out: torch.Tensor,
     row_index: torch.Tensor,
@@ -9188,7 +11342,7 @@ def run_arhsa_dense_gemm_128(
         out = out.contiguous()
 
     compile_key = (
-        "arhsa_dense_gemm_128",
+        "arhsa_dense_gemm_128_v2",
         a.dtype,
         out.dtype,
         int(a.shape[0]),
@@ -9217,6 +11371,798 @@ def run_arhsa_dense_gemm_128(
     return out
 
 
+def run_arhsa_out_projection_write(
+    attended: torch.Tensor,
+    out_weight: torch.Tensor,
+    out_bias: torch.Tensor,
+    base: torch.Tensor,
+    parent_rows: torch.Tensor,
+    raw_node_repr: torch.Tensor,
+) -> torch.Tensor:
+    """Run out projection with fused base/bias and raw-state write."""
+    _require_cute_runtime()
+    if attended.device.type != "cuda" or raw_node_repr.device.type != "cuda":
+        raise ValueError("ARHSA out projection write requires CUDA tensors")
+    if attended.ndim != 2 or raw_node_repr.ndim != 2:
+        raise ValueError("attended and raw_node_repr must be 2D")
+    if int(attended.shape[1]) != 128 or int(raw_node_repr.shape[1]) != 128:
+        raise ValueError("ARHSA out projection write expects 128-wide rows")
+    if tuple(out_weight.shape) != (128, 128):
+        raise ValueError(f"out_weight must have shape [128,128], got {tuple(out_weight.shape)}")
+    if out_bias.shape != (128,) or base.shape != (128,):
+        raise ValueError("out_bias and base must have shape [128]")
+    if int(parent_rows.numel()) != int(attended.shape[0]):
+        raise ValueError("parent_rows length must match attended rows")
+    if int(attended.shape[0]) % 128 != 0:
+        raise ValueError("ARHSA out projection write requires M to be a multiple of 128")
+    if attended.dtype != out_weight.dtype:
+        raise ValueError("attended and out_weight must have matching dtypes")
+    if raw_node_repr.dtype != attended.dtype:
+        raise ValueError("raw_node_repr dtype must match attended dtype")
+    if attended.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"ARHSA out projection write does not support dtype {attended.dtype}")
+
+    attended = attended.contiguous()
+    out_weight = out_weight.contiguous()
+    out_bias = out_bias.to(device=attended.device, dtype=attended.dtype).contiguous()
+    base = base.to(device=attended.device, dtype=attended.dtype).contiguous()
+    parent_rows = parent_rows.to(device=attended.device, dtype=torch.int32).contiguous()
+    raw_node_repr = raw_node_repr.contiguous()
+    parent_raw = torch.empty((int(attended.shape[0]), 128), dtype=attended.dtype, device=attended.device)
+
+    compile_key = (
+        "arhsa_out_projection_write_v3",
+        attended.dtype,
+        parent_raw.dtype,
+        int(attended.shape[0]),
+        torch.cuda.get_device_capability(attended.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_out_projection_write.compile_cache:
+        op = ARHSAOutProjectionWriteGemmSm100()
+        run_arhsa_out_projection_write.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(attended),
+            _to_cute_gemm_2d(out_weight),
+            to_cute_tensor(parent_rows, assumed_align=4),
+            to_cute_tensor(base, assumed_align=16),
+            to_cute_tensor(out_bias, assumed_align=16),
+            _to_cute_gemm_2d(parent_raw),
+            _to_cute_gemm_2d(raw_node_repr),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_out_projection_write.compile_cache[compile_key](
+        attended,
+        out_weight,
+        parent_rows,
+        base,
+        out_bias,
+        parent_raw,
+        raw_node_repr,
+        current_stream,
+    )
+    return parent_raw
+
+
+def run_arhsa_key_projection_postprocess(
+    key_projected: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    parent_rows: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    *,
+    key_norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse key bias, LayerNorm, per-head normalization, and node-state writes."""
+    _require_cute_runtime()
+    if key_projected.device.type != "cuda" or node_repr.device.type != "cuda":
+        raise ValueError("ARHSA key postprocess requires CUDA tensors")
+    group_count = int(key_projected.shape[0])
+    d_model = int(key_projected.shape[1]) if key_projected.ndim == 2 else -1
+    if key_projected.ndim != 2 or d_model != 128:
+        raise ValueError(f"key_projected must have shape [M,128], got {tuple(key_projected.shape)}")
+    if int(n_heads) * int(head_dim) != d_model:
+        raise ValueError("n_heads * head_dim must equal 128")
+    if int(n_heads) > 8:
+        raise ValueError("key postprocess supports at most 8 heads")
+    if int(parent_rows.numel()) != group_count:
+        raise ValueError("parent_rows length must match key_projected rows")
+    if node_repr.ndim != 2 or node_repr_normalized_flat.ndim != 2:
+        raise ValueError("node state tensors must be 2D")
+    if node_repr.shape != node_repr_normalized_flat.shape or int(node_repr.shape[1]) != 128:
+        raise ValueError("node state tensors must have matching 128-wide shapes")
+    for name, tensor in {
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tensor.shape != (128,):
+            raise ValueError(f"{name} must have shape [128], got {tuple(tensor.shape)}")
+    if node_repr.dtype != key_projected.dtype or node_repr_normalized_flat.dtype != key_projected.dtype:
+        raise ValueError("node state dtypes must match key_projected dtype")
+
+    key_projected = key_projected.contiguous()
+    key_proj_bias = key_proj_bias.to(device=key_projected.device, dtype=key_projected.dtype).contiguous()
+    key_norm_weight = key_norm_weight.to(device=key_projected.device, dtype=key_projected.dtype).contiguous()
+    key_norm_bias = key_norm_bias.to(device=key_projected.device, dtype=key_projected.dtype).contiguous()
+    parent_rows = parent_rows.to(device=key_projected.device, dtype=torch.int32).contiguous()
+    node_repr = node_repr.contiguous()
+    node_repr_normalized_flat = node_repr_normalized_flat.contiguous()
+    key_x_hat = torch.empty_like(key_projected)
+    key_rstd = torch.empty((group_count, 1), dtype=key_projected.dtype, device=key_projected.device)
+    proj_rows = torch.empty_like(key_projected)
+    normalized_rows = torch.empty(
+        (group_count, int(n_heads), int(head_dim)),
+        dtype=key_projected.dtype,
+        device=key_projected.device,
+    )
+    norm_denom = torch.empty(
+        (group_count, int(n_heads), 1),
+        dtype=key_projected.dtype,
+        device=key_projected.device,
+    )
+    if group_count == 0:
+        return proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+    chunk_rows = int(os.environ.get("HSA_CUTE_CHILD_GAT_KEY_POSTPROCESS_CHUNK_M", "1024"))
+    if chunk_rows < 128 or chunk_rows % 128 != 0:
+        raise ValueError("HSA_CUTE_CHILD_GAT_KEY_POSTPROCESS_CHUNK_M must be a positive multiple of 128")
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    for chunk_start in range(0, group_count, chunk_rows):
+        chunk_end = min(group_count, chunk_start + chunk_rows)
+        chunk_m = int(chunk_end - chunk_start)
+        key_projected_chunk = key_projected[chunk_start:chunk_end]
+        parent_rows_chunk = parent_rows[chunk_start:chunk_end]
+        key_x_hat_chunk = key_x_hat[chunk_start:chunk_end]
+        key_rstd_chunk = key_rstd[chunk_start:chunk_end]
+        proj_rows_chunk = proj_rows[chunk_start:chunk_end]
+        normalized_rows_chunk = normalized_rows[chunk_start:chunk_end]
+        norm_denom_chunk = norm_denom[chunk_start:chunk_end]
+        compile_key = (
+            "arhsa_key_projection_postprocess_v2",
+            key_projected.dtype,
+            chunk_m,
+            int(n_heads),
+            int(head_dim),
+            int(node_repr.shape[0]),
+            torch.cuda.get_device_capability(key_projected.device),
+        )
+        if compile_key not in run_arhsa_key_projection_postprocess.compile_cache:
+            op = ARHSAKeyProjectionPostprocessSm100()
+            run_arhsa_key_projection_postprocess.compile_cache[compile_key] = cute.compile(
+                op,
+                _to_cute_gemm_2d(key_projected_chunk),
+                to_cute_tensor(parent_rows_chunk, assumed_align=4),
+                to_cute_tensor(key_proj_bias, assumed_align=16),
+                to_cute_tensor(key_norm_weight, assumed_align=16),
+                to_cute_tensor(key_norm_bias, assumed_align=16),
+                _to_cute_gemm_2d(key_x_hat_chunk),
+                to_cute_tensor(key_rstd_chunk),
+                _to_cute_gemm_2d(proj_rows_chunk),
+                to_cute_tensor(normalized_rows_chunk),
+                to_cute_tensor(norm_denom_chunk),
+                _to_cute_gemm_2d(node_repr),
+                _to_cute_gemm_2d(node_repr_normalized_flat),
+                Float32(float(key_norm_eps)),
+                Int32(chunk_m),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_key_projection_postprocess.compile_cache[compile_key](
+            key_projected_chunk,
+            parent_rows_chunk,
+            key_proj_bias,
+            key_norm_weight,
+            key_norm_bias,
+            key_x_hat_chunk,
+            key_rstd_chunk,
+            proj_rows_chunk,
+            normalized_rows_chunk,
+            norm_denom_chunk,
+            node_repr,
+            node_repr_normalized_flat,
+            Float32(float(key_norm_eps)),
+            Int32(chunk_m),
+            current_stream,
+        )
+    return proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+
+def run_arhsa_key_projection_norm_write(
+    parent_raw: torch.Tensor,
+    key_proj_weight: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    parent_rows: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    *,
+    key_norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run key projection with fused bias, LayerNorm, normalization, and writes."""
+    _require_cute_runtime()
+    if parent_raw.device.type != "cuda" or node_repr.device.type != "cuda":
+        raise ValueError("ARHSA fused key projection requires CUDA tensors")
+    group_count = int(parent_raw.shape[0])
+    if parent_raw.ndim != 2 or int(parent_raw.shape[1]) != 128:
+        raise ValueError(f"parent_raw must have shape [M,128], got {tuple(parent_raw.shape)}")
+    if int(parent_raw.shape[0]) % 128 != 0:
+        raise ValueError("ARHSA fused key projection requires M to be a multiple of 128")
+    if tuple(key_proj_weight.shape) != (128, 128):
+        raise ValueError(
+            f"key_proj_weight must have shape [128,128], got {tuple(key_proj_weight.shape)}"
+        )
+    for name, tensor in {
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tensor.shape != (128,):
+            raise ValueError(f"{name} must have shape [128], got {tuple(tensor.shape)}")
+    if int(n_heads) * int(head_dim) != 128:
+        raise ValueError("n_heads * head_dim must equal 128")
+    if int(n_heads) > 8:
+        raise ValueError("fused key projection supports at most 8 heads")
+    if int(parent_rows.numel()) != group_count:
+        raise ValueError("parent_rows length must match parent_raw rows")
+    if node_repr.ndim != 2 or node_repr_normalized_flat.ndim != 2:
+        raise ValueError("node state tensors must be 2D")
+    if node_repr.shape != node_repr_normalized_flat.shape or int(node_repr.shape[1]) != 128:
+        raise ValueError("node state tensors must have matching 128-wide shapes")
+    if (
+        parent_raw.dtype != key_proj_weight.dtype
+        or parent_raw.dtype != node_repr.dtype
+        or parent_raw.dtype != node_repr_normalized_flat.dtype
+    ):
+        raise ValueError("parent/key/node state dtypes must match")
+    if parent_raw.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"ARHSA fused key projection does not support dtype {parent_raw.dtype}")
+
+    parent_raw = parent_raw.contiguous()
+    key_proj_weight = key_proj_weight.contiguous()
+    key_proj_bias = key_proj_bias.to(device=parent_raw.device, dtype=parent_raw.dtype).contiguous()
+    key_norm_weight = key_norm_weight.to(device=parent_raw.device, dtype=parent_raw.dtype).contiguous()
+    key_norm_bias = key_norm_bias.to(device=parent_raw.device, dtype=parent_raw.dtype).contiguous()
+    parent_rows = parent_rows.to(device=parent_raw.device, dtype=torch.int32).contiguous()
+    node_repr = node_repr.contiguous()
+    node_repr_normalized_flat = node_repr_normalized_flat.contiguous()
+    key_x_hat = torch.empty_like(parent_raw)
+    key_rstd = torch.empty((group_count, 1), dtype=parent_raw.dtype, device=parent_raw.device)
+    proj_rows = torch.empty_like(parent_raw)
+    normalized_rows = torch.empty(
+        (group_count, int(n_heads), int(head_dim)),
+        dtype=parent_raw.dtype,
+        device=parent_raw.device,
+    )
+    norm_denom = torch.empty(
+        (group_count, int(n_heads), 1),
+        dtype=parent_raw.dtype,
+        device=parent_raw.device,
+    )
+    if group_count == 0:
+        return proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+    chunk_rows = int(os.environ.get("HSA_CUTE_CHILD_GAT_KEY_GEMM_EPILOGUE_CHUNK_M", "4096"))
+    if chunk_rows < 128 or chunk_rows % 128 != 0:
+        raise ValueError(
+            "HSA_CUTE_CHILD_GAT_KEY_GEMM_EPILOGUE_CHUNK_M must be a positive multiple of 128"
+        )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    for chunk_start in range(0, group_count, chunk_rows):
+        chunk_end = min(group_count, chunk_start + chunk_rows)
+        chunk_m = int(chunk_end - chunk_start)
+        parent_raw_chunk = parent_raw[chunk_start:chunk_end]
+        parent_rows_chunk = parent_rows[chunk_start:chunk_end]
+        key_x_hat_chunk = key_x_hat[chunk_start:chunk_end]
+        key_rstd_chunk = key_rstd[chunk_start:chunk_end]
+        proj_rows_chunk = proj_rows[chunk_start:chunk_end]
+        normalized_rows_chunk = normalized_rows[chunk_start:chunk_end]
+        norm_denom_chunk = norm_denom[chunk_start:chunk_end]
+        compile_key = (
+            "arhsa_key_projection_norm_write_gemm_v7",
+            parent_raw.dtype,
+            chunk_m,
+            int(n_heads),
+            int(head_dim),
+            int(node_repr.shape[0]),
+            torch.cuda.get_device_capability(parent_raw.device),
+        )
+        if compile_key not in run_arhsa_key_projection_norm_write.compile_cache:
+            op = ARHSAKeyProjectionNormWriteGemmSm100()
+            run_arhsa_key_projection_norm_write.compile_cache[compile_key] = cute.compile(
+                op,
+                _to_cute_gemm_2d(parent_raw_chunk),
+                _to_cute_gemm_2d(key_proj_weight),
+                to_cute_tensor(parent_rows_chunk, assumed_align=4),
+                to_cute_tensor(key_proj_bias, assumed_align=16),
+                to_cute_tensor(key_norm_weight, assumed_align=16),
+                to_cute_tensor(key_norm_bias, assumed_align=16),
+                _to_cute_gemm_2d(key_x_hat_chunk),
+                to_cute_tensor(key_rstd_chunk),
+                _to_cute_gemm_2d(proj_rows_chunk),
+                to_cute_tensor(normalized_rows_chunk),
+                to_cute_tensor(norm_denom_chunk),
+                _to_cute_gemm_2d(node_repr),
+                _to_cute_gemm_2d(node_repr_normalized_flat),
+                Float32(float(key_norm_eps)),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_key_projection_norm_write.compile_cache[compile_key](
+            parent_raw_chunk,
+            key_proj_weight,
+            parent_rows_chunk,
+            key_proj_bias,
+            key_norm_weight,
+            key_norm_bias,
+            key_x_hat_chunk,
+            key_rstd_chunk,
+            proj_rows_chunk,
+            normalized_rows_chunk,
+            norm_denom_chunk,
+            node_repr,
+            node_repr_normalized_flat,
+            Float32(float(key_norm_eps)),
+            current_stream,
+        )
+    return proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+
+def run_arhsa_projection_norm_write_small(
+    attended: torch.Tensor,
+    out_weight: torch.Tensor,
+    out_bias: torch.Tensor,
+    base: torch.Tensor,
+    key_proj_weight: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    parent_rows: torch.Tensor,
+    raw_node_repr: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    *,
+    key_norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse small-M out projection, key projection, key LN and state writes."""
+    _require_cute_runtime()
+    if attended.device.type != "cuda" or raw_node_repr.device.type != "cuda":
+        raise ValueError("ARHSA small projection write requires CUDA tensors")
+    group_count = int(attended.shape[0])
+    if attended.ndim != 2 or int(attended.shape[1]) != 128:
+        raise ValueError(f"attended must have shape [M,128], got {tuple(attended.shape)}")
+    if int(n_heads) != 2 or int(head_dim) != 64:
+        raise ValueError("ARHSA small projection write currently requires n_heads=2, head_dim=64")
+    if int(parent_rows.numel()) != group_count:
+        raise ValueError("parent_rows length must match attended rows")
+    for name, tensor in {
+        "out_weight": out_weight,
+        "key_proj_weight": key_proj_weight,
+    }.items():
+        if tuple(tensor.shape) != (128, 128):
+            raise ValueError(f"{name} must have shape [128,128], got {tuple(tensor.shape)}")
+    for name, tensor in {
+        "out_bias": out_bias,
+        "base": base,
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tensor.shape != (128,):
+            raise ValueError(f"{name} must have shape [128], got {tuple(tensor.shape)}")
+    if raw_node_repr.shape != node_repr.shape or raw_node_repr.shape != node_repr_normalized_flat.shape:
+        raise ValueError("state tensors must have matching flattened shapes")
+    if int(raw_node_repr.shape[1]) != 128:
+        raise ValueError("state tensors must have 128 columns")
+    if out_weight.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"ARHSA small projection write does not support dtype {out_weight.dtype}")
+    if (
+        out_weight.dtype != key_proj_weight.dtype
+        or out_weight.dtype != raw_node_repr.dtype
+        or out_weight.dtype != node_repr.dtype
+        or out_weight.dtype != node_repr_normalized_flat.dtype
+    ):
+        raise ValueError("weights and state tensors must have matching dtypes")
+
+    attended = attended.to(device=raw_node_repr.device, dtype=out_weight.dtype).contiguous()
+    out_weight = out_weight.contiguous()
+    out_bias = out_bias.to(device=attended.device, dtype=attended.dtype).contiguous()
+    base = base.to(device=attended.device, dtype=attended.dtype).contiguous()
+    key_proj_weight = key_proj_weight.contiguous()
+    key_proj_bias = key_proj_bias.to(device=attended.device, dtype=attended.dtype).contiguous()
+    key_norm_weight = key_norm_weight.to(device=attended.device, dtype=attended.dtype).contiguous()
+    key_norm_bias = key_norm_bias.to(device=attended.device, dtype=attended.dtype).contiguous()
+    parent_rows = parent_rows.to(device=attended.device, dtype=torch.int32).contiguous()
+    raw_node_repr = raw_node_repr.contiguous()
+    node_repr = node_repr.contiguous()
+    node_repr_normalized_flat = node_repr_normalized_flat.contiguous()
+
+    parent_raw = torch.empty((group_count, 128), dtype=attended.dtype, device=attended.device)
+    key_x_hat = torch.empty_like(parent_raw)
+    key_rstd = torch.empty((group_count, 1), dtype=attended.dtype, device=attended.device)
+    proj_rows = torch.empty_like(parent_raw)
+    normalized_rows = torch.empty((group_count, 2, 64), dtype=attended.dtype, device=attended.device)
+    norm_denom = torch.empty((group_count, 2, 1), dtype=attended.dtype, device=attended.device)
+    if group_count == 0:
+        return parent_raw, proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+    compile_key = (
+        "arhsa_projection_norm_write_small_v1",
+        attended.dtype,
+        group_count,
+        int(raw_node_repr.shape[0]),
+        torch.cuda.get_device_capability(attended.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_projection_norm_write_small.compile_cache:
+        op = ARHSAProjectionNormWriteSmallSm100()
+        run_arhsa_projection_norm_write_small.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(attended),
+            _to_cute_gemm_2d(out_weight),
+            to_cute_tensor(out_bias, assumed_align=16),
+            to_cute_tensor(base, assumed_align=16),
+            _to_cute_gemm_2d(key_proj_weight),
+            to_cute_tensor(key_proj_bias, assumed_align=16),
+            to_cute_tensor(key_norm_weight, assumed_align=16),
+            to_cute_tensor(key_norm_bias, assumed_align=16),
+            to_cute_tensor(parent_rows, assumed_align=4),
+            _to_cute_gemm_2d(raw_node_repr),
+            _to_cute_gemm_2d(node_repr),
+            _to_cute_gemm_2d(node_repr_normalized_flat),
+            _to_cute_gemm_2d(parent_raw),
+            _to_cute_gemm_2d(key_x_hat),
+            to_cute_tensor(key_rstd),
+            _to_cute_gemm_2d(proj_rows),
+            to_cute_tensor(normalized_rows),
+            to_cute_tensor(norm_denom),
+            Float32(float(key_norm_eps)),
+            Int32(group_count),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_projection_norm_write_small.compile_cache[compile_key](
+        attended,
+        out_weight,
+        out_bias,
+        base,
+        key_proj_weight,
+        key_proj_bias,
+        key_norm_weight,
+        key_norm_bias,
+        parent_rows,
+        raw_node_repr,
+        node_repr,
+        node_repr_normalized_flat,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+        Float32(float(key_norm_eps)),
+        Int32(group_count),
+        current_stream,
+    )
+    return parent_raw, proj_rows, key_x_hat, key_rstd, normalized_rows, norm_denom
+
+
+def run_arhsa_child_gat_state_forward_cta(
+    raw_node_repr: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    parent_rows: torch.Tensor,
+    child_rows_flat: torch.Tensor,
+    child_mask: torch.Tensor,
+    base: torch.Tensor,
+    q: torch.Tensor,
+    child_norm_weight: torch.Tensor,
+    child_norm_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    out_bias: torch.Tensor,
+    key_proj_weight: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    *,
+    child_norm_eps: float,
+    key_norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, ...]:
+    """CTA-parallel one-launch child-GAT state update for small buckets."""
+    _require_cute_runtime()
+    if raw_node_repr.device.type != "cuda":
+        raise ValueError("CTA child-GAT state forward requires CUDA tensors")
+    if raw_node_repr.ndim != 2 or int(raw_node_repr.shape[1]) != 128:
+        raise ValueError("CTA child-GAT state forward requires state[M,128]")
+    if raw_node_repr.shape != node_repr.shape or raw_node_repr.shape != node_repr_normalized_flat.shape:
+        raise ValueError("state tensors must have matching flattened shapes")
+    if child_mask.ndim != 2:
+        raise ValueError("child_mask must have shape [group_count,bucket_size]")
+    group_count = int(child_mask.shape[0])
+    bucket_size = int(child_mask.shape[1])
+    if int(parent_rows.numel()) != group_count:
+        raise ValueError("parent_rows length must match child_mask rows")
+    if int(child_rows_flat.numel()) != group_count * bucket_size:
+        raise ValueError("child_rows_flat length must equal group_count * bucket_size")
+    if int(n_heads) != 2 or int(head_dim) != 64:
+        raise ValueError("CTA child-GAT state forward currently requires n_heads=2, head_dim=64")
+    if bucket_size > 64:
+        raise ValueError("CTA child-GAT state forward supports bucket_size <= 64")
+    for name, tensor in {
+        "base": base,
+        "child_norm_weight": child_norm_weight,
+        "child_norm_bias": child_norm_bias,
+        "out_bias": out_bias,
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tuple(tensor.shape) != (128,):
+            raise ValueError(f"{name} must have shape [128], got {tuple(tensor.shape)}")
+    for name, tensor in {
+        "k_weight": k_weight,
+        "v_weight": v_weight,
+        "out_weight": out_weight,
+        "key_proj_weight": key_proj_weight,
+    }.items():
+        if tuple(tensor.shape) != (128, 128):
+            raise ValueError(f"{name} must have shape [128,128], got {tuple(tensor.shape)}")
+    if q.shape != (2, 64):
+        raise ValueError(f"q must have shape [2,64], got {tuple(q.shape)}")
+    if raw_node_repr.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"CTA child-GAT state forward does not support dtype {raw_node_repr.dtype}")
+    for name, tensor in {
+        "base": base,
+        "q": q,
+        "child_norm_weight": child_norm_weight,
+        "child_norm_bias": child_norm_bias,
+        "k_weight": k_weight,
+        "v_weight": v_weight,
+        "out_weight": out_weight,
+        "out_bias": out_bias,
+        "key_proj_weight": key_proj_weight,
+        "key_proj_bias": key_proj_bias,
+        "key_norm_weight": key_norm_weight,
+        "key_norm_bias": key_norm_bias,
+    }.items():
+        if tensor.dtype != raw_node_repr.dtype:
+            raise ValueError(
+                f"{name} dtype must match state dtype {raw_node_repr.dtype}, got {tensor.dtype}"
+            )
+
+    raw_node_repr = raw_node_repr.contiguous()
+    node_repr = node_repr.contiguous()
+    node_repr_normalized_flat = node_repr_normalized_flat.contiguous()
+    parent_rows = parent_rows.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+    child_rows_flat = child_rows_flat.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+    child_mask = child_mask.to(device=raw_node_repr.device, dtype=torch.bool).contiguous()
+    base = base.contiguous()
+    q = q.contiguous()
+    child_norm_weight = child_norm_weight.contiguous()
+    child_norm_bias = child_norm_bias.contiguous()
+    k_weight = k_weight.contiguous()
+    v_weight = v_weight.contiguous()
+    out_weight = out_weight.contiguous()
+    out_bias = out_bias.contiguous()
+    key_proj_weight = key_proj_weight.contiguous()
+    key_proj_bias = key_proj_bias.contiguous()
+    key_norm_weight = key_norm_weight.contiguous()
+    key_norm_bias = key_norm_bias.contiguous()
+
+    child_x_hat = torch.empty((group_count * bucket_size, 128), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    child_rstd = torch.empty((group_count * bucket_size, 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    child_norm = torch.empty_like(child_x_hat)
+    k = torch.empty((group_count, bucket_size, 2, 64), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    v = torch.empty_like(k)
+    attn = torch.empty((group_count, bucket_size, 2), dtype=torch.float32, device=raw_node_repr.device)
+    attended = torch.empty((group_count, 128), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    parent_raw = torch.empty_like(attended)
+    key_x_hat = torch.empty_like(attended)
+    key_rstd = torch.empty((group_count, 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    proj_rows = torch.empty_like(attended)
+    normalized_rows = torch.empty((group_count, 2, 64), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    norm_denom = torch.empty((group_count, 2, 1), dtype=raw_node_repr.dtype, device=raw_node_repr.device)
+    if group_count == 0:
+        return (
+            child_x_hat,
+            child_rstd,
+            child_norm,
+            k,
+            v,
+            attn,
+            attended,
+            parent_raw,
+            key_x_hat,
+            key_rstd,
+            proj_rows,
+            normalized_rows,
+            norm_denom,
+        )
+
+    compile_key = (
+        "arhsa_child_gat_state_forward_cta_v1",
+        raw_node_repr.dtype,
+        attn.dtype,
+        int(raw_node_repr.shape[0]),
+        group_count,
+        bucket_size,
+        torch.cuda.get_device_capability(raw_node_repr.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_state_forward_cta.compile_cache:
+        op = ARHSAChildGATStateForwardCtaSm100()
+
+        def cute_unaligned(t: torch.Tensor):
+            return to_cute_tensor(t, assumed_align=1)
+
+        run_arhsa_child_gat_state_forward_cta.compile_cache[compile_key] = cute.compile(
+            op,
+            cute_unaligned(raw_node_repr),
+            cute_unaligned(node_repr),
+            cute_unaligned(node_repr_normalized_flat),
+            cute_unaligned(parent_rows),
+            cute_unaligned(child_rows_flat),
+            cute_unaligned(child_mask),
+            cute_unaligned(base),
+            cute_unaligned(q),
+            cute_unaligned(child_norm_weight),
+            cute_unaligned(child_norm_bias),
+            cute_unaligned(k_weight),
+            cute_unaligned(v_weight),
+            cute_unaligned(out_weight),
+            cute_unaligned(out_bias),
+            cute_unaligned(key_proj_weight),
+            cute_unaligned(key_proj_bias),
+            cute_unaligned(key_norm_weight),
+            cute_unaligned(key_norm_bias),
+            cute_unaligned(child_x_hat),
+            cute_unaligned(child_rstd),
+            cute_unaligned(child_norm),
+            cute_unaligned(k),
+            cute_unaligned(v),
+            cute_unaligned(attn),
+            cute_unaligned(attended),
+            cute_unaligned(parent_raw),
+            cute_unaligned(key_x_hat),
+            cute_unaligned(key_rstd),
+            cute_unaligned(proj_rows),
+            cute_unaligned(normalized_rows),
+            cute_unaligned(norm_denom),
+            Float32(float(child_norm_eps)),
+            Float32(float(key_norm_eps)),
+            Int32(group_count),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_state_forward_cta.compile_cache[compile_key](
+        raw_node_repr,
+        node_repr,
+        node_repr_normalized_flat,
+        parent_rows,
+        child_rows_flat,
+        child_mask,
+        base,
+        q,
+        child_norm_weight,
+        child_norm_bias,
+        k_weight,
+        v_weight,
+        out_weight,
+        out_bias,
+        key_proj_weight,
+        key_proj_bias,
+        key_norm_weight,
+        key_norm_bias,
+        child_x_hat,
+        child_rstd,
+        child_norm,
+        k,
+        v,
+        attn,
+        attended,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+        Float32(float(child_norm_eps)),
+        Float32(float(key_norm_eps)),
+        Int32(group_count),
+        current_stream,
+    )
+    return (
+        child_x_hat,
+        child_rstd,
+        child_norm,
+        k,
+        v,
+        attn,
+        attended,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+    )
+
+
+def run_arhsa_child_gat_kv_projection_small(
+    child_norm: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Small-M CuTe K/V projection for child-GAT buckets below one TMA tile."""
+    _require_cute_runtime()
+    if child_norm.device.type != "cuda":
+        raise ValueError("child-GAT small K/V projection requires CUDA tensors")
+    if child_norm.ndim != 2 or int(child_norm.shape[1]) != 128:
+        raise ValueError(f"child_norm must have shape [M,128], got {tuple(child_norm.shape)}")
+    if tuple(k_weight.shape) != (128, 128) or tuple(v_weight.shape) != (128, 128):
+        raise ValueError("child-GAT small K/V projection expects weights[128,128]")
+    if child_norm.dtype != k_weight.dtype or child_norm.dtype != v_weight.dtype:
+        raise ValueError("child_norm and K/V weights must have matching dtypes")
+    if child_norm.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"child-GAT small K/V projection does not support dtype {child_norm.dtype}")
+    total_rows = int(child_norm.shape[0])
+    if total_rows > 127:
+        raise ValueError("child-GAT small K/V projection expects M <= 127")
+
+    child_norm = child_norm.contiguous()
+    k_weight = k_weight.contiguous()
+    v_weight = v_weight.contiguous()
+    k_flat = torch.empty((total_rows, 128), dtype=child_norm.dtype, device=child_norm.device)
+    v_flat = torch.empty_like(k_flat)
+    if total_rows == 0:
+        return k_flat, v_flat
+
+    compile_key = (
+        "arhsa_child_gat_kv_projection_small_v1",
+        child_norm.dtype,
+        total_rows,
+        torch.cuda.get_device_capability(child_norm.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_kv_projection_small.compile_cache:
+        op = ARHSAChildGATKVProjectionSmallSm100()
+        run_arhsa_child_gat_kv_projection_small.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(child_norm),
+            _to_cute_gemm_2d(k_weight),
+            _to_cute_gemm_2d(v_weight),
+            _to_cute_gemm_2d(k_flat),
+            _to_cute_gemm_2d(v_flat),
+            Int32(total_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_kv_projection_small.compile_cache[compile_key](
+        child_norm,
+        k_weight,
+        v_weight,
+        k_flat,
+        v_flat,
+        Int32(total_rows),
+        current_stream,
+    )
+    return k_flat, v_flat
+
+
 def run_arhsa_child_gat_kv_projection(
     child_norm: torch.Tensor,
     k_weight: torch.Tensor,
@@ -9242,7 +12188,7 @@ def run_arhsa_child_gat_kv_projection(
         raise ValueError("child-GAT K/V GEMM requires matching child/weight dtypes")
 
     compile_key = (
-        "arhsa_child_gat_kv_gemm",
+        "arhsa_child_gat_kv_gemm_v2",
         child_norm.dtype,
         k_flat.dtype,
         int(child_norm.shape[0]),
@@ -9290,8 +12236,8 @@ def run_arhsa_child_gat_score_reduce(
     bucket_size = int(k.shape[1])
     n_heads = int(k.shape[2])
     head_dim = int(k.shape[3])
-    if bucket_size > 32:
-        raise ValueError("child-GAT score/reduce supports bucket_size <= 32")
+    if bucket_size > 64:
+        raise ValueError("child-GAT score/reduce supports bucket_size <= 64")
     if n_heads > 4:
         raise ValueError("child-GAT score/reduce currently supports at most 4 heads")
     if head_dim != 64:
@@ -9314,9 +12260,10 @@ def run_arhsa_child_gat_score_reduce(
 
     num_threads = 256 if n_heads > 2 else 128
     compile_key = (
-        "arhsa_child_gat_score_reduce",
+        "arhsa_child_gat_score_reduce_v3",
         k.dtype,
         attn.dtype,
+        group_count,
         bucket_size,
         n_heads,
         head_dim,
@@ -9353,6 +12300,529 @@ def run_arhsa_child_gat_score_reduce(
         current_stream,
     )
     return attn, attended
+
+
+def run_arhsa_child_gat_score_reduce_backward(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    child_mask: torch.Tensor,
+    q: torch.Tensor,
+    attn: torch.Tensor,
+    grad_attended: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for fused child-GAT score/reduce.
+
+    Returns ``grad_k_flat``, ``grad_v_flat`` and an FP32 ``grad_q``.
+    """
+    _require_cute_runtime()
+    if k.device.type != "cuda" or v.device.type != "cuda" or grad_attended.device.type != "cuda":
+        raise ValueError("child-GAT score/reduce backward requires CUDA tensors")
+    if k.ndim != 4 or v.ndim != 4 or k.shape != v.shape:
+        raise ValueError("k and v must have matching shape [group_count,bucket,n_heads,head_dim]")
+    group_count = int(k.shape[0])
+    bucket_size = int(k.shape[1])
+    n_heads = int(k.shape[2])
+    head_dim = int(k.shape[3])
+    d_model = n_heads * head_dim
+    if bucket_size > 64:
+        raise ValueError("child-GAT score/reduce backward supports bucket_size <= 64")
+    if n_heads > 4:
+        raise ValueError("child-GAT score/reduce backward currently supports at most 4 heads")
+    if head_dim != 64:
+        raise ValueError("child-GAT score/reduce backward currently supports head_dim=64")
+    if q.shape != (n_heads, head_dim):
+        raise ValueError(f"q must have shape [{n_heads}, {head_dim}], got {tuple(q.shape)}")
+    if attn.shape != (group_count, bucket_size, n_heads):
+        raise ValueError(f"attn shape mismatch: got {tuple(attn.shape)}")
+    if child_mask.shape != (group_count, bucket_size):
+        raise ValueError(f"child_mask shape mismatch: got {tuple(child_mask.shape)}")
+    if grad_attended.shape != (group_count, n_heads, head_dim):
+        raise ValueError(f"grad_attended shape mismatch: got {tuple(grad_attended.shape)}")
+
+    k = k.contiguous()
+    v = v.contiguous()
+    child_mask = child_mask.to(device=k.device, dtype=torch.bool).contiguous()
+    q = q.to(device=k.device, dtype=k.dtype).contiguous()
+    attn = attn.to(device=k.device, dtype=torch.float32).contiguous()
+    grad_attended = grad_attended.contiguous()
+    grad_k_flat = torch.empty(
+        (group_count * bucket_size, d_model),
+        dtype=grad_attended.dtype,
+        device=k.device,
+    )
+    grad_v_flat = torch.empty_like(grad_k_flat)
+    grad_q = torch.zeros((n_heads, head_dim), dtype=torch.float32, device=k.device)
+    if group_count == 0:
+        return grad_k_flat, grad_v_flat, grad_q
+
+    num_threads = 256 if n_heads > 2 else 128
+    compile_key = (
+        "arhsa_child_gat_score_reduce_backward_v3",
+        k.dtype,
+        v.dtype,
+        grad_attended.dtype,
+        grad_k_flat.dtype,
+        group_count,
+        bucket_size,
+        n_heads,
+        head_dim,
+        num_threads,
+        torch.cuda.get_device_capability(k.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_child_gat_score_reduce_backward.compile_cache:
+        op = ARHSAChildGATScoreReduceBackwardSm100(num_threads=num_threads)
+
+        def cute_unaligned(t: torch.Tensor):
+            return to_cute_tensor(t, assumed_align=1)
+
+        run_arhsa_child_gat_score_reduce_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            cute_unaligned(k),
+            cute_unaligned(v),
+            cute_unaligned(child_mask),
+            cute_unaligned(q),
+            cute_unaligned(attn),
+            cute_unaligned(grad_attended),
+            cute_unaligned(grad_k_flat),
+            cute_unaligned(grad_v_flat),
+            cute_unaligned(grad_q),
+            Int32(group_count),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_child_gat_score_reduce_backward.compile_cache[compile_key](
+        k,
+        v,
+        child_mask,
+        q,
+        attn,
+        grad_attended,
+        grad_k_flat,
+        grad_v_flat,
+        grad_q,
+        Int32(group_count),
+        current_stream,
+    )
+    return grad_k_flat, grad_v_flat, grad_q
+
+
+def _arhsa_layer_norm_forward_torch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mean = x.mean(dim=-1, keepdim=True)
+    centered = x - mean
+    var = centered.square().mean(dim=-1, keepdim=True)
+    rstd = torch.rsqrt(var + float(eps))
+    x_hat = centered * rstd
+    return x_hat * weight + bias, x_hat, rstd
+
+
+def run_arhsa_child_gat_state_forward_tma_pipeline(
+    raw_node_repr: torch.Tensor,
+    node_repr: torch.Tensor,
+    node_repr_normalized_flat: torch.Tensor,
+    parent_rows: torch.Tensor,
+    child_rows_flat: torch.Tensor,
+    child_mask: torch.Tensor,
+    base: torch.Tensor,
+    q: torch.Tensor,
+    child_norm_weight: torch.Tensor,
+    child_norm_bias: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    out_bias: torch.Tensor,
+    key_proj_weight: torch.Tensor,
+    key_proj_bias: torch.Tensor,
+    key_norm_weight: torch.Tensor,
+    key_norm_bias: torch.Tensor,
+    *,
+    child_norm_eps: float,
+    key_norm_eps: float,
+    n_heads: int,
+    head_dim: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """CuTe-owned child-GAT state-update pipeline.
+
+    This is the integration point for the monolithic child-GAT update.  Today it
+    still dispatches a small number of CuTe kernels internally so we keep the
+    fast TMA/UMMA GEMM paths; future fusion should collapse those internals
+    without changing the autograd call site in HSA_ARHSA.
+    """
+    _require_cute_runtime()
+    if raw_node_repr.device.type != "cuda":
+        raise ValueError("ARHSA child-GAT TMA pipeline requires CUDA tensors")
+    group_count = int(child_mask.shape[0])
+    bucket_size = int(child_mask.shape[1])
+    d_model = int(raw_node_repr.shape[1])
+    if d_model != 128 or int(n_heads) * int(head_dim) != 128:
+        raise ValueError("ARHSA child-GAT TMA pipeline currently requires d_model=128")
+
+    with _maybe_arhsa_benchmark_stage(
+        "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.prepare"
+    ):
+        parent_rows = parent_rows.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+        child_rows_flat = child_rows_flat.to(device=raw_node_repr.device, dtype=torch.int32).contiguous()
+        child_mask = child_mask.to(device=raw_node_repr.device, dtype=torch.bool).contiguous()
+    child_count = int(child_rows_flat.numel())
+    if child_count != group_count * bucket_size:
+        raise ValueError("child_rows_flat length must match group_count * bucket_size")
+
+    use_fused_cta = (
+        os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA", "1")
+        not in {"0", "false", "False"}
+        and group_count
+        <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_GROUPS", "64"))
+        and child_count
+        <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_CHILDREN", "4"))
+        and int(raw_node_repr.shape[0])
+        <= int(os.environ.get("HSA_CUTE_CHILD_GAT_FUSED_CTA_MAX_STATE_ROWS", "8192"))
+        and bucket_size <= 64
+        and int(n_heads) == 2
+        and int(head_dim) == 64
+        and raw_node_repr.shape == node_repr.shape == node_repr_normalized_flat.shape
+        and raw_node_repr.dtype
+        == node_repr.dtype
+        == node_repr_normalized_flat.dtype
+        == base.dtype
+        == q.dtype
+        == child_norm_weight.dtype
+        == child_norm_bias.dtype
+        == k_weight.dtype
+        == v_weight.dtype
+        == out_weight.dtype
+        == out_bias.dtype
+        == key_proj_weight.dtype
+        == key_proj_bias.dtype
+        == key_norm_weight.dtype
+        == key_norm_bias.dtype
+        and child_norm_weight.shape == (128,)
+        and child_norm_bias.shape == (128,)
+        and k_weight.shape == (128, 128)
+        and v_weight.shape == (128, 128)
+        and out_weight.shape == (128, 128)
+        and key_proj_weight.shape == (128, 128)
+    )
+    if use_fused_cta:
+        with _maybe_arhsa_benchmark_stage(
+            "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.fused_cta"
+        ):
+            return run_arhsa_child_gat_state_forward_cta(
+                raw_node_repr,
+                node_repr,
+                node_repr_normalized_flat,
+                parent_rows,
+                child_rows_flat,
+                child_mask,
+                base,
+                q,
+                child_norm_weight,
+                child_norm_bias,
+                k_weight,
+                v_weight,
+                out_weight,
+                out_bias,
+                key_proj_weight,
+                key_proj_bias,
+                key_norm_weight,
+                key_norm_bias,
+                child_norm_eps=float(child_norm_eps),
+                key_norm_eps=float(key_norm_eps),
+                n_heads=int(n_heads),
+                head_dim=int(head_dim),
+            )
+
+    use_cute_gather_ln = (
+        os.environ.get("HSA_CUTE_CHILD_GAT_GATHER_LN", "1")
+        not in {"0", "false", "False"}
+        and child_count
+        <= int(os.environ.get("HSA_CUTE_CHILD_GAT_GATHER_LN_MAX_M", "1048576"))
+        and child_norm_weight.shape == (128,)
+        and child_norm_bias.shape == (128,)
+    )
+    if use_cute_gather_ln:
+        with _maybe_arhsa_benchmark_stage(
+            "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.gather_ln_cute"
+        ):
+            child_norm, child_x_hat, child_rstd = run_arhsa_row_gather_layer_norm(
+                raw_node_repr,
+                child_rows_flat,
+                child_norm_weight,
+                child_norm_bias,
+                float(child_norm_eps),
+            )
+    else:
+        with _maybe_arhsa_benchmark_stage(
+            "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.gather_ln_torch"
+        ):
+            child_repr = run_arhsa_row_gather_2d(raw_node_repr, child_rows_flat).view(
+                group_count,
+                bucket_size,
+                d_model,
+            )
+            child_2d = child_repr.reshape(-1, d_model)
+            child_norm, child_x_hat, child_rstd = _arhsa_layer_norm_forward_torch(
+                child_2d,
+                child_norm_weight,
+                child_norm_bias,
+                float(child_norm_eps),
+            )
+
+    use_cute_kv_gemm = (
+        os.environ.get("HSA_CUTE_CHILD_GAT_KV_GEMM", "1") not in {"0", "false", "False"}
+        and int(child_norm.shape[0]) >= int(os.environ.get("HSA_CUTE_CHILD_GAT_KV_GEMM_MIN_M", "128"))
+        and int(child_norm.shape[0]) % 128 == 0
+        and k_weight.shape == (128, 128)
+        and v_weight.shape == (128, 128)
+        and child_norm.dtype == k_weight.dtype == v_weight.dtype
+    )
+    with _maybe_arhsa_benchmark_stage(
+        "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.kv_projection"
+    ):
+        if use_cute_kv_gemm:
+            k_flat, v_flat = run_arhsa_child_gat_kv_projection(
+                child_norm,
+                k_weight,
+                v_weight,
+            )
+        elif (
+            os.environ.get("HSA_CUTE_CHILD_GAT_KV_GEMM_SMALL", "1")
+            not in {"0", "false", "False"}
+            and int(child_norm.shape[0])
+            <= int(os.environ.get("HSA_CUTE_CHILD_GAT_KV_GEMM_SMALL_MAX_M", "127"))
+            and int(child_norm.shape[1]) == 128
+            and k_weight.shape == (128, 128)
+            and v_weight.shape == (128, 128)
+            and child_norm.dtype == k_weight.dtype == v_weight.dtype
+        ):
+            k_flat, v_flat = run_arhsa_child_gat_kv_projection_small(
+                child_norm,
+                k_weight,
+                v_weight,
+            )
+        else:
+            k_flat = torch.nn.functional.linear(child_norm, k_weight)
+            v_flat = torch.nn.functional.linear(child_norm, v_weight)
+        k = k_flat.view(group_count, bucket_size, int(n_heads), int(head_dim))
+        v = v_flat.view(group_count, bucket_size, int(n_heads), int(head_dim))
+
+    use_cute_score_reduce = (
+        os.environ.get("HSA_CUTE_CHILD_GAT_SCORE_REDUCE", "1") not in {"0", "false", "False"}
+        and bucket_size <= 64
+        and int(n_heads) <= 4
+        and int(head_dim) == 64
+    )
+    with _maybe_arhsa_benchmark_stage(
+        "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.score_reduce"
+    ):
+        if use_cute_score_reduce:
+            attn, attended = run_arhsa_child_gat_score_reduce(
+                k,
+                v,
+                child_mask,
+                q,
+            )
+        else:
+            scores = (
+                k * q.to(device=k.device, dtype=k.dtype).view(1, 1, int(n_heads), int(head_dim))
+            ).sum(dim=-1) * (float(head_dim) ** -0.5)
+            scores = scores.masked_fill(
+                ~child_mask.unsqueeze(-1),
+                torch.finfo(scores.dtype).min,
+            )
+            attn = torch.softmax(scores, dim=1)
+            attended = (attn.unsqueeze(-1) * v).sum(dim=1).reshape(group_count, d_model)
+
+    use_cute_projection_pipeline = (
+        os.environ.get("HSA_CUTE_CHILD_GAT_PROJ_PIPELINE", "1") not in {"0", "false", "False"}
+        and group_count >= int(os.environ.get("HSA_CUTE_CHILD_GAT_PROJ_PIPELINE_MIN_M", "128"))
+        and group_count <= int(os.environ.get("HSA_CUTE_CHILD_GAT_PROJ_PIPELINE_MAX_M", "16384"))
+        and int(raw_node_repr.shape[0])
+        <= int(os.environ.get("HSA_CUTE_CHILD_GAT_PROJ_PIPELINE_MAX_STATE_ROWS", "1048576"))
+        and group_count % 128 == 0
+        and int(n_heads) <= 8
+        and raw_node_repr.shape == node_repr.shape
+        and raw_node_repr.dtype
+        == node_repr.dtype
+        == node_repr_normalized_flat.dtype
+        == attended.dtype
+        == out_weight.dtype
+        == out_bias.dtype
+        == base.dtype
+        == key_proj_weight.dtype
+        == key_proj_bias.dtype
+        == key_norm_weight.dtype
+        == key_norm_bias.dtype
+        and out_weight.shape == (128, 128)
+        and key_proj_weight.shape == (128, 128)
+    )
+    if use_cute_projection_pipeline:
+        with _maybe_arhsa_benchmark_stage(
+            "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.out_projection_write"
+        ):
+            parent_raw = run_arhsa_out_projection_write(
+                attended,
+                out_weight,
+                out_bias,
+                base,
+                parent_rows,
+                raw_node_repr,
+            )
+        use_key_gemm_epilogue = (
+            os.environ.get("HSA_CUTE_CHILD_GAT_KEY_GEMM_EPILOGUE", "1")
+            not in {"0", "false", "False"}
+            and group_count
+            <= int(os.environ.get("HSA_CUTE_CHILD_GAT_KEY_GEMM_EPILOGUE_MAX_M", "1048576"))
+        )
+        if use_key_gemm_epilogue:
+            with _maybe_arhsa_benchmark_stage(
+                "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.key_projection_norm_write"
+            ):
+                (
+                    proj_rows,
+                    key_x_hat,
+                    key_rstd,
+                    normalized_rows,
+                    norm_denom,
+                ) = run_arhsa_key_projection_norm_write(
+                    parent_raw,
+                    key_proj_weight,
+                    key_proj_bias,
+                    key_norm_weight,
+                    key_norm_bias,
+                    parent_rows,
+                    node_repr,
+                    node_repr_normalized_flat,
+                    key_norm_eps=float(key_norm_eps),
+                    n_heads=int(n_heads),
+                    head_dim=int(head_dim),
+                )
+        else:
+            with _maybe_arhsa_benchmark_stage(
+                "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.key_projection_postprocess"
+            ):
+                key_projected = run_arhsa_dense_gemm_128(parent_raw, key_proj_weight)
+                (
+                    proj_rows,
+                    key_x_hat,
+                    key_rstd,
+                    normalized_rows,
+                    norm_denom,
+                ) = run_arhsa_key_projection_postprocess(
+                    key_projected,
+                    key_proj_bias,
+                    key_norm_weight,
+                    key_norm_bias,
+                    parent_rows,
+                    node_repr,
+                    node_repr_normalized_flat,
+                    key_norm_eps=float(key_norm_eps),
+                    n_heads=int(n_heads),
+                    head_dim=int(head_dim),
+                )
+    else:
+        use_small_projection = (
+            os.environ.get("HSA_CUTE_CHILD_GAT_SMALL_PROJ_WRITE", "1")
+            not in {"0", "false", "False"}
+            and group_count <= int(os.environ.get("HSA_CUTE_CHILD_GAT_SMALL_PROJ_WRITE_MAX_M", "127"))
+            and int(n_heads) == 2
+            and int(head_dim) == 64
+            and raw_node_repr.shape == node_repr.shape == node_repr_normalized_flat.shape
+            and raw_node_repr.dtype
+            == node_repr.dtype
+            == node_repr_normalized_flat.dtype
+            == out_weight.dtype
+            == key_proj_weight.dtype
+        )
+        if use_small_projection:
+            with _maybe_arhsa_benchmark_stage(
+                "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.projection_small_cute"
+            ):
+                (
+                    parent_raw,
+                    proj_rows,
+                    key_x_hat,
+                    key_rstd,
+                    normalized_rows,
+                    norm_denom,
+                ) = run_arhsa_projection_norm_write_small(
+                    attended,
+                    out_weight,
+                    out_bias,
+                    base,
+                    key_proj_weight,
+                    key_proj_bias,
+                    key_norm_weight,
+                    key_norm_bias,
+                    parent_rows,
+                    raw_node_repr,
+                    node_repr,
+                    node_repr_normalized_flat,
+                    key_norm_eps=float(key_norm_eps),
+                    n_heads=int(n_heads),
+                    head_dim=int(head_dim),
+                )
+        else:
+            with _maybe_arhsa_benchmark_stage(
+                "forward.hsa.v3.layer.internal_aggregation.child_gat.tma_pipeline.projection_torch_write"
+            ):
+                parent_raw = torch.nn.functional.linear(attended, out_weight, out_bias)
+                parent_raw.add_(base)
+                key_projected = torch.nn.functional.linear(parent_raw, key_proj_weight, key_proj_bias)
+                proj_rows, key_x_hat, key_rstd = _arhsa_layer_norm_forward_torch(
+                    key_projected,
+                    key_norm_weight,
+                    key_norm_bias,
+                    float(key_norm_eps),
+                )
+                proj_view = proj_rows.reshape(group_count, int(n_heads), int(head_dim))
+                norm_denom = proj_view.norm(dim=-1, keepdim=True).clamp_min(1.0e-12)
+                normalized_rows = proj_view / norm_denom
+                run_arhsa_row_write_2d_triple_(
+                    raw_node_repr,
+                    node_repr,
+                    node_repr_normalized_flat,
+                    parent_rows,
+                    parent_raw.to(dtype=raw_node_repr.dtype),
+                    proj_rows.to(dtype=node_repr.dtype),
+                    normalized_rows.reshape(group_count, d_model).to(
+                        dtype=node_repr_normalized_flat.dtype
+                    ),
+                )
+
+    return (
+        child_x_hat,
+        child_rstd,
+        child_norm,
+        k,
+        v,
+        attn,
+        attended,
+        parent_raw,
+        key_x_hat,
+        key_rstd,
+        proj_rows,
+        normalized_rows,
+        norm_denom,
+    )
 
 
 def run_arhsa_child_gat_state_forward(
@@ -13485,12 +16955,32 @@ run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
 )
 run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
 run_arhsa_row_gather_2d_triple.compile_cache = get_jit_cache("arhsa_row_gather_2d_triple")
+run_arhsa_row_gather_layer_norm.compile_cache = get_jit_cache("arhsa_row_gather_layer_norm_v2")
 run_arhsa_row_gather_2d_backward.compile_cache = get_jit_cache("arhsa_row_gather_2d_backward")
 run_arhsa_row_write_2d_.compile_cache = get_jit_cache("arhsa_row_write_2d")
 run_arhsa_row_write_2d_triple_.compile_cache = get_jit_cache("arhsa_row_write_2d_triple")
-run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128")
-run_arhsa_child_gat_kv_projection.compile_cache = get_jit_cache("arhsa_child_gat_kv_gemm")
-run_arhsa_child_gat_score_reduce.compile_cache = get_jit_cache("arhsa_child_gat_score_reduce")
+run_arhsa_dense_gemm_128.compile_cache = get_jit_cache("arhsa_dense_gemm_128_v2")
+run_arhsa_out_projection_write.compile_cache = get_jit_cache("arhsa_out_projection_write_v3")
+run_arhsa_key_projection_postprocess.compile_cache = get_jit_cache(
+    "arhsa_key_projection_postprocess_v2"
+)
+run_arhsa_key_projection_norm_write.compile_cache = get_jit_cache(
+    "arhsa_key_projection_norm_write_gemm_v7"
+)
+run_arhsa_projection_norm_write_small.compile_cache = get_jit_cache(
+    "arhsa_projection_norm_write_small_v1"
+)
+run_arhsa_child_gat_state_forward_cta.compile_cache = get_jit_cache(
+    "arhsa_child_gat_state_forward_cta_v1"
+)
+run_arhsa_child_gat_kv_projection_small.compile_cache = get_jit_cache(
+    "arhsa_child_gat_kv_projection_small_v1"
+)
+run_arhsa_child_gat_kv_projection.compile_cache = get_jit_cache("arhsa_child_gat_kv_gemm_v2")
+run_arhsa_child_gat_score_reduce.compile_cache = get_jit_cache("arhsa_child_gat_score_reduce_v3")
+run_arhsa_child_gat_score_reduce_backward.compile_cache = get_jit_cache(
+    "arhsa_child_gat_score_reduce_backward_v3"
+)
 run_arhsa_child_gat_state_forward.compile_cache = get_jit_cache("arhsa_child_gat_state_forward")
 run_arhsa_leaf_readout.compile_cache = get_jit_cache("arhsa_leaf_readout")
 run_arhsa_pack_leaf_values.compile_cache = get_jit_cache("arhsa_pack_leaf_values")

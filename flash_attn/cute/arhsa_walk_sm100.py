@@ -2246,6 +2246,515 @@ class ARHSAV3StartWeightBackwardSm100:
             mGradStartMass[query_idx, head_idx] = bar_mass.to(mGradStartMass.element_type)
 
 
+class ARHSAV3StartInitialStateForwardSm100:
+    """Packed v3 start-weight normalization that writes initial walk state."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mP0: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mStartScores,
+            mOpenScores,
+            mSelfMass,
+            mStartRowPtr,
+            mGroupIndex,
+            mIncludeOpen,
+            mP0,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mP0: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mStartScores.shape[1])
+            n_groups = Int32(mOpenScores.shape[1])
+            n_starts = Int32(mStartScores.shape[0])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            neg_inf = Float32(-3.4028234663852886e38)
+            max0 = neg_inf
+            max1 = neg_inf
+            max2 = neg_inf
+            max3 = neg_inf
+            has0 = Int32(0)
+            has1 = Int32(0)
+            has2 = Int32(0)
+            has3 = Int32(0)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    has0 = Int32(1)
+                    if score > max0:
+                        max0 = score
+                elif g == Int32(1):
+                    has1 = Int32(1)
+                    if score > max1:
+                        max1 = score
+                elif g == Int32(2):
+                    has2 = Int32(1)
+                    if score > max2:
+                        max2 = score
+                elif g == Int32(3):
+                    has3 = Int32(1)
+                    if score > max3:
+                        max3 = score
+
+            inc0 = has0 != Int32(0) and n_groups > Int32(0) and Int32(mIncludeOpen[0]) != Int32(0)
+            inc1 = has1 != Int32(0) and n_groups > Int32(1) and Int32(mIncludeOpen[1]) != Int32(0)
+            inc2 = has2 != Int32(0) and n_groups > Int32(2) and Int32(mIncludeOpen[2]) != Int32(0)
+            inc3 = has3 != Int32(0) and n_groups > Int32(3) and Int32(mIncludeOpen[3]) != Int32(0)
+            open0 = Float32.zero
+            open1 = Float32.zero
+            open2 = Float32.zero
+            open3 = Float32.zero
+            if n_groups > Int32(0):
+                open0 = Float32(mOpenScores[query_idx, 0, head_idx])
+                if inc0 and open0 > max0:
+                    max0 = open0
+            if n_groups > Int32(1):
+                open1 = Float32(mOpenScores[query_idx, 1, head_idx])
+                if inc1 and open1 > max1:
+                    max1 = open1
+            if n_groups > Int32(2):
+                open2 = Float32(mOpenScores[query_idx, 2, head_idx])
+                if inc2 and open2 > max2:
+                    max2 = open2
+            if n_groups > Int32(3):
+                open3 = Float32(mOpenScores[query_idx, 3, head_idx])
+                if inc3 and open3 > max3:
+                    max3 = open3
+
+            sum0 = Float32.zero
+            sum1 = Float32.zero
+            sum2 = Float32.zero
+            sum3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    sum0 += cute.math.exp2((score - max0) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(1):
+                    sum1 += cute.math.exp2((score - max1) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(2):
+                    sum2 += cute.math.exp2((score - max2) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(3):
+                    sum3 += cute.math.exp2((score - max3) * Float32(_LOG2_E), fastmath=True)
+
+            open_exp0 = Float32.zero
+            open_exp1 = Float32.zero
+            open_exp2 = Float32.zero
+            open_exp3 = Float32.zero
+            if inc0:
+                open_exp0 = cute.math.exp2((open0 - max0) * Float32(_LOG2_E), fastmath=True)
+            if inc1:
+                open_exp1 = cute.math.exp2((open1 - max1) * Float32(_LOG2_E), fastmath=True)
+            if inc2:
+                open_exp2 = cute.math.exp2((open2 - max2) * Float32(_LOG2_E), fastmath=True)
+            if inc3:
+                open_exp3 = cute.math.exp2((open3 - max3) * Float32(_LOG2_E), fastmath=True)
+            den0 = sum0 + open_exp0
+            den1 = sum1 + open_exp1
+            den2 = sum2 + open_exp2
+            den3 = sum3 + open_exp3
+            if den0 < Float32(1.0e-8):
+                den0 = Float32(1.0e-8)
+            if den1 < Float32(1.0e-8):
+                den1 = Float32(1.0e-8)
+            if den2 < Float32(1.0e-8):
+                den2 = Float32(1.0e-8)
+            if den3 < Float32(1.0e-8):
+                den3 = Float32(1.0e-8)
+            c0 = Float32(1.0)
+            c1 = Float32(1.0)
+            c2 = Float32(1.0)
+            c3 = Float32(1.0)
+            if has0 != Int32(0):
+                c0 = open_exp0 / den0
+            if has1 != Int32(0):
+                c1 = open_exp1 / den1
+            if has2 != Int32(0):
+                c2 = open_exp2 / den2
+            if has3 != Int32(0):
+                c3 = open_exp3 / den3
+            carry0 = Float32(1.0)
+            carry1 = c0
+            carry2 = c0 * c1
+            carry3 = c0 * c1 * c2
+            self_mass = Float32(mSelfMass[query_idx, head_idx])
+            mass = Float32(1.0) - self_mass
+            mP0[n_starts + query_idx, head_idx] = self_mass.to(mP0.element_type)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                mP0[ptr, head_idx] = (mass * carry * prob).to(mP0.element_type)
+
+
+class ARHSAV3StartInitialStateBackwardSm100:
+    """Backward for packed start normalization plus initial-state write."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mGradP0: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mGradStartScores: cute.Tensor,
+        mGradOpenScores: cute.Tensor,
+        mGradSelfMass: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mStartScores,
+            mOpenScores,
+            mSelfMass,
+            mGradP0,
+            mStartRowPtr,
+            mGroupIndex,
+            mIncludeOpen,
+            mGradStartScores,
+            mGradOpenScores,
+            mGradSelfMass,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartScores: cute.Tensor,
+        mOpenScores: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mGradP0: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mGroupIndex: cute.Tensor,
+        mIncludeOpen: cute.Tensor,
+        mGradStartScores: cute.Tensor,
+        mGradOpenScores: cute.Tensor,
+        mGradSelfMass: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mStartScores.shape[1])
+            n_groups = Int32(mOpenScores.shape[1])
+            n_starts = Int32(mStartScores.shape[0])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            neg_inf = Float32(-3.4028234663852886e38)
+            max0 = neg_inf
+            max1 = neg_inf
+            max2 = neg_inf
+            max3 = neg_inf
+            has0 = Int32(0)
+            has1 = Int32(0)
+            has2 = Int32(0)
+            has3 = Int32(0)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    has0 = Int32(1)
+                    if score > max0:
+                        max0 = score
+                elif g == Int32(1):
+                    has1 = Int32(1)
+                    if score > max1:
+                        max1 = score
+                elif g == Int32(2):
+                    has2 = Int32(1)
+                    if score > max2:
+                        max2 = score
+                elif g == Int32(3):
+                    has3 = Int32(1)
+                    if score > max3:
+                        max3 = score
+            inc0 = has0 != Int32(0) and n_groups > Int32(0) and Int32(mIncludeOpen[0]) != Int32(0)
+            inc1 = has1 != Int32(0) and n_groups > Int32(1) and Int32(mIncludeOpen[1]) != Int32(0)
+            inc2 = has2 != Int32(0) and n_groups > Int32(2) and Int32(mIncludeOpen[2]) != Int32(0)
+            inc3 = has3 != Int32(0) and n_groups > Int32(3) and Int32(mIncludeOpen[3]) != Int32(0)
+            open0 = Float32.zero
+            open1 = Float32.zero
+            open2 = Float32.zero
+            open3 = Float32.zero
+            if n_groups > Int32(0):
+                open0 = Float32(mOpenScores[query_idx, 0, head_idx])
+                if inc0 and open0 > max0:
+                    max0 = open0
+            if n_groups > Int32(1):
+                open1 = Float32(mOpenScores[query_idx, 1, head_idx])
+                if inc1 and open1 > max1:
+                    max1 = open1
+            if n_groups > Int32(2):
+                open2 = Float32(mOpenScores[query_idx, 2, head_idx])
+                if inc2 and open2 > max2:
+                    max2 = open2
+            if n_groups > Int32(3):
+                open3 = Float32(mOpenScores[query_idx, 3, head_idx])
+                if inc3 and open3 > max3:
+                    max3 = open3
+            sum0 = Float32.zero
+            sum1 = Float32.zero
+            sum2 = Float32.zero
+            sum3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                if g == Int32(0):
+                    sum0 += cute.math.exp2((score - max0) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(1):
+                    sum1 += cute.math.exp2((score - max1) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(2):
+                    sum2 += cute.math.exp2((score - max2) * Float32(_LOG2_E), fastmath=True)
+                elif g == Int32(3):
+                    sum3 += cute.math.exp2((score - max3) * Float32(_LOG2_E), fastmath=True)
+            open_exp0 = Float32.zero
+            open_exp1 = Float32.zero
+            open_exp2 = Float32.zero
+            open_exp3 = Float32.zero
+            if inc0:
+                open_exp0 = cute.math.exp2((open0 - max0) * Float32(_LOG2_E), fastmath=True)
+            if inc1:
+                open_exp1 = cute.math.exp2((open1 - max1) * Float32(_LOG2_E), fastmath=True)
+            if inc2:
+                open_exp2 = cute.math.exp2((open2 - max2) * Float32(_LOG2_E), fastmath=True)
+            if inc3:
+                open_exp3 = cute.math.exp2((open3 - max3) * Float32(_LOG2_E), fastmath=True)
+            den0 = sum0 + open_exp0
+            den1 = sum1 + open_exp1
+            den2 = sum2 + open_exp2
+            den3 = sum3 + open_exp3
+            if den0 < Float32(1.0e-8):
+                den0 = Float32(1.0e-8)
+            if den1 < Float32(1.0e-8):
+                den1 = Float32(1.0e-8)
+            if den2 < Float32(1.0e-8):
+                den2 = Float32(1.0e-8)
+            if den3 < Float32(1.0e-8):
+                den3 = Float32(1.0e-8)
+            c0 = Float32(1.0)
+            c1 = Float32(1.0)
+            c2 = Float32(1.0)
+            c3 = Float32(1.0)
+            if has0 != Int32(0):
+                c0 = open_exp0 / den0
+            if has1 != Int32(0):
+                c1 = open_exp1 / den1
+            if has2 != Int32(0):
+                c2 = open_exp2 / den2
+            if has3 != Int32(0):
+                c3 = open_exp3 / den3
+            carry0 = Float32(1.0)
+            carry1 = c0
+            carry2 = c0 * c1
+            carry3 = c0 * c1 * c2
+            mass = Float32(1.0) - Float32(mSelfMass[query_idx, head_idx])
+            bar_mass = Float32.zero
+            bar_carry0 = Float32.zero
+            bar_carry1 = Float32.zero
+            bar_carry2 = Float32.zero
+            bar_carry3 = Float32.zero
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad = Float32(mGradP0[ptr, head_idx])
+                bar_mass += grad * carry * prob
+                bar_carry = grad * mass * prob
+                if g == Int32(0):
+                    bar_carry0 += bar_carry
+                elif g == Int32(1):
+                    bar_carry1 += bar_carry
+                elif g == Int32(2):
+                    bar_carry2 += bar_carry
+                elif g == Int32(3):
+                    bar_carry3 += bar_carry
+            bar_c0 = Float32.zero
+            bar_c1 = Float32.zero
+            bar_c2 = Float32.zero
+            bar_c3 = Float32.zero
+            if n_groups > Int32(3):
+                bar_c2 += bar_carry3 * carry2
+                bar_carry2 += bar_carry3 * c2
+            if n_groups > Int32(2):
+                bar_c1 += bar_carry2 * carry1
+                bar_carry1 += bar_carry2 * c1
+            if n_groups > Int32(1):
+                bar_c0 += bar_carry1 * carry0
+                bar_carry0 += bar_carry1 * c0
+            dot0 = bar_c0 * c0
+            dot1 = bar_c1 * c1
+            dot2 = bar_c2 * c2
+            dot3 = bar_c3 * c3
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                dot = dot0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                    dot = dot1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                    dot = dot2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                    dot = dot3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad_prob = Float32(mGradP0[ptr, head_idx]) * mass * carry
+                if g == Int32(0):
+                    dot0 += grad_prob * prob
+                elif g == Int32(1):
+                    dot1 += grad_prob * prob
+                elif g == Int32(2):
+                    dot2 += grad_prob * prob
+                elif g == Int32(3):
+                    dot3 += grad_prob * prob
+            open_grad0 = Float32.zero
+            open_grad1 = Float32.zero
+            open_grad2 = Float32.zero
+            open_grad3 = Float32.zero
+            if inc0:
+                open_grad0 = c0 * (bar_c0 - dot0)
+            if inc1:
+                open_grad1 = c1 * (bar_c1 - dot1)
+            if inc2:
+                open_grad2 = c2 * (bar_c2 - dot2)
+            if inc3:
+                open_grad3 = c3 * (bar_c3 - dot3)
+            if n_groups > Int32(0):
+                mGradOpenScores[query_idx, 0, head_idx] = open_grad0.to(mGradOpenScores.element_type)
+            if n_groups > Int32(1):
+                mGradOpenScores[query_idx, 1, head_idx] = open_grad1.to(mGradOpenScores.element_type)
+            if n_groups > Int32(2):
+                mGradOpenScores[query_idx, 2, head_idx] = open_grad2.to(mGradOpenScores.element_type)
+            if n_groups > Int32(3):
+                mGradOpenScores[query_idx, 3, head_idx] = open_grad3.to(mGradOpenScores.element_type)
+            for ptr in cutlass.range(start, end, unroll=1):
+                g = Int32(mGroupIndex[ptr])
+                score = Float32(mStartScores[ptr, head_idx])
+                carry = carry0
+                row_max = max0
+                denom = den0
+                dot = dot0
+                if g == Int32(1):
+                    carry = carry1
+                    row_max = max1
+                    denom = den1
+                    dot = dot1
+                elif g == Int32(2):
+                    carry = carry2
+                    row_max = max2
+                    denom = den2
+                    dot = dot2
+                elif g == Int32(3):
+                    carry = carry3
+                    row_max = max3
+                    denom = den3
+                    dot = dot3
+                prob = cute.math.exp2((score - row_max) * Float32(_LOG2_E), fastmath=True) / denom
+                grad_prob = Float32(mGradP0[ptr, head_idx]) * mass * carry
+                mGradStartScores[ptr, head_idx] = (prob * (grad_prob - dot)).to(
+                    mGradStartScores.element_type
+                )
+            tail_grad = Float32(mGradP0[n_starts + query_idx, head_idx])
+            mGradSelfMass[query_idx, head_idx] = (tail_grad - bar_mass).to(
+                mGradSelfMass.element_type
+            )
+
+
 class ARHSASampledEdgeDstDotSm100:
     """Sample q[level(dst)] dot row_repr(dst) directly for ARHSAv2 edges."""
 
@@ -10529,6 +11038,201 @@ def run_arhsa_v3_start_weight_backward(
     return grad_start_scores, grad_open_scores, grad_start_mass
 
 
+def run_arhsa_v3_start_initial_state_forward(
+    start_scores: torch.Tensor,
+    open_scores: torch.Tensor,
+    self_mass: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    group_index: torch.Tensor,
+    include_open: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize packed ARHSAv3 start weights and write the initial state."""
+    _require_cute_runtime()
+    if start_scores.device.type != "cuda":
+        raise ValueError("start_scores must be a CUDA tensor")
+    if start_scores.ndim != 2:
+        raise ValueError(f"start_scores must have shape [n_starts, n_heads], got {tuple(start_scores.shape)}")
+    if open_scores.ndim != 3:
+        raise ValueError(f"open_scores must have shape [n_queries, n_groups, n_heads], got {tuple(open_scores.shape)}")
+    if self_mass.shape != (open_scores.shape[0], start_scores.shape[1]):
+        raise ValueError(f"self_mass shape mismatch: got {tuple(self_mass.shape)}")
+    if start_row_ptr.shape != (open_scores.shape[0] + 1,):
+        raise ValueError(f"start_row_ptr shape mismatch: got {tuple(start_row_ptr.shape)}")
+    if group_index.shape != (start_scores.shape[0],):
+        raise ValueError(f"group_index shape mismatch: got {tuple(group_index.shape)}")
+    if include_open.shape != (open_scores.shape[1],):
+        raise ValueError(f"include_open shape mismatch: got {tuple(include_open.shape)}")
+    for tensor_name, tensor in (
+        ("start_scores", start_scores),
+        ("open_scores", open_scores),
+        ("self_mass", self_mass),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    expected_shape = (
+        start_scores.shape[0] + open_scores.shape[0],
+        start_scores.shape[1],
+    )
+    if out is None:
+        out = torch.empty(expected_shape, dtype=start_scores.dtype, device=start_scores.device)
+    if out.shape != expected_shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_shape}")
+
+    start_scores = start_scores.contiguous()
+    open_scores = open_scores.contiguous()
+    self_mass = self_mass.contiguous()
+    out = out.contiguous()
+    start_row_ptr = start_row_ptr.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    group_index = group_index.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    include_open = include_open.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    total_tasks = int(open_scores.shape[0] * start_scores.shape[1])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_v3_start_initial_state_forward",
+        start_scores.dtype,
+        open_scores.dtype,
+        self_mass.dtype,
+        out.dtype,
+        start_scores.shape[1],
+        open_scores.shape[1],
+        torch.cuda.get_device_capability(start_scores.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_initial_state_forward.compile_cache:
+        op = ARHSAV3StartInitialStateForwardSm100()
+        run_arhsa_v3_start_initial_state_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(start_scores),
+            to_cute_tensor(open_scores),
+            to_cute_tensor(self_mass),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(group_index, assumed_align=4),
+            to_cute_tensor(include_open, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_initial_state_forward.compile_cache[compile_key](
+        start_scores,
+        open_scores,
+        self_mass,
+        start_row_ptr,
+        group_index,
+        include_open,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_v3_start_initial_state_backward(
+    start_scores: torch.Tensor,
+    open_scores: torch.Tensor,
+    self_mass: torch.Tensor,
+    grad_p0: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    group_index: torch.Tensor,
+    include_open: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for packed ARHSAv3 start normalization plus initial state."""
+    _require_cute_runtime()
+    if start_scores.device.type != "cuda":
+        raise ValueError("start_scores must be a CUDA tensor")
+    if start_scores.ndim != 2:
+        raise ValueError("start_scores must have shape [n_starts, n_heads]")
+    if open_scores.ndim != 3 or open_scores.shape[2] != start_scores.shape[1]:
+        raise ValueError("open_scores must have shape [n_queries, n_groups, n_heads]")
+    if self_mass.shape != (open_scores.shape[0], start_scores.shape[1]):
+        raise ValueError(f"self_mass shape mismatch: got {tuple(self_mass.shape)}")
+    expected_grad_shape = (
+        start_scores.shape[0] + open_scores.shape[0],
+        start_scores.shape[1],
+    )
+    if grad_p0.shape != expected_grad_shape:
+        raise ValueError(f"grad_p0 shape mismatch: got {tuple(grad_p0.shape)}, expected {expected_grad_shape}")
+    if start_row_ptr.shape != (open_scores.shape[0] + 1,):
+        raise ValueError(f"start_row_ptr shape mismatch: got {tuple(start_row_ptr.shape)}")
+    if group_index.shape != (start_scores.shape[0],):
+        raise ValueError(f"group_index shape mismatch: got {tuple(group_index.shape)}")
+    if include_open.shape != (open_scores.shape[1],):
+        raise ValueError(f"include_open shape mismatch: got {tuple(include_open.shape)}")
+    for tensor_name, tensor in (
+        ("start_scores", start_scores),
+        ("open_scores", open_scores),
+        ("self_mass", self_mass),
+        ("grad_p0", grad_p0),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_start_scores = torch.empty_like(start_scores)
+    grad_open_scores = torch.empty_like(open_scores)
+    grad_self_mass = torch.empty_like(self_mass)
+    start_scores = start_scores.contiguous()
+    open_scores = open_scores.contiguous()
+    self_mass = self_mass.contiguous()
+    grad_p0 = grad_p0.contiguous()
+    start_row_ptr = start_row_ptr.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    group_index = group_index.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    include_open = include_open.to(device=start_scores.device, dtype=torch.int32).contiguous()
+    total_tasks = int(open_scores.shape[0] * start_scores.shape[1])
+    if total_tasks == 0:
+        return grad_start_scores, grad_open_scores, grad_self_mass
+
+    compile_key = (
+        "arhsa_v3_start_initial_state_backward",
+        start_scores.dtype,
+        open_scores.dtype,
+        self_mass.dtype,
+        grad_p0.dtype,
+        grad_start_scores.dtype,
+        grad_open_scores.dtype,
+        grad_self_mass.dtype,
+        start_scores.shape[1],
+        open_scores.shape[1],
+        torch.cuda.get_device_capability(start_scores.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_initial_state_backward.compile_cache:
+        op = ARHSAV3StartInitialStateBackwardSm100()
+        run_arhsa_v3_start_initial_state_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(start_scores),
+            to_cute_tensor(open_scores),
+            to_cute_tensor(self_mass),
+            to_cute_tensor(grad_p0),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(group_index, assumed_align=4),
+            to_cute_tensor(include_open, assumed_align=4),
+            to_cute_tensor(grad_start_scores),
+            to_cute_tensor(grad_open_scores),
+            to_cute_tensor(grad_self_mass),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_initial_state_backward.compile_cache[compile_key](
+        start_scores,
+        open_scores,
+        self_mass,
+        grad_p0,
+        start_row_ptr,
+        group_index,
+        include_open,
+        grad_start_scores,
+        grad_open_scores,
+        grad_self_mass,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_start_scores, grad_open_scores, grad_self_mass
+
+
 def run_arhsa_sampled_edge_dst_dot(
     q_levels: torch.Tensor,
     row_repr: torch.Tensor,
@@ -16946,6 +17650,12 @@ run_arhsa_v3_start_weight_forward.compile_cache = get_jit_cache(
 )
 run_arhsa_v3_start_weight_backward.compile_cache = get_jit_cache(
     "arhsa_v3_start_weight_backward"
+)
+run_arhsa_v3_start_initial_state_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_start_initial_state_forward"
+)
+run_arhsa_v3_start_initial_state_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_start_initial_state_backward"
 )
 run_arhsa_sampled_edge_dst_dot.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot")
 run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_edge_dst_dot_backward")

@@ -4485,6 +4485,7 @@ class ARHSARowGatherLayerNormSm100:
 
     def __init__(self, *, num_threads: int = 128):
         self.num_threads = num_threads
+        self.num_warps = num_threads // 32
 
     @cute.jit
     def __call__(
@@ -4530,65 +4531,147 @@ class ARHSARowGatherLayerNormSm100:
         tidx, _, _ = cute.arch.thread_idx()
         row_idx, _, _ = cute.arch.block_idx()
         src_row = Int32(mRowIndex[row_idx])
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
 
         smem = cutlass.utils.SmemAllocator()
         sBuf = smem.allocate_tensor(
             Float32,
-            cute.make_layout((128,)),
+            cute.make_layout((4,)),
             byte_alignment=16,
         )
 
         x = Float32(mSrc[src_row, tidx])
-        sBuf[tidx] = x
+        warp_sum = cute_utils.warp_reduce(x, lambda a, b: a + b)
+        if lane == Int32(0):
+            sBuf[warp_idx] = warp_sum
         cute.arch.barrier()
 
-        if tidx < Int32(64):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
-        cute.arch.barrier()
-        if tidx < Int32(32):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
-        cute.arch.barrier()
-        if tidx < Int32(16):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
-        cute.arch.barrier()
-        if tidx < Int32(8):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
-        cute.arch.barrier()
-        if tidx < Int32(4):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
-        cute.arch.barrier()
-        if tidx < Int32(2):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
-        cute.arch.barrier()
-        if tidx < Int32(1):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+        row_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                row_sum = sBuf[lane]
+            row_sum = cute_utils.warp_reduce(row_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                sBuf[0] = row_sum
         cute.arch.barrier()
 
         mean = sBuf[0] * Float32(0.0078125)
         centered = x - mean
-        sBuf[tidx] = centered * centered
+        sq = centered * centered
+        warp_sq_sum = cute_utils.warp_reduce(sq, lambda a, b: a + b)
+        if lane == Int32(0):
+            sBuf[warp_idx] = warp_sq_sum
         cute.arch.barrier()
 
-        if tidx < Int32(64):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(64)]
+        row_sq_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                row_sq_sum = sBuf[lane]
+            row_sq_sum = cute_utils.warp_reduce(row_sq_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                sBuf[0] = row_sq_sum
         cute.arch.barrier()
-        if tidx < Int32(32):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(32)]
+
+        rstd = Float32(cute.math.rsqrt(sBuf[0] * Float32(0.0078125) + eps, fastmath=True))
+        x_hat = centered * rstd
+        mXHat[row_idx, tidx] = x_hat.to(mXHat.element_type)
+        mOut[row_idx, tidx] = (
+            x_hat * Float32(mWeight[tidx]) + Float32(mBias[tidx])
+        ).to(mOut.element_type)
+        if tidx == Int32(0):
+            mRstd[row_idx, 0] = rstd.to(mRstd.element_type)
+
+
+class ARHSALayerNormForward128Sm100:
+    """LayerNorm forward for contiguous [M, 128] rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.num_warps = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrc: cute.Tensor,
+        mWeight: cute.Tensor,
+        mBias: cute.Tensor,
+        mOut: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        eps: Float32,
+        total_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mSrc,
+            mWeight,
+            mBias,
+            mOut,
+            mXHat,
+            mRstd,
+            eps,
+        ).launch(
+            grid=[total_rows, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrc: cute.Tensor,
+        mWeight: cute.Tensor,
+        mBias: cute.Tensor,
+        mOut: cute.Tensor,
+        mXHat: cute.Tensor,
+        mRstd: cute.Tensor,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row_idx, _, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+
+        smem = cutlass.utils.SmemAllocator()
+        sBuf = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((4,)),
+            byte_alignment=16,
+        )
+
+        x = Float32(mSrc[row_idx, tidx])
+        warp_sum = cute_utils.warp_reduce(x, lambda a, b: a + b)
+        if lane == Int32(0):
+            sBuf[warp_idx] = warp_sum
         cute.arch.barrier()
-        if tidx < Int32(16):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(16)]
+
+        row_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                row_sum = sBuf[lane]
+            row_sum = cute_utils.warp_reduce(row_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                sBuf[0] = row_sum
         cute.arch.barrier()
-        if tidx < Int32(8):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(8)]
+
+        mean = sBuf[0] * Float32(0.0078125)
+        centered = x - mean
+        sq = centered * centered
+        warp_sq_sum = cute_utils.warp_reduce(sq, lambda a, b: a + b)
+        if lane == Int32(0):
+            sBuf[warp_idx] = warp_sq_sum
         cute.arch.barrier()
-        if tidx < Int32(4):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(4)]
-        cute.arch.barrier()
-        if tidx < Int32(2):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(2)]
-        cute.arch.barrier()
-        if tidx < Int32(1):
-            sBuf[tidx] = sBuf[tidx] + sBuf[tidx + Int32(1)]
+
+        row_sq_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                row_sq_sum = sBuf[lane]
+            row_sq_sum = cute_utils.warp_reduce(row_sq_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                sBuf[0] = row_sq_sum
         cute.arch.barrier()
 
         rstd = Float32(cute.math.rsqrt(sBuf[0] * Float32(0.0078125) + eps, fastmath=True))
@@ -4763,7 +4846,7 @@ class ARHSARowWrite2DTripleSm100:
 
 
 class ARHSALayerNormBackward128Sm100:
-    """One-warp layer-norm backward for contiguous [M, 128] rows."""
+    """One-warp layer-norm input backward for contiguous [M, 128] rows."""
 
     arch = 100
 
@@ -4822,14 +4905,6 @@ class ARHSALayerNormBackward128Sm100:
                 grad_xhat = grad_y * Float32(mWeight[dim_idx])
                 partial_grad += grad_xhat
                 partial_grad_xhat += grad_xhat * x_hat
-                cute_utils.atomic_add_fp32(
-                    grad_y * x_hat,
-                    cute_utils.elem_pointer(mGradWeight, (dim_idx,)),
-                )
-                cute_utils.atomic_add_fp32(
-                    grad_y,
-                    cute_utils.elem_pointer(mGradBias, (dim_idx,)),
-                )
             reduce_grad = cute_utils.warp_reduce(partial_grad, lambda a, b: a + b)
             reduce_grad_xhat = cute_utils.warp_reduce(partial_grad_xhat, lambda a, b: a + b)
             scale = Float32(mRstd[row_idx, 0]) * Float32(0.0078125)
@@ -4844,6 +4919,152 @@ class ARHSALayerNormBackward128Sm100:
                     - x_hat * reduce_grad_xhat
                 ) * scale
                 mGradX[row_idx, dim_idx] = grad_x.to(mGradX.element_type)
+
+
+class ARHSALayerNormParamGrad128Sm100:
+    """Column reductions for 128-wide LayerNorm weight and bias gradients."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+        self.num_warps = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradY: cute.Tensor,
+        mXHat: cute.Tensor,
+        mGradWeight: cute.Tensor,
+        mGradBias: cute.Tensor,
+        n_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mGradY,
+            mXHat,
+            mGradWeight,
+            mGradBias,
+            n_rows,
+        ).launch(
+            grid=[128, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradY: cute.Tensor,
+        mXHat: cute.Tensor,
+        mGradWeight: cute.Tensor,
+        mGradBias: cute.Tensor,
+        n_rows: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        col_idx, _, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+
+        weight_acc = Float32.zero
+        bias_acc = Float32.zero
+        for row_idx in cutlass.range(tidx, n_rows, self.num_threads, unroll=1):
+            grad_y = Float32(mGradY[row_idx, col_idx])
+            weight_acc += grad_y * Float32(mXHat[row_idx, col_idx])
+            bias_acc += grad_y
+
+        weight_warp = cute_utils.warp_reduce(weight_acc, lambda a, b: a + b)
+        bias_warp = cute_utils.warp_reduce(bias_acc, lambda a, b: a + b)
+        smem = cutlass.utils.SmemAllocator()
+        sWeight = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        sBias = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        if lane == Int32(0):
+            sWeight[warp_idx] = weight_warp
+            sBias[warp_idx] = bias_warp
+        cute.arch.barrier()
+
+        weight_sum = Float32.zero
+        bias_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                weight_sum = sWeight[lane]
+                bias_sum = sBias[lane]
+            weight_sum = cute_utils.warp_reduce(weight_sum, lambda a, b: a + b)
+            bias_sum = cute_utils.warp_reduce(bias_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                mGradWeight[col_idx] = weight_sum.to(mGradWeight.element_type)
+                mGradBias[col_idx] = bias_sum.to(mGradBias.element_type)
+
+
+class ARHSARowSum128Sm100:
+    """Column reduction for contiguous [M, 128] rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+        self.num_warps = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrc: cute.Tensor,
+        mOut: cute.Tensor,
+        n_rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mSrc,
+            mOut,
+            n_rows,
+        ).launch(
+            grid=[128, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrc: cute.Tensor,
+        mOut: cute.Tensor,
+        n_rows: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        col_idx, _, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+
+        acc = Float32.zero
+        for row_idx in cutlass.range(tidx, n_rows, self.num_threads, unroll=1):
+            acc += Float32(mSrc[row_idx, col_idx])
+
+        warp_sum = cute_utils.warp_reduce(acc, lambda a, b: a + b)
+        smem = cutlass.utils.SmemAllocator()
+        sWarp = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((8,)),
+            byte_alignment=16,
+        )
+        if lane == Int32(0):
+            sWarp[warp_idx] = warp_sum
+        cute.arch.barrier()
+
+        block_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                block_sum = sWarp[lane]
+            block_sum = cute_utils.warp_reduce(block_sum, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[col_idx] = block_sum.to(mOut.element_type)
 
 
 class ARHSAKeyNormBackward128Sm100:
@@ -14854,7 +15075,7 @@ def run_arhsa_row_gather_layer_norm(
         return out, x_hat, rstd
 
     compile_key = (
-        "arhsa_row_gather_layer_norm_v2",
+        "arhsa_row_gather_layer_norm_v3",
         src.dtype,
         out.dtype,
         total_rows,
@@ -14881,6 +15102,74 @@ def run_arhsa_row_gather_layer_norm(
     run_arhsa_row_gather_layer_norm.compile_cache[compile_key](
         src,
         row_index,
+        weight,
+        bias,
+        out,
+        x_hat,
+        rstd,
+        Float32(eps),
+        Int32(total_rows),
+        current_stream,
+    )
+    return out, x_hat, rstd
+
+
+def run_arhsa_layer_norm_forward_128(
+    src: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return LayerNorm output, x_hat, and rstd for contiguous [M, 128] rows."""
+    _require_cute_runtime()
+    if src.device.type != "cuda":
+        raise ValueError("src must be a CUDA tensor")
+    if src.ndim != 2 or int(src.shape[1]) != 128:
+        raise ValueError(f"src must have shape [M,128], got {tuple(src.shape)}")
+    if weight.shape != (128,) or bias.shape != (128,):
+        raise ValueError("weight and bias must have shape [128]")
+    if src.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"src dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    src = src.contiguous()
+    out_dtype = torch.promote_types(src.dtype, weight.dtype)
+    out_dtype = torch.promote_types(out_dtype, bias.dtype)
+    if out_dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"output dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out_dtype}")
+    weight = weight.to(device=src.device, dtype=out_dtype).contiguous()
+    bias = bias.to(device=src.device, dtype=out_dtype).contiguous()
+    out = torch.empty_like(src, dtype=out_dtype)
+    x_hat = torch.empty_like(out)
+    rstd = torch.empty((int(src.shape[0]), 1), dtype=out_dtype, device=src.device)
+    total_rows = int(src.shape[0])
+    if total_rows == 0:
+        return out, x_hat, rstd
+
+    compile_key = (
+        "arhsa_layer_norm_forward_128_v2",
+        src.dtype,
+        out.dtype,
+        total_rows,
+        torch.cuda.get_device_capability(src.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_layer_norm_forward_128.compile_cache:
+        op = ARHSALayerNormForward128Sm100()
+        run_arhsa_layer_norm_forward_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(src),
+            to_cute_tensor(weight),
+            to_cute_tensor(bias),
+            to_cute_tensor(out),
+            to_cute_tensor(x_hat),
+            to_cute_tensor(rstd),
+            Float32(eps),
+            Int32(total_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_layer_norm_forward_128.compile_cache[compile_key](
+        src,
         weight,
         bias,
         out,
@@ -15094,7 +15383,7 @@ def run_arhsa_layer_norm_backward_128(
     rstd: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run one-warp CuTe layer-norm backward for [M, 128] rows."""
+    """Run CuTe layer-norm backward for [M, 128] rows."""
     _require_cute_runtime()
     if grad_y.device.type != "cuda":
         raise ValueError("grad_y must be a CUDA tensor")
@@ -15115,14 +15404,16 @@ def run_arhsa_layer_norm_backward_128(
     rstd = rstd.contiguous()
     weight = weight.contiguous()
     grad_x = torch.empty_like(grad_y, dtype=torch.float32)
-    grad_weight = torch.zeros((128,), device=grad_y.device, dtype=torch.float32)
-    grad_bias = torch.zeros((128,), device=grad_y.device, dtype=torch.float32)
+    grad_weight = torch.empty((128,), device=grad_y.device, dtype=torch.float32)
+    grad_bias = torch.empty((128,), device=grad_y.device, dtype=torch.float32)
     n_rows = int(grad_y.shape[0])
     if n_rows == 0:
+        grad_weight.zero_()
+        grad_bias.zero_()
         return grad_x, grad_weight.to(dtype=weight.dtype), grad_bias.to(dtype=weight.dtype)
 
     compile_key = (
-        "arhsa_layer_norm_backward_128_v1",
+        "arhsa_layer_norm_backward_input_128_v2",
         grad_y.dtype,
         x_hat.dtype,
         rstd.dtype,
@@ -15157,7 +15448,78 @@ def run_arhsa_layer_norm_backward_128(
         Int32(n_rows),
         current_stream,
     )
+    param_compile_key = (
+        "arhsa_layer_norm_param_grad_128_v1",
+        grad_y.dtype,
+        x_hat.dtype,
+        grad_weight.dtype,
+        grad_bias.dtype,
+        torch.cuda.get_device_capability(grad_y.device),
+    )
+    if param_compile_key not in run_arhsa_layer_norm_backward_128.compile_cache:
+        op = ARHSALayerNormParamGrad128Sm100()
+        run_arhsa_layer_norm_backward_128.compile_cache[param_compile_key] = cute.compile(
+            op,
+            to_cute_tensor(grad_y),
+            to_cute_tensor(x_hat),
+            to_cute_tensor(grad_weight),
+            to_cute_tensor(grad_bias),
+            Int32(n_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_layer_norm_backward_128.compile_cache[param_compile_key](
+        grad_y,
+        x_hat,
+        grad_weight,
+        grad_bias,
+        Int32(n_rows),
+        current_stream,
+    )
     return grad_x, grad_weight.to(dtype=weight.dtype), grad_bias.to(dtype=weight.dtype)
+
+
+def run_arhsa_row_sum_128(src: torch.Tensor) -> torch.Tensor:
+    """Return ``src.sum(dim=0, dtype=float32)`` for contiguous [M, 128] rows."""
+    _require_cute_runtime()
+    if src.device.type != "cuda":
+        raise ValueError("src must be a CUDA tensor")
+    if src.ndim != 2 or int(src.shape[1]) != 128:
+        raise ValueError(f"src must have shape [M,128], got {tuple(src.shape)}")
+    if src.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"src dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    src = src.contiguous()
+    out = torch.empty((128,), device=src.device, dtype=torch.float32)
+    n_rows = int(src.shape[0])
+    if n_rows == 0:
+        out.zero_()
+        return out
+
+    compile_key = (
+        "arhsa_row_sum_128_v1",
+        src.dtype,
+        out.dtype,
+        n_rows,
+        torch.cuda.get_device_capability(src.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_row_sum_128.compile_cache:
+        op = ARHSARowSum128Sm100()
+        run_arhsa_row_sum_128.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(src),
+            to_cute_tensor(out),
+            Int32(n_rows),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_row_sum_128.compile_cache[compile_key](
+        src,
+        out,
+        Int32(n_rows),
+        current_stream,
+    )
+    return out
 
 
 def run_arhsa_key_norm_backward_128(
@@ -21387,13 +21749,17 @@ run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
 )
 run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
 run_arhsa_row_gather_2d_triple.compile_cache = get_jit_cache("arhsa_row_gather_2d_triple")
-run_arhsa_row_gather_layer_norm.compile_cache = get_jit_cache("arhsa_row_gather_layer_norm_v2")
+run_arhsa_row_gather_layer_norm.compile_cache = get_jit_cache("arhsa_row_gather_layer_norm_v3")
 run_arhsa_row_gather_2d_backward.compile_cache = get_jit_cache("arhsa_row_gather_2d_backward")
 run_arhsa_row_write_2d_.compile_cache = get_jit_cache("arhsa_row_write_2d")
 run_arhsa_row_write_2d_triple_.compile_cache = get_jit_cache("arhsa_row_write_2d_triple")
-run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
-    "arhsa_layer_norm_backward_128"
+run_arhsa_layer_norm_forward_128.compile_cache = get_jit_cache(
+    "arhsa_layer_norm_forward_128_v2"
 )
+run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
+    "arhsa_layer_norm_backward_128_v2"
+)
+run_arhsa_row_sum_128.compile_cache = get_jit_cache("arhsa_row_sum_128_v1")
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_key_norm_backward_128_v2"
 )

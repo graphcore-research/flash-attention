@@ -5678,6 +5678,619 @@ class ARHSAV3CompactBeamStepMaterializedBackwardSm100:
                             )
 
 
+class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
+    """Monolithic exact compact-beam initial state, walk, and readout."""
+
+    arch = 100
+
+    def __init__(self, *, beam_width: int, n_iters: int, num_threads: int = 256):
+        self.beam_width = beam_width
+        self.n_iters = n_iters
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartWeights: cute.Tensor,
+        mStartRows: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mChildRowPtr: cute.Tensor,
+        mChildRowIndex: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mValue: cute.Tensor,
+        mOut: cute.Tensor,
+        mBeamRowsHistory: cute.Tensor,
+        mBeamMassHistory: cute.Tensor,
+        mSelectedOffsetHistory: cute.Tensor,
+        mSelectedStartEntry: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mStartWeights,
+            mStartRows,
+            mStartRowPtr,
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mChildRowPtr,
+            mChildRowIndex,
+            mDownBias,
+            mValue,
+            mOut,
+            mBeamRowsHistory,
+            mBeamMassHistory,
+            mSelectedOffsetHistory,
+            mSelectedStartEntry,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartWeights: cute.Tensor,
+        mStartRows: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mChildRowPtr: cute.Tensor,
+        mChildRowIndex: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mValue: cute.Tensor,
+        mOut: cute.Tensor,
+        mBeamRowsHistory: cute.Tensor,
+        mBeamMassHistory: cute.Tensor,
+        mSelectedOffsetHistory: cute.Tensor,
+        mSelectedStartEntry: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mQLevels.shape[2])
+            head_dim = Int32(mQLevels.shape[3])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            scale = Float32(cute.math.sqrt(Float32(head_dim), fastmath=True))
+            bias = Float32(mDownBias[head_idx])
+
+            beam_rows = cute.make_fragment(self.beam_width, Int32)
+            beam_mass = cute.make_fragment(self.beam_width, Float32)
+            selected_start = cute.make_fragment(self.beam_width, Int32)
+            next_rows = cute.make_fragment(self.beam_width, Int32)
+            next_mass = cute.make_fragment(self.beam_width, Float32)
+            next_offset = cute.make_fragment(self.beam_width, Int32)
+
+            for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                beam_rows[slot] = Int32(-1)
+                beam_mass[slot] = Float32.zero
+                selected_start[slot] = Int32(-1)
+
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            for ptr in cutlass.range(start, end, unroll=1):
+                mass = Float32(mStartWeights[ptr, head_idx])
+                if mass > Float32.zero:
+                    min_slot = Int32(0)
+                    min_mass = beam_mass[0]
+                    for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                        if slot != 0 and beam_mass[slot] < min_mass:
+                            min_mass = beam_mass[slot]
+                            min_slot = Int32(slot)
+                    if mass > min_mass:
+                        for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                            if min_slot == Int32(slot):
+                                beam_rows[slot] = Int32(mStartRows[ptr])
+                                beam_mass[slot] = mass
+                                selected_start[slot] = ptr
+
+            for dst_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                max_slot = Int32(dst_slot)
+                max_mass = beam_mass[dst_slot]
+                for src_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    if src_slot > dst_slot and beam_mass[src_slot] > max_mass:
+                        max_mass = beam_mass[src_slot]
+                        max_slot = Int32(src_slot)
+                if max_slot != Int32(dst_slot):
+                    swap_mass = beam_mass[dst_slot]
+                    swap_row = beam_rows[dst_slot]
+                    swap_entry = selected_start[dst_slot]
+                    for src_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                        if max_slot == Int32(src_slot):
+                            beam_mass[dst_slot] = max_mass
+                            beam_rows[dst_slot] = beam_rows[src_slot]
+                            selected_start[dst_slot] = selected_start[src_slot]
+                            beam_mass[src_slot] = swap_mass
+                            beam_rows[src_slot] = swap_row
+                            selected_start[src_slot] = swap_entry
+
+            if lane == Int32(0):
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    mBeamRowsHistory[0, query_idx, head_idx, slot] = beam_rows[slot]
+                    mBeamMassHistory[0, query_idx, head_idx, slot] = beam_mass[
+                        slot
+                    ].to(mBeamMassHistory.element_type)
+                    mSelectedStartEntry[query_idx, head_idx, slot] = selected_start[
+                        slot
+                    ]
+
+            for iter_idx in cutlass.range_constexpr(self.n_iters):
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    next_rows[slot] = Int32(-1)
+                    next_mass[slot] = Float32.zero
+                    next_offset[slot] = Int32(-1)
+
+                candidate_offset = Int32(0)
+                for parent_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    parent_row = beam_rows[parent_slot]
+                    parent_mass = beam_mass[parent_slot]
+                    if parent_row >= Int32(0) and parent_mass > Float32.zero:
+                        child_start = Int32(mChildRowPtr[parent_row])
+                        child_end = Int32(mChildRowPtr[parent_row + Int32(1)])
+                        row_max = Float32(-3.4028234663852886e38)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            if score > row_max:
+                                row_max = score
+
+                        row_sum = Float32.zero
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            row_sum += Float32(
+                                cute.math.exp2(
+                                    (score - row_max) * Float32(_LOG2_E),
+                                    fastmath=True,
+                                )
+                            )
+                        if row_sum < Float32(1.0e-8):
+                            row_sum = Float32(1.0e-8)
+                        inv_sum = Float32(1.0) / row_sum
+
+                        local_child = Int32(0)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            prob = (
+                                Float32(
+                                    cute.math.exp2(
+                                        (score - row_max) * Float32(_LOG2_E),
+                                        fastmath=True,
+                                    )
+                                )
+                                * inv_sum
+                            )
+                            candidate_mass = parent_mass * prob
+                            min_slot = Int32(0)
+                            min_mass = next_mass[0]
+                            for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                                if slot != 0 and next_mass[slot] < min_mass:
+                                    min_mass = next_mass[slot]
+                                    min_slot = Int32(slot)
+                            if candidate_mass > min_mass:
+                                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                                    if min_slot == Int32(slot):
+                                        next_rows[slot] = child_row
+                                        next_mass[slot] = candidate_mass
+                                        next_offset[slot] = candidate_offset + local_child
+                            local_child += Int32(1)
+                        candidate_offset += child_end - child_start
+
+                for dst_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    max_slot = Int32(dst_slot)
+                    max_mass = next_mass[dst_slot]
+                    for src_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                        if src_slot > dst_slot and next_mass[src_slot] > max_mass:
+                            max_mass = next_mass[src_slot]
+                            max_slot = Int32(src_slot)
+                    if max_slot != Int32(dst_slot):
+                        swap_mass = next_mass[dst_slot]
+                        swap_row = next_rows[dst_slot]
+                        swap_offset = next_offset[dst_slot]
+                        for src_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                            if max_slot == Int32(src_slot):
+                                next_mass[dst_slot] = max_mass
+                                next_rows[dst_slot] = next_rows[src_slot]
+                                next_offset[dst_slot] = next_offset[src_slot]
+                                next_mass[src_slot] = swap_mass
+                                next_rows[src_slot] = swap_row
+                                next_offset[src_slot] = swap_offset
+
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    beam_rows[slot] = next_rows[slot]
+                    beam_mass[slot] = next_mass[slot]
+                    if lane == Int32(0):
+                        mBeamRowsHistory[
+                            iter_idx + 1,
+                            query_idx,
+                            head_idx,
+                            slot,
+                        ] = beam_rows[slot]
+                        mBeamMassHistory[
+                            iter_idx + 1,
+                            query_idx,
+                            head_idx,
+                            slot,
+                        ] = beam_mass[slot].to(mBeamMassHistory.element_type)
+                        mSelectedOffsetHistory[
+                            iter_idx,
+                            query_idx,
+                            head_idx,
+                            slot,
+                        ] = next_offset[slot]
+
+            num_queries = Int32(mValue.shape[0])
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                acc = Float32.zero
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    row = beam_rows[slot]
+                    if row >= Int32(0) and row < num_queries:
+                        acc += beam_mass[slot] * Float32(mValue[row, head_idx, dim_idx])
+                mOut[query_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
+
+
+class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
+    """Monolithic backward for exact compact-beam walk and readout."""
+
+    arch = 100
+
+    def __init__(self, *, beam_width: int, n_iters: int, num_threads: int = 256):
+        self.beam_width = beam_width
+        self.n_iters = n_iters
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartWeights: cute.Tensor,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mChildRowPtr: cute.Tensor,
+        mChildRowIndex: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mBeamRowsHistory: cute.Tensor,
+        mBeamMassHistory: cute.Tensor,
+        mSelectedOffsetHistory: cute.Tensor,
+        mSelectedStartEntry: cute.Tensor,
+        mGradStartWeights: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mStartWeights,
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mChildRowPtr,
+            mChildRowIndex,
+            mDownBias,
+            mValue,
+            mGradOut,
+            mBeamRowsHistory,
+            mBeamMassHistory,
+            mSelectedOffsetHistory,
+            mSelectedStartEntry,
+            mGradStartWeights,
+            mGradQ,
+            mGradRow,
+            mGradDownBias,
+            mGradValue,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartWeights: cute.Tensor,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mChildRowPtr: cute.Tensor,
+        mChildRowIndex: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mBeamRowsHistory: cute.Tensor,
+        mBeamMassHistory: cute.Tensor,
+        mSelectedOffsetHistory: cute.Tensor,
+        mSelectedStartEntry: cute.Tensor,
+        mGradStartWeights: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        mGradDownBias: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mQLevels.shape[2])
+            head_dim = Int32(mQLevels.shape[3])
+            num_queries = Int32(mValue.shape[0])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            scale = Float32(cute.math.sqrt(Float32(head_dim), fastmath=True))
+            bias = Float32(mDownBias[head_idx])
+
+            grad_next_mass = cute.make_fragment(self.beam_width, Float32)
+            grad_prev_mass = cute.make_fragment(self.beam_width, Float32)
+            for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                row = Int32(
+                    mBeamRowsHistory[self.n_iters, query_idx, head_idx, slot]
+                )
+                mass = Float32(
+                    mBeamMassHistory[self.n_iters, query_idx, head_idx, slot]
+                )
+                grad_mass = Float32.zero
+                if row >= Int32(0) and row < num_queries:
+                    for dim_idx in cutlass.range(
+                        lane,
+                        head_dim,
+                        cute.arch.WARP_SIZE,
+                        unroll=2,
+                    ):
+                        grad_out = Float32(mGradOut[query_idx, head_idx, dim_idx])
+                        value = Float32(mValue[row, head_idx, dim_idx])
+                        grad_mass += grad_out * value
+                        cute_utils.atomic_add_fp32(
+                            mass * grad_out,
+                            cute_utils.elem_pointer(
+                                mGradValue,
+                                (row, head_idx, dim_idx),
+                            ),
+                        )
+                    grad_mass = cute_utils.warp_reduce(grad_mass, lambda a, b: a + b)
+                grad_next_mass[slot] = grad_mass
+
+            for reverse_iter in cutlass.range_constexpr(self.n_iters):
+                iter_idx = self.n_iters - reverse_iter - 1
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    grad_prev_mass[slot] = Float32.zero
+
+                candidate_offset = Int32(0)
+                for parent_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    parent_row = Int32(
+                        mBeamRowsHistory[iter_idx, query_idx, head_idx, parent_slot]
+                    )
+                    parent_mass = Float32(
+                        mBeamMassHistory[iter_idx, query_idx, head_idx, parent_slot]
+                    )
+                    if parent_row >= Int32(0) and parent_mass > Float32.zero:
+                        child_start = Int32(mChildRowPtr[parent_row])
+                        child_end = Int32(mChildRowPtr[parent_row + Int32(1)])
+                        row_max = Float32(-3.4028234663852886e38)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            if score > row_max:
+                                row_max = score
+
+                        row_sum = Float32.zero
+                        softmax_weighted_grad = Float32.zero
+                        grad_parent_mass_num = Float32.zero
+                        local_child = Int32(0)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            exp_score = Float32(
+                                cute.math.exp2(
+                                    (score - row_max) * Float32(_LOG2_E),
+                                    fastmath=True,
+                                )
+                            )
+                            row_sum += exp_score
+                            cand_offset = candidate_offset + local_child
+                            grad_candidate_mass = Float32.zero
+                            for out_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                                if (
+                                    Int32(
+                                        mSelectedOffsetHistory[
+                                            iter_idx,
+                                            query_idx,
+                                            head_idx,
+                                            out_slot,
+                                        ]
+                                    )
+                                    == cand_offset
+                                ):
+                                    grad_candidate_mass += grad_next_mass[out_slot]
+                            grad_parent_mass_num += grad_candidate_mass * exp_score
+                            softmax_weighted_grad += (
+                                exp_score * grad_candidate_mass * parent_mass
+                            )
+                            local_child += Int32(1)
+                        if row_sum < Float32(1.0e-8):
+                            row_sum = Float32(1.0e-8)
+                        inv_sum = Float32(1.0) / row_sum
+
+                        softmax_dot = softmax_weighted_grad * inv_sum
+                        grad_prev_mass[parent_slot] = grad_parent_mass_num * inv_sum
+
+                        local_child = Int32(0)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            prob = (
+                                Float32(
+                                    cute.math.exp2(
+                                        (score - row_max) * Float32(_LOG2_E),
+                                        fastmath=True,
+                                    )
+                                )
+                                * inv_sum
+                            )
+                            cand_offset = candidate_offset + local_child
+                            grad_candidate_mass = Float32.zero
+                            for out_slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                                if (
+                                    Int32(
+                                        mSelectedOffsetHistory[
+                                            iter_idx,
+                                            query_idx,
+                                            head_idx,
+                                            out_slot,
+                                        ]
+                                    )
+                                    == cand_offset
+                                ):
+                                    grad_candidate_mass += grad_next_mass[out_slot]
+                            grad_prob = grad_candidate_mass * parent_mass
+                            grad_score = prob * (grad_prob - softmax_dot)
+                            grad_dot = grad_score * scale
+                            if lane == Int32(0):
+                                cute_utils.atomic_add_fp32(
+                                    grad_score,
+                                    cute_utils.elem_pointer(mGradDownBias, (head_idx,)),
+                                )
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                q = Float32(
+                                    mQLevels[query_idx, level, head_idx, dim_idx]
+                                )
+                                row = Float32(
+                                    mRowRepr[child_row, head_idx, dim_idx]
+                                )
+                                cute_utils.atomic_add_fp32(
+                                    grad_dot * row,
+                                    cute_utils.elem_pointer(
+                                        mGradQ,
+                                        (query_idx, level, head_idx, dim_idx),
+                                    ),
+                                )
+                                cute_utils.atomic_add_fp32(
+                                    grad_dot * q,
+                                    cute_utils.elem_pointer(
+                                        mGradRow,
+                                        (child_row, head_idx, dim_idx),
+                                    ),
+                                )
+                            local_child += Int32(1)
+                        candidate_offset += child_end - child_start
+
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    grad_next_mass[slot] = grad_prev_mass[slot]
+
+            if lane == Int32(0):
+                for slot in cutlass.range(Int32(self.beam_width), unroll=1):
+                    entry = Int32(mSelectedStartEntry[query_idx, head_idx, slot])
+                    if entry >= Int32(0):
+                        mGradStartWeights[entry, head_idx] = grad_next_mass[slot].to(
+                            mGradStartWeights.element_type
+                        )
+
+
 class ARHSARowGather2DSm100:
     """Gather rows from a 2-D state tensor."""
 
@@ -17091,6 +17704,327 @@ def run_arhsa_v3_compact_beam_step_materialized_backward(
     return grad_q, grad_row, grad_down_bias, grad_beam_mass
 
 
+def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
+    start_weights: torch.Tensor,
+    start_rows: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    child_row_ptr: torch.Tensor,
+    child_row_index: torch.Tensor,
+    down_bias: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    top_k: int,
+    n_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run exact compact initial beam, walk, and readout in one CuTe launch."""
+    _require_cute_runtime()
+    top_k = int(top_k)
+    n_iters = int(n_iters)
+    if start_weights.device.type != "cuda":
+        raise ValueError("start_weights must be a CUDA tensor")
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
+    if n_iters < 0:
+        raise ValueError("n_iters must be >= 0")
+    if start_weights.ndim != 2:
+        raise ValueError("start_weights must have shape [n_starts, n_heads]")
+    if q_levels.ndim != 4:
+        raise ValueError("q_levels must have shape [n_queries, n_levels, n_heads, head_dim]")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim]")
+    if value.ndim != 3 or value.shape[0] != q_levels.shape[0] or value.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("value must have shape [n_queries, n_heads, head_dim]")
+    if start_weights.shape[1] != q_levels.shape[2]:
+        raise ValueError("start_weights head count must match q_levels")
+    if start_rows.ndim != 1 or start_rows.shape[0] != start_weights.shape[0]:
+        raise ValueError("start_rows must have shape [n_starts]")
+    if start_row_ptr.ndim != 1 or start_row_ptr.shape[0] != q_levels.shape[0] + 1:
+        raise ValueError("start_row_ptr must have shape [n_queries + 1]")
+    if feature_row_level.shape != (row_repr.shape[0],):
+        raise ValueError("feature_row_level shape mismatch")
+    if child_row_ptr.ndim != 1 or child_row_index.ndim != 1:
+        raise ValueError("child CSR tensors must be 1D")
+    if down_bias.numel() not in (1, q_levels.shape[2]):
+        raise ValueError("down_bias must be scalar or [n_heads]")
+    for tensor_name, tensor in (
+        ("start_weights", start_weights),
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("value", value),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    n_queries = int(q_levels.shape[0])
+    n_heads = int(q_levels.shape[2])
+    head_dim = int(q_levels.shape[3])
+    out = torch.empty((n_queries, n_heads, head_dim), dtype=value.dtype, device=value.device)
+    beam_rows_history = torch.empty(
+        (n_iters + 1, n_queries, n_heads, top_k),
+        dtype=torch.int32,
+        device=value.device,
+    )
+    beam_mass_history = torch.empty(
+        (n_iters + 1, n_queries, n_heads, top_k),
+        dtype=start_weights.dtype,
+        device=value.device,
+    )
+    selected_offset_history = torch.empty(
+        (n_iters, n_queries, n_heads, top_k),
+        dtype=torch.int32,
+        device=value.device,
+    )
+    selected_start_entry = torch.empty(
+        (n_queries, n_heads, top_k),
+        dtype=torch.int32,
+        device=value.device,
+    )
+
+    start_weights = start_weights.contiguous()
+    start_rows = start_rows.to(device=value.device, dtype=torch.int32).contiguous()
+    start_row_ptr = start_row_ptr.to(device=value.device, dtype=torch.int32).contiguous()
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    feature_row_level = feature_row_level.to(device=value.device, dtype=torch.int32).contiguous()
+    child_row_ptr = child_row_ptr.to(device=value.device, dtype=torch.int32).contiguous()
+    child_row_index = child_row_index.to(device=value.device, dtype=torch.int32).contiguous()
+    if down_bias.numel() == 1 and n_heads != 1:
+        down_bias = down_bias.reshape(1).expand(n_heads).contiguous()
+    else:
+        down_bias = down_bias.reshape(-1).contiguous()
+    value = value.contiguous()
+
+    total_tasks = int(n_queries * n_heads)
+    if total_tasks > 0:
+        compile_key = (
+            "arhsa_v3_compact_exact_beam_walk_readout_forward_v1",
+            start_weights.dtype,
+            q_levels.dtype,
+            row_repr.dtype,
+            value.dtype,
+            n_heads,
+            head_dim,
+            top_k,
+            n_iters,
+            torch.cuda.get_device_capability(value.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_compact_exact_beam_walk_readout_forward.compile_cache:
+            op = ARHSAV3CompactExactBeamWalkReadoutForwardSm100(
+                beam_width=top_k,
+                n_iters=n_iters,
+            )
+            run_arhsa_v3_compact_exact_beam_walk_readout_forward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(start_weights),
+                to_cute_tensor(start_rows, assumed_align=4),
+                to_cute_tensor(start_row_ptr, assumed_align=4),
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(feature_row_level, assumed_align=4),
+                to_cute_tensor(child_row_ptr, assumed_align=4),
+                to_cute_tensor(child_row_index, assumed_align=4),
+                to_cute_tensor(down_bias),
+                to_cute_tensor(value),
+                to_cute_tensor(out),
+                to_cute_tensor(beam_rows_history, assumed_align=4),
+                to_cute_tensor(beam_mass_history),
+                to_cute_tensor(selected_offset_history, assumed_align=4),
+                to_cute_tensor(selected_start_entry, assumed_align=4),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_compact_exact_beam_walk_readout_forward.compile_cache[compile_key](
+            start_weights,
+            start_rows,
+            start_row_ptr,
+            q_levels,
+            row_repr,
+            feature_row_level,
+            child_row_ptr,
+            child_row_index,
+            down_bias,
+            value,
+            out,
+            beam_rows_history,
+            beam_mass_history,
+            selected_offset_history,
+            selected_start_entry,
+            Int32(total_tasks),
+            current_stream,
+        )
+    return (
+        out,
+        beam_rows_history,
+        beam_mass_history,
+        selected_offset_history,
+        selected_start_entry,
+    )
+
+
+def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
+    start_weights: torch.Tensor,
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    feature_row_level: torch.Tensor,
+    child_row_ptr: torch.Tensor,
+    child_row_index: torch.Tensor,
+    down_bias: torch.Tensor,
+    value: torch.Tensor,
+    grad_out: torch.Tensor,
+    beam_rows_history: torch.Tensor,
+    beam_mass_history: torch.Tensor,
+    selected_offset_history: torch.Tensor,
+    selected_start_entry: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward for the monolithic exact compact-beam walk/readout kernel."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError("q_levels must have shape [n_queries, n_levels, n_heads, head_dim]")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim]")
+    if value.ndim != 3 or value.shape != grad_out.shape:
+        raise ValueError("value and grad_out must have shape [n_queries, n_heads, head_dim]")
+    if value.shape[0] != q_levels.shape[0] or value.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("value shape must match q_levels query/head dimensions")
+    if beam_rows_history.shape != beam_mass_history.shape:
+        raise ValueError("beam history row/mass shape mismatch")
+    if beam_rows_history.ndim != 4:
+        raise ValueError("beam history must have shape [n_iters + 1, n_queries, n_heads, top_k]")
+    if selected_start_entry.shape != beam_rows_history.shape[1:]:
+        raise ValueError("selected_start_entry shape mismatch")
+    expected_selected_shape = (beam_rows_history.shape[0] - 1,) + beam_rows_history.shape[1:]
+    if selected_offset_history.shape != expected_selected_shape:
+        raise ValueError("selected_offset_history shape mismatch")
+    if down_bias.numel() not in (1, q_levels.shape[2]):
+        raise ValueError("down_bias must be scalar or [n_heads]")
+    for tensor_name, tensor in (
+        ("start_weights", start_weights),
+        ("q_levels", q_levels),
+        ("row_repr", row_repr),
+        ("value", value),
+        ("grad_out", grad_out),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    n_queries = int(q_levels.shape[0])
+    n_heads = int(q_levels.shape[2])
+    head_dim = int(q_levels.shape[3])
+    top_k = int(beam_rows_history.shape[3])
+    n_iters = int(beam_rows_history.shape[0] - 1)
+    grad_start_weights = torch.zeros_like(start_weights, dtype=torch.float32)
+    grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
+    grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
+    grad_down_bias = torch.zeros((n_heads,), dtype=torch.float32, device=q_levels.device)
+    grad_value = torch.zeros_like(value, dtype=torch.float32)
+
+    start_weights = start_weights.contiguous()
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    feature_row_level = feature_row_level.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    child_row_ptr = child_row_ptr.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    child_row_index = child_row_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    if down_bias.numel() == 1 and n_heads != 1:
+        down_bias = down_bias.reshape(1).expand(n_heads).contiguous()
+    else:
+        down_bias = down_bias.reshape(-1).contiguous()
+    value = value.contiguous()
+    grad_out = grad_out.contiguous()
+    beam_rows_history = beam_rows_history.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    beam_mass_history = beam_mass_history.contiguous()
+    selected_offset_history = selected_offset_history.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    selected_start_entry = selected_start_entry.to(device=q_levels.device, dtype=torch.int32).contiguous()
+
+    total_tasks = int(n_queries * n_heads)
+    if total_tasks > 0:
+        compile_key = (
+            "arhsa_v3_compact_exact_beam_walk_readout_backward_v1",
+            start_weights.dtype,
+            q_levels.dtype,
+            row_repr.dtype,
+            value.dtype,
+            grad_out.dtype,
+            grad_q.dtype,
+            grad_row.dtype,
+            grad_down_bias.dtype,
+            grad_value.dtype,
+            n_heads,
+            head_dim,
+            top_k,
+            n_iters,
+            torch.cuda.get_device_capability(q_levels.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_compact_exact_beam_walk_readout_backward.compile_cache:
+            op = ARHSAV3CompactExactBeamWalkReadoutBackwardSm100(
+                beam_width=top_k,
+                n_iters=n_iters,
+            )
+            run_arhsa_v3_compact_exact_beam_walk_readout_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(start_weights),
+                to_cute_tensor(q_levels),
+                to_cute_tensor(row_repr),
+                to_cute_tensor(feature_row_level, assumed_align=4),
+                to_cute_tensor(child_row_ptr, assumed_align=4),
+                to_cute_tensor(child_row_index, assumed_align=4),
+                to_cute_tensor(down_bias),
+                to_cute_tensor(value),
+                to_cute_tensor(grad_out),
+                to_cute_tensor(beam_rows_history, assumed_align=4),
+                to_cute_tensor(beam_mass_history),
+                to_cute_tensor(selected_offset_history, assumed_align=4),
+                to_cute_tensor(selected_start_entry, assumed_align=4),
+                to_cute_tensor(grad_start_weights),
+                to_cute_tensor(grad_q),
+                to_cute_tensor(grad_row),
+                to_cute_tensor(grad_down_bias),
+                to_cute_tensor(grad_value),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_compact_exact_beam_walk_readout_backward.compile_cache[compile_key](
+            start_weights,
+            q_levels,
+            row_repr,
+            feature_row_level,
+            child_row_ptr,
+            child_row_index,
+            down_bias,
+            value,
+            grad_out,
+            beam_rows_history,
+            beam_mass_history,
+            selected_offset_history,
+            selected_start_entry,
+            grad_start_weights,
+            grad_q,
+            grad_row,
+            grad_down_bias,
+            grad_value,
+            Int32(total_tasks),
+            current_stream,
+        )
+
+    if grad_start_weights.dtype != start_weights.dtype:
+        grad_start_weights = grad_start_weights.to(dtype=start_weights.dtype)
+    if grad_q.dtype != q_levels.dtype:
+        grad_q = grad_q.to(dtype=q_levels.dtype)
+    if grad_row.dtype != row_repr.dtype:
+        grad_row = grad_row.to(dtype=row_repr.dtype)
+    if grad_down_bias.dtype != down_bias.dtype:
+        grad_down_bias = grad_down_bias.to(dtype=down_bias.dtype)
+    return grad_start_weights, grad_q, grad_row, grad_down_bias, grad_value
+
+
 def run_arhsa_row_gather_2d(
     src: torch.Tensor,
     row_index: torch.Tensor,
@@ -23956,6 +24890,12 @@ run_arhsa_v3_compact_beam_step_materialized_forward.compile_cache = get_jit_cach
 )
 run_arhsa_v3_compact_beam_step_materialized_backward.compile_cache = get_jit_cache(
     "arhsa_v3_compact_beam_step_materialized_backward"
+)
+run_arhsa_v3_compact_exact_beam_walk_readout_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_exact_beam_walk_readout_forward"
+)
+run_arhsa_v3_compact_exact_beam_walk_readout_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_exact_beam_walk_readout_backward"
 )
 run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
 run_arhsa_row_gather_2d_triple.compile_cache = get_jit_cache("arhsa_row_gather_2d_triple")

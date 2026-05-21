@@ -4676,99 +4676,186 @@ class ARHSAV3CompactBeamStepForwardSm100:
                 if parent_row >= Int32(0) and parent_mass > Float32.zero:
                     child_start = Int32(mChildRowPtr[parent_row])
                     child_end = Int32(mChildRowPtr[parent_row + Int32(1)])
-                    row_max = Float32(-3.4028234663852886e38)
-                    for child_pos in cutlass.range(child_start, child_end, unroll=1):
-                        child_row = Int32(mChildRowIndex[child_pos])
-                        level = Int32(mFeatureRowLevel[child_row])
-                        partial = Float32.zero
-                        for dim_idx in cutlass.range(
-                            lane,
-                            head_dim,
-                            cute.arch.WARP_SIZE,
-                            unroll=2,
-                        ):
-                            partial += (
-                                Float32(mQLevels[query_idx, level, head_idx, dim_idx])
-                                * Float32(mRowRepr[child_row, head_idx, dim_idx])
-                            )
-                        dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
-                        score = Float32(dot.to(mQLevels.element_type)) * scale + bias
-                        if score > row_max:
-                            row_max = score
+                    child_count = child_end - child_start
+                    if child_count <= Int32(8):
+                        score_frag = cute.make_fragment(8, Float32)
+                        row_frag = cute.make_fragment(8, Int32)
+                        offset_frag = cute.make_fragment(8, Int32)
+                        score_frag.fill(-3.4028234663852886e38)
+                        row_frag.fill(Int32(-1))
+                        offset_frag.fill(Int32(-1))
+                        row_max = Float32(-3.4028234663852886e38)
+                        local_child = Int32(0)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            if score > row_max:
+                                row_max = score
+                            for local_slot in cutlass.range_constexpr(8):
+                                if local_child == Int32(local_slot):
+                                    score_frag[local_slot] = score
+                                    row_frag[local_slot] = child_row
+                                    offset_frag[local_slot] = candidate_offset + local_child
+                            local_child += Int32(1)
 
-                    row_sum = Float32.zero
-                    for child_pos in cutlass.range(child_start, child_end, unroll=1):
-                        child_row = Int32(mChildRowIndex[child_pos])
-                        level = Int32(mFeatureRowLevel[child_row])
-                        partial = Float32.zero
-                        for dim_idx in cutlass.range(
-                            lane,
-                            head_dim,
-                            cute.arch.WARP_SIZE,
-                            unroll=2,
-                        ):
-                            partial += (
-                                Float32(mQLevels[query_idx, level, head_idx, dim_idx])
-                                * Float32(mRowRepr[child_row, head_idx, dim_idx])
-                            )
-                        dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
-                        score = Float32(dot.to(mQLevels.element_type)) * scale + bias
-                        row_sum += Float32(
-                            cute.math.exp2(
-                                (score - row_max) * Float32(_LOG2_E),
-                                fastmath=True,
-                            )
-                        )
-                    if row_sum < Float32(1.0e-8):
-                        row_sum = Float32(1.0e-8)
-                    inv_sum = Float32(1.0) / row_sum
+                        row_sum = Float32.zero
+                        for local_slot in cutlass.range_constexpr(8):
+                            if Int32(local_slot) < child_count:
+                                row_sum += Float32(
+                                    cute.math.exp2(
+                                        (score_frag[local_slot] - row_max)
+                                        * Float32(_LOG2_E),
+                                        fastmath=True,
+                                    )
+                                )
+                        if row_sum < Float32(1.0e-8):
+                            row_sum = Float32(1.0e-8)
+                        inv_sum = Float32(1.0) / row_sum
 
-                    local_child = Int32(0)
-                    for child_pos in cutlass.range(child_start, child_end, unroll=1):
-                        child_row = Int32(mChildRowIndex[child_pos])
-                        level = Int32(mFeatureRowLevel[child_row])
-                        partial = Float32.zero
-                        for dim_idx in cutlass.range(
-                            lane,
-                            head_dim,
-                            cute.arch.WARP_SIZE,
-                            unroll=2,
-                        ):
-                            partial += (
-                                Float32(mQLevels[query_idx, level, head_idx, dim_idx])
-                                * Float32(mRowRepr[child_row, head_idx, dim_idx])
-                            )
-                        dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
-                        score = Float32(dot.to(mQLevels.element_type)) * scale + bias
-                        prob = (
-                            Float32(
+                        for local_slot in cutlass.range_constexpr(8):
+                            if Int32(local_slot) < child_count:
+                                prob = (
+                                    Float32(
+                                        cute.math.exp2(
+                                            (score_frag[local_slot] - row_max)
+                                            * Float32(_LOG2_E),
+                                            fastmath=True,
+                                        )
+                                    )
+                                    * inv_sum
+                                )
+                                candidate_mass = parent_mass * prob
+                                if lane == Int32(0):
+                                    min_slot = Int32(0)
+                                    min_mass = Float32(mNextMass[query_idx, head_idx, 0])
+                                    for slot in cutlass.range(
+                                        Int32(1),
+                                        beam_width,
+                                        unroll=1,
+                                    ):
+                                        slot_mass = Float32(
+                                            mNextMass[query_idx, head_idx, slot]
+                                        )
+                                        if slot_mass < min_mass:
+                                            min_mass = slot_mass
+                                            min_slot = slot
+                                    if candidate_mass > min_mass:
+                                        mNextRows[query_idx, head_idx, min_slot] = (
+                                            row_frag[local_slot]
+                                        )
+                                        mNextMass[query_idx, head_idx, min_slot] = (
+                                            candidate_mass.to(mNextMass.element_type)
+                                        )
+                                        mSelectedOffset[query_idx, head_idx, min_slot] = (
+                                            offset_frag[local_slot]
+                                        )
+                    else:
+                        row_max = Float32(-3.4028234663852886e38)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            if score > row_max:
+                                row_max = score
+
+                        row_sum = Float32.zero
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
+                                )
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            row_sum += Float32(
                                 cute.math.exp2(
                                     (score - row_max) * Float32(_LOG2_E),
                                     fastmath=True,
                                 )
                             )
-                            * inv_sum
-                        )
-                        candidate_mass = parent_mass * prob
+                        if row_sum < Float32(1.0e-8):
+                            row_sum = Float32(1.0e-8)
+                        inv_sum = Float32(1.0) / row_sum
 
-                        if lane == Int32(0):
-                            min_slot = Int32(0)
-                            min_mass = Float32(mNextMass[query_idx, head_idx, 0])
-                            for slot in cutlass.range(Int32(1), beam_width, unroll=1):
-                                slot_mass = Float32(mNextMass[query_idx, head_idx, slot])
-                                if slot_mass < min_mass:
-                                    min_mass = slot_mass
-                                    min_slot = slot
-                            if candidate_mass > min_mass:
-                                mNextRows[query_idx, head_idx, min_slot] = child_row
-                                mNextMass[query_idx, head_idx, min_slot] = (
-                                    candidate_mass.to(mNextMass.element_type)
+                        local_child = Int32(0)
+                        for child_pos in cutlass.range(child_start, child_end, unroll=1):
+                            child_row = Int32(mChildRowIndex[child_pos])
+                            level = Int32(mFeatureRowLevel[child_row])
+                            partial = Float32.zero
+                            for dim_idx in cutlass.range(
+                                lane,
+                                head_dim,
+                                cute.arch.WARP_SIZE,
+                                unroll=2,
+                            ):
+                                partial += (
+                                    Float32(mQLevels[query_idx, level, head_idx, dim_idx])
+                                    * Float32(mRowRepr[child_row, head_idx, dim_idx])
                                 )
-                                mSelectedOffset[query_idx, head_idx, min_slot] = (
-                                    candidate_offset + local_child
+                            dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                            score = Float32(dot.to(mQLevels.element_type)) * scale + bias
+                            prob = (
+                                Float32(
+                                    cute.math.exp2(
+                                        (score - row_max) * Float32(_LOG2_E),
+                                        fastmath=True,
+                                    )
                                 )
-                        local_child += Int32(1)
-                    candidate_offset += child_end - child_start
+                                * inv_sum
+                            )
+                            candidate_mass = parent_mass * prob
+
+                            if lane == Int32(0):
+                                min_slot = Int32(0)
+                                min_mass = Float32(mNextMass[query_idx, head_idx, 0])
+                                for slot in cutlass.range(Int32(1), beam_width, unroll=1):
+                                    slot_mass = Float32(mNextMass[query_idx, head_idx, slot])
+                                    if slot_mass < min_mass:
+                                        min_mass = slot_mass
+                                        min_slot = slot
+                                if candidate_mass > min_mass:
+                                    mNextRows[query_idx, head_idx, min_slot] = child_row
+                                    mNextMass[query_idx, head_idx, min_slot] = (
+                                        candidate_mass.to(mNextMass.element_type)
+                                    )
+                                    mSelectedOffset[query_idx, head_idx, min_slot] = (
+                                        candidate_offset + local_child
+                                    )
+                            local_child += Int32(1)
+                    candidate_offset += child_count
 
             if lane == Int32(0):
                 for dst_slot in cutlass.range(beam_width, unroll=1):
@@ -4912,34 +4999,8 @@ class ARHSAV3CompactBeamStepBackwardSm100:
                             row_max = score
 
                     row_sum = Float32.zero
-                    for child_pos in cutlass.range(child_start, child_end, unroll=1):
-                        child_row = Int32(mChildRowIndex[child_pos])
-                        level = Int32(mFeatureRowLevel[child_row])
-                        partial = Float32.zero
-                        for dim_idx in cutlass.range(
-                            lane,
-                            head_dim,
-                            cute.arch.WARP_SIZE,
-                            unroll=2,
-                        ):
-                            partial += (
-                                Float32(mQLevels[query_idx, level, head_idx, dim_idx])
-                                * Float32(mRowRepr[child_row, head_idx, dim_idx])
-                            )
-                        dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
-                        score = Float32(dot.to(mQLevels.element_type)) * scale + bias
-                        row_sum += Float32(
-                            cute.math.exp2(
-                                (score - row_max) * Float32(_LOG2_E),
-                                fastmath=True,
-                            )
-                        )
-                    if row_sum < Float32(1.0e-8):
-                        row_sum = Float32(1.0e-8)
-                    inv_sum = Float32(1.0) / row_sum
-
-                    softmax_dot = Float32.zero
-                    grad_parent_mass = Float32.zero
+                    softmax_weighted_grad = Float32.zero
+                    grad_parent_mass_num = Float32.zero
                     local_child = Int32(0)
                     for child_pos in cutlass.range(child_start, child_end, unroll=1):
                         child_row = Int32(mChildRowIndex[child_pos])
@@ -4957,15 +5018,13 @@ class ARHSAV3CompactBeamStepBackwardSm100:
                             )
                         dot = cute_utils.warp_reduce(partial, lambda a, b: a + b)
                         score = Float32(dot.to(mQLevels.element_type)) * scale + bias
-                        prob = (
-                            Float32(
-                                cute.math.exp2(
-                                    (score - row_max) * Float32(_LOG2_E),
-                                    fastmath=True,
-                                )
+                        exp_score = Float32(
+                            cute.math.exp2(
+                                (score - row_max) * Float32(_LOG2_E),
+                                fastmath=True,
                             )
-                            * inv_sum
                         )
+                        row_sum += exp_score
                         cand_offset = candidate_offset + local_child
                         grad_candidate_mass = Float32.zero
                         for out_slot in cutlass.range(beam_width, unroll=1):
@@ -4973,10 +5032,17 @@ class ARHSAV3CompactBeamStepBackwardSm100:
                                 grad_candidate_mass += Float32(
                                     mGradNextMass[query_idx, head_idx, out_slot]
                                 )
-                        grad_parent_mass += grad_candidate_mass * prob
-                        grad_prob = grad_candidate_mass * parent_mass
-                        softmax_dot += prob * grad_prob
+                        grad_parent_mass_num += grad_candidate_mass * exp_score
+                        softmax_weighted_grad += (
+                            exp_score * grad_candidate_mass * parent_mass
+                        )
                         local_child += Int32(1)
+                    if row_sum < Float32(1.0e-8):
+                        row_sum = Float32(1.0e-8)
+                    inv_sum = Float32(1.0) / row_sum
+
+                    softmax_dot = softmax_weighted_grad * inv_sum
+                    grad_parent_mass = grad_parent_mass_num * inv_sum
 
                     if lane == Int32(0):
                         mGradBeamMass[query_idx, head_idx, parent_slot] = (
@@ -15884,7 +15950,7 @@ def run_arhsa_v3_compact_beam_step_forward(
         return next_rows, next_mass, selected_offset
 
     compile_key = (
-        "arhsa_v3_compact_beam_step_forward_warp",
+        "arhsa_v3_compact_beam_step_forward_warp_fanout8",
         q_levels.dtype,
         row_repr.dtype,
         beam_mass.dtype,
@@ -16008,7 +16074,7 @@ def run_arhsa_v3_compact_beam_step_backward(
     total_tasks = int(q_levels.shape[0] * q_levels.shape[2])
     if total_tasks > 0:
         compile_key = (
-            "arhsa_v3_compact_beam_step_backward_warp",
+            "arhsa_v3_compact_beam_step_backward_warp3",
             q_levels.dtype,
             row_repr.dtype,
             beam_mass.dtype,

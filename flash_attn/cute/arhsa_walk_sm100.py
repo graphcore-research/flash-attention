@@ -4441,6 +4441,144 @@ class ARHSAGroupedWeightedValueBackwardSm100:
             mGradAttn[edge_idx, head_idx] = grad_attn.to(mGradAttn.element_type)
 
 
+class ARHSAV3CompactBeamReadoutSm100:
+    """Gather compact beam leaves and reduce mass-weighted values."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mValue: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mBeamRows,
+            mBeamMass,
+            mValue,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mValue: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_queries = Int32(mValue.shape[0])
+            num_heads = Int32(mValue.shape[1])
+            head_dim = Int32(mValue.shape[2])
+            beam_width = Int32(mBeamRows.shape[2])
+            elems_per_query = num_heads * head_dim
+            query_idx = task_idx // elems_per_query
+            rem = task_idx - query_idx * elems_per_query
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            acc = Float32.zero
+            for beam_idx in cutlass.range(beam_width, unroll=1):
+                row = Int32(mBeamRows[query_idx, head_idx, beam_idx])
+                if row >= Int32(0) and row < num_queries:
+                    mass = Float32(mBeamMass[query_idx, head_idx, beam_idx])
+                    value = Float32(mValue[row, head_idx, dim_idx])
+                    acc += mass * value
+            mOut[query_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
+
+
+class ARHSAV3CompactBeamReadoutBackwardSm100:
+    """Backward for compact beam readout."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mGradMass: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mBeamRows,
+            mBeamMass,
+            mValue,
+            mGradOut,
+            mGradMass,
+            mGradValue,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mValue: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mGradMass: cute.Tensor,
+        mGradValue: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_queries = Int32(mValue.shape[0])
+            num_heads = Int32(mValue.shape[1])
+            head_dim = Int32(mValue.shape[2])
+            beam_width = Int32(mBeamRows.shape[2])
+            query_idx = task_idx // (num_heads * beam_width)
+            rem = task_idx - query_idx * num_heads * beam_width
+            head_idx = rem // beam_width
+            beam_idx = rem - head_idx * beam_width
+            row = Int32(mBeamRows[query_idx, head_idx, beam_idx])
+            grad_mass = Float32.zero
+            if row >= Int32(0) and row < num_queries:
+                mass = Float32(mBeamMass[query_idx, head_idx, beam_idx])
+                for dim_idx in cutlass.range(head_dim, unroll=16):
+                    grad_out = Float32(mGradOut[query_idx, head_idx, dim_idx])
+                    value = Float32(mValue[row, head_idx, dim_idx])
+                    grad_mass += grad_out * value
+                    cute_utils.atomic_add_fp32(
+                        mass * grad_out,
+                        cute_utils.elem_pointer(mGradValue, (row, head_idx, dim_idx)),
+                    )
+            mGradMass[query_idx, head_idx, beam_idx] = grad_mass.to(
+                mGradMass.element_type
+            )
+
+
 class ARHSARowGather2DSm100:
     """Gather rows from a 2-D state tensor."""
 
@@ -15050,6 +15188,164 @@ def run_arhsa_grouped_weighted_value_backward(
     return grad_attn, grad_value
 
 
+def run_arhsa_v3_compact_beam_readout(
+    beam_rows: torch.Tensor,
+    beam_mass: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run compact exact-beam leaf readout without materialising edge values."""
+    _require_cute_runtime()
+    if beam_rows.device.type != "cuda":
+        raise ValueError("beam_rows must be a CUDA tensor")
+    if beam_rows.ndim != 3:
+        raise ValueError(f"beam_rows must have shape [n_queries, n_heads, k], got {tuple(beam_rows.shape)}")
+    if beam_mass.shape != beam_rows.shape:
+        raise ValueError(f"beam_mass shape mismatch: got {tuple(beam_mass.shape)}")
+    if value.ndim != 3:
+        raise ValueError(f"value must have shape [n_queries, n_heads, head_dim], got {tuple(value.shape)}")
+    if value.shape[:2] != beam_rows.shape[:2]:
+        raise ValueError("value and beam tensors must agree on query/head dimensions")
+    if beam_mass.dtype not in _CUTE_BACKWARD_DTYPES or value.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"beam_mass/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    expected_shape = (value.shape[0], value.shape[1], value.shape[2])
+    if out is None:
+        out = torch.empty(expected_shape, dtype=value.dtype, device=value.device)
+    if out.shape != expected_shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    beam_rows = beam_rows.to(device=value.device, dtype=torch.int32).contiguous()
+    beam_mass = beam_mass.contiguous()
+    value = value.contiguous()
+    out = out.contiguous()
+    total_tasks = int(value.shape[0] * value.shape[1] * value.shape[2])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_v3_compact_beam_readout",
+        beam_mass.dtype,
+        value.dtype,
+        out.dtype,
+        value.shape[1],
+        value.shape[2],
+        beam_rows.shape[2],
+        torch.cuda.get_device_capability(value.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_compact_beam_readout.compile_cache:
+        op = ARHSAV3CompactBeamReadoutSm100()
+        run_arhsa_v3_compact_beam_readout.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(beam_rows, assumed_align=4),
+            to_cute_tensor(beam_mass),
+            to_cute_tensor(value),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_compact_beam_readout.compile_cache[compile_key](
+        beam_rows,
+        beam_mass,
+        value,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_v3_compact_beam_readout_backward(
+    beam_rows: torch.Tensor,
+    beam_mass: torch.Tensor,
+    value: torch.Tensor,
+    grad_out: torch.Tensor,
+    grad_mass: torch.Tensor | None = None,
+    grad_value: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for compact exact-beam leaf readout."""
+    _require_cute_runtime()
+    if beam_rows.device.type != "cuda":
+        raise ValueError("beam_rows must be a CUDA tensor")
+    if beam_rows.ndim != 3:
+        raise ValueError(f"beam_rows must have shape [n_queries, n_heads, k], got {tuple(beam_rows.shape)}")
+    if beam_mass.shape != beam_rows.shape:
+        raise ValueError(f"beam_mass shape mismatch: got {tuple(beam_mass.shape)}")
+    if value.ndim != 3 or value.shape[:2] != beam_rows.shape[:2]:
+        raise ValueError("value must have shape [n_queries, n_heads, head_dim] matching beam rows")
+    if grad_out.shape != value.shape:
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    if beam_mass.dtype not in _CUTE_BACKWARD_DTYPES or value.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"beam_mass/value dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if grad_out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {grad_out.dtype}")
+    if grad_mass is None:
+        grad_mass = (
+            torch.empty_like(beam_mass)
+            if beam_mass.dtype == torch.float32
+            else torch.empty_like(beam_mass, dtype=torch.float32)
+        )
+    if grad_value is None:
+        grad_value = torch.zeros_like(value, dtype=torch.float32)
+    if grad_mass.shape != beam_mass.shape:
+        raise ValueError(f"grad_mass shape mismatch: got {tuple(grad_mass.shape)}")
+    if grad_value.shape != value.shape:
+        raise ValueError(f"grad_value shape mismatch: got {tuple(grad_value.shape)}")
+
+    beam_rows = beam_rows.to(device=value.device, dtype=torch.int32).contiguous()
+    beam_mass = beam_mass.contiguous()
+    value = value.contiguous()
+    grad_out = grad_out.contiguous()
+    grad_mass = grad_mass.contiguous()
+    grad_value = grad_value.contiguous()
+    total_tasks = int(beam_rows.shape[0] * beam_rows.shape[1] * beam_rows.shape[2])
+    if total_tasks == 0:
+        return grad_mass, grad_value
+
+    compile_key = (
+        "arhsa_v3_compact_beam_readout_backward",
+        beam_mass.dtype,
+        value.dtype,
+        grad_out.dtype,
+        grad_mass.dtype,
+        grad_value.dtype,
+        value.shape[1],
+        value.shape[2],
+        beam_rows.shape[2],
+        torch.cuda.get_device_capability(value.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_compact_beam_readout_backward.compile_cache:
+        op = ARHSAV3CompactBeamReadoutBackwardSm100()
+        run_arhsa_v3_compact_beam_readout_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(beam_rows, assumed_align=4),
+            to_cute_tensor(beam_mass),
+            to_cute_tensor(value),
+            to_cute_tensor(grad_out),
+            to_cute_tensor(grad_mass),
+            to_cute_tensor(grad_value),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_compact_beam_readout_backward.compile_cache[compile_key](
+        beam_rows,
+        beam_mass,
+        value,
+        grad_out,
+        grad_mass,
+        grad_value,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_mass, grad_value
+
+
 def run_arhsa_row_gather_2d(
     src: torch.Tensor,
     row_index: torch.Tensor,
@@ -21891,6 +22187,12 @@ run_arhsa_sampled_edge_dst_dot_backward.compile_cache = get_jit_cache("arhsa_sam
 run_arhsa_grouped_weighted_value.compile_cache = get_jit_cache("arhsa_grouped_weighted_value")
 run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_grouped_weighted_value_backward"
+)
+run_arhsa_v3_compact_beam_readout.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_beam_readout"
+)
+run_arhsa_v3_compact_beam_readout_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_beam_readout_backward"
 )
 run_arhsa_row_gather_2d.compile_cache = get_jit_cache("arhsa_row_gather_2d")
 run_arhsa_row_gather_2d_triple.compile_cache = get_jit_cache("arhsa_row_gather_2d_triple")

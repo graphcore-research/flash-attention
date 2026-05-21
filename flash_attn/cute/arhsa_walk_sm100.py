@@ -3338,6 +3338,173 @@ class ARHSAV3StartBeamTopKSm100:
                         mOut[ptr, head_idx] = Float32(0.0).to(mOut.element_type)
 
 
+class ARHSAV3CompactInitialBeamForwardSm100:
+    """Build the exact compact ARHSAv3 initial beam from packed start weights."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mStartWeights: cute.Tensor,
+        mStartRows: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mSelectedEntry: cute.Tensor,
+        top_k: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mStartWeights,
+            mStartRows,
+            mStartRowPtr,
+            mBeamRows,
+            mBeamMass,
+            mSelectedEntry,
+            top_k,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mStartWeights: cute.Tensor,
+        mStartRows: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mBeamRows: cute.Tensor,
+        mBeamMass: cute.Tensor,
+        mSelectedEntry: cute.Tensor,
+        top_k: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mStartWeights.shape[1])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+
+            for slot in cutlass.range(top_k, unroll=1):
+                mBeamRows[query_idx, head_idx, slot] = Int32(-1)
+                mBeamMass[query_idx, head_idx, slot] = Float32(0.0).to(
+                    mBeamMass.element_type
+                )
+                mSelectedEntry[query_idx, head_idx, slot] = Int32(-1)
+
+            for ptr in cutlass.range(start, end, unroll=1):
+                mass = Float32(mStartWeights[ptr, head_idx])
+                if mass > Float32.zero:
+                    min_slot = Int32(0)
+                    min_mass = Float32(mBeamMass[query_idx, head_idx, 0])
+                    for slot in cutlass.range(Int32(1), top_k, unroll=1):
+                        slot_mass = Float32(mBeamMass[query_idx, head_idx, slot])
+                        if slot_mass < min_mass:
+                            min_mass = slot_mass
+                            min_slot = slot
+                    if mass > min_mass:
+                        mBeamRows[query_idx, head_idx, min_slot] = Int32(mStartRows[ptr])
+                        mBeamMass[query_idx, head_idx, min_slot] = mass.to(
+                            mBeamMass.element_type
+                        )
+                        mSelectedEntry[query_idx, head_idx, min_slot] = ptr
+
+            for dst_slot in cutlass.range(top_k, unroll=1):
+                max_slot = dst_slot
+                max_mass = Float32(mBeamMass[query_idx, head_idx, dst_slot])
+                for src_slot in cutlass.range(dst_slot + Int32(1), top_k, unroll=1):
+                    src_mass = Float32(mBeamMass[query_idx, head_idx, src_slot])
+                    if src_mass > max_mass:
+                        max_mass = src_mass
+                        max_slot = src_slot
+                if max_slot != dst_slot:
+                    swap_mass = Float32(mBeamMass[query_idx, head_idx, dst_slot])
+                    swap_row = Int32(mBeamRows[query_idx, head_idx, dst_slot])
+                    swap_entry = Int32(mSelectedEntry[query_idx, head_idx, dst_slot])
+                    mBeamMass[query_idx, head_idx, dst_slot] = max_mass.to(
+                        mBeamMass.element_type
+                    )
+                    mBeamRows[query_idx, head_idx, dst_slot] = Int32(
+                        mBeamRows[query_idx, head_idx, max_slot]
+                    )
+                    mSelectedEntry[query_idx, head_idx, dst_slot] = Int32(
+                        mSelectedEntry[query_idx, head_idx, max_slot]
+                    )
+                    mBeamMass[query_idx, head_idx, max_slot] = swap_mass.to(
+                        mBeamMass.element_type
+                    )
+                    mBeamRows[query_idx, head_idx, max_slot] = swap_row
+                    mSelectedEntry[query_idx, head_idx, max_slot] = swap_entry
+
+
+class ARHSAV3CompactInitialBeamBackwardSm100:
+    """Scatter compact initial-beam gradients back to packed start weights."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSelectedEntry: cute.Tensor,
+        mGradBeamMass: cute.Tensor,
+        mGradStartWeights: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSelectedEntry,
+            mGradBeamMass,
+            mGradStartWeights,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSelectedEntry: cute.Tensor,
+        mGradBeamMass: cute.Tensor,
+        mGradStartWeights: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSelectedEntry.shape[1])
+            beam_width = Int32(mSelectedEntry.shape[2])
+            query_idx = task_idx // (num_heads * beam_width)
+            rem = task_idx - query_idx * num_heads * beam_width
+            head_idx = rem // beam_width
+            slot = rem - head_idx * beam_width
+            entry = Int32(mSelectedEntry[query_idx, head_idx, slot])
+            if entry >= Int32(0):
+                mGradStartWeights[entry, head_idx] = Float32(
+                    mGradBeamMass[query_idx, head_idx, slot]
+                ).to(
+                    mGradStartWeights.element_type
+                )
+
+
 class ARHSAV3StartInitialStateForwardSm100:
     """Packed v3 start-weight normalization that writes initial walk state."""
 
@@ -15291,6 +15458,142 @@ def run_arhsa_v3_start_beam_topk(
     return out
 
 
+def run_arhsa_v3_compact_initial_beam_forward(
+    start_weights: torch.Tensor,
+    start_rows: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build compact exact-beam initial rows/masses from packed starts."""
+    _require_cute_runtime()
+    if start_weights.device.type != "cuda":
+        raise ValueError("start_weights must be a CUDA tensor")
+    if start_weights.ndim != 2:
+        raise ValueError(f"start_weights must have shape [n_starts, n_heads], got {tuple(start_weights.shape)}")
+    if start_rows.ndim != 1 or start_rows.shape[0] != start_weights.shape[0]:
+        raise ValueError("start_rows must have shape [n_starts]")
+    if start_row_ptr.ndim != 1:
+        raise ValueError("start_row_ptr must be 1D")
+    if top_k < 0:
+        raise ValueError("top_k must be >= 0")
+    if start_weights.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"start_weights dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    n_queries = int(start_row_ptr.shape[0] - 1)
+    n_heads = int(start_weights.shape[1])
+    beam_rows = torch.empty(
+        (n_queries, n_heads, int(top_k)),
+        dtype=torch.int32,
+        device=start_weights.device,
+    )
+    beam_mass = torch.empty(
+        (n_queries, n_heads, int(top_k)),
+        dtype=start_weights.dtype,
+        device=start_weights.device,
+    )
+    selected_entry = torch.empty_like(beam_rows)
+    if n_queries == 0 or n_heads == 0 or int(top_k) == 0:
+        beam_rows.fill_(-1)
+        beam_mass.zero_()
+        selected_entry.fill_(-1)
+        return beam_rows, beam_mass, selected_entry
+
+    start_weights = start_weights.contiguous()
+    start_rows = start_rows.to(device=start_weights.device, dtype=torch.int32).contiguous()
+    start_row_ptr = start_row_ptr.to(device=start_weights.device, dtype=torch.int32).contiguous()
+    total_tasks = int(n_queries * n_heads)
+    compile_key = (
+        "arhsa_v3_compact_initial_beam_forward_v1",
+        start_weights.dtype,
+        n_heads,
+        int(top_k),
+        torch.cuda.get_device_capability(start_weights.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_compact_initial_beam_forward.compile_cache:
+        op = ARHSAV3CompactInitialBeamForwardSm100()
+        run_arhsa_v3_compact_initial_beam_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(start_weights),
+            to_cute_tensor(start_rows, assumed_align=4),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(beam_rows, assumed_align=4),
+            to_cute_tensor(beam_mass),
+            to_cute_tensor(selected_entry, assumed_align=4),
+            Int32(int(top_k)),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_compact_initial_beam_forward.compile_cache[compile_key](
+        start_weights,
+        start_rows,
+        start_row_ptr,
+        beam_rows,
+        beam_mass,
+        selected_entry,
+        Int32(int(top_k)),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return beam_rows, beam_mass, selected_entry
+
+
+def run_arhsa_v3_compact_initial_beam_backward(
+    start_weights: torch.Tensor,
+    selected_entry: torch.Tensor,
+    grad_beam_mass: torch.Tensor,
+) -> torch.Tensor:
+    """Backward for compact exact-beam initial rows/masses."""
+    _require_cute_runtime()
+    if start_weights.device.type != "cuda":
+        raise ValueError("start_weights must be a CUDA tensor")
+    if start_weights.ndim != 2:
+        raise ValueError(f"start_weights must have shape [n_starts, n_heads], got {tuple(start_weights.shape)}")
+    if selected_entry.ndim != 3 or grad_beam_mass.shape != selected_entry.shape:
+        raise ValueError("selected_entry and grad_beam_mass must have shape [n_queries, n_heads, top_k]")
+    if selected_entry.shape[1] != start_weights.shape[1]:
+        raise ValueError("selected_entry head count must match start_weights")
+    if grad_beam_mass.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_beam_mass dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_start_weights = torch.zeros_like(start_weights, dtype=torch.float32)
+    selected_entry = selected_entry.to(device=start_weights.device, dtype=torch.int32).contiguous()
+    grad_beam_mass = grad_beam_mass.contiguous()
+    total_tasks = int(selected_entry.numel())
+    if total_tasks > 0:
+        compile_key = (
+            "arhsa_v3_compact_initial_beam_backward_v1",
+            grad_beam_mass.dtype,
+            grad_start_weights.dtype,
+            selected_entry.shape[1],
+            selected_entry.shape[2],
+            torch.cuda.get_device_capability(start_weights.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_v3_compact_initial_beam_backward.compile_cache:
+            op = ARHSAV3CompactInitialBeamBackwardSm100()
+            run_arhsa_v3_compact_initial_beam_backward.compile_cache[compile_key] = cute.compile(
+                op,
+                to_cute_tensor(selected_entry, assumed_align=4),
+                to_cute_tensor(grad_beam_mass),
+                to_cute_tensor(grad_start_weights),
+                Int32(total_tasks),
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        run_arhsa_v3_compact_initial_beam_backward.compile_cache[compile_key](
+            selected_entry,
+            grad_beam_mass,
+            grad_start_weights,
+            Int32(total_tasks),
+            current_stream,
+        )
+    if grad_start_weights.dtype != start_weights.dtype:
+        return grad_start_weights.to(dtype=start_weights.dtype)
+    return grad_start_weights
+
+
 def run_arhsa_v3_start_initial_state_forward(
     start_scores: torch.Tensor,
     open_scores: torch.Tensor,
@@ -23611,6 +23914,12 @@ run_arhsa_v3_start_weight_backward.compile_cache = get_jit_cache(
 )
 run_arhsa_v3_start_beam_topk.compile_cache = get_jit_cache(
     "arhsa_v3_start_beam_topk_v1"
+)
+run_arhsa_v3_compact_initial_beam_forward.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_initial_beam_forward"
+)
+run_arhsa_v3_compact_initial_beam_backward.compile_cache = get_jit_cache(
+    "arhsa_v3_compact_initial_beam_backward"
 )
 run_arhsa_v3_start_initial_state_forward.compile_cache = get_jit_cache(
     "arhsa_v3_start_initial_state_forward"

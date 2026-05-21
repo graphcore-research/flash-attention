@@ -3265,6 +3265,79 @@ class ARHSAV3StartWeightBackwardSm100:
             mGradStartMass[query_idx, head_idx] = bar_mass.to(mGradStartMass.element_type)
 
 
+class ARHSAV3StartBeamTopKSm100:
+    """Apply per-query/head top-k pruning to packed start weights."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mScores: cute.Tensor,
+        mValues: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mOut: cute.Tensor,
+        top_k: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mScores,
+            mValues,
+            mStartRowPtr,
+            mOut,
+            top_k,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mScores: cute.Tensor,
+        mValues: cute.Tensor,
+        mStartRowPtr: cute.Tensor,
+        mOut: cute.Tensor,
+        top_k: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mScores.shape[1])
+            query_idx = task_idx // num_heads
+            head_idx = task_idx - query_idx * num_heads
+            start = Int32(mStartRowPtr[query_idx])
+            end = Int32(mStartRowPtr[query_idx + Int32(1)])
+            row_count = end - start
+            if top_k <= Int32(0):
+                for ptr in cutlass.range(start, end, unroll=1):
+                    mOut[ptr, head_idx] = Float32(0.0).to(mOut.element_type)
+            elif top_k >= row_count:
+                for ptr in cutlass.range(start, end, unroll=1):
+                    mOut[ptr, head_idx] = mValues[ptr, head_idx]
+            else:
+                for ptr in cutlass.range(start, end, unroll=1):
+                    score = Float32(mScores[ptr, head_idx])
+                    better = Int32(0)
+                    for other in cutlass.range(start, end, unroll=1):
+                        other_score = Float32(mScores[other, head_idx])
+                        if other_score > score or (other_score == score and other < ptr):
+                            better += Int32(1)
+                    if better < top_k:
+                        mOut[ptr, head_idx] = mValues[ptr, head_idx]
+                    else:
+                        mOut[ptr, head_idx] = Float32(0.0).to(mOut.element_type)
+
+
 class ARHSAV3StartInitialStateForwardSm100:
     """Packed v3 start-weight normalization that writes initial walk state."""
 
@@ -14079,6 +14152,75 @@ def run_arhsa_v3_start_weight_backward(
     return grad_start_scores, grad_open_scores, grad_start_mass
 
 
+def run_arhsa_v3_start_beam_topk(
+    scores: torch.Tensor,
+    start_row_ptr: torch.Tensor,
+    top_k: int,
+    values: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply packed ARHSAv3 start-beam top-k pruning in one CuTe kernel."""
+    _require_cute_runtime()
+    if scores.device.type != "cuda":
+        raise ValueError("scores must be a CUDA tensor")
+    if scores.ndim != 2:
+        raise ValueError(f"scores must have shape [n_starts, n_heads], got {tuple(scores.shape)}")
+    if values is None:
+        values = scores
+    if values.shape != scores.shape:
+        raise ValueError(f"values shape mismatch: got {tuple(values.shape)}")
+    if start_row_ptr.ndim != 1:
+        raise ValueError("start_row_ptr must be 1D")
+    if out is None:
+        out = torch.empty_like(values)
+    if out.shape != values.shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if scores.dtype not in _CUTE_BACKWARD_DTYPES or values.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"scores/values dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    scores = scores.contiguous()
+    values = values.contiguous()
+    out = out.contiguous()
+    start_row_ptr = start_row_ptr.to(device=scores.device, dtype=torch.int32).contiguous()
+    n_queries = int(start_row_ptr.shape[0] - 1)
+    total_tasks = int(n_queries * scores.shape[1])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_v3_start_beam_topk",
+        scores.dtype,
+        values.dtype,
+        out.dtype,
+        scores.shape[1],
+        torch.cuda.get_device_capability(scores.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_beam_topk.compile_cache:
+        op = ARHSAV3StartBeamTopKSm100()
+        run_arhsa_v3_start_beam_topk.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(scores),
+            to_cute_tensor(values),
+            to_cute_tensor(start_row_ptr, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(int(top_k)),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_beam_topk.compile_cache[compile_key](
+        scores,
+        values,
+        start_row_ptr,
+        out,
+        Int32(int(top_k)),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_v3_start_initial_state_forward(
     start_scores: torch.Tensor,
     open_scores: torch.Tensor,
@@ -21728,6 +21870,9 @@ run_arhsa_v3_start_weight_forward.compile_cache = get_jit_cache(
 )
 run_arhsa_v3_start_weight_backward.compile_cache = get_jit_cache(
     "arhsa_v3_start_weight_backward"
+)
+run_arhsa_v3_start_beam_topk.compile_cache = get_jit_cache(
+    "arhsa_v3_start_beam_topk_v1"
 )
 run_arhsa_v3_start_initial_state_forward.compile_cache = get_jit_cache(
     "arhsa_v3_start_initial_state_forward"

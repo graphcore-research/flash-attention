@@ -11693,12 +11693,14 @@ class ARHSALeafReadoutQueryWarpSm100:
         head_dim_is_64: bool = False,
         write_denom: bool = False,
         use_dropout: bool = False,
+        normalize_readout: bool = True,
     ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.head_dim_is_64 = head_dim_is_64
         self.write_denom = write_denom
         self.use_dropout = use_dropout
+        self.normalize_readout = normalize_readout
 
     @cute.jit
     def __call__(
@@ -11772,9 +11774,11 @@ class ARHSALeafReadoutQueryWarpSm100:
                     node_idx = Int32(mLeafNodeIndex[leaf_entry])
                     denom_partial += Float32(mP[node_idx, head_idx])
                 denom = cute_utils.warp_reduce(denom_partial, lambda a, b: a + b, width=16)
-                if denom < Float32(1.0e-8):
-                    denom = Float32(1.0e-8)
-                inv_denom = Float32(1.0) / denom
+                inv_denom = Float32(1.0)
+                if cutlass.const_expr(self.normalize_readout):
+                    if denom < Float32(1.0e-8):
+                        denom = Float32(1.0e-8)
+                    inv_denom = Float32(1.0) / denom
                 if cutlass.const_expr(self.write_denom):
                     if lane16 == Int32(0):
                         mDenom[query_idx, head_idx] = denom.to(mDenom.element_type)
@@ -11819,9 +11823,11 @@ class ARHSALeafReadoutQueryWarpSm100:
                     node_idx = Int32(mLeafNodeIndex[leaf_entry])
                     denom_partial += Float32(mP[node_idx, head_idx])
                 denom = cute_utils.warp_reduce(denom_partial, lambda a, b: a + b)
-                if denom < Float32(1.0e-8):
-                    denom = Float32(1.0e-8)
-                inv_denom = Float32(1.0) / denom
+                inv_denom = Float32(1.0)
+                if cutlass.const_expr(self.normalize_readout):
+                    if denom < Float32(1.0e-8):
+                        denom = Float32(1.0e-8)
+                    inv_denom = Float32(1.0) / denom
                 if cutlass.const_expr(self.write_denom):
                     if lane == Int32(0):
                         mDenom[query_idx, head_idx] = denom.to(mDenom.element_type)
@@ -13683,12 +13689,14 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
         vectorize_dim4: bool = False,
         head_dim_is_64: bool = False,
         use_dropout: bool = False,
+        normalize_readout: bool = True,
     ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.vectorize_dim4 = vectorize_dim4
         self.head_dim_is_64 = head_dim_is_64
         self.use_dropout = use_dropout
+        self.normalize_readout = normalize_readout
 
     @cute.jit
     def __call__(
@@ -13779,13 +13787,17 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                             dropout = Float32(mDropoutMask[leaf_entry, head_idx])
                         if dim_group == Int32(0):
                             grad_leaf_attn = Float32(mLeafGradAttn[leaf_entry, head_idx])
-                            grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
+                            grad_mass = grad_leaf_attn
+                            if cutlass.const_expr(self.normalize_readout):
+                                grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
                             cute_utils.atomic_add_fp32(
                                 grad_mass,
                                 cute_utils.elem_pointer(mGradP, (node_idx, head_idx)),
                             )
 
-                        attn = mass / denom * dropout
+                        attn = mass * dropout
+                        if cutlass.const_expr(self.normalize_readout):
+                            attn = mass / denom * dropout
                         dim0 = dim_group * Int32(4)
                         dim1 = dim0 + Int32(1)
                         dim2 = dim0 + Int32(2)
@@ -13808,13 +13820,17 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                         dropout = Float32(mDropoutMask[leaf_entry, head_idx])
                     if lane == Int32(0):
                         grad_leaf_attn = Float32(mLeafGradAttn[leaf_entry, head_idx])
-                        grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
+                        grad_mass = grad_leaf_attn
+                        if cutlass.const_expr(self.normalize_readout):
+                            grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
                         cute_utils.atomic_add_fp32(
                             grad_mass,
                             cute_utils.elem_pointer(mGradP, (node_idx, head_idx)),
                         )
 
-                    attn = mass / denom * dropout
+                    attn = mass * dropout
+                    if cutlass.const_expr(self.normalize_readout):
+                        attn = mass / denom * dropout
                     if cutlass.const_expr(self.vectorize_dim4):
                         for dim_group in cutlass.range(lane, head_dim_v // Int32(4), cute.arch.WARP_SIZE, unroll=1):
                             dim0 = dim_group * Int32(4)
@@ -22178,6 +22194,7 @@ def run_arhsa_leaf_readout(
     pack_query_index: torch.Tensor | None = None,
     pack_value_index: torch.Tensor | None = None,
     pack_query_value_leaf_entry: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> torch.Tensor:
     """Run the CuTe direct leaf normalization/readout kernel."""
     _require_cute_runtime()
@@ -22217,6 +22234,8 @@ def run_arhsa_leaf_readout(
         dropout_mask = dropout_mask.contiguous()
     else:
         dropout_mask = p.new_empty((0,), dtype=p.dtype)
+    if not normalize_readout and not query_warp:
+        raise ValueError("normalize_readout=False is currently supported only by query_warp readout")
     p = p.contiguous()
     value = value.contiguous()
     if denom is not None:
@@ -22318,6 +22337,7 @@ def run_arhsa_leaf_readout(
             value.shape[2] == 64,
             write_denom,
             use_dropout_mask,
+            bool(normalize_readout),
             torch.cuda.get_device_capability(p.device),
         )
         if compile_key not in run_arhsa_leaf_readout.compile_cache:
@@ -22325,6 +22345,7 @@ def run_arhsa_leaf_readout(
                 head_dim_is_64=value.shape[2] == 64,
                 write_denom=write_denom,
                 use_dropout=use_dropout_mask,
+                normalize_readout=bool(normalize_readout),
             )
             run_arhsa_leaf_readout.compile_cache[compile_key] = cute.compile(
                 op,
@@ -23530,6 +23551,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
     *,
     n_queries: int,
     dropout_mask: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Scatter readout gradients with one warp per query/head."""
     _require_cute_runtime()
@@ -23586,6 +23608,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
         head_dim_v % 4 == 0,
         head_dim_v == 64,
         use_dropout_mask,
+        bool(normalize_readout),
         torch.cuda.get_device_capability(p.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -23594,6 +23617,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
             vectorize_dim4=(head_dim_v % 4 == 0),
             head_dim_is_64=(head_dim_v == 64),
             use_dropout=use_dropout_mask,
+            normalize_readout=bool(normalize_readout),
         )
         run_arhsa_leaf_readout_backward_scatter_query_warp.compile_cache[compile_key] = cute.compile(
             op,
@@ -24058,6 +24082,7 @@ def run_arhsa_leaf_readout_backward(
     pack_query_index: torch.Tensor | None = None,
     pack_query_value_index: torch.Tensor | None = None,
     pack_query_value_leaf_entry: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the CuTe direct leaf readout backward kernel."""
     _require_cute_runtime()
@@ -24485,8 +24510,13 @@ def run_arhsa_leaf_readout_backward(
             grad_value,
             n_queries=int(n_queries),
             dropout_mask=dropout_mask if use_dropout_mask else None,
+            normalize_readout=bool(normalize_readout),
         )
     else:
+        if not normalize_readout:
+            raise ValueError(
+                "normalize_readout=False currently requires query_warp_scatter=True"
+            )
         run_arhsa_leaf_readout_backward_scatter(
             p,
             leaf_node_index,
@@ -24916,6 +24946,7 @@ def run_arhsa_walk_readout_fixed_iters(
     incoming_src: torch.Tensor | None = None,
     incoming_edge_prob: torch.Tensor | None = None,
     dropout_mask: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """
     Exact fixed-iteration ARHSA walk and leaf readout.
@@ -24961,6 +24992,7 @@ def run_arhsa_walk_readout_fixed_iters(
         pack_value_index=pack_value_index,
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,
         dropout_mask=dropout_mask,
+        normalize_readout=bool(normalize_readout),
     )
     leaf_attn = None
     if return_leaf_attn:
@@ -25002,6 +25034,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
     incoming_packed_step: bool = False,
     incoming_src: torch.Tensor | None = None,
     dropout_mask: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """
     Convenience exact forward prototype from edge logits to readout.
@@ -25054,6 +25087,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
         incoming_src=incoming_src if incoming_packed_step else None,
         incoming_edge_prob=incoming_edge_prob,
         dropout_mask=dropout_mask,
+        normalize_readout=bool(normalize_readout),
     )
     return readout, leaf_attn, p_final, edge_prob
 
@@ -25228,6 +25262,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     level_bounds: torch.Tensor | None = None,
     level_range_kernels: bool = False,
     dropout_mask: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CuTe-backed backward for fixed-iteration ARHSA direct-PV readout."""
     _require_cute_runtime()
@@ -25411,6 +25446,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
         pack_query_value_index=pack_query_value_index,
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,
         dropout_mask=dropout_mask,
+        normalize_readout=bool(normalize_readout),
     )
     grad_edge_prob = torch.empty_like(edge_prob) if n_iters > 0 else torch.zeros_like(edge_prob)
     grad_next = grad_p_final
@@ -25518,6 +25554,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         tensor_core_query_value_packed: bool,
         query_value_pack_scatter: bool,
         tensor_core_query_value_pack_scatter_dv: bool,
+        normalize_readout: bool,
     ) -> torch.Tensor:
         ctx.n_queries = int(n_queries)
         ctx.n_iters = int(n_iters)
@@ -25538,6 +25575,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.tensor_core_query_value_packed = bool(tensor_core_query_value_packed)
         ctx.query_value_pack_scatter = bool(query_value_pack_scatter)
         ctx.tensor_core_query_value_pack_scatter_dv = bool(tensor_core_query_value_pack_scatter_dv)
+        ctx.normalize_readout = bool(normalize_readout)
         ctx.no_edge_direct_readout = False
         ctx.has_dropout_mask = bool(int(dropout_mask.numel()) > 0)
         if ctx.level_range_kernels and not ctx.incoming_packed_step:
@@ -25567,6 +25605,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                     dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
+                    normalize_readout=ctx.normalize_readout,
                 )
             elif bool(use_cute_softmax) and ctx.incoming_packed_step and edge_incoming_index.numel() > 0:
                 edge_prob, incoming_edge_prob = run_arhsa_outgoing_softmax_with_incoming(
@@ -25643,6 +25682,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                     dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
+                    normalize_readout=ctx.normalize_readout,
                 )
             elif ctx.level_range_kernels:
                 p_history_local = [p0]
@@ -25676,6 +25716,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                     dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
+                    normalize_readout=ctx.normalize_readout,
                 )
             else:
                 readout, _, _ = run_arhsa_walk_readout_fixed_iters(
@@ -25703,6 +25744,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     incoming_src=incoming_src if ctx.incoming_packed_step else None,
                     incoming_edge_prob=incoming_edge_prob,
                     dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
+                    normalize_readout=ctx.normalize_readout,
                 )
         saved_tensors = [
             p0,
@@ -25802,6 +25844,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 pack_query_value_index=pack_query_value_index,
                 pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                 dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
+                normalize_readout=getattr(ctx, "normalize_readout", True),
             )
             grad_edge_scores = torch.zeros_like(edge_scores)
             if not ctx.needs_input_grad[0]:
@@ -25881,6 +25924,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 pack_query_value_index=pack_query_value_index,
                 pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                 dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
+                normalize_readout=getattr(ctx, "normalize_readout", True),
             )
         else:
             grad_p0, grad_edge_scores, grad_value = torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
@@ -25959,6 +26003,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     pack_query_value_index: torch.Tensor | None = None,
     pack_query_value_leaf_entry: torch.Tensor | None = None,
     dropout_mask: torch.Tensor | None = None,
+    normalize_readout: bool = True,
 ) -> torch.Tensor:
     """
     Differentiable ARHSA readout: CuTe forward and CuTe-backed fp32/BF16 backward.
@@ -26089,6 +26134,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         bool(tensor_core_query_value_packed),
         bool(query_value_pack_scatter),
         bool(tensor_core_query_value_pack_scatter_dv),
+        bool(normalize_readout),
     )
 
 

@@ -5683,11 +5683,19 @@ class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
 
     arch = 100
 
-    def __init__(self, *, beam_width: int, n_iters: int, num_threads: int = 256):
+    def __init__(
+        self,
+        *,
+        beam_width: int,
+        n_iters: int,
+        num_threads: int = 256,
+        use_dropout: bool = False,
+    ):
         self.beam_width = beam_width
         self.n_iters = n_iters
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
+        self.use_dropout = use_dropout
 
     @cute.jit
     def __call__(
@@ -5702,6 +5710,7 @@ class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
         mChildRowIndex: cute.Tensor,
         mDownBias: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mOut: cute.Tensor,
         mBeamRowsHistory: cute.Tensor,
         mBeamMassHistory: cute.Tensor,
@@ -5722,6 +5731,7 @@ class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
             mChildRowIndex,
             mDownBias,
             mValue,
+            mDropoutMask,
             mOut,
             mBeamRowsHistory,
             mBeamMassHistory,
@@ -5747,6 +5757,7 @@ class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
         mChildRowIndex: cute.Tensor,
         mDownBias: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mOut: cute.Tensor,
         mBeamRowsHistory: cute.Tensor,
         mBeamMassHistory: cute.Tensor,
@@ -5978,7 +5989,10 @@ class ARHSAV3CompactExactBeamWalkReadoutForwardSm100:
                 for slot in cutlass.range(Int32(self.beam_width), unroll=1):
                     row = beam_rows[slot]
                     if row >= Int32(0) and row < num_queries:
-                        acc += beam_mass[slot] * Float32(mValue[row, head_idx, dim_idx])
+                        mass = beam_mass[slot]
+                        if cutlass.const_expr(self.use_dropout):
+                            mass *= Float32(mDropoutMask[query_idx, head_idx, slot])
+                        acc += mass * Float32(mValue[row, head_idx, dim_idx])
                 mOut[query_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
 
 
@@ -6410,11 +6424,19 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
 
     arch = 100
 
-    def __init__(self, *, beam_width: int, n_iters: int, num_threads: int = 256):
+    def __init__(
+        self,
+        *,
+        beam_width: int,
+        n_iters: int,
+        num_threads: int = 256,
+        use_dropout: bool = False,
+    ):
         self.beam_width = beam_width
         self.n_iters = n_iters
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
+        self.use_dropout = use_dropout
 
     @cute.jit
     def __call__(
@@ -6428,6 +6450,7 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
         mDownBias: cute.Tensor,
         mValue: cute.Tensor,
         mGradOut: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mBeamRowsHistory: cute.Tensor,
         mBeamMassHistory: cute.Tensor,
         mSelectedOffsetHistory: cute.Tensor,
@@ -6451,6 +6474,7 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
             mDownBias,
             mValue,
             mGradOut,
+            mDropoutMask,
             mBeamRowsHistory,
             mBeamMassHistory,
             mSelectedOffsetHistory,
@@ -6479,6 +6503,7 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
         mDownBias: cute.Tensor,
         mValue: cute.Tensor,
         mGradOut: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mBeamRowsHistory: cute.Tensor,
         mBeamMassHistory: cute.Tensor,
         mSelectedOffsetHistory: cute.Tensor,
@@ -6515,6 +6540,9 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
                 )
                 grad_mass = Float32.zero
                 if row >= Int32(0) and row < num_queries:
+                    dropout = Float32(1.0)
+                    if cutlass.const_expr(self.use_dropout):
+                        dropout = Float32(mDropoutMask[query_idx, head_idx, slot])
                     for dim_idx in cutlass.range(
                         lane,
                         head_dim,
@@ -6523,9 +6551,9 @@ class ARHSAV3CompactExactBeamWalkReadoutBackwardSm100:
                     ):
                         grad_out = Float32(mGradOut[query_idx, head_idx, dim_idx])
                         value = Float32(mValue[row, head_idx, dim_idx])
-                        grad_mass += grad_out * value
+                        grad_mass += grad_out * value * dropout
                         cute_utils.atomic_add_fp32(
-                            mass * grad_out,
+                            mass * dropout * grad_out,
                             cute_utils.elem_pointer(
                                 mGradValue,
                                 (row, head_idx, dim_idx),
@@ -18537,6 +18565,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
     child_row_index: torch.Tensor,
     down_bias: torch.Tensor,
     value: torch.Tensor,
+    dropout_mask: torch.Tensor | None = None,
     *,
     top_k: int,
     n_iters: int,
@@ -18583,6 +18612,20 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
     n_queries = int(q_levels.shape[0])
     n_heads = int(q_levels.shape[2])
     head_dim = int(q_levels.shape[3])
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        expected_dropout_shape = (n_queries, n_heads, top_k)
+        if dropout_mask.shape != expected_dropout_shape:
+            raise ValueError(
+                f"dropout_mask must have shape {expected_dropout_shape}, got {tuple(dropout_mask.shape)}"
+            )
+        if dropout_mask.device != value.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as value")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.to(device=value.device, dtype=value.dtype).contiguous()
+    else:
+        dropout_mask = value.new_empty((0,), dtype=value.dtype)
     out = torch.empty((n_queries, n_heads, head_dim), dtype=value.dtype, device=value.device)
     beam_rows_history = torch.empty(
         (n_iters + 1, n_queries, n_heads, top_k),
@@ -18627,6 +18670,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
             q_levels.dtype,
             row_repr.dtype,
             value.dtype,
+            use_dropout_mask,
             n_heads,
             head_dim,
             top_k,
@@ -18638,6 +18682,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
             op = ARHSAV3CompactExactBeamWalkReadoutForwardSm100(
                 beam_width=top_k,
                 n_iters=n_iters,
+                use_dropout=use_dropout_mask,
             )
             run_arhsa_v3_compact_exact_beam_walk_readout_forward.compile_cache[compile_key] = cute.compile(
                 op,
@@ -18651,6 +18696,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
                 to_cute_tensor(child_row_index, assumed_align=4),
                 to_cute_tensor(down_bias),
                 to_cute_tensor(value),
+                to_cute_tensor(dropout_mask),
                 to_cute_tensor(out),
                 to_cute_tensor(beam_rows_history, assumed_align=4),
                 to_cute_tensor(beam_mass_history),
@@ -18671,6 +18717,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_forward(
             child_row_index,
             down_bias,
             value,
+            dropout_mask,
             out,
             beam_rows_history,
             beam_mass_history,
@@ -18866,6 +18913,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
     down_bias: torch.Tensor,
     value: torch.Tensor,
     grad_out: torch.Tensor,
+    dropout_mask: torch.Tensor | None,
     beam_rows_history: torch.Tensor,
     beam_mass_history: torch.Tensor,
     selected_offset_history: torch.Tensor,
@@ -18909,6 +18957,20 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
     head_dim = int(q_levels.shape[3])
     top_k = int(beam_rows_history.shape[3])
     n_iters = int(beam_rows_history.shape[0] - 1)
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        expected_dropout_shape = (n_queries, n_heads, top_k)
+        if dropout_mask.shape != expected_dropout_shape:
+            raise ValueError(
+                f"dropout_mask must have shape {expected_dropout_shape}, got {tuple(dropout_mask.shape)}"
+            )
+        if dropout_mask.device != q_levels.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as q_levels")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.to(device=q_levels.device, dtype=value.dtype).contiguous()
+    else:
+        dropout_mask = value.new_empty((0,), dtype=value.dtype)
     grad_start_weights = torch.zeros_like(start_weights, dtype=torch.float32)
     grad_q = torch.zeros_like(q_levels, dtype=torch.float32)
     grad_row = torch.zeros_like(row_repr, dtype=torch.float32)
@@ -18941,6 +19003,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
             row_repr.dtype,
             value.dtype,
             grad_out.dtype,
+            use_dropout_mask,
             grad_q.dtype,
             grad_row.dtype,
             grad_down_bias.dtype,
@@ -18956,6 +19019,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
             op = ARHSAV3CompactExactBeamWalkReadoutBackwardSm100(
                 beam_width=top_k,
                 n_iters=n_iters,
+                use_dropout=use_dropout_mask,
             )
             run_arhsa_v3_compact_exact_beam_walk_readout_backward.compile_cache[compile_key] = cute.compile(
                 op,
@@ -18968,6 +19032,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
                 to_cute_tensor(down_bias),
                 to_cute_tensor(value),
                 to_cute_tensor(grad_out),
+                to_cute_tensor(dropout_mask),
                 to_cute_tensor(beam_rows_history, assumed_align=4),
                 to_cute_tensor(beam_mass_history),
                 to_cute_tensor(selected_offset_history, assumed_align=4),
@@ -18991,6 +19056,7 @@ def run_arhsa_v3_compact_exact_beam_walk_readout_backward(
             down_bias,
             value,
             grad_out,
+            dropout_mask,
             beam_rows_history,
             beam_mass_history,
             selected_offset_history,

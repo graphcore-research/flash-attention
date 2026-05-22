@@ -11692,11 +11692,13 @@ class ARHSALeafReadoutQueryWarpSm100:
         num_threads: int = 64,
         head_dim_is_64: bool = False,
         write_denom: bool = False,
+        use_dropout: bool = False,
     ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.head_dim_is_64 = head_dim_is_64
         self.write_denom = write_denom
+        self.use_dropout = use_dropout
 
     @cute.jit
     def __call__(
@@ -11707,6 +11709,7 @@ class ARHSALeafReadoutQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mReadout: cute.Tensor,
         mDenom: cute.Tensor,
         total_tasks: Int32,
@@ -11723,6 +11726,7 @@ class ARHSALeafReadoutQueryWarpSm100:
             mQueryLeafRowPtr,
             mQueryLeafEntryIndex,
             mValue,
+            mDropoutMask,
             mReadout,
             mDenom,
             total_tasks,
@@ -11741,6 +11745,7 @@ class ARHSALeafReadoutQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mReadout: cute.Tensor,
         mDenom: cute.Tensor,
         total_tasks: Int32,
@@ -11787,6 +11792,8 @@ class ARHSALeafReadoutQueryWarpSm100:
                     node_idx = Int32(mLeafNodeIndex[leaf_entry])
                     value_idx = Int32(mLeafValueIndex[leaf_entry])
                     weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                    if cutlass.const_expr(self.use_dropout):
+                        weight *= Float32(mDropoutMask[leaf_entry, head_idx])
                     acc0 += weight * Float32(mValue[value_idx, head_idx, dim0])
                     acc1 += weight * Float32(mValue[value_idx, head_idx, dim1])
                     acc2 += weight * Float32(mValue[value_idx, head_idx, dim2])
@@ -11826,6 +11833,8 @@ class ARHSALeafReadoutQueryWarpSm100:
                         node_idx = Int32(mLeafNodeIndex[leaf_entry])
                         value_idx = Int32(mLeafValueIndex[leaf_entry])
                         weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                        if cutlass.const_expr(self.use_dropout):
+                            weight *= Float32(mDropoutMask[leaf_entry, head_idx])
                         acc += weight * Float32(mValue[value_idx, head_idx, dim_idx])
                     mReadout[query_idx, head_idx, dim_idx] = acc.to(mReadout.element_type)
 
@@ -12976,10 +12985,17 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 128, head_dim_is_64: bool = False):
+    def __init__(
+        self,
+        *,
+        num_threads: int = 128,
+        head_dim_is_64: bool = False,
+        use_dropout: bool = False,
+    ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.head_dim_is_64 = head_dim_is_64
+        self.use_dropout = use_dropout
 
     @cute.jit
     def __call__(
@@ -12991,6 +13007,7 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
         mGradReadout: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mLeafGradAttn: cute.Tensor,
         mDenom: cute.Tensor,
         mWeightedGradSum: cute.Tensor,
@@ -13009,6 +13026,7 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
             mQueryLeafEntryIndex,
             mValue,
             mGradReadout,
+            mDropoutMask,
             mLeafGradAttn,
             mDenom,
             mWeightedGradSum,
@@ -13029,6 +13047,7 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
         mGradReadout: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mLeafGradAttn: cute.Tensor,
         mDenom: cute.Tensor,
         mWeightedGradSum: cute.Tensor,
@@ -13076,6 +13095,8 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
                     partial += d3 * Float32(mValue[value_idx, head_idx, dim3])
                     grad_attn = cute_utils.warp_reduce(partial, lambda a, b: a + b, width=16)
                     if lane16 == Int32(0):
+                        if cutlass.const_expr(self.use_dropout):
+                            grad_attn *= Float32(mDropoutMask[leaf_entry, head_idx])
                         node_idx = Int32(mLeafNodeIndex[leaf_entry])
                         mass = Float32(mP[node_idx, head_idx])
                         mLeafGradAttn[leaf_entry, head_idx] = grad_attn.to(mLeafGradAttn.element_type)
@@ -13112,6 +13133,8 @@ class ARHSALeafReadoutBackwardStatsQueryWarpSm100:
                             mValue[value_idx, head_idx, dim_idx]
                         )
                     grad_attn = cute_utils.warp_reduce(partial, lambda a, b: a + b)
+                    if cutlass.const_expr(self.use_dropout):
+                        grad_attn *= Float32(mDropoutMask[leaf_entry, head_idx])
                     if lane == Int32(0):
                         mLeafGradAttn[leaf_entry, head_idx] = grad_attn.to(mLeafGradAttn.element_type)
                     denom += mass
@@ -13659,11 +13682,13 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
         num_threads: int = 128,
         vectorize_dim4: bool = False,
         head_dim_is_64: bool = False,
+        use_dropout: bool = False,
     ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.vectorize_dim4 = vectorize_dim4
         self.head_dim_is_64 = head_dim_is_64
+        self.use_dropout = use_dropout
 
     @cute.jit
     def __call__(
@@ -13674,6 +13699,7 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mGradReadout: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mLeafGradAttn: cute.Tensor,
         mDenom: cute.Tensor,
         mWeightedGradSum: cute.Tensor,
@@ -13690,6 +13716,7 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
             mQueryLeafRowPtr,
             mQueryLeafEntryIndex,
             mGradReadout,
+            mDropoutMask,
             mLeafGradAttn,
             mDenom,
             mWeightedGradSum,
@@ -13711,6 +13738,7 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mGradReadout: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mLeafGradAttn: cute.Tensor,
         mDenom: cute.Tensor,
         mWeightedGradSum: cute.Tensor,
@@ -13746,6 +13774,9 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                         node_idx = Int32(mLeafNodeIndex[leaf_entry])
                         value_idx = Int32(mLeafValueIndex[leaf_entry])
                         mass = Float32(mP[node_idx, head_idx])
+                        dropout = Float32(1.0)
+                        if cutlass.const_expr(self.use_dropout):
+                            dropout = Float32(mDropoutMask[leaf_entry, head_idx])
                         if dim_group == Int32(0):
                             grad_leaf_attn = Float32(mLeafGradAttn[leaf_entry, head_idx])
                             grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
@@ -13754,7 +13785,7 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                                 cute_utils.elem_pointer(mGradP, (node_idx, head_idx)),
                             )
 
-                        attn = mass / denom
+                        attn = mass / denom * dropout
                         dim0 = dim_group * Int32(4)
                         dim1 = dim0 + Int32(1)
                         dim2 = dim0 + Int32(2)
@@ -13772,6 +13803,9 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                     node_idx = Int32(mLeafNodeIndex[leaf_entry])
                     value_idx = Int32(mLeafValueIndex[leaf_entry])
                     mass = Float32(mP[node_idx, head_idx])
+                    dropout = Float32(1.0)
+                    if cutlass.const_expr(self.use_dropout):
+                        dropout = Float32(mDropoutMask[leaf_entry, head_idx])
                     if lane == Int32(0):
                         grad_leaf_attn = Float32(mLeafGradAttn[leaf_entry, head_idx])
                         grad_mass = (grad_leaf_attn - weighted_grad_sum / denom) / denom
@@ -13780,7 +13814,7 @@ class ARHSALeafReadoutBackwardScatterQueryWarpSm100:
                             cute_utils.elem_pointer(mGradP, (node_idx, head_idx)),
                         )
 
-                    attn = mass / denom
+                    attn = mass / denom * dropout
                     if cutlass.const_expr(self.vectorize_dim4):
                         for dim_group in cutlass.range(lane, head_dim_v // Int32(4), cute.arch.WARP_SIZE, unroll=1):
                             dim0 = dim_group * Int32(4)
@@ -22137,6 +22171,7 @@ def run_arhsa_leaf_readout(
     n_queries: int,
     readout: torch.Tensor | None = None,
     denom: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
     query_warp: bool = False,
     query_value_pack: bool = False,
     tensor_core_query_value_pack: bool = False,
@@ -22165,6 +22200,23 @@ def run_arhsa_leaf_readout(
             raise ValueError(f"denom shape mismatch: got {tuple(denom.shape)}")
         if denom.dtype != torch.float32:
             raise ValueError("denom must be float32 when supplied")
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        if dropout_mask.shape != (leaf_node_index.numel(), p.shape[1]):
+            raise ValueError(
+                "dropout_mask must have shape [n_leaf_entries, n_heads], "
+                f"got {tuple(dropout_mask.shape)} for n_leaf_entries={leaf_node_index.numel()} "
+                f"and n_heads={p.shape[1]}"
+            )
+        if dropout_mask.device != p.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        if not query_warp or query_value_pack or tensor_core_query_value_pack:
+            raise ValueError("dropout_mask is currently supported only by query_warp leaf readout")
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p.new_empty((0,), dtype=p.dtype)
     p = p.contiguous()
     value = value.contiguous()
     if denom is not None:
@@ -22265,12 +22317,14 @@ def run_arhsa_leaf_readout(
             value.shape[2],
             value.shape[2] == 64,
             write_denom,
+            use_dropout_mask,
             torch.cuda.get_device_capability(p.device),
         )
         if compile_key not in run_arhsa_leaf_readout.compile_cache:
             op = ARHSALeafReadoutQueryWarpSm100(
                 head_dim_is_64=value.shape[2] == 64,
                 write_denom=write_denom,
+                use_dropout=use_dropout_mask,
             )
             run_arhsa_leaf_readout.compile_cache[compile_key] = cute.compile(
                 op,
@@ -22280,6 +22334,7 @@ def run_arhsa_leaf_readout(
                 to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
                 to_cute_tensor(query_leaf_entry_index, assumed_align=4),
                 to_cute_tensor(value),
+                to_cute_tensor(dropout_mask),
                 to_cute_tensor(readout),
                 to_cute_tensor(denom_arg),
                 Int32(warp_tasks),
@@ -22293,6 +22348,7 @@ def run_arhsa_leaf_readout(
             query_leaf_row_ptr,
             query_leaf_entry_index,
             value,
+            dropout_mask,
             readout,
             denom_arg,
             Int32(warp_tasks),
@@ -23065,6 +23121,7 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
     leaf_grad_attn: torch.Tensor | None = None,
     denom: torch.Tensor | None = None,
     weighted_grad_sum: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Query/head-owned warp stats pass for small leaf fanout."""
     _require_cute_runtime()
@@ -23092,6 +23149,19 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
         raise ValueError("denom and weighted_grad_sum must have shape [n_queries, n_heads]")
     if leaf_grad_attn.dtype != torch.float32 or denom.dtype != torch.float32 or weighted_grad_sum.dtype != torch.float32:
         raise ValueError("leaf_grad_attn, denom, and weighted_grad_sum must be float32 tensors")
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        if dropout_mask.shape != leaf_grad_shape:
+            raise ValueError(
+                f"dropout_mask must have shape {leaf_grad_shape}, got {tuple(dropout_mask.shape)}"
+            )
+        if dropout_mask.device != p.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p.new_empty((0,), dtype=p.dtype)
 
     p = p.contiguous()
     value = value.contiguous()
@@ -23115,12 +23185,14 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
         grad_readout.dtype,
         value.shape[1],
         value.shape[2],
+        use_dropout_mask,
         torch.cuda.get_device_capability(p.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if compile_key not in run_arhsa_leaf_readout_backward_stats_query_warp.compile_cache:
         op = ARHSALeafReadoutBackwardStatsQueryWarpSm100(
-            head_dim_is_64=(int(value.shape[2]) == 64)
+            head_dim_is_64=(int(value.shape[2]) == 64),
+            use_dropout=use_dropout_mask,
         )
         run_arhsa_leaf_readout_backward_stats_query_warp.compile_cache[compile_key] = cute.compile(
             op,
@@ -23131,6 +23203,7 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
             to_cute_tensor(query_leaf_entry_index, assumed_align=4),
             to_cute_tensor(value),
             to_cute_tensor(grad_readout),
+            to_cute_tensor(dropout_mask),
             to_cute_tensor(leaf_grad_attn),
             to_cute_tensor(denom),
             to_cute_tensor(weighted_grad_sum),
@@ -23146,6 +23219,7 @@ def run_arhsa_leaf_readout_backward_stats_query_warp(
         query_leaf_entry_index,
         value,
         grad_readout,
+        dropout_mask,
         leaf_grad_attn,
         denom,
         weighted_grad_sum,
@@ -23455,6 +23529,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
     grad_value: torch.Tensor,
     *,
     n_queries: int,
+    dropout_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Scatter readout gradients with one warp per query/head."""
     _require_cute_runtime()
@@ -23468,6 +23543,20 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
         raise ValueError(f"grad_p shape mismatch: got {tuple(grad_p.shape)}")
     if leaf_grad_attn.dtype != torch.float32 or denom.dtype != torch.float32 or weighted_grad_sum.dtype != torch.float32:
         raise ValueError("leaf_grad_attn, denom, and weighted_grad_sum must be float32 tensors")
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        expected_shape = (leaf_node_index.numel(), p.shape[1])
+        if dropout_mask.shape != expected_shape:
+            raise ValueError(
+                f"dropout_mask must have shape {expected_shape}, got {tuple(dropout_mask.shape)}"
+            )
+        if dropout_mask.device != p.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p.new_empty((0,), dtype=p.dtype)
 
     p = p.contiguous()
     grad_readout = grad_readout.contiguous()
@@ -23496,6 +23585,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
         head_dim_v,
         head_dim_v % 4 == 0,
         head_dim_v == 64,
+        use_dropout_mask,
         torch.cuda.get_device_capability(p.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -23503,6 +23593,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
         op = ARHSALeafReadoutBackwardScatterQueryWarpSm100(
             vectorize_dim4=(head_dim_v % 4 == 0),
             head_dim_is_64=(head_dim_v == 64),
+            use_dropout=use_dropout_mask,
         )
         run_arhsa_leaf_readout_backward_scatter_query_warp.compile_cache[compile_key] = cute.compile(
             op,
@@ -23512,6 +23603,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
             to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
             to_cute_tensor(query_leaf_entry_index, assumed_align=4),
             to_cute_tensor(grad_readout),
+            to_cute_tensor(dropout_mask),
             to_cute_tensor(leaf_grad_attn),
             to_cute_tensor(denom),
             to_cute_tensor(weighted_grad_sum),
@@ -23528,6 +23620,7 @@ def run_arhsa_leaf_readout_backward_scatter_query_warp(
         query_leaf_row_ptr,
         query_leaf_entry_index,
         grad_readout,
+        dropout_mask,
         leaf_grad_attn,
         denom,
         weighted_grad_sum,
@@ -23946,6 +24039,7 @@ def run_arhsa_leaf_readout_backward(
     weighted_grad_sum: torch.Tensor | None = None,
     grad_p_accum: torch.Tensor | None = None,
     grad_value_accum: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
     leaf_major_stats: bool = False,
     denom_precomputed: bool = False,
     packed_value: torch.Tensor | None = None,
@@ -23996,6 +24090,34 @@ def run_arhsa_leaf_readout_backward(
         raise ValueError(f"grad_p_accum shape mismatch: got {tuple(grad_p_accum.shape)}")
     if grad_value_accum is not None and grad_value_accum.shape != value.shape:
         raise ValueError(f"grad_value_accum shape mismatch: got {tuple(grad_value_accum.shape)}")
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        expected_dropout_shape = (leaf_node_index.numel(), p.shape[1])
+        if dropout_mask.shape != expected_dropout_shape:
+            raise ValueError(
+                f"dropout_mask must have shape {expected_dropout_shape}, got {tuple(dropout_mask.shape)}"
+            )
+        if dropout_mask.device != p.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        if not (leaf_major_stats and query_warp_stats and query_warp_scatter):
+            raise ValueError(
+                "dropout_mask currently requires leaf_major_stats=True, "
+                "query_warp_stats=True, and query_warp_scatter=True"
+            )
+        if (
+            query_warp_fused
+            or tensor_core_stats
+            or tensor_core_fused
+            or tensor_core_packed
+            or tensor_core_query_value_packed
+            or query_value_pack_scatter
+            or tensor_core_query_value_pack_scatter_dv
+            or max_leaves_per_query is not None
+            or packed_value is not None
+        ):
+            raise ValueError("dropout_mask is not supported by this readout backward variant")
     if packed_value is not None:
         if not leaf_major_stats:
             raise ValueError("packed_value currently requires leaf_major_stats=True")
@@ -24120,6 +24242,10 @@ def run_arhsa_leaf_readout_backward(
     grad_readout = grad_readout.contiguous()
     if packed_value is not None:
         packed_value = packed_value.contiguous()
+    if use_dropout_mask:
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p.new_empty((0,), dtype=p.dtype)
     leaf_node_index = leaf_node_index.to(device=p.device, dtype=torch.int32).contiguous()
     leaf_query_index = leaf_query_index.to(device=p.device, dtype=torch.int32).contiguous()
     leaf_value_index = leaf_value_index.to(device=p.device, dtype=torch.int32).contiguous()
@@ -24301,6 +24427,7 @@ def run_arhsa_leaf_readout_backward(
                 leaf_grad_attn=leaf_grad_attn,
                 denom=denom,
                 weighted_grad_sum=weighted_grad_sum,
+                dropout_mask=dropout_mask if use_dropout_mask else None,
             )
         elif packed_value is not None:
             leaf_grad_attn, denom, weighted_grad_sum = run_arhsa_leaf_readout_backward_stats_leaf_major_packed(
@@ -24357,6 +24484,7 @@ def run_arhsa_leaf_readout_backward(
             grad_p,
             grad_value,
             n_queries=int(n_queries),
+            dropout_mask=dropout_mask if use_dropout_mask else None,
         )
     else:
         run_arhsa_leaf_readout_backward_scatter(
@@ -24787,6 +24915,7 @@ def run_arhsa_walk_readout_fixed_iters(
     pack_query_value_leaf_entry: torch.Tensor | None = None,
     incoming_src: torch.Tensor | None = None,
     incoming_edge_prob: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """
     Exact fixed-iteration ARHSA walk and leaf readout.
@@ -24831,6 +24960,7 @@ def run_arhsa_walk_readout_fixed_iters(
         pack_query_index=pack_query_index,
         pack_value_index=pack_value_index,
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+        dropout_mask=dropout_mask,
     )
     leaf_attn = None
     if return_leaf_attn:
@@ -24871,6 +25001,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
     pack_query_value_leaf_entry: torch.Tensor | None = None,
     incoming_packed_step: bool = False,
     incoming_src: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """
     Convenience exact forward prototype from edge logits to readout.
@@ -24922,6 +25053,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters(
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,
         incoming_src=incoming_src if incoming_packed_step else None,
         incoming_edge_prob=incoming_edge_prob,
+        dropout_mask=dropout_mask,
     )
     return readout, leaf_attn, p_final, edge_prob
 
@@ -24940,6 +25072,7 @@ def torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
     *,
     n_queries: int,
     n_iters: int,
+    dropout_mask: torch.Tensor | None = None,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -24989,6 +25122,16 @@ def torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
         denom.index_add_(0, leaf_query_index, leaf_mass)
     denom_safe = denom.clamp(min=eps)
     leaf_attn = leaf_mass / denom_safe[leaf_query_index]
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        if dropout_mask.shape != leaf_attn.shape:
+            raise ValueError(
+                f"dropout_mask must have shape {tuple(leaf_attn.shape)}, got {tuple(dropout_mask.shape)}"
+            )
+        dropout_mask = dropout_mask.to(device=p0.device, dtype=leaf_attn.dtype).contiguous()
+        leaf_attn_for_readout = leaf_attn * dropout_mask
+    else:
+        leaf_attn_for_readout = leaf_attn
 
     grad_readout = grad_readout.to(device=p0.device, dtype=value.dtype).contiguous()
     grad_value = torch.zeros_like(value)
@@ -24996,11 +25139,13 @@ def torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
         grad_value.index_add_(
             0,
             leaf_value_index,
-            leaf_attn.to(dtype=value.dtype).unsqueeze(-1) * grad_readout[leaf_query_index],
+            leaf_attn_for_readout.to(dtype=value.dtype).unsqueeze(-1) * grad_readout[leaf_query_index],
         )
 
     grad_leaf_attn = (grad_readout[leaf_query_index] * value[leaf_value_index]).sum(dim=-1)
     grad_leaf_attn = grad_leaf_attn.to(dtype=p0.dtype)
+    if use_dropout_mask:
+        grad_leaf_attn = grad_leaf_attn * dropout_mask.to(dtype=p0.dtype)
     grad_leaf_mass = grad_leaf_attn / denom_safe[leaf_query_index]
     denom_grad = torch.zeros_like(denom)
     if leaf_mass.numel() > 0:
@@ -25082,6 +25227,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
     recompute_history: bool = False,
     level_bounds: torch.Tensor | None = None,
     level_range_kernels: bool = False,
+    dropout_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CuTe-backed backward for fixed-iteration ARHSA direct-PV readout."""
     _require_cute_runtime()
@@ -25264,6 +25410,7 @@ def run_arhsa_walk_readout_from_scores_fixed_iters_backward(
         pack_query_index=pack_query_index,
         pack_query_value_index=pack_query_value_index,
         pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+        dropout_mask=dropout_mask,
     )
     grad_edge_prob = torch.empty_like(edge_prob) if n_iters > 0 else torch.zeros_like(edge_prob)
     grad_next = grad_p_final
@@ -25349,6 +25496,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         pack_query_value_index: torch.Tensor,
         pack_query_value_leaf_entry: torch.Tensor,
         level_bounds: torch.Tensor,
+        dropout_mask: torch.Tensor,
         n_queries: int,
         n_iters: int,
         use_cute_softmax: bool,
@@ -25391,6 +25539,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.query_value_pack_scatter = bool(query_value_pack_scatter)
         ctx.tensor_core_query_value_pack_scatter_dv = bool(tensor_core_query_value_pack_scatter_dv)
         ctx.no_edge_direct_readout = False
+        ctx.has_dropout_mask = bool(int(dropout_mask.numel()) > 0)
         if ctx.level_range_kernels and not ctx.incoming_packed_step:
             raise ValueError("level_range_kernels requires incoming_packed_step")
         level_bounds_list = _level_bounds_as_ints(level_bounds) if ctx.level_range_kernels else []
@@ -25417,6 +25566,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_query_index=pack_query_index,
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
                 )
             elif bool(use_cute_softmax) and ctx.incoming_packed_step and edge_incoming_index.numel() > 0:
                 edge_prob, incoming_edge_prob = run_arhsa_outgoing_softmax_with_incoming(
@@ -25492,6 +25642,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_query_index=pack_query_index,
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
                 )
             elif ctx.level_range_kernels:
                 p_history_local = [p0]
@@ -25524,6 +25675,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_query_index=pack_query_index,
                     pack_value_index=pack_query_value_index,
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
                 )
             else:
                 readout, _, _ = run_arhsa_walk_readout_fixed_iters(
@@ -25550,6 +25702,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     pack_query_value_leaf_entry=pack_query_value_leaf_entry,
                     incoming_src=incoming_src if ctx.incoming_packed_step else None,
                     incoming_edge_prob=incoming_edge_prob,
+                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
                 )
         saved_tensors = [
             p0,
@@ -25576,6 +25729,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_value_index,
             pack_query_value_leaf_entry,
             level_bounds,
+            dropout_mask,
         ]
         if ctx.save_forward_history:
             if p_history is None:
@@ -25617,7 +25771,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_value_index,
             pack_query_value_leaf_entry,
             level_bounds,
-        ) = ctx.saved_tensors[:24]
+            dropout_mask,
+        ) = ctx.saved_tensors[:25]
         if getattr(ctx, "no_edge_direct_readout", False):
             grad_p0, grad_value = run_arhsa_leaf_readout_backward(
                 p0,
@@ -25646,6 +25801,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 pack_query_index=pack_query_index,
                 pack_query_value_index=pack_query_value_index,
                 pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
             )
             grad_edge_scores = torch.zeros_like(edge_scores)
             if not ctx.needs_input_grad[0]:
@@ -25663,7 +25819,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         cached_incoming_edge_prob = None
         cached_p_history = None
         if ctx.save_forward_history:
-            cached = ctx.saved_tensors[24:]
+            cached = ctx.saved_tensors[25:]
             if len(cached) != ctx.n_iters + 2:
                 raise RuntimeError(
                     f"saved forward history has {len(cached)} tensors; expected {ctx.n_iters + 2}"
@@ -25724,6 +25880,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 pack_query_index=pack_query_index,
                 pack_query_value_index=pack_query_value_index,
                 pack_query_value_leaf_entry=pack_query_value_leaf_entry,
+                dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
             )
         else:
             grad_p0, grad_edge_scores, grad_value = torch_arhsa_walk_readout_from_scores_fixed_iters_backward(
@@ -25739,6 +25896,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 grad_readout,
                 n_queries=ctx.n_queries,
                 n_iters=ctx.n_iters,
+                dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
             )
         if not ctx.needs_input_grad[0]:
             grad_p0 = None
@@ -25800,6 +25958,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     pack_query_index: torch.Tensor | None = None,
     pack_query_value_index: torch.Tensor | None = None,
     pack_query_value_leaf_entry: torch.Tensor | None = None,
+    dropout_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Differentiable ARHSA readout: CuTe forward and CuTe-backed fp32/BF16 backward.
@@ -25825,6 +25984,20 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
             leaf_query_index,
             n_queries=int(n_queries),
         )
+    if dropout_mask is not None and int(dropout_mask.numel()) > 0:
+        expected_dropout_shape = (leaf_node_index.numel(), p0.shape[1])
+        if dropout_mask.shape != expected_dropout_shape:
+            raise ValueError(
+                "dropout_mask must have shape [n_leaf_entries, n_heads], "
+                f"got {tuple(dropout_mask.shape)} expected {expected_dropout_shape}"
+            )
+        if dropout_mask.device != p0.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p0")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p0.new_empty((0,), dtype=p0.dtype)
     if pack_leaf_entry_index is None:
         pack_leaf_entry_index = leaf_value_index.new_empty((0, 16), dtype=torch.int32)
     if pack_value_index is None:
@@ -25894,6 +26067,7 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         pack_query_value_index,
         pack_query_value_leaf_entry,
         level_bounds_tensor,
+        dropout_mask,
         int(n_queries),
         int(n_iters),
         bool(use_cute_softmax),

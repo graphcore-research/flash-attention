@@ -12020,6 +12020,176 @@ class ARHSAMixedLocalHSACombineSm100:
             mOut[row_idx, head_idx, dim_idx] = (local + hsa).to(mOut.element_type)
 
 
+class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
+    """Fuse HSA leaf readout with the mixed local/HSA output combine."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64, head_dim_is_64: bool = False):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.head_dim_is_64 = head_dim_is_64
+
+    @cute.jit
+    def __call__(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mPrevOut: cute.Tensor,
+        mSelfValue: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mHasPrev: cute.Tensor,
+        mHSAStartMass: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(self.head_dim_is_64):
+            grid_x = cute.ceil_div(total_tasks, self.warps_per_cta * 2)
+        else:
+            grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mP,
+            mLeafNodeIndex,
+            mLeafValueIndex,
+            mQueryLeafRowPtr,
+            mQueryLeafEntryIndex,
+            mValue,
+            mPrevOut,
+            mSelfValue,
+            mSelfMass,
+            mHasPrev,
+            mHSAStartMass,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mP: cute.Tensor,
+        mLeafNodeIndex: cute.Tensor,
+        mLeafValueIndex: cute.Tensor,
+        mQueryLeafRowPtr: cute.Tensor,
+        mQueryLeafEntryIndex: cute.Tensor,
+        mValue: cute.Tensor,
+        mPrevOut: cute.Tensor,
+        mSelfValue: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mHasPrev: cute.Tensor,
+        mHSAStartMass: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        if cutlass.const_expr(self.head_dim_is_64):
+            half_warp = lane // Int32(16)
+            lane16 = lane - half_warp * Int32(16)
+            task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
+            if task_idx < total_tasks:
+                num_heads = Int32(mP.shape[1])
+                query_idx = task_idx // num_heads
+                head_idx = task_idx - query_idx * num_heads
+                start = Int32(mQueryLeafRowPtr[query_idx])
+                end = Int32(mQueryLeafRowPtr[query_idx + 1])
+                leaf_count = end - start
+
+                denom_partial = Float32.zero
+                for leaf_offset in cutlass.range(lane16, leaf_count, Int32(16), unroll=1):
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_offset])
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    denom_partial += Float32(mP[node_idx, head_idx])
+                denom = cute_utils.warp_reduce(denom_partial, lambda a, b: a + b, width=16)
+                if denom < Float32(1.0e-8):
+                    denom = Float32(1.0e-8)
+                inv_denom = Float32(1.0) / denom
+
+                dim0 = lane16 * Int32(4)
+                dim1 = dim0 + Int32(1)
+                dim2 = dim0 + Int32(2)
+                dim3 = dim0 + Int32(3)
+                acc0 = Float32.zero
+                acc1 = Float32.zero
+                acc2 = Float32.zero
+                acc3 = Float32.zero
+                for ptr in cutlass.range(start, end, unroll=1):
+                    leaf_entry = Int32(mQueryLeafEntryIndex[ptr])
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    value_idx = Int32(mLeafValueIndex[leaf_entry])
+                    weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                    acc0 += weight * Float32(mValue[value_idx, head_idx, dim0])
+                    acc1 += weight * Float32(mValue[value_idx, head_idx, dim1])
+                    acc2 += weight * Float32(mValue[value_idx, head_idx, dim2])
+                    acc3 += weight * Float32(mValue[value_idx, head_idx, dim3])
+
+                self_mass = Float32(mSelfMass[query_idx, head_idx])
+                hsa_mass = Float32(mHSAStartMass[query_idx, head_idx])
+                local0 = Float32(mSelfValue[query_idx, head_idx, dim0])
+                local1 = Float32(mSelfValue[query_idx, head_idx, dim1])
+                local2 = Float32(mSelfValue[query_idx, head_idx, dim2])
+                local3 = Float32(mSelfValue[query_idx, head_idx, dim3])
+                if mHasPrev[query_idx]:
+                    one_minus_self = Float32(1.0) - self_mass
+                    local0 = one_minus_self * Float32(mPrevOut[query_idx, head_idx, dim0]) + self_mass * local0
+                    local1 = one_minus_self * Float32(mPrevOut[query_idx, head_idx, dim1]) + self_mass * local1
+                    local2 = one_minus_self * Float32(mPrevOut[query_idx, head_idx, dim2]) + self_mass * local2
+                    local3 = one_minus_self * Float32(mPrevOut[query_idx, head_idx, dim3]) + self_mass * local3
+                mOut[query_idx, head_idx, dim0] = (local0 + hsa_mass * acc0).to(mOut.element_type)
+                mOut[query_idx, head_idx, dim1] = (local1 + hsa_mass * acc1).to(mOut.element_type)
+                mOut[query_idx, head_idx, dim2] = (local2 + hsa_mass * acc2).to(mOut.element_type)
+                mOut[query_idx, head_idx, dim3] = (local3 + hsa_mass * acc3).to(mOut.element_type)
+        else:
+            task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+            if task_idx < total_tasks:
+                num_heads = Int32(mP.shape[1])
+                head_dim_v = Int32(mValue.shape[2])
+                query_idx = task_idx // num_heads
+                head_idx = task_idx - query_idx * num_heads
+                start = Int32(mQueryLeafRowPtr[query_idx])
+                end = Int32(mQueryLeafRowPtr[query_idx + 1])
+                leaf_count = end - start
+
+                denom_partial = Float32.zero
+                for leaf_offset in cutlass.range(lane, leaf_count, cute.arch.WARP_SIZE, unroll=1):
+                    leaf_entry = Int32(mQueryLeafEntryIndex[start + leaf_offset])
+                    node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                    denom_partial += Float32(mP[node_idx, head_idx])
+                denom = cute_utils.warp_reduce(denom_partial, lambda a, b: a + b)
+                if denom < Float32(1.0e-8):
+                    denom = Float32(1.0e-8)
+                inv_denom = Float32(1.0) / denom
+
+                self_mass = Float32(mSelfMass[query_idx, head_idx])
+                hsa_mass = Float32(mHSAStartMass[query_idx, head_idx])
+                for dim_idx in cutlass.range(lane, head_dim_v, cute.arch.WARP_SIZE, unroll=2):
+                    acc = Float32.zero
+                    for ptr in cutlass.range(start, end, unroll=1):
+                        leaf_entry = Int32(mQueryLeafEntryIndex[ptr])
+                        node_idx = Int32(mLeafNodeIndex[leaf_entry])
+                        value_idx = Int32(mLeafValueIndex[leaf_entry])
+                        weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                        acc += weight * Float32(mValue[value_idx, head_idx, dim_idx])
+                    local = Float32(mSelfValue[query_idx, head_idx, dim_idx])
+                    if mHasPrev[query_idx]:
+                        local = (
+                            (Float32(1.0) - self_mass)
+                            * Float32(mPrevOut[query_idx, head_idx, dim_idx])
+                            + self_mass * local
+                        )
+                    mOut[query_idx, head_idx, dim_idx] = (local + hsa_mass * acc).to(mOut.element_type)
+
+
 class ARHSALeafReadoutQueryValuePackD64Sm100:
     """Pack-owned D=64 readout for dense 16-query x N-value qv packs."""
 
@@ -22736,6 +22906,124 @@ def run_arhsa_leaf_readout(
     return readout
 
 
+def run_arhsa_leaf_readout_mixed_local_hsa_combine(
+    p: torch.Tensor,
+    leaf_node_index: torch.Tensor,
+    leaf_value_index: torch.Tensor,
+    query_leaf_row_ptr: torch.Tensor,
+    query_leaf_entry_index: torch.Tensor,
+    value: torch.Tensor,
+    prev_out: torch.Tensor,
+    self_value: torch.Tensor,
+    self_mass: torch.Tensor,
+    has_prev: torch.Tensor,
+    hsa_start_mass: torch.Tensor,
+    *,
+    n_queries: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run HSA leaf readout and mixed local/HSA combine in one CuTe launch."""
+    _require_cute_runtime()
+    if p.device.type != "cuda":
+        raise ValueError("p must be a CUDA tensor")
+    if p.ndim != 2:
+        raise ValueError(f"p must have shape [n_nodes, n_heads], got {tuple(p.shape)}")
+    if value.ndim != 3 or value.shape[1] != p.shape[1]:
+        raise ValueError(
+            "value must have shape [n_values, n_heads, head_dim_v] with matching head count, "
+            f"got value={tuple(value.shape)} p={tuple(p.shape)}"
+        )
+    n_queries = int(n_queries)
+    expected_heads = (n_queries, value.shape[1], value.shape[2])
+    if prev_out.shape != expected_heads or self_value.shape != expected_heads:
+        raise ValueError(
+            "prev_out and self_value must have shape "
+            f"{expected_heads}, got prev_out={tuple(prev_out.shape)} self_value={tuple(self_value.shape)}"
+        )
+    expected_mass = (n_queries, value.shape[1])
+    if self_mass.shape != expected_mass or hsa_start_mass.shape != expected_mass:
+        raise ValueError(
+            "self_mass and hsa_start_mass must have shape "
+            f"{expected_mass}, got self_mass={tuple(self_mass.shape)} hsa_start_mass={tuple(hsa_start_mass.shape)}"
+        )
+    if has_prev.shape != (n_queries,):
+        raise ValueError(f"has_prev must have shape [{n_queries}], got {tuple(has_prev.shape)}")
+    if out is None:
+        out = torch.empty(expected_heads, dtype=value.dtype, device=value.device)
+    if out.shape != expected_heads:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_heads}")
+
+    p = p.contiguous()
+    value = value.contiguous()
+    prev_out = prev_out.contiguous()
+    self_value = self_value.contiguous()
+    self_mass = self_mass.contiguous()
+    has_prev = has_prev.to(device=p.device, dtype=torch.bool).contiguous()
+    hsa_start_mass = hsa_start_mass.contiguous()
+    out = out.contiguous()
+    leaf_node_index = leaf_node_index.to(device=p.device, dtype=torch.int32).contiguous()
+    leaf_value_index = leaf_value_index.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_row_ptr = query_leaf_row_ptr.to(device=p.device, dtype=torch.int32).contiguous()
+    query_leaf_entry_index = query_leaf_entry_index.to(device=p.device, dtype=torch.int32).contiguous()
+    warp_tasks = int(n_queries * value.shape[1])
+    if warp_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_leaf_readout_mixed_local_hsa_combine_query_warp",
+        p.dtype,
+        value.dtype,
+        prev_out.dtype,
+        self_value.dtype,
+        self_mass.dtype,
+        hsa_start_mass.dtype,
+        value.shape[1],
+        value.shape[2],
+        value.shape[2] == 64,
+        torch.cuda.get_device_capability(p.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache:
+        op = ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100(
+            head_dim_is_64=value.shape[2] == 64,
+        )
+        run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(p),
+            to_cute_tensor(leaf_node_index, assumed_align=4),
+            to_cute_tensor(leaf_value_index, assumed_align=4),
+            to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
+            to_cute_tensor(query_leaf_entry_index, assumed_align=4),
+            to_cute_tensor(value),
+            to_cute_tensor(prev_out),
+            to_cute_tensor(self_value),
+            to_cute_tensor(self_mass),
+            to_cute_tensor(has_prev),
+            to_cute_tensor(hsa_start_mass),
+            to_cute_tensor(out),
+            Int32(warp_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache[compile_key](
+        p,
+        leaf_node_index,
+        leaf_value_index,
+        query_leaf_row_ptr,
+        query_leaf_entry_index,
+        value,
+        prev_out,
+        self_value,
+        self_mass,
+        has_prev,
+        hsa_start_mass,
+        out,
+        Int32(warp_tasks),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_mixed_local_hsa_combine(
     prev_out: torch.Tensor,
     value: torch.Tensor,
@@ -25992,6 +26280,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         pack_query_value_leaf_entry: torch.Tensor,
         level_bounds: torch.Tensor,
         dropout_mask: torch.Tensor,
+        mixed_prev_out: torch.Tensor,
+        mixed_self_value: torch.Tensor,
+        mixed_self_mass: torch.Tensor,
+        mixed_has_prev: torch.Tensor,
+        mixed_hsa_start_mass: torch.Tensor,
         n_queries: int,
         n_iters: int,
         use_cute_softmax: bool,
@@ -26037,6 +26330,18 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.normalize_readout = bool(normalize_readout)
         ctx.no_edge_direct_readout = False
         ctx.has_dropout_mask = bool(int(dropout_mask.numel()) > 0)
+        ctx.mixed_local_hsa_combine = bool(int(mixed_prev_out.numel()) > 0)
+        if ctx.mixed_local_hsa_combine:
+            if ctx.has_dropout_mask:
+                raise ValueError("mixed fused leaf readout/combine does not support dropout")
+            if not bool(query_warp_readout):
+                raise ValueError("mixed fused leaf readout/combine requires query_warp_readout=True")
+            if bool(query_value_pack_readout) or bool(tensor_core_query_value_pack_readout):
+                raise ValueError("mixed fused leaf readout/combine does not support qv-pack readout")
+            if not bool(normalize_readout):
+                raise ValueError("mixed fused leaf readout/combine requires normalize_readout=True")
+            if not ctx.save_forward_history:
+                raise ValueError("mixed fused leaf readout/combine requires save_forward_history=True")
         if ctx.level_range_kernels and not ctx.incoming_packed_step:
             raise ValueError("level_range_kernels requires incoming_packed_step")
         level_bounds_list = _level_bounds_as_ints(level_bounds) if ctx.level_range_kernels else []
@@ -26045,12 +26350,24 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         with torch.no_grad():
             p_history: list[torch.Tensor] | None = None
             incoming_edge_prob = None
-            if int(edge_scores.numel()) == 0 and int(src.numel()) == 0 and int(dst.numel()) == 0:
-                ctx.no_edge_direct_readout = True
-                ctx.save_forward_history = False
-                ctx.recompute_history = False
-                readout = run_arhsa_leaf_readout(
-                    p0,
+            def leaf_readout(final_p: torch.Tensor) -> torch.Tensor:
+                if ctx.mixed_local_hsa_combine:
+                    return run_arhsa_leaf_readout_mixed_local_hsa_combine(
+                        final_p,
+                        leaf_node_index,
+                        leaf_value_index,
+                        query_leaf_row_ptr,
+                        query_leaf_entry_index,
+                        value,
+                        mixed_prev_out,
+                        mixed_self_value,
+                        mixed_self_mass,
+                        mixed_has_prev,
+                        mixed_hsa_start_mass,
+                        n_queries=ctx.n_queries,
+                    )
+                return run_arhsa_leaf_readout(
+                    final_p,
                     leaf_node_index,
                     leaf_value_index,
                     query_leaf_row_ptr,
@@ -26066,6 +26383,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                     dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
                     normalize_readout=ctx.normalize_readout,
                 )
+            if int(edge_scores.numel()) == 0 and int(src.numel()) == 0 and int(dst.numel()) == 0:
+                ctx.no_edge_direct_readout = True
+                ctx.save_forward_history = False
+                ctx.recompute_history = False
+                readout = leaf_readout(p0)
             elif bool(use_cute_softmax) and ctx.incoming_packed_step and edge_incoming_index.numel() > 0:
                 edge_prob, incoming_edge_prob = run_arhsa_outgoing_softmax_with_incoming(
                     edge_scores,
@@ -26126,23 +26448,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                             p_next,
                         )
                     p_history.append(p_next)
-                readout = run_arhsa_leaf_readout(
-                    p_history[-1],
-                    leaf_node_index,
-                    leaf_value_index,
-                    query_leaf_row_ptr,
-                    query_leaf_entry_index,
-                    value,
-                    n_queries=ctx.n_queries,
-                    query_warp=bool(query_warp_readout),
-                    query_value_pack=ctx.query_value_pack_readout,
-                    tensor_core_query_value_pack=ctx.tensor_core_query_value_pack_readout,
-                    pack_query_index=pack_query_index,
-                    pack_value_index=pack_query_value_index,
-                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
-                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
-                    normalize_readout=ctx.normalize_readout,
-                )
+                readout = leaf_readout(p_history[-1])
             elif ctx.level_range_kernels:
                 p_history_local = [p0]
                 for iter_idx in range(ctx.n_iters):
@@ -26160,23 +26466,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                         p_next=p_next,
                     )
                     p_history_local.append(p_next)
-                readout = run_arhsa_leaf_readout(
-                    p_history_local[-1],
-                    leaf_node_index,
-                    leaf_value_index,
-                    query_leaf_row_ptr,
-                    query_leaf_entry_index,
-                    value,
-                    n_queries=ctx.n_queries,
-                    query_warp=bool(query_warp_readout),
-                    query_value_pack=ctx.query_value_pack_readout,
-                    tensor_core_query_value_pack=ctx.tensor_core_query_value_pack_readout,
-                    pack_query_index=pack_query_index,
-                    pack_value_index=pack_query_value_index,
-                    pack_query_value_leaf_entry=pack_query_value_leaf_entry,
-                    dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
-                    normalize_readout=ctx.normalize_readout,
-                )
+                readout = leaf_readout(p_history_local[-1])
             else:
                 readout, _, _ = run_arhsa_walk_readout_fixed_iters(
                     p0,
@@ -26231,6 +26521,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_value_leaf_entry,
             level_bounds,
             dropout_mask,
+            mixed_prev_out,
+            mixed_self_value,
+            mixed_self_mass,
+            mixed_has_prev,
+            mixed_hsa_start_mass,
         ]
         if ctx.save_forward_history:
             if p_history is None:
@@ -26273,8 +26568,51 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             pack_query_value_leaf_entry,
             level_bounds,
             dropout_mask,
-        ) = ctx.saved_tensors[:25]
+            mixed_prev_out,
+            mixed_self_value,
+            mixed_self_mass,
+            mixed_has_prev,
+            mixed_hsa_start_mass,
+        ) = ctx.saved_tensors[:30]
+        grad_readout_for_hsa = grad_readout
+        grad_mixed_prev_out = None
+        grad_mixed_self_value = None
+        grad_mixed_self_mass = None
+        grad_mixed_hsa_start_mass = None
+        if getattr(ctx, "mixed_local_hsa_combine", False):
+            grad_dtype = grad_readout.dtype
+            has_prev_f = mixed_has_prev.to(dtype=grad_dtype).view(-1, 1, 1)
+            self_mass_exp = mixed_self_mass.to(dtype=grad_dtype).unsqueeze(-1)
+            hsa_start_mass_exp = mixed_hsa_start_mass.to(dtype=grad_dtype).unsqueeze(-1)
+            grad_readout_for_hsa = grad_readout * hsa_start_mass_exp
+            grad_mixed_prev_out = grad_readout * (1.0 - self_mass_exp) * has_prev_f
+            grad_mixed_self_value = grad_readout * (
+                self_mass_exp * has_prev_f + (1.0 - has_prev_f)
+            )
+            grad_mixed_self_mass = (
+                grad_readout
+                * (
+                    mixed_self_value.to(dtype=grad_dtype)
+                    - mixed_prev_out.to(dtype=grad_dtype)
+                )
+                * has_prev_f
+            ).sum(dim=-1)
         if getattr(ctx, "no_edge_direct_readout", False):
+            if getattr(ctx, "mixed_local_hsa_combine", False):
+                hsa_readout_for_mass = run_arhsa_leaf_readout(
+                    p0,
+                    leaf_node_index,
+                    leaf_value_index,
+                    query_leaf_row_ptr,
+                    query_leaf_entry_index,
+                    value,
+                    n_queries=ctx.n_queries,
+                    query_warp=True,
+                    normalize_readout=True,
+                )
+                grad_mixed_hsa_start_mass = (
+                    grad_readout * hsa_readout_for_mass.to(dtype=grad_readout.dtype)
+                ).sum(dim=-1)
             grad_p0, grad_value = run_arhsa_leaf_readout_backward(
                 p0,
                 leaf_node_index,
@@ -26283,7 +26621,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 query_leaf_row_ptr,
                 query_leaf_entry_index,
                 value,
-                grad_readout,
+                grad_readout_for_hsa,
                 n_queries=ctx.n_queries,
                 max_leaves_per_query=ctx.max_leaves_per_query,
                 leaf_major_stats=ctx.leaf_major_stats,
@@ -26316,12 +26654,18 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             grads[0] = grad_p0
             grads[1] = grad_edge_scores
             grads[8] = grad_value
+            grads[25] = grad_mixed_prev_out if ctx.needs_input_grad[25] else None
+            grads[26] = grad_mixed_self_value if ctx.needs_input_grad[26] else None
+            grads[27] = grad_mixed_self_mass if ctx.needs_input_grad[27] else None
+            grads[29] = (
+                grad_mixed_hsa_start_mass if ctx.needs_input_grad[29] else None
+            )
             return tuple(grads)
         cached_edge_prob = None
         cached_incoming_edge_prob = None
         cached_p_history = None
         if ctx.save_forward_history:
-            cached = ctx.saved_tensors[25:]
+            cached = ctx.saved_tensors[30:]
             if len(cached) != ctx.n_iters + 2:
                 raise RuntimeError(
                     f"saved forward history has {len(cached)} tensors; expected {ctx.n_iters + 2}"
@@ -26330,12 +26674,32 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             cached_incoming_edge_prob = cached[1] if cached[1].numel() > 0 else None
             cached_p_history = (p0, *cached[2:])
 
+        if getattr(ctx, "mixed_local_hsa_combine", False):
+            if cached_p_history is None:
+                raise RuntimeError(
+                    "mixed fused leaf readout/combine backward requires saved p history"
+                )
+            hsa_readout_for_mass = run_arhsa_leaf_readout(
+                cached_p_history[-1],
+                leaf_node_index,
+                leaf_value_index,
+                query_leaf_row_ptr,
+                query_leaf_entry_index,
+                value,
+                n_queries=ctx.n_queries,
+                query_warp=True,
+                normalize_readout=True,
+            )
+            grad_mixed_hsa_start_mass = (
+                grad_readout * hsa_readout_for_mass.to(dtype=grad_readout.dtype)
+            ).sum(dim=-1)
+
         if (
             p0.device.type == "cuda"
             and p0.dtype in _CUTE_BACKWARD_DTYPES
             and edge_scores.dtype in _CUTE_BACKWARD_DTYPES
             and value.dtype in _CUTE_BACKWARD_DTYPES
-            and grad_readout.dtype in _CUTE_BACKWARD_DTYPES
+            and grad_readout_for_hsa.dtype in _CUTE_BACKWARD_DTYPES
         ):
             grad_p0, grad_edge_scores, grad_value = run_arhsa_walk_readout_from_scores_fixed_iters_backward(
                 p0,
@@ -26347,7 +26711,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 leaf_query_index,
                 leaf_value_index,
                 value,
-                grad_readout,
+                grad_readout_for_hsa,
                 n_queries=ctx.n_queries,
                 n_iters=ctx.n_iters,
                 src_row_ptr=src_row_ptr,
@@ -26396,7 +26760,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 leaf_query_index,
                 leaf_value_index,
                 value,
-                grad_readout,
+                grad_readout_for_hsa,
                 n_queries=ctx.n_queries,
                 n_iters=ctx.n_iters,
                 dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
@@ -26411,6 +26775,10 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         grads[0] = grad_p0
         grads[1] = grad_edge_scores
         grads[8] = grad_value
+        grads[25] = grad_mixed_prev_out if ctx.needs_input_grad[25] else None
+        grads[26] = grad_mixed_self_value if ctx.needs_input_grad[26] else None
+        grads[27] = grad_mixed_self_mass if ctx.needs_input_grad[27] else None
+        grads[29] = grad_mixed_hsa_start_mass if ctx.needs_input_grad[29] else None
         return tuple(grads)
 
 
@@ -26463,6 +26831,11 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
     pack_query_value_leaf_entry: torch.Tensor | None = None,
     dropout_mask: torch.Tensor | None = None,
     normalize_readout: bool = True,
+    mixed_prev_out: torch.Tensor | None = None,
+    mixed_self_value: torch.Tensor | None = None,
+    mixed_self_mass: torch.Tensor | None = None,
+    mixed_has_prev: torch.Tensor | None = None,
+    mixed_hsa_start_mass: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Differentiable ARHSA readout: CuTe forward and CuTe-backed fp32/BF16 backward.
@@ -26502,6 +26875,54 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         dropout_mask = dropout_mask.contiguous()
     else:
         dropout_mask = p0.new_empty((0,), dtype=p0.dtype)
+    mixed_tensors = (
+        mixed_prev_out,
+        mixed_self_value,
+        mixed_self_mass,
+        mixed_has_prev,
+        mixed_hsa_start_mass,
+    )
+    use_mixed_local_hsa_combine = any(t is not None for t in mixed_tensors)
+    if use_mixed_local_hsa_combine:
+        if not all(t is not None for t in mixed_tensors):
+            raise ValueError("mixed fused leaf readout/combine requires all mixed tensors")
+        expected_heads = (int(n_queries), value.shape[1], value.shape[2])
+        expected_mass = (int(n_queries), value.shape[1])
+        if mixed_prev_out.shape != expected_heads or mixed_self_value.shape != expected_heads:
+            raise ValueError(
+                "mixed_prev_out and mixed_self_value must have shape "
+                f"{expected_heads}, got {tuple(mixed_prev_out.shape)} and {tuple(mixed_self_value.shape)}"
+            )
+        if mixed_self_mass.shape != expected_mass or mixed_hsa_start_mass.shape != expected_mass:
+            raise ValueError(
+                "mixed_self_mass and mixed_hsa_start_mass must have shape "
+                f"{expected_mass}, got {tuple(mixed_self_mass.shape)} and {tuple(mixed_hsa_start_mass.shape)}"
+            )
+        if mixed_has_prev.shape != (int(n_queries),):
+            raise ValueError(
+                f"mixed_has_prev must have shape [{int(n_queries)}], got {tuple(mixed_has_prev.shape)}"
+            )
+        if int(dropout_mask.numel()) > 0:
+            raise ValueError("mixed fused leaf readout/combine does not support dropout")
+        if not bool(query_warp_readout):
+            raise ValueError("mixed fused leaf readout/combine requires query_warp_readout=True")
+        if bool(query_value_pack_readout) or bool(tensor_core_query_value_pack_readout):
+            raise ValueError("mixed fused leaf readout/combine does not support qv-pack readout")
+        if not bool(normalize_readout):
+            raise ValueError("mixed fused leaf readout/combine requires normalize_readout=True")
+        if not bool(save_forward_history):
+            raise ValueError("mixed fused leaf readout/combine requires save_forward_history=True")
+        mixed_prev_out = mixed_prev_out.to(device=p0.device).contiguous()
+        mixed_self_value = mixed_self_value.to(device=p0.device).contiguous()
+        mixed_self_mass = mixed_self_mass.to(device=p0.device).contiguous()
+        mixed_has_prev = mixed_has_prev.to(device=p0.device, dtype=torch.bool).contiguous()
+        mixed_hsa_start_mass = mixed_hsa_start_mass.to(device=p0.device).contiguous()
+    else:
+        mixed_prev_out = p0.new_empty((0,), dtype=value.dtype)
+        mixed_self_value = p0.new_empty((0,), dtype=value.dtype)
+        mixed_self_mass = p0.new_empty((0,), dtype=value.dtype)
+        mixed_has_prev = torch.empty((0,), device=p0.device, dtype=torch.bool)
+        mixed_hsa_start_mass = p0.new_empty((0,), dtype=value.dtype)
     if pack_leaf_entry_index is None:
         pack_leaf_entry_index = leaf_value_index.new_empty((0, 16), dtype=torch.int32)
     if pack_value_index is None:
@@ -26572,6 +26993,11 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
         pack_query_value_leaf_entry,
         level_bounds_tensor,
         dropout_mask,
+        mixed_prev_out,
+        mixed_self_value,
+        mixed_self_mass,
+        mixed_has_prev,
+        mixed_hsa_start_mass,
         int(n_queries),
         int(n_iters),
         bool(use_cute_softmax),
@@ -26614,6 +27040,9 @@ run_arhsa_markov_incoming_packed_range_step.compile_cache = get_jit_cache(
 run_arhsa_markov_backward_step.compile_cache = get_jit_cache("arhsa_markov_backward_step")
 run_arhsa_markov_backward_range_step.compile_cache = get_jit_cache("arhsa_markov_backward_range_step")
 run_arhsa_gather_edge_prob_by_index.compile_cache = get_jit_cache("arhsa_gather_edge_prob_by_index")
+run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache = get_jit_cache(
+    "arhsa_leaf_readout_mixed_local_hsa_combine"
+)
 run_arhsa_mixed_local_hsa_combine.compile_cache = get_jit_cache("arhsa_mixed_local_hsa_combine")
 run_arhsa_outgoing_softmax.compile_cache = get_jit_cache("arhsa_outgoing_softmax")
 run_arhsa_outgoing_softmax_with_incoming.compile_cache = get_jit_cache("arhsa_outgoing_softmax_with_incoming")

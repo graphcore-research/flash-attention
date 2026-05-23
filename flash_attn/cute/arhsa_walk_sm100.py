@@ -11946,6 +11946,80 @@ class ARHSALeafReadoutQueryWarpSm100:
                     mReadout[query_idx, head_idx, dim_idx] = acc.to(mReadout.element_type)
 
 
+class ARHSAMixedLocalHSACombineSm100:
+    """Elementwise mixed-ARHSA epilogue: local window branch plus HSA readout."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mPrevOut: cute.Tensor,
+        mValue: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mHasPrev: cute.Tensor,
+        mHSAReadout: cute.Tensor,
+        mHSAStartMass: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mPrevOut,
+            mValue,
+            mSelfMass,
+            mHasPrev,
+            mHSAReadout,
+            mHSAStartMass,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mPrevOut: cute.Tensor,
+        mValue: cute.Tensor,
+        mSelfMass: cute.Tensor,
+        mHasPrev: cute.Tensor,
+        mHSAReadout: cute.Tensor,
+        mHSAStartMass: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mValue.shape[1])
+            head_dim = Int32(mValue.shape[2])
+            elems_per_row = num_heads * head_dim
+            row_idx = task_idx // elems_per_row
+            rem = task_idx - row_idx * elems_per_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+
+            value = Float32(mValue[row_idx, head_idx, dim_idx])
+            local = value
+            if mHasPrev[row_idx]:
+                self_mass = Float32(mSelfMass[row_idx, head_idx])
+                prev = Float32(mPrevOut[row_idx, head_idx, dim_idx])
+                local = (Float32(1.0) - self_mass) * prev + self_mass * value
+            hsa = (
+                Float32(mHSAStartMass[row_idx, head_idx])
+                * Float32(mHSAReadout[row_idx, head_idx, dim_idx])
+            )
+            mOut[row_idx, head_idx, dim_idx] = (local + hsa).to(mOut.element_type)
+
+
 class ARHSALeafReadoutQueryValuePackD64Sm100:
     """Pack-owned D=64 readout for dense 16-query x N-value qv packs."""
 
@@ -22662,6 +22736,182 @@ def run_arhsa_leaf_readout(
     return readout
 
 
+def run_arhsa_mixed_local_hsa_combine(
+    prev_out: torch.Tensor,
+    value: torch.Tensor,
+    self_mass: torch.Tensor,
+    has_prev: torch.Tensor,
+    hsa_readout: torch.Tensor,
+    hsa_start_mass: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the mixed local/HSA output epilogue in one CuTe elementwise pass."""
+    _require_cute_runtime()
+    if prev_out.device.type != "cuda":
+        raise ValueError("prev_out must be a CUDA tensor")
+    expected_shape = prev_out.shape
+    if prev_out.ndim != 3:
+        raise ValueError(f"prev_out must have shape [n_tokens, n_heads, head_dim], got {tuple(prev_out.shape)}")
+    if value.shape != expected_shape or hsa_readout.shape != expected_shape:
+        raise ValueError(
+            "value and hsa_readout must match prev_out shape, "
+            f"got value={tuple(value.shape)} hsa_readout={tuple(hsa_readout.shape)} prev_out={tuple(prev_out.shape)}"
+        )
+    mass_shape = expected_shape[:2]
+    if self_mass.shape != mass_shape or hsa_start_mass.shape != mass_shape:
+        raise ValueError(
+            "self_mass and hsa_start_mass must have shape [n_tokens, n_heads], "
+            f"got self_mass={tuple(self_mass.shape)} hsa_start_mass={tuple(hsa_start_mass.shape)} expected={mass_shape}"
+        )
+    if has_prev.shape != (expected_shape[0],):
+        raise ValueError(f"has_prev must have shape [n_tokens], got {tuple(has_prev.shape)}")
+    if out is None:
+        out = torch.empty_like(value)
+    if out.shape != expected_shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {tuple(expected_shape)}")
+
+    prev_out = prev_out.contiguous()
+    value = value.contiguous()
+    self_mass = self_mass.contiguous()
+    has_prev = has_prev.to(device=prev_out.device, dtype=torch.bool).contiguous()
+    hsa_readout = hsa_readout.contiguous()
+    hsa_start_mass = hsa_start_mass.contiguous()
+    out = out.contiguous()
+    total_tasks = int(prev_out.numel())
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_mixed_local_hsa_combine",
+        prev_out.dtype,
+        value.dtype,
+        self_mass.dtype,
+        hsa_readout.dtype,
+        hsa_start_mass.dtype,
+        value.shape[1],
+        value.shape[2],
+        torch.cuda.get_device_capability(prev_out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_mixed_local_hsa_combine.compile_cache:
+        op = ARHSAMixedLocalHSACombineSm100()
+        run_arhsa_mixed_local_hsa_combine.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(prev_out),
+            to_cute_tensor(value),
+            to_cute_tensor(self_mass),
+            to_cute_tensor(has_prev),
+            to_cute_tensor(hsa_readout),
+            to_cute_tensor(hsa_start_mass),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_mixed_local_hsa_combine.compile_cache[compile_key](
+        prev_out,
+        value,
+        self_mass,
+        has_prev,
+        hsa_readout,
+        hsa_start_mass,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+class _ARHSAMixedLocalHSACombine(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        prev_out: torch.Tensor,
+        value: torch.Tensor,
+        self_mass: torch.Tensor,
+        has_prev: torch.Tensor,
+        hsa_readout: torch.Tensor,
+        hsa_start_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(
+            prev_out,
+            value,
+            self_mass,
+            has_prev,
+            hsa_readout,
+            hsa_start_mass,
+        )
+        with torch.no_grad():
+            return run_arhsa_mixed_local_hsa_combine(
+                prev_out,
+                value,
+                self_mass,
+                has_prev,
+                hsa_readout,
+                hsa_start_mass,
+            )
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (
+            prev_out,
+            value,
+            self_mass,
+            has_prev,
+            hsa_readout,
+            hsa_start_mass,
+        ) = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        has_prev_value = has_prev.to(dtype=grad_out.dtype).view(-1, 1, 1)
+        self_mass_exp = self_mass.to(dtype=grad_out.dtype).unsqueeze(-1)
+        hsa_start_mass_exp = hsa_start_mass.to(dtype=grad_out.dtype).unsqueeze(-1)
+
+        grad_prev = grad_out * (1.0 - self_mass_exp) * has_prev_value
+        grad_value = grad_out * (
+            self_mass_exp * has_prev_value + (1.0 - has_prev_value)
+        )
+        grad_self_mass = (
+            grad_out
+            * (value.to(dtype=grad_out.dtype) - prev_out.to(dtype=grad_out.dtype))
+            * has_prev_value
+        ).sum(dim=-1)
+        grad_hsa = grad_out * hsa_start_mass_exp
+        grad_hsa_start_mass = (
+            grad_out * hsa_readout.to(dtype=grad_out.dtype)
+        ).sum(dim=-1)
+
+        if not ctx.needs_input_grad[0]:
+            grad_prev = None
+        if not ctx.needs_input_grad[1]:
+            grad_value = None
+        if not ctx.needs_input_grad[2]:
+            grad_self_mass = None
+        if not ctx.needs_input_grad[4]:
+            grad_hsa = None
+        if not ctx.needs_input_grad[5]:
+            grad_hsa_start_mass = None
+        return grad_prev, grad_value, grad_self_mass, None, grad_hsa, grad_hsa_start_mass
+
+
+def arhsa_mixed_local_hsa_combine_autograd(
+    prev_out: torch.Tensor,
+    value: torch.Tensor,
+    self_mass: torch.Tensor,
+    has_prev: torch.Tensor,
+    hsa_readout: torch.Tensor,
+    hsa_start_mass: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable mixed local/HSA epilogue with a CuTe forward kernel."""
+    return _ARHSAMixedLocalHSACombine.apply(
+        prev_out,
+        value,
+        self_mass,
+        has_prev,
+        hsa_readout,
+        hsa_start_mass,
+    )
+
+
 def run_arhsa_pack_leaf_values(
     leaf_value_index: torch.Tensor,
     value: torch.Tensor,
@@ -26364,6 +26614,7 @@ run_arhsa_markov_incoming_packed_range_step.compile_cache = get_jit_cache(
 run_arhsa_markov_backward_step.compile_cache = get_jit_cache("arhsa_markov_backward_step")
 run_arhsa_markov_backward_range_step.compile_cache = get_jit_cache("arhsa_markov_backward_range_step")
 run_arhsa_gather_edge_prob_by_index.compile_cache = get_jit_cache("arhsa_gather_edge_prob_by_index")
+run_arhsa_mixed_local_hsa_combine.compile_cache = get_jit_cache("arhsa_mixed_local_hsa_combine")
 run_arhsa_outgoing_softmax.compile_cache = get_jit_cache("arhsa_outgoing_softmax")
 run_arhsa_outgoing_softmax_with_incoming.compile_cache = get_jit_cache("arhsa_outgoing_softmax_with_incoming")
 run_arhsa_outgoing_softmax_backward.compile_cache = get_jit_cache("arhsa_outgoing_softmax_backward")

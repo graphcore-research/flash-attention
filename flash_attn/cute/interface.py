@@ -147,6 +147,10 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    mixed_self_value: Optional[torch.Tensor] = None,
+    mixed_self_mass: Optional[torch.Tensor] = None,
+    mixed_hsa_readout: Optional[torch.Tensor] = None,
+    mixed_hsa_start_mass: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -405,6 +409,57 @@ def _flash_attn_fwd(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    mixed_epilogue = mixed_self_value is not None
+    mixed_epilogue_metadata = None
+    if mixed_epilogue:
+        if any(
+            tensor is None
+            for tensor in (
+                mixed_self_mass,
+                mixed_hsa_readout,
+                mixed_hsa_start_mass,
+            )
+        ):
+            raise ValueError("mixed epilogue requires self value/mass and HSA readout/mass tensors")
+        if arch // 10 not in [10, 11]:
+            raise NotImplementedError("mixed epilogue currently requires the SM100/SM110 FA4 forward kernel")
+        if cu_seqlens_q is not None or seqused_q is not None:
+            raise NotImplementedError("mixed epilogue currently supports padded BLHD inputs only")
+        if is_split_kv:
+            raise NotImplementedError("mixed epilogue does not support split-KV")
+        expected_mixed_shapes = {
+            "mixed_self_value": (
+                mixed_self_value,
+                (batch_size, seqlen_q, num_head, head_dim_v),
+            ),
+            "mixed_self_mass": (
+                mixed_self_mass,
+                (batch_size, seqlen_q, num_head),
+            ),
+            "mixed_hsa_readout": (
+                mixed_hsa_readout,
+                (batch_size, seqlen_q, num_head, head_dim_v),
+            ),
+            "mixed_hsa_start_mass": (
+                mixed_hsa_start_mass,
+                (batch_size, seqlen_q, num_head),
+            ),
+        }
+        for name, (tensor, expected_shape) in expected_mixed_shapes.items():
+            assert tensor.shape == expected_shape, f"{name} shape {tensor.shape} != expected {expected_shape}"
+            assert tensor.device == device, f"{name} device {tensor.device} != expected {device}"
+            assert tensor.is_cuda, f"{name} must be on CUDA"
+            assert tensor.dtype in torch2cute_dtype_map, f"{name} dtype {tensor.dtype} is not supported by CuTe"
+        mixed_epilogue_metadata = (
+            mixed_self_value.dtype,
+            mixed_self_mass.dtype,
+            mixed_hsa_readout.dtype,
+            mixed_hsa_start_mass.dtype,
+            get_broadcast_dims(mixed_self_value),
+            get_broadcast_dims(mixed_self_mass),
+            get_broadcast_dims(mixed_hsa_readout),
+            get_broadcast_dims(mixed_hsa_start_mass),
+        )
 
     compile_key = (
         dtype,
@@ -436,6 +491,8 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        mixed_epilogue,
+        mixed_epilogue_metadata,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -473,6 +530,13 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+
+        mixed_self_value_tensor = to_cute_tensor(mixed_self_value) if mixed_epilogue else None
+        mixed_self_mass_tensor = to_cute_tensor(mixed_self_mass) if mixed_epilogue else None
+        mixed_hsa_readout_tensor = to_cute_tensor(mixed_hsa_readout) if mixed_epilogue else None
+        mixed_hsa_start_mass_tensor = (
+            to_cute_tensor(mixed_hsa_start_mass) if mixed_epilogue else None
+        )
 
         if arch // 10 == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -528,8 +592,7 @@ def _flash_attn_fwd(
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
             )
-        # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -548,6 +611,19 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+        ]
+        if arch // 10 in [10, 11]:
+            compile_args.extend(
+                [
+                    mixed_self_value_tensor,
+                    mixed_self_mass_tensor,
+                    mixed_hsa_readout_tensor,
+                    mixed_hsa_start_mass_tensor,
+                ]
+            )
+        # TODO: check @can_implement
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args,
             options="--enable-tvm-ffi",
         )
 
@@ -556,7 +632,7 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        _flash_attn_fwd.compile_cache[compile_key](
+        runtime_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -574,7 +650,17 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-        )
+        ]
+        if arch // 10 in [10, 11]:
+            runtime_args.extend(
+                [
+                    mixed_self_value,
+                    mixed_self_mass,
+                    mixed_hsa_readout,
+                    mixed_hsa_start_mass,
+                ]
+            )
+        _flash_attn_fwd.compile_cache[compile_key](*runtime_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1472,6 +1558,142 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 16)
 
 
+class FlashAttnMixedLocalHSAFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mixed_self_value: torch.Tensor,
+        mixed_self_mass: torch.Tensor,
+        mixed_hsa_readout: torch.Tensor,
+        mixed_hsa_start_mass: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        causal: bool = True,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        deterministic: bool = False,
+    ):
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            num_splits=1,
+            mixed_self_value=mixed_self_value,
+            mixed_self_mass=mixed_self_mass,
+            mixed_hsa_readout=mixed_hsa_readout,
+            mixed_hsa_start_mass=mixed_hsa_start_mass,
+        )
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            mixed_self_value,
+            mixed_self_mass,
+            mixed_hsa_readout,
+            mixed_hsa_start_mass,
+            lse,
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.deterministic = deterministic
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        (
+            q,
+            k,
+            v,
+            mixed_self_value,
+            mixed_self_mass,
+            mixed_hsa_readout,
+            mixed_hsa_start_mass,
+            lse,
+        ) = ctx.saved_tensors
+        has_prev = (
+            torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
+            .view(1, q.shape[1], 1, 1)
+            .gt(0)
+        )
+        has_prev_f = has_prev.to(dtype=dout.dtype)
+        self_mass = mixed_self_mass.to(dtype=dout.dtype).unsqueeze(-1)
+        hsa_start_mass = mixed_hsa_start_mass.to(dtype=dout.dtype).unsqueeze(-1)
+
+        grad_local = dout * (1.0 - self_mass) * has_prev_f
+        grad_self_value = dout * (
+            self_mass * has_prev_f + (1.0 - has_prev_f)
+        )
+        grad_hsa_readout = dout * hsa_start_mass
+        grad_hsa_start_mass = (
+            dout * mixed_hsa_readout.to(dtype=dout.dtype)
+        ).sum(dim=-1)
+
+        local_out, recomputed_lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
+            num_splits=1,
+            return_lse=True,
+        )
+        lse_for_bwd = lse if lse is not None else recomputed_lse
+        grad_self_mass = (
+            dout
+            * (
+                mixed_self_value.to(dtype=dout.dtype)
+                - local_out.to(dtype=dout.dtype)
+            )
+            * has_prev_f
+        ).sum(dim=-1)
+
+        dq = dk = dv = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            dq, dk, dv = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                local_out,
+                grad_local,
+                lse_for_bwd,
+                ctx.softmax_scale,
+                ctx.causal,
+                0.0,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                deterministic=ctx.deterministic,
+            )
+        if not ctx.needs_input_grad[3]:
+            grad_self_value = None
+        if not ctx.needs_input_grad[4]:
+            grad_self_mass = None
+        if not ctx.needs_input_grad[5]:
+            grad_hsa_readout = None
+        if not ctx.needs_input_grad[6]:
+            grad_hsa_start_mass = None
+        return (
+            dq,
+            dk,
+            dv,
+            grad_self_value,
+            grad_self_mass,
+            grad_hsa_readout,
+            grad_hsa_start_mass,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1603,6 +1825,34 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
+    )
+
+
+def flash_attn_mixed_local_hsa_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mixed_self_value: torch.Tensor,
+    mixed_self_mass: torch.Tensor,
+    mixed_hsa_readout: torch.Tensor,
+    mixed_hsa_start_mass: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    deterministic: bool = False,
+):
+    return FlashAttnMixedLocalHSAFunc.apply(
+        q,
+        k,
+        v,
+        mixed_self_value,
+        mixed_self_mass,
+        mixed_hsa_readout,
+        mixed_hsa_start_mass,
+        softmax_scale,
+        causal,
+        window_size,
+        deterministic,
     )
 
 

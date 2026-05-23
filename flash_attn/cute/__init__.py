@@ -11,6 +11,7 @@ import cutlass.cute as cute
 
 from .interface import (
     flash_attn_func,
+    flash_attn_mixed_local_hsa_func,
     flash_attn_varlen_func,
 )
 from .hsa import (
@@ -115,6 +116,7 @@ cute.compile = cute_compile_patched
 
 __all__ = [
     "flash_attn_func",
+    "flash_attn_mixed_local_hsa_func",
     "flash_attn_varlen_func",
     "flash_attn_hsa_func",
     "flash_attn_hsa_sparse_func",

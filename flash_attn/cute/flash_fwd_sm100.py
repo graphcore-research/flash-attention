@@ -300,6 +300,10 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMixedSelfValue: Optional[cute.Tensor] = None,
+        mMixedSelfMass: Optional[cute.Tensor] = None,
+        mMixedHSAReadout: Optional[cute.Tensor] = None,
+        mMixedHSAStartMass: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -352,7 +356,11 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = (
+            self.arch >= Arch.sm_90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+        )
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
@@ -638,6 +646,10 @@ class FlashAttentionForwardSm100:
             window_size_right,
             learnable_sink,
             blocksparse_tensors,
+            mMixedSelfValue,
+            mMixedSelfMass,
+            mMixedHSAReadout,
+            mMixedHSAStartMass,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -683,6 +695,10 @@ class FlashAttentionForwardSm100:
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
+        mMixedSelfValue: Optional[cute.Tensor],
+        mMixedSelfMass: Optional[cute.Tensor],
+        mMixedHSAReadout: Optional[cute.Tensor],
+        mMixedHSAStartMass: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1031,6 +1047,10 @@ class FlashAttentionForwardSm100:
                     SeqlenInfoCls,
                     TileSchedulerCls,
                     mma_tile_coord_v,
+                    mMixedSelfValue,
+                    mMixedSelfMass,
+                    mMixedHSAReadout,
+                    mMixedHSAStartMass,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1112,6 +1132,10 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mMixedSelfValue,
+                mMixedSelfMass,
+                mMixedHSAReadout,
+                mMixedHSAStartMass,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2109,6 +2133,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mMixedSelfValue: Optional[cute.Tensor] = None,
+        mMixedSelfMass: Optional[cute.Tensor] = None,
+        mMixedHSAReadout: Optional[cute.Tensor] = None,
+        mMixedHSAStartMass: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2267,6 +2295,14 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO[None, None, stage],
                         gmem_tiled_copy_O,
+                        head_idx,
+                        batch_idx,
+                        (m_block * self.q_stage + stage) * self.cta_group_size
+                        + mma_tile_coord_v,
+                        mMixedSelfValue,
+                        mMixedSelfMass,
+                        mMixedHSAReadout,
+                        mMixedHSAStartMass,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2428,6 +2464,13 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        head_idx: Int32 = Int32(0),
+        batch_idx: Int32 = Int32(0),
+        m_tile_idx: Int32 = Int32(0),
+        mMixedSelfValue: Optional[cute.Tensor] = None,
+        mMixedSelfMass: Optional[cute.Tensor] = None,
+        mMixedHSAReadout: Optional[cute.Tensor] = None,
+        mMixedHSAStartMass: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2483,12 +2526,43 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOcO_t2r_i = tOcO_t2r[None, 0, 0, i]
+            tOrO_frg = cute.make_fragment(tOcO_t2r_i.shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
                 )
+            if const_expr(mMixedSelfValue is not None and self.use_tma_O):
+                for j in cutlass.range(cute.size(tOrO_frg), unroll_full=True):
+                    row_coord = tOcO_t2r_i[j][0]
+                    dim_idx = tOcO_t2r_i[j][1]
+                    row_idx = m_tile_idx * self.m_block_size + row_coord
+                    if row_idx < seqlen_q and dim_idx < mMixedSelfValue.shape[3]:
+                        value = Float32(
+                            mMixedSelfValue[batch_idx, row_idx, head_idx, dim_idx]
+                        )
+                        local = value
+                        if row_idx > Int32(0):
+                            self_mass = Float32(
+                                mMixedSelfMass[batch_idx, row_idx, head_idx]
+                            )
+                            local = (
+                                (Float32(1.0) - self_mass) * Float32(tOrO_frg[j])
+                                + self_mass * value
+                            )
+                        hsa = (
+                            Float32(mMixedHSAStartMass[batch_idx, row_idx, head_idx])
+                            * Float32(
+                                mMixedHSAReadout[
+                                    batch_idx,
+                                    row_idx,
+                                    head_idx,
+                                    dim_idx,
+                                ]
+                            )
+                        )
+                        tOrO_frg[j] = local + hsa
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
 
@@ -2564,6 +2638,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        mMixedSelfValue: Optional[cute.Tensor] = None,
+        mMixedSelfMass: Optional[cute.Tensor] = None,
+        mMixedHSAReadout: Optional[cute.Tensor] = None,
+        mMixedHSAStartMass: Optional[cute.Tensor] = None,
     ):
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()

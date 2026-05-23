@@ -7790,6 +7790,79 @@ class ARHSARowSum128Sm100:
                 mOut[col_idx] = block_sum.to(mOut.element_type)
 
 
+class ARHSAUniformChildMean128Sm100:
+    """Reduce uniformly grouped child rows into one 128-wide parent row."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.num_warps = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mRawNode: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mOut: cute.Tensor,
+        n_groups: Int32,
+        fanout: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mRawNode,
+            mChildRows,
+            mOut,
+            n_groups,
+            fanout,
+        ).launch(
+            grid=[n_groups, 128, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRawNode: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mOut: cute.Tensor,
+        n_groups: Int32,
+        fanout: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, col_idx, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+
+        acc = Float32.zero
+        if group_idx < n_groups:
+            for child_offset in cutlass.range(tidx, fanout, self.num_threads, unroll=1):
+                child_pos = group_idx * fanout + child_offset
+                child_row = Int32(mChildRows[child_pos])
+                acc += Float32(mRawNode[child_row, col_idx])
+
+        warp_sum = cute_utils.warp_reduce(acc, lambda a, b: a + b)
+        smem = cutlass.utils.SmemAllocator()
+        sWarp = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((4,)),
+            byte_alignment=16,
+        )
+        if lane == Int32(0):
+            sWarp[warp_idx] = warp_sum
+        cute.arch.barrier()
+
+        block_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                block_sum = sWarp[lane]
+            block_sum = cute_utils.warp_reduce(block_sum, lambda a, b: a + b)
+            if lane == Int32(0) and group_idx < n_groups:
+                mean = block_sum / Float32(fanout)
+                mOut[group_idx, col_idx] = mean.to(mOut.element_type)
+
+
 class ARHSAKeyNormBackward128Sm100:
     """Fuse key L2-normalization backward with key layer-norm backward."""
 
@@ -19876,6 +19949,76 @@ def run_arhsa_row_sum_128(src: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def run_arhsa_uniform_child_mean_128(
+    raw_node_repr: torch.Tensor,
+    child_rows: torch.Tensor,
+    *,
+    fanout: int,
+) -> torch.Tensor:
+    """Return grouped child means for uniform fanout child-row segments."""
+    _require_cute_runtime()
+    if raw_node_repr.device.type != "cuda":
+        raise ValueError("raw_node_repr must be a CUDA tensor")
+    if raw_node_repr.ndim != 2 or int(raw_node_repr.shape[1]) != 128:
+        raise ValueError(
+            f"raw_node_repr must have shape [N,128], got {tuple(raw_node_repr.shape)}"
+        )
+    if child_rows.ndim != 1:
+        raise ValueError(f"child_rows must be 1D, got {tuple(child_rows.shape)}")
+    fanout = int(fanout)
+    if fanout <= 0:
+        raise ValueError("fanout must be positive")
+    if int(child_rows.numel()) % fanout != 0:
+        raise ValueError("child_rows length must be divisible by fanout")
+    if raw_node_repr.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported raw_node_repr dtype {raw_node_repr.dtype}")
+
+    raw_node_repr = raw_node_repr.contiguous()
+    child_rows = child_rows.to(
+        device=raw_node_repr.device,
+        dtype=torch.int32,
+    ).contiguous()
+    n_groups = int(child_rows.numel()) // fanout
+    out = torch.empty(
+        (n_groups, 128),
+        dtype=raw_node_repr.dtype,
+        device=raw_node_repr.device,
+    )
+    if n_groups == 0:
+        return out
+
+    compile_key = (
+        "arhsa_uniform_child_mean_128_v1",
+        raw_node_repr.dtype,
+        int(raw_node_repr.shape[0]),
+        n_groups,
+        fanout,
+        torch.cuda.get_device_capability(raw_node_repr.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_uniform_child_mean_128.compile_cache:
+        op = ARHSAUniformChildMean128Sm100()
+        run_arhsa_uniform_child_mean_128.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(raw_node_repr),
+            to_cute_tensor(child_rows, assumed_align=4),
+            _to_cute_gemm_2d(out),
+            Int32(n_groups),
+            Int32(fanout),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_uniform_child_mean_128.compile_cache[compile_key](
+        raw_node_repr,
+        child_rows,
+        out,
+        Int32(n_groups),
+        Int32(fanout),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_key_norm_backward_128(
     grad_proj_rows: torch.Tensor,
     grad_normalized: torch.Tensor,
@@ -26323,6 +26466,9 @@ run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_layer_norm_backward_128_v2"
 )
 run_arhsa_row_sum_128.compile_cache = get_jit_cache("arhsa_row_sum_128_v1")
+run_arhsa_uniform_child_mean_128.compile_cache = get_jit_cache(
+    "arhsa_uniform_child_mean_128_v1"
+)
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_key_norm_backward_128_v2"
 )

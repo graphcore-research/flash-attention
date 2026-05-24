@@ -1761,6 +1761,160 @@ class ARHSASampledNodeDotBackwardH2D64VecSm100:
             )
 
 
+class ARHSASampledNodeDotBackwardHeadPairD64VecSm100:
+    """D64 sampled-dot backward, computing one head-pair per warp with vector atomics."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128, cta_reduce_grad_q: bool = True):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.cta_reduce_grad_q = cta_reduce_grad_q
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            n_nodes = Int32(mQueryNodeFeatureRowIndex.shape[0])
+            pair_idx = task_idx // n_nodes
+            node_idx = task_idx - pair_idx * n_nodes
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            local_head = lane // Int32(16)
+            dim_group = lane - local_head * Int32(16)
+            head_idx = pair_idx * Int32(2) + local_head
+            dim0 = dim_group * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            grad = Float32(mGradOut[node_idx, head_idx]) * scale
+            q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+            q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+            q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+            q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+            row0 = Float32(mRowRepr[feature_row, head_idx, dim0])
+            row1 = Float32(mRowRepr[feature_row, head_idx, dim1])
+            row2 = Float32(mRowRepr[feature_row, head_idx, dim2])
+            row3 = Float32(mRowRepr[feature_row, head_idx, dim3])
+            grad_q0 = grad * row0
+            grad_q1 = grad * row1
+            grad_q2 = grad * row2
+            grad_q3 = grad * row3
+            if cutlass.const_expr(self.cta_reduce_grad_q):
+                leader = warp_idx == Int32(0)
+                if warp_idx > Int32(0):
+                    prev_task_idx = task_idx - Int32(1)
+                    prev_pair_idx = prev_task_idx // n_nodes
+                    prev_node_idx = prev_task_idx - prev_pair_idx * n_nodes
+                    prev_feature_row = Int32(mQueryNodeFeatureRowIndex[prev_node_idx])
+                    prev_query_idx = Int32(mQueryNodeQueryIndex[prev_node_idx])
+                    prev_level = Int32(mFeatureRowLevel[prev_feature_row])
+                    leader = (
+                        prev_pair_idx != pair_idx
+                        or prev_query_idx != query_idx
+                        or prev_level != level
+                    )
+                if leader:
+                    acc_q0 = grad_q0
+                    acc_q1 = grad_q1
+                    acc_q2 = grad_q2
+                    acc_q3 = grad_q3
+                    keep_reducing = True
+                    for other_warp in cutlass.range(warp_idx + Int32(1), Int32(self.warps_per_cta), unroll=1):
+                        if keep_reducing:
+                            other_task_idx = block_idx * Int32(self.warps_per_cta) + other_warp
+                            if other_task_idx < total_tasks:
+                                other_pair_idx = other_task_idx // n_nodes
+                                other_node_idx = other_task_idx - other_pair_idx * n_nodes
+                                other_feature_row = Int32(mQueryNodeFeatureRowIndex[other_node_idx])
+                                other_query_idx = Int32(mQueryNodeQueryIndex[other_node_idx])
+                                other_level = Int32(mFeatureRowLevel[other_feature_row])
+                                if (
+                                    other_pair_idx == pair_idx
+                                    and other_query_idx == query_idx
+                                    and other_level == level
+                                ):
+                                    other_grad = Float32(mGradOut[other_node_idx, head_idx]) * scale
+                                    acc_q0 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim0])
+                                    acc_q1 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim1])
+                                    acc_q2 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim2])
+                                    acc_q3 += other_grad * Float32(mRowRepr[other_feature_row, head_idx, dim3])
+                                else:
+                                    keep_reducing = False
+                    copy_utils.atomic_add_fp32x4(
+                        acc_q0,
+                        acc_q1,
+                        acc_q2,
+                        acc_q3,
+                        cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                    )
+            else:
+                copy_utils.atomic_add_fp32x4(
+                    grad_q0,
+                    grad_q1,
+                    grad_q2,
+                    grad_q3,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                )
+            copy_utils.atomic_add_fp32x4(
+                grad * q0,
+                grad * q1,
+                grad * q2,
+                grad * q3,
+                cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim0)),
+            )
+
+
 class ARHSAV3StartScoreH2Sm100:
     """Two-head packed v3 start-score dot with bias and old BF16 rounding semantics."""
 
@@ -16565,9 +16719,22 @@ def run_arhsa_sampled_node_dot_backward(
         and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_H2_D64_VEC", "1")
         not in {"0", "false", "False", ""}
     )
+    use_head_pair_d64_vec_any = (
+        use_head_pair
+        and row_repr.shape[1] != 2
+        and row_repr.shape[2] == 64
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR_D64_VEC", "1")
+        not in {"0", "false", "False", ""}
+    )
+    if use_head_pair_d64_vec_any:
+        use_head_triple = False
     use_head_pair_d64_cta_reduce = (
         use_head_pair_d64_vec
         and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_H2_D64_CTA_REDUCE", "1")
+        not in {"0", "false", "False", ""}
+    ) or (
+        use_head_pair_d64_vec_any
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR_D64_CTA_REDUCE", "0")
         not in {"0", "false", "False", ""}
     )
     total_tasks = int(
@@ -16575,7 +16742,7 @@ def run_arhsa_sampled_node_dot_backward(
         if use_head_triple
         else (
             query_node_feature_row_index.numel() * (row_repr.shape[1] // 2)
-            if use_head_pair and row_repr.shape[1] != 2
+            if (use_head_pair and row_repr.shape[1] != 2) or use_head_pair_d64_vec_any
             else (
                 query_node_feature_row_index.numel()
                 if use_head_pair
@@ -16592,6 +16759,8 @@ def run_arhsa_sampled_node_dot_backward(
             (
                 "arhsa_sampled_node_dot_backward_h2_d64_vec"
                 if use_head_pair_d64_vec
+                else "arhsa_sampled_node_dot_backward_head_pair_d64_vec"
+                if use_head_pair_d64_vec_any
                 else (
                     "arhsa_sampled_node_dot_backward_head_triple"
                     if use_head_triple
@@ -16623,6 +16792,11 @@ def run_arhsa_sampled_node_dot_backward(
                     cta_reduce_grad_q=use_head_pair_d64_cta_reduce,
                 )
                 if use_head_pair_d64_vec
+                else ARHSASampledNodeDotBackwardHeadPairD64VecSm100(
+                    num_threads=num_threads,
+                    cta_reduce_grad_q=use_head_pair_d64_cta_reduce,
+                )
+                if use_head_pair_d64_vec_any
                 else (
                     ARHSASampledNodeDotBackwardHeadTripleSm100(
                         num_threads=num_threads

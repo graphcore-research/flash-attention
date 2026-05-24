@@ -1149,6 +1149,182 @@ class ARHSASampledNodeDotH2Sm100:
                 mOut[node_idx, 1] = (acc1 * scale).to(mOut.element_type)
 
 
+class ARHSASampledNodeDotHeadPairSm100:
+    """Sample q[level] dot row_repr, computing two heads per warp task."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_pairs = num_heads // Int32(2)
+            node_idx = task_idx // head_pairs
+            pair_idx = task_idx - node_idx * head_pairs
+            head0 = pair_idx * Int32(2)
+            head1 = head0 + Int32(1)
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            partial0 = Float32.zero
+            partial1 = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                partial0 += (
+                    Float32(mQLevels[query_idx, level, head0, dim_idx])
+                    * Float32(mRowRepr[feature_row, head0, dim_idx])
+                )
+                partial1 += (
+                    Float32(mQLevels[query_idx, level, head1, dim_idx])
+                    * Float32(mRowRepr[feature_row, head1, dim_idx])
+                )
+            acc0 = cute_utils.warp_reduce(partial0, lambda a, b: a + b)
+            acc1 = cute_utils.warp_reduce(partial1, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[node_idx, head0] = (acc0 * scale).to(mOut.element_type)
+                mOut[node_idx, head1] = (acc1 * scale).to(mOut.element_type)
+
+
+class ARHSASampledNodeDotHeadTripleSm100:
+    """Sample q[level] dot row_repr, computing three heads per warp task."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_triples = num_heads // Int32(3)
+            node_idx = task_idx // head_triples
+            triple_idx = task_idx - node_idx * head_triples
+            head0 = triple_idx * Int32(3)
+            head1 = head0 + Int32(1)
+            head2 = head0 + Int32(2)
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            partial0 = Float32.zero
+            partial1 = Float32.zero
+            partial2 = Float32.zero
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                partial0 += (
+                    Float32(mQLevels[query_idx, level, head0, dim_idx])
+                    * Float32(mRowRepr[feature_row, head0, dim_idx])
+                )
+                partial1 += (
+                    Float32(mQLevels[query_idx, level, head1, dim_idx])
+                    * Float32(mRowRepr[feature_row, head1, dim_idx])
+                )
+                partial2 += (
+                    Float32(mQLevels[query_idx, level, head2, dim_idx])
+                    * Float32(mRowRepr[feature_row, head2, dim_idx])
+                )
+            acc0 = cute_utils.warp_reduce(partial0, lambda a, b: a + b)
+            acc1 = cute_utils.warp_reduce(partial1, lambda a, b: a + b)
+            acc2 = cute_utils.warp_reduce(partial2, lambda a, b: a + b)
+            if lane == Int32(0):
+                mOut[node_idx, head0] = (acc0 * scale).to(mOut.element_type)
+                mOut[node_idx, head1] = (acc1 * scale).to(mOut.element_type)
+                mOut[node_idx, head2] = (acc2 * scale).to(mOut.element_type)
+
+
 class ARHSASampledNodeDotBackwardH2Sm100:
     """Backward for the common two-head sampled-dot kernel."""
 
@@ -1237,6 +1413,212 @@ class ARHSASampledNodeDotBackwardH2Sm100:
                 cute_utils.atomic_add_fp32(
                     grad1 * q1,
                     cute_utils.elem_pointer(mGradRow, (feature_row, 1, dim_idx)),
+                )
+
+
+class ARHSASampledNodeDotBackwardHeadPairSm100:
+    """Backward sampled-dot accumulation, computing two heads per warp task."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_pairs = num_heads // Int32(2)
+            node_idx = task_idx // head_pairs
+            pair_idx = task_idx - node_idx * head_pairs
+            head0 = pair_idx * Int32(2)
+            head1 = head0 + Int32(1)
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            grad0 = Float32(mGradOut[node_idx, head0]) * scale
+            grad1 = Float32(mGradOut[node_idx, head1]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q0 = Float32(mQLevels[query_idx, level, head0, dim_idx])
+                row0 = Float32(mRowRepr[feature_row, head0, dim_idx])
+                q1 = Float32(mQLevels[query_idx, level, head1, dim_idx])
+                row1 = Float32(mRowRepr[feature_row, head1, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad0 * row0,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad0 * q0,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * row1,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head1, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * q1,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head1, dim_idx)),
+                )
+
+
+class ARHSASampledNodeDotBackwardHeadTripleSm100:
+    """Backward sampled-dot accumulation, computing three heads per warp task."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mGradOut,
+            mFeatureRowLevel,
+            mQueryNodeFeatureRowIndex,
+            mQueryNodeQueryIndex,
+            mGradQ,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mFeatureRowLevel: cute.Tensor,
+        mQueryNodeFeatureRowIndex: cute.Tensor,
+        mQueryNodeQueryIndex: cute.Tensor,
+        mGradQ: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            num_heads = Int32(mRowRepr.shape[1])
+            head_triples = num_heads // Int32(3)
+            node_idx = task_idx // head_triples
+            triple_idx = task_idx - node_idx * head_triples
+            head0 = triple_idx * Int32(3)
+            head1 = head0 + Int32(1)
+            head2 = head0 + Int32(2)
+            head_dim = Int32(mRowRepr.shape[2])
+            feature_row = Int32(mQueryNodeFeatureRowIndex[node_idx])
+            query_idx = Int32(mQueryNodeQueryIndex[node_idx])
+            level = Int32(mFeatureRowLevel[feature_row])
+            grad0 = Float32(mGradOut[node_idx, head0]) * scale
+            grad1 = Float32(mGradOut[node_idx, head1]) * scale
+            grad2 = Float32(mGradOut[node_idx, head2]) * scale
+            for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                q0 = Float32(mQLevels[query_idx, level, head0, dim_idx])
+                row0 = Float32(mRowRepr[feature_row, head0, dim_idx])
+                q1 = Float32(mQLevels[query_idx, level, head1, dim_idx])
+                row1 = Float32(mRowRepr[feature_row, head1, dim_idx])
+                q2 = Float32(mQLevels[query_idx, level, head2, dim_idx])
+                row2 = Float32(mRowRepr[feature_row, head2, dim_idx])
+                cute_utils.atomic_add_fp32(
+                    grad0 * row0,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad0 * q0,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head0, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * row1,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head1, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad1 * q1,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head1, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad2 * row2,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head2, dim_idx)),
+                )
+                cute_utils.atomic_add_fp32(
+                    grad2 * q2,
+                    cute_utils.elem_pointer(mGradRow, (feature_row, head2, dim_idx)),
                 )
 
 
@@ -12357,10 +12739,19 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
 
     arch = 100
 
-    def __init__(self, *, num_threads: int = 64, head_dim_is_64: bool = False):
+    def __init__(
+        self,
+        *,
+        num_threads: int = 64,
+        head_dim_is_64: bool = False,
+        use_dropout: bool = False,
+        write_hsa_readout: bool = False,
+    ):
         self.num_threads = num_threads
         self.warps_per_cta = num_threads // 32
         self.head_dim_is_64 = head_dim_is_64
+        self.use_dropout = use_dropout
+        self.write_hsa_readout = write_hsa_readout
 
     @cute.jit
     def __call__(
@@ -12371,12 +12762,14 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mPrevOut: cute.Tensor,
         mSelfValue: cute.Tensor,
         mSelfMass: cute.Tensor,
         mHasPrev: cute.Tensor,
         mHSAStartMass: cute.Tensor,
         mOut: cute.Tensor,
+        mHSAReadout: cute.Tensor,
         total_tasks: Int32,
         stream: cuda.CUstream,
     ):
@@ -12391,12 +12784,14 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
             mQueryLeafRowPtr,
             mQueryLeafEntryIndex,
             mValue,
+            mDropoutMask,
             mPrevOut,
             mSelfValue,
             mSelfMass,
             mHasPrev,
             mHSAStartMass,
             mOut,
+            mHSAReadout,
             total_tasks,
         ).launch(
             grid=[grid_x, 1, 1],
@@ -12413,12 +12808,14 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
         mQueryLeafRowPtr: cute.Tensor,
         mQueryLeafEntryIndex: cute.Tensor,
         mValue: cute.Tensor,
+        mDropoutMask: cute.Tensor,
         mPrevOut: cute.Tensor,
         mSelfValue: cute.Tensor,
         mSelfMass: cute.Tensor,
         mHasPrev: cute.Tensor,
         mHSAStartMass: cute.Tensor,
         mOut: cute.Tensor,
+        mHSAReadout: cute.Tensor,
         total_tasks: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -12460,10 +12857,17 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
                     node_idx = Int32(mLeafNodeIndex[leaf_entry])
                     value_idx = Int32(mLeafValueIndex[leaf_entry])
                     weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                    if cutlass.const_expr(self.use_dropout):
+                        weight *= Float32(mDropoutMask[leaf_entry, head_idx])
                     acc0 += weight * Float32(mValue[value_idx, head_idx, dim0])
                     acc1 += weight * Float32(mValue[value_idx, head_idx, dim1])
                     acc2 += weight * Float32(mValue[value_idx, head_idx, dim2])
                     acc3 += weight * Float32(mValue[value_idx, head_idx, dim3])
+                if cutlass.const_expr(self.write_hsa_readout):
+                    mHSAReadout[query_idx, head_idx, dim0] = acc0.to(mHSAReadout.element_type)
+                    mHSAReadout[query_idx, head_idx, dim1] = acc1.to(mHSAReadout.element_type)
+                    mHSAReadout[query_idx, head_idx, dim2] = acc2.to(mHSAReadout.element_type)
+                    mHSAReadout[query_idx, head_idx, dim3] = acc3.to(mHSAReadout.element_type)
 
                 self_mass = Float32(mSelfMass[query_idx, head_idx])
                 hsa_mass = Float32(mHSAStartMass[query_idx, head_idx])
@@ -12511,7 +12915,11 @@ class ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100:
                         node_idx = Int32(mLeafNodeIndex[leaf_entry])
                         value_idx = Int32(mLeafValueIndex[leaf_entry])
                         weight = Float32(mP[node_idx, head_idx]) * inv_denom
+                        if cutlass.const_expr(self.use_dropout):
+                            weight *= Float32(mDropoutMask[leaf_entry, head_idx])
                         acc += weight * Float32(mValue[value_idx, head_idx, dim_idx])
+                    if cutlass.const_expr(self.write_hsa_readout):
+                        mHSAReadout[query_idx, head_idx, dim_idx] = acc.to(mHSAReadout.element_type)
                     local = Float32(mSelfValue[query_idx, head_idx, dim_idx])
                     if mHasPrev[query_idx]:
                         local = (
@@ -15995,14 +16403,28 @@ def run_arhsa_sampled_node_dot(
     ).contiguous()
     query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
     use_head_pair = (
-        row_repr.shape[1] == 2
+        row_repr.shape[1] % 2 == 0
         and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR", "1")
         not in {"0", "false", "False", ""}
     )
+    use_head_triple = (
+        row_repr.shape[1] % 3 == 0
+        and row_repr.shape[1] != 3
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_TRIPLE", "1")
+        not in {"0", "false", "False", ""}
+    )
     total_tasks = int(
-        query_node_feature_row_index.numel()
-        if use_head_pair
-        else query_node_feature_row_index.numel() * row_repr.shape[1]
+        query_node_feature_row_index.numel() * (row_repr.shape[1] // 3)
+        if use_head_triple
+        else (
+            query_node_feature_row_index.numel() * (row_repr.shape[1] // 2)
+            if use_head_pair and row_repr.shape[1] != 2
+            else (
+                query_node_feature_row_index.numel()
+                if use_head_pair
+                else query_node_feature_row_index.numel() * row_repr.shape[1]
+            )
+        )
     )
     if total_tasks == 0:
         return out
@@ -16012,7 +16434,17 @@ def run_arhsa_sampled_node_dot(
     if num_threads not in {128, 256, 512}:
         raise ValueError("HSA_CUTE_SAMPLED_NODE_DOT_THREADS must be 128, 256, or 512")
     compile_key = (
-        "arhsa_sampled_node_dot_h2" if use_head_pair else "arhsa_sampled_node_dot",
+        (
+            "arhsa_sampled_node_dot_head_triple"
+            if use_head_triple
+            else (
+            "arhsa_sampled_node_dot_h2"
+            if row_repr.shape[1] == 2
+            else "arhsa_sampled_node_dot_head_pair"
+            )
+        )
+        if use_head_pair or use_head_triple
+        else "arhsa_sampled_node_dot",
         q_levels.dtype,
         row_repr.dtype,
         out.dtype,
@@ -16024,9 +16456,15 @@ def run_arhsa_sampled_node_dot(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if compile_key not in run_arhsa_sampled_node_dot.compile_cache:
         op = (
-            ARHSASampledNodeDotH2Sm100(num_threads=num_threads)
-            if use_head_pair
-            else ARHSASampledNodeDotSm100(num_threads=num_threads)
+            ARHSASampledNodeDotHeadTripleSm100(num_threads=num_threads)
+            if use_head_triple
+            else (
+                ARHSASampledNodeDotH2Sm100(num_threads=num_threads)
+                if use_head_pair and row_repr.shape[1] == 2
+                else ARHSASampledNodeDotHeadPairSm100(num_threads=num_threads)
+                if use_head_pair
+                else ARHSASampledNodeDotSm100(num_threads=num_threads)
+            )
         )
         run_arhsa_sampled_node_dot.compile_cache[compile_key] = cute.compile(
             op,
@@ -16109,12 +16547,20 @@ def run_arhsa_sampled_node_dot_backward(
     ).contiguous()
     query_node_query_index = query_node_query_index.to(device=q_levels.device, dtype=torch.int32).contiguous()
     use_head_pair = (
-        row_repr.shape[1] == 2
+        row_repr.shape[1] % 2 == 0
         and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_PAIR", "1")
+        not in {"0", "false", "False", ""}
+    )
+    use_head_triple = (
+        row_repr.shape[1] % 3 == 0
+        and row_repr.shape[1] != 3
+        and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_HEAD_TRIPLE", "1")
         not in {"0", "false", "False", ""}
     )
     use_head_pair_d64_vec = (
         use_head_pair
+        and not use_head_triple
+        and row_repr.shape[1] == 2
         and row_repr.shape[2] == 64
         and os.environ.get("HSA_CUTE_SAMPLED_NODE_DOT_H2_D64_VEC", "1")
         not in {"0", "false", "False", ""}
@@ -16125,9 +16571,17 @@ def run_arhsa_sampled_node_dot_backward(
         not in {"0", "false", "False", ""}
     )
     total_tasks = int(
-        query_node_feature_row_index.numel()
-        if use_head_pair
-        else query_node_feature_row_index.numel() * row_repr.shape[1]
+        query_node_feature_row_index.numel() * (row_repr.shape[1] // 3)
+        if use_head_triple
+        else (
+            query_node_feature_row_index.numel() * (row_repr.shape[1] // 2)
+            if use_head_pair and row_repr.shape[1] != 2
+            else (
+                query_node_feature_row_index.numel()
+                if use_head_pair
+                else query_node_feature_row_index.numel() * row_repr.shape[1]
+            )
+        )
     )
     if total_tasks > 0:
         scale = float(q_levels.shape[-1] ** 0.5)
@@ -16139,9 +16593,15 @@ def run_arhsa_sampled_node_dot_backward(
                 "arhsa_sampled_node_dot_backward_h2_d64_vec"
                 if use_head_pair_d64_vec
                 else (
+                    "arhsa_sampled_node_dot_backward_head_triple"
+                    if use_head_triple
+                    else (
                     "arhsa_sampled_node_dot_backward_h2"
+                    if use_head_pair and row_repr.shape[1] == 2
+                    else "arhsa_sampled_node_dot_backward_head_pair"
                     if use_head_pair
                     else "arhsa_sampled_node_dot_backward"
+                    )
                 )
             ),
             q_levels.dtype,
@@ -16164,9 +16624,19 @@ def run_arhsa_sampled_node_dot_backward(
                 )
                 if use_head_pair_d64_vec
                 else (
+                    ARHSASampledNodeDotBackwardHeadTripleSm100(
+                        num_threads=num_threads
+                    )
+                    if use_head_triple
+                    else (
                     ARHSASampledNodeDotBackwardH2Sm100(num_threads=num_threads)
+                    if use_head_pair and row_repr.shape[1] == 2
+                    else ARHSASampledNodeDotBackwardHeadPairSm100(
+                        num_threads=num_threads
+                    )
                     if use_head_pair
                     else ARHSASampledNodeDotBackwardSm100(num_threads=num_threads)
+                    )
                 )
             )
             run_arhsa_sampled_node_dot_backward.compile_cache[compile_key] = cute.compile(
@@ -23447,8 +23917,10 @@ def run_arhsa_leaf_readout_mixed_local_hsa_combine(
     hsa_start_mass: torch.Tensor,
     *,
     n_queries: int,
+    dropout_mask: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_hsa_readout: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run HSA leaf readout and mixed local/HSA combine in one CuTe launch."""
     _require_cute_runtime()
     if p.device.type != "cuda":
@@ -23479,6 +23951,22 @@ def run_arhsa_leaf_readout_mixed_local_hsa_combine(
         out = torch.empty(expected_heads, dtype=value.dtype, device=value.device)
     if out.shape != expected_heads:
         raise ValueError(f"out shape mismatch: got {tuple(out.shape)}, expected {expected_heads}")
+    hsa_readout = torch.empty_like(out) if bool(return_hsa_readout) else value.new_empty((0,), dtype=value.dtype)
+    use_dropout_mask = dropout_mask is not None and int(dropout_mask.numel()) > 0
+    if use_dropout_mask:
+        expected_dropout_shape = (leaf_node_index.numel(), p.shape[1])
+        if dropout_mask.shape != expected_dropout_shape:
+            raise ValueError(
+                "dropout_mask must have shape [n_leaf_entries, n_heads], "
+                f"got {tuple(dropout_mask.shape)} expected {expected_dropout_shape}"
+            )
+        if dropout_mask.device != p.device:
+            raise ValueError("dropout_mask must be on the same CUDA device as p")
+        if not torch.is_floating_point(dropout_mask):
+            raise ValueError("dropout_mask must be a floating-point tensor")
+        dropout_mask = dropout_mask.contiguous()
+    else:
+        dropout_mask = p.new_empty((0,), dtype=p.dtype)
 
     p = p.contiguous()
     value = value.contiguous()
@@ -23507,12 +23995,16 @@ def run_arhsa_leaf_readout_mixed_local_hsa_combine(
         value.shape[1],
         value.shape[2],
         value.shape[2] == 64,
+        use_dropout_mask,
+        bool(return_hsa_readout),
         torch.cuda.get_device_capability(p.device),
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     if compile_key not in run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache:
         op = ARHSALeafReadoutMixedLocalHSACombineQueryWarpSm100(
             head_dim_is_64=value.shape[2] == 64,
+            use_dropout=use_dropout_mask,
+            write_hsa_readout=bool(return_hsa_readout),
         )
         run_arhsa_leaf_readout_mixed_local_hsa_combine.compile_cache[compile_key] = cute.compile(
             op,
@@ -23522,12 +24014,14 @@ def run_arhsa_leaf_readout_mixed_local_hsa_combine(
             to_cute_tensor(query_leaf_row_ptr, assumed_align=4),
             to_cute_tensor(query_leaf_entry_index, assumed_align=4),
             to_cute_tensor(value),
+            to_cute_tensor(dropout_mask),
             to_cute_tensor(prev_out),
             to_cute_tensor(self_value),
             to_cute_tensor(self_mass),
             to_cute_tensor(has_prev),
             to_cute_tensor(hsa_start_mass),
             to_cute_tensor(out),
+            to_cute_tensor(hsa_readout),
             Int32(warp_tasks),
             current_stream,
             options="--enable-tvm-ffi",
@@ -23539,15 +24033,19 @@ def run_arhsa_leaf_readout_mixed_local_hsa_combine(
         query_leaf_row_ptr,
         query_leaf_entry_index,
         value,
+        dropout_mask,
         prev_out,
         self_value,
         self_mass,
         has_prev,
         hsa_start_mass,
         out,
+        hsa_readout,
         Int32(warp_tasks),
         current_stream,
     )
+    if bool(return_hsa_readout):
+        return out, hsa_readout
     return out
 
 
@@ -26859,8 +27357,6 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         ctx.has_dropout_mask = bool(int(dropout_mask.numel()) > 0)
         ctx.mixed_local_hsa_combine = bool(int(mixed_prev_out.numel()) > 0)
         if ctx.mixed_local_hsa_combine:
-            if ctx.has_dropout_mask:
-                raise ValueError("mixed fused leaf readout/combine does not support dropout")
             if not bool(query_warp_readout):
                 raise ValueError("mixed fused leaf readout/combine requires query_warp_readout=True")
             if bool(query_value_pack_readout) or bool(tensor_core_query_value_pack_readout):
@@ -26877,9 +27373,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         with torch.no_grad():
             p_history: list[torch.Tensor] | None = None
             incoming_edge_prob = None
+            mixed_hsa_readout = None
             def leaf_readout(final_p: torch.Tensor) -> torch.Tensor:
+                nonlocal mixed_hsa_readout
                 if ctx.mixed_local_hsa_combine:
-                    return run_arhsa_leaf_readout_mixed_local_hsa_combine(
+                    readout, hsa_readout = run_arhsa_leaf_readout_mixed_local_hsa_combine(
                         final_p,
                         leaf_node_index,
                         leaf_value_index,
@@ -26892,7 +27390,11 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                         mixed_has_prev,
                         mixed_hsa_start_mass,
                         n_queries=ctx.n_queries,
+                        dropout_mask=dropout_mask if ctx.has_dropout_mask else None,
+                        return_hsa_readout=True,
                     )
+                    mixed_hsa_readout = hsa_readout
+                    return readout
                 return run_arhsa_leaf_readout(
                     final_p,
                     leaf_node_index,
@@ -27053,6 +27555,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             mixed_self_mass,
             mixed_has_prev,
             mixed_hsa_start_mass,
+            mixed_hsa_readout if mixed_hsa_readout is not None else value.new_empty((0,), dtype=value.dtype),
         ]
         if ctx.save_forward_history:
             if p_history is None:
@@ -27100,7 +27603,8 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             mixed_self_mass,
             mixed_has_prev,
             mixed_hsa_start_mass,
-        ) = ctx.saved_tensors[:30]
+            mixed_hsa_readout,
+        ) = ctx.saved_tensors[:31]
         grad_readout_for_hsa = grad_readout
         grad_mixed_prev_out = None
         grad_mixed_self_value = None
@@ -27126,17 +27630,21 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
             ).sum(dim=-1)
         if getattr(ctx, "no_edge_direct_readout", False):
             if getattr(ctx, "mixed_local_hsa_combine", False):
-                hsa_readout_for_mass = run_arhsa_leaf_readout(
-                    p0,
-                    leaf_node_index,
-                    leaf_value_index,
-                    query_leaf_row_ptr,
-                    query_leaf_entry_index,
-                    value,
-                    n_queries=ctx.n_queries,
-                    query_warp=True,
-                    normalize_readout=True,
-                )
+                if int(mixed_hsa_readout.numel()) > 0:
+                    hsa_readout_for_mass = mixed_hsa_readout
+                else:
+                    hsa_readout_for_mass = run_arhsa_leaf_readout(
+                        p0,
+                        leaf_node_index,
+                        leaf_value_index,
+                        query_leaf_row_ptr,
+                        query_leaf_entry_index,
+                        value,
+                        n_queries=ctx.n_queries,
+                        query_warp=True,
+                        dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
+                        normalize_readout=True,
+                    )
                 grad_mixed_hsa_start_mass = (
                     grad_readout * hsa_readout_for_mass.to(dtype=grad_readout.dtype)
                 ).sum(dim=-1)
@@ -27192,7 +27700,7 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
         cached_incoming_edge_prob = None
         cached_p_history = None
         if ctx.save_forward_history:
-            cached = ctx.saved_tensors[30:]
+            cached = ctx.saved_tensors[31:]
             if len(cached) != ctx.n_iters + 2:
                 raise RuntimeError(
                     f"saved forward history has {len(cached)} tensors; expected {ctx.n_iters + 2}"
@@ -27206,17 +27714,21 @@ class _ARHSAWalkReadoutFromScoresFixedIters(torch.autograd.Function):
                 raise RuntimeError(
                     "mixed fused leaf readout/combine backward requires saved p history"
                 )
-            hsa_readout_for_mass = run_arhsa_leaf_readout(
-                cached_p_history[-1],
-                leaf_node_index,
-                leaf_value_index,
-                query_leaf_row_ptr,
-                query_leaf_entry_index,
-                value,
-                n_queries=ctx.n_queries,
-                query_warp=True,
-                normalize_readout=True,
-            )
+            if int(mixed_hsa_readout.numel()) > 0:
+                hsa_readout_for_mass = mixed_hsa_readout
+            else:
+                hsa_readout_for_mass = run_arhsa_leaf_readout(
+                    cached_p_history[-1],
+                    leaf_node_index,
+                    leaf_value_index,
+                    query_leaf_row_ptr,
+                    query_leaf_entry_index,
+                    value,
+                    n_queries=ctx.n_queries,
+                    query_warp=True,
+                    dropout_mask=dropout_mask if getattr(ctx, "has_dropout_mask", False) else None,
+                    normalize_readout=True,
+                )
             grad_mixed_hsa_start_mass = (
                 grad_readout * hsa_readout_for_mass.to(dtype=grad_readout.dtype)
             ).sum(dim=-1)
@@ -27429,8 +27941,6 @@ def arhsa_walk_readout_from_scores_fixed_iters_autograd(
             raise ValueError(
                 f"mixed_has_prev must have shape [{int(n_queries)}], got {tuple(mixed_has_prev.shape)}"
             )
-        if int(dropout_mask.numel()) > 0:
-            raise ValueError("mixed fused leaf readout/combine does not support dropout")
         if not bool(query_warp_readout):
             raise ValueError("mixed fused leaf readout/combine requires query_warp_readout=True")
         if bool(query_value_pack_readout) or bool(tensor_core_query_value_pack_readout):

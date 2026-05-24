@@ -8731,6 +8731,138 @@ class ARHSAUniformChildMean128Sm100:
                 mOut[group_idx, col_idx] = mean.to(mOut.element_type)
 
 
+class ARHSAUniformChildMeanDenseSm100:
+    """Reduce uniformly grouped child rows into one dense parent row."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.num_warps = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mRawNode: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mOut: cute.Tensor,
+        n_groups: Int32,
+        fanout: Int32,
+        n_cols: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mRawNode,
+            mChildRows,
+            mOut,
+            n_groups,
+            fanout,
+            n_cols,
+        ).launch(
+            grid=[n_groups, n_cols, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRawNode: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mOut: cute.Tensor,
+        n_groups: Int32,
+        fanout: Int32,
+        n_cols: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        group_idx, col_idx, _ = cute.arch.block_idx()
+        lane = tidx % cute.arch.WARP_SIZE
+        warp_idx = tidx // cute.arch.WARP_SIZE
+
+        acc = Float32.zero
+        if group_idx < n_groups and col_idx < n_cols:
+            for child_offset in cutlass.range(tidx, fanout, self.num_threads, unroll=1):
+                child_pos = group_idx * fanout + child_offset
+                child_row = Int32(mChildRows[child_pos])
+                acc += Float32(mRawNode[child_row, col_idx])
+
+        warp_sum = cute_utils.warp_reduce(acc, lambda a, b: a + b)
+        smem = cutlass.utils.SmemAllocator()
+        sWarp = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((4,)),
+            byte_alignment=16,
+        )
+        if lane == Int32(0):
+            sWarp[warp_idx] = warp_sum
+        cute.arch.barrier()
+
+        block_sum = Float32.zero
+        if warp_idx == Int32(0):
+            if lane < Int32(self.num_warps):
+                block_sum = sWarp[lane]
+            block_sum = cute_utils.warp_reduce(block_sum, lambda a, b: a + b)
+            if lane == Int32(0) and group_idx < n_groups and col_idx < n_cols:
+                mean = block_sum / Float32(fanout)
+                mOut[group_idx, col_idx] = mean.to(mOut.element_type)
+
+
+class ARHSAUniformChildMeanDenseBackwardSm100:
+    """Backward scatter for uniformly grouped dense child-mean rows."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mGradParent: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mGradRaw: cute.Tensor,
+        total_tasks: Int32,
+        fanout: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mGradParent,
+            mChildRows,
+            mGradRaw,
+            total_tasks,
+            fanout,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGradParent: cute.Tensor,
+        mChildRows: cute.Tensor,
+        mGradRaw: cute.Tensor,
+        total_tasks: Int32,
+        fanout: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            n_cols = Int32(mGradParent.shape[1])
+            child_pos = task_idx // n_cols
+            col_idx = task_idx - child_pos * n_cols
+            group_idx = child_pos // fanout
+            child_row = Int32(mChildRows[child_pos])
+            grad = Float32(mGradParent[group_idx, col_idx]) / Float32(fanout)
+            cute_utils.atomic_add_fp32(
+                grad,
+                cute_utils.elem_pointer(mGradRaw, (child_row, col_idx)),
+            )
+
+
 class ARHSAKeyNormBackward128Sm100:
     """Fuse key L2-normalization backward with key layer-norm backward."""
 
@@ -21434,6 +21566,153 @@ def run_arhsa_uniform_child_mean_128(
     return out
 
 
+def run_arhsa_uniform_child_mean_dense(
+    raw_node_repr: torch.Tensor,
+    child_rows: torch.Tensor,
+    *,
+    fanout: int,
+) -> torch.Tensor:
+    """Return grouped child means for uniform fanout dense child-row segments."""
+    _require_cute_runtime()
+    if raw_node_repr.device.type != "cuda":
+        raise ValueError("raw_node_repr must be a CUDA tensor")
+    if raw_node_repr.ndim != 2:
+        raise ValueError(
+            f"raw_node_repr must have shape [N,D], got {tuple(raw_node_repr.shape)}"
+        )
+    if child_rows.ndim != 1:
+        raise ValueError(f"child_rows must be 1D, got {tuple(child_rows.shape)}")
+    fanout = int(fanout)
+    if fanout <= 0:
+        raise ValueError("fanout must be positive")
+    if int(child_rows.numel()) % fanout != 0:
+        raise ValueError("child_rows length must be divisible by fanout")
+    if raw_node_repr.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported raw_node_repr dtype {raw_node_repr.dtype}")
+
+    raw_node_repr = raw_node_repr.contiguous()
+    child_rows = child_rows.to(
+        device=raw_node_repr.device,
+        dtype=torch.int32,
+    ).contiguous()
+    n_groups = int(child_rows.numel()) // fanout
+    n_cols = int(raw_node_repr.shape[1])
+    out = torch.empty(
+        (n_groups, n_cols),
+        dtype=raw_node_repr.dtype,
+        device=raw_node_repr.device,
+    )
+    if n_groups == 0:
+        return out
+
+    compile_key = (
+        "arhsa_uniform_child_mean_dense_v1",
+        raw_node_repr.dtype,
+        int(raw_node_repr.shape[0]),
+        n_groups,
+        n_cols,
+        fanout,
+        torch.cuda.get_device_capability(raw_node_repr.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_uniform_child_mean_dense.compile_cache:
+        op = ARHSAUniformChildMeanDenseSm100()
+        run_arhsa_uniform_child_mean_dense.compile_cache[compile_key] = cute.compile(
+            op,
+            _to_cute_gemm_2d(raw_node_repr),
+            to_cute_tensor(child_rows, assumed_align=4),
+            _to_cute_gemm_2d(out),
+            Int32(n_groups),
+            Int32(fanout),
+            Int32(n_cols),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_uniform_child_mean_dense.compile_cache[compile_key](
+        raw_node_repr,
+        child_rows,
+        out,
+        Int32(n_groups),
+        Int32(fanout),
+        Int32(n_cols),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_uniform_child_mean_dense_backward(
+    grad_parent: torch.Tensor,
+    child_rows: torch.Tensor,
+    *,
+    fanout: int,
+    n_src_rows: int,
+    src_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Backward for ``run_arhsa_uniform_child_mean_dense``."""
+    _require_cute_runtime()
+    if grad_parent.device.type != "cuda":
+        raise ValueError("grad_parent must be a CUDA tensor")
+    if grad_parent.ndim != 2:
+        raise ValueError(
+            f"grad_parent must have shape [n_groups,D], got {tuple(grad_parent.shape)}"
+        )
+    if child_rows.ndim != 1:
+        raise ValueError(f"child_rows must be 1D, got {tuple(child_rows.shape)}")
+    fanout = int(fanout)
+    if fanout <= 0:
+        raise ValueError("fanout must be positive")
+    if int(child_rows.numel()) != int(grad_parent.shape[0]) * fanout:
+        raise ValueError("child_rows length must equal n_groups * fanout")
+    if grad_parent.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"grad_parent dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+
+    grad_parent = grad_parent.contiguous()
+    child_rows = child_rows.to(
+        device=grad_parent.device,
+        dtype=torch.int32,
+    ).contiguous()
+    grad_raw = torch.zeros(
+        (int(n_src_rows), int(grad_parent.shape[1])),
+        dtype=torch.float32,
+        device=grad_parent.device,
+    )
+    total_tasks = int(child_rows.numel() * grad_parent.shape[1])
+    if total_tasks > 0:
+        compile_key = (
+            "arhsa_uniform_child_mean_dense_backward_v1",
+            grad_parent.dtype,
+            grad_raw.dtype,
+            grad_parent.shape[1],
+            fanout,
+            torch.cuda.get_device_capability(grad_parent.device),
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        if compile_key not in run_arhsa_uniform_child_mean_dense_backward.compile_cache:
+            op = ARHSAUniformChildMeanDenseBackwardSm100()
+            run_arhsa_uniform_child_mean_dense_backward.compile_cache[compile_key] = (
+                cute.compile(
+                    op,
+                    to_cute_tensor(grad_parent),
+                    to_cute_tensor(child_rows, assumed_align=4),
+                    to_cute_tensor(grad_raw),
+                    Int32(total_tasks),
+                    Int32(fanout),
+                    current_stream,
+                    options="--enable-tvm-ffi",
+                )
+            )
+        run_arhsa_uniform_child_mean_dense_backward.compile_cache[compile_key](
+            grad_parent,
+            child_rows,
+            grad_raw,
+            Int32(total_tasks),
+            Int32(fanout),
+            current_stream,
+        )
+
+    return grad_raw if grad_raw.dtype == src_dtype else grad_raw.to(dtype=src_dtype)
+
+
 def run_arhsa_key_norm_backward_128(
     grad_proj_rows: torch.Tensor,
     grad_normalized: torch.Tensor,
@@ -28364,6 +28643,12 @@ run_arhsa_layer_norm_backward_128.compile_cache = get_jit_cache(
 run_arhsa_row_sum_128.compile_cache = get_jit_cache("arhsa_row_sum_128_v1")
 run_arhsa_uniform_child_mean_128.compile_cache = get_jit_cache(
     "arhsa_uniform_child_mean_128_v1"
+)
+run_arhsa_uniform_child_mean_dense.compile_cache = get_jit_cache(
+    "arhsa_uniform_child_mean_dense_v1"
+)
+run_arhsa_uniform_child_mean_dense_backward.compile_cache = get_jit_cache(
+    "arhsa_uniform_child_mean_dense_backward_v1"
 )
 run_arhsa_key_norm_backward_128.compile_cache = get_jit_cache(
     "arhsa_key_norm_backward_128_v2"

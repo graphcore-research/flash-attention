@@ -4551,7 +4551,7 @@ class ARHSAV3StartInitialStateBackwardSm100:
 
 
 class ARHSAV3SelfMassForwardH2D64Sm100:
-    """Compute ARHSAv3 leaf self-mass for the common two-head D64 path."""
+    """Compute ARHSAv3 leaf self-mass for D64 per-head rows."""
 
     arch = 100
 
@@ -4620,8 +4620,9 @@ class ARHSAV3SelfMassForwardH2D64Sm100:
         lane16 = lane - half_warp * Int32(16)
         task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
         if task_idx < total_tasks:
-            query_idx = task_idx // Int32(2)
-            head_idx = task_idx - query_idx * Int32(2)
+            n_heads = Int32(mQLevels.shape[2])
+            query_idx = task_idx // n_heads
+            head_idx = task_idx - query_idx * n_heads
             dim0 = lane16 * Int32(4)
             dim1 = dim0 + Int32(1)
             dim2 = dim0 + Int32(2)
@@ -4681,7 +4682,7 @@ class ARHSAV3SelfMassForwardH2D64Sm100:
 
 
 class ARHSAV3SelfMassBackwardH2D64Sm100:
-    """Backward for fused two-head D64 ARHSAv3 leaf self-mass."""
+    """Backward for fused D64 per-head ARHSAv3 leaf self-mass."""
 
     arch = 100
 
@@ -4762,8 +4763,9 @@ class ARHSAV3SelfMassBackwardH2D64Sm100:
         lane16 = lane - half_warp * Int32(16)
         task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
         if task_idx < total_tasks:
-            query_idx = task_idx // Int32(2)
-            head_idx = task_idx - query_idx * Int32(2)
+            n_heads = Int32(mQLevels.shape[2])
+            query_idx = task_idx // n_heads
+            head_idx = task_idx - query_idx * n_heads
             dim0 = lane16 * Int32(4)
             dim1 = dim0 + Int32(1)
             dim2 = dim0 + Int32(2)
@@ -18696,8 +18698,8 @@ def run_arhsa_v3_self_mass_forward(
         raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
     if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
         raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
-    if int(q_levels.shape[2]) != 2 or int(q_levels.shape[3]) != 64:
-        raise ValueError("run_arhsa_v3_self_mass_forward requires two heads and head_dim=64")
+    if int(q_levels.shape[3]) != 64:
+        raise ValueError("run_arhsa_v3_self_mass_forward requires head_dim=64")
     n_queries = int(q_levels.shape[0])
     if row_repr.shape[0] < n_queries:
         raise ValueError("row_repr must contain leaf rows at positions [0:n_queries)")
@@ -18741,11 +18743,12 @@ def run_arhsa_v3_self_mass_forward(
         raise ValueError("HSA_CUTE_V3_SELF_MASS_THREADS must be 128, 256, or 512")
     scale = float(q_levels.shape[-1] ** 0.5)
     compile_key = (
-        "arhsa_v3_self_mass_forward_h2_d64",
+        "arhsa_v3_self_mass_forward_hd64",
         q_levels.dtype,
         row_repr.dtype,
         open_key_by_level.dtype,
         out.dtype,
+        int(q_levels.shape[2]),
         down_bias.reshape(-1).numel(),
         up_bias.reshape(-1).numel(),
         int(leaf_level),
@@ -18812,8 +18815,8 @@ def run_arhsa_v3_self_mass_backward(
         raise ValueError("q_levels, row_repr, and open_key_by_level must be 4D/3D/3D tensors")
     if q_levels.shape[2:] != row_repr.shape[1:] or row_repr.shape[1:] != open_key_by_level.shape[1:]:
         raise ValueError("q_levels, row_repr, and open_key_by_level head dimensions must match")
-    if int(q_levels.shape[2]) != 2 or int(q_levels.shape[3]) != 64:
-        raise ValueError("run_arhsa_v3_self_mass_backward requires two heads and head_dim=64")
+    if int(q_levels.shape[3]) != 64:
+        raise ValueError("run_arhsa_v3_self_mass_backward requires head_dim=64")
     n_queries = int(q_levels.shape[0])
     if self_mass.shape != (n_queries, q_levels.shape[2]):
         raise ValueError(f"self_mass shape mismatch: got {tuple(self_mass.shape)}")
@@ -18869,7 +18872,7 @@ def run_arhsa_v3_self_mass_backward(
             raise ValueError("HSA_CUTE_V3_SELF_MASS_THREADS must be 128, 256, or 512")
         scale = float(q_levels.shape[-1] ** 0.5)
         compile_key = (
-            "arhsa_v3_self_mass_backward_h2_d64",
+            "arhsa_v3_self_mass_backward_hd64",
             q_levels.dtype,
             row_repr.dtype,
             open_key_by_level.dtype,
@@ -18878,6 +18881,7 @@ def run_arhsa_v3_self_mass_backward(
             grad_q.dtype,
             grad_row.dtype,
             grad_open_key.dtype,
+            int(q_levels.shape[2]),
             grad_down_bias.numel(),
             grad_up_bias.numel(),
             int(leaf_level),

@@ -151,6 +151,10 @@ def _flash_attn_fwd(
     mixed_self_mass: Optional[torch.Tensor] = None,
     mixed_hsa_readout: Optional[torch.Tensor] = None,
     mixed_hsa_start_mass: Optional[torch.Tensor] = None,
+    fixed_block_weight: Optional[torch.Tensor] = None,
+    fixed_block_accum: Optional[torch.Tensor] = None,
+    fixed_block_query_start: int = 0,
+    fixed_block_skip_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -460,6 +464,49 @@ def _flash_attn_fwd(
             get_broadcast_dims(mixed_hsa_readout),
             get_broadcast_dims(mixed_hsa_start_mass),
         )
+    fixed_block_epilogue = fixed_block_weight is not None or fixed_block_accum is not None
+    fixed_block_epilogue_metadata = None
+    if fixed_block_epilogue:
+        if fixed_block_weight is None or fixed_block_accum is None:
+            raise ValueError("fixed-block epilogue requires both weight and accum tensors")
+        if mixed_epilogue:
+            raise NotImplementedError("fixed-block epilogue cannot be combined with mixed epilogue")
+        if arch // 10 not in [10, 11]:
+            raise NotImplementedError("fixed-block epilogue currently requires the SM100/SM110 FA4 forward kernel")
+        if cu_seqlens_q is not None or seqused_q is not None:
+            raise NotImplementedError("fixed-block epilogue currently supports padded BLHD inputs only")
+        if is_split_kv:
+            raise NotImplementedError("fixed-block epilogue does not support split-KV")
+        _validate_tensor(
+            fixed_block_weight,
+            "fixed_block_weight",
+            (batch_size, seqlen_q, num_head),
+            fixed_block_weight.dtype,
+            device,
+        )
+        assert fixed_block_weight.dtype in torch2cute_dtype_map, (
+            f"fixed_block_weight dtype {fixed_block_weight.dtype} is not supported by CuTe"
+        )
+        assert fixed_block_accum.shape[0] == batch_size, (
+            f"fixed_block_accum batch {fixed_block_accum.shape[0]} != expected {batch_size}"
+        )
+        assert fixed_block_accum.shape[2:] == (num_head, head_dim_v), (
+            f"fixed_block_accum trailing shape {fixed_block_accum.shape[2:]} != expected {(num_head, head_dim_v)}"
+        )
+        assert fixed_block_query_start >= 0, "fixed_block_query_start must be non-negative"
+        assert fixed_block_query_start + seqlen_q <= fixed_block_accum.shape[1], (
+            "fixed_block_accum sequence dimension is too small for fixed_block_query_start + seqlen_q"
+        )
+        assert fixed_block_accum.device == device and fixed_block_accum.is_cuda, (
+            f"fixed_block_accum device {fixed_block_accum.device} != expected {device}"
+        )
+        assert fixed_block_accum.dtype == torch.float32, "fixed_block_accum must be float32 for atomic add"
+        fixed_block_epilogue_metadata = (
+            fixed_block_weight.dtype,
+            fixed_block_accum.dtype,
+            get_broadcast_dims(fixed_block_weight),
+            get_broadcast_dims(fixed_block_accum),
+        )
 
     compile_key = (
         dtype,
@@ -493,6 +540,9 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mixed_epilogue,
         mixed_epilogue_metadata,
+        fixed_block_epilogue,
+        fixed_block_epilogue_metadata,
+        fixed_block_skip_output,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -536,6 +586,12 @@ def _flash_attn_fwd(
         mixed_hsa_readout_tensor = to_cute_tensor(mixed_hsa_readout) if mixed_epilogue else None
         mixed_hsa_start_mass_tensor = (
             to_cute_tensor(mixed_hsa_start_mass) if mixed_epilogue else None
+        )
+        fixed_block_weight_tensor = (
+            to_cute_tensor(fixed_block_weight) if fixed_block_epilogue else None
+        )
+        fixed_block_accum_tensor = (
+            to_cute_tensor(fixed_block_accum) if fixed_block_epilogue else None
         )
 
         if arch // 10 == 9:
@@ -619,6 +675,10 @@ def _flash_attn_fwd(
                     mixed_self_mass_tensor,
                     mixed_hsa_readout_tensor,
                     mixed_hsa_start_mass_tensor,
+                    fixed_block_weight_tensor,
+                    fixed_block_accum_tensor,
+                    fixed_block_query_start,
+                    fixed_block_skip_output,
                 ]
             )
         # TODO: check @can_implement
@@ -658,6 +718,9 @@ def _flash_attn_fwd(
                     mixed_self_mass,
                     mixed_hsa_readout,
                     mixed_hsa_start_mass,
+                    fixed_block_weight,
+                    fixed_block_accum,
+                    fixed_block_query_start,
                 ]
             )
         _flash_attn_fwd.compile_cache[compile_key](*runtime_args)
@@ -1694,6 +1757,96 @@ class FlashAttnMixedLocalHSAFunc(torch.autograd.Function):
         )
 
 
+class FlashAttnFixedBlockWeightedAccumFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        weights: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        deterministic: bool = False,
+        m_block_size: int = 128,
+        n_block_size: int = 128,
+    ):
+        accum = torch.zeros(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            v.shape[-1],
+            device=q.device,
+            dtype=torch.float32,
+        )
+        dummy_out = torch.empty(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            v.shape[-1],
+            device=q.device,
+            dtype=q.dtype,
+        )
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=False,
+            num_splits=1,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            out=dummy_out,
+            fixed_block_weight=weights,
+            fixed_block_accum=accum,
+            fixed_block_query_start=0,
+            fixed_block_skip_output=True,
+        )
+        ctx.save_for_backward(q, k, v, weights)
+        ctx.softmax_scale = softmax_scale
+        ctx.deterministic = deterministic
+        ctx.m_block_size = int(m_block_size)
+        ctx.n_block_size = int(n_block_size)
+        return accum.to(dtype=q.dtype)
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, weights = ctx.saved_tensors
+        local_out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=ctx.softmax_scale,
+            causal=False,
+            num_splits=1,
+            m_block_size=ctx.m_block_size,
+            n_block_size=ctx.n_block_size,
+            return_lse=True,
+        )
+        grad_local = dout.to(dtype=local_out.dtype) * weights.to(
+            dtype=local_out.dtype
+        ).unsqueeze(-1)
+        dq = dk = dv = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+            dq, dk, dv = _flash_attn_bwd(
+                q,
+                k,
+                v,
+                local_out,
+                grad_local,
+                lse,
+                ctx.softmax_scale,
+                False,
+                0.0,
+                deterministic=ctx.deterministic,
+            )
+        grad_weights = None
+        if ctx.needs_input_grad[3]:
+            grad_weights = (
+                dout.to(dtype=torch.float32) * local_out.to(dtype=torch.float32)
+            ).sum(dim=-1).to(dtype=weights.dtype)
+        return dq, dk, dv, grad_weights, None, None, None, None
+
+
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1853,6 +2006,28 @@ def flash_attn_mixed_local_hsa_func(
         causal,
         window_size,
         deterministic,
+    )
+
+
+def flash_attn_fixed_block_weighted_accum_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    deterministic: bool = False,
+    m_block_size: int = 128,
+    n_block_size: int = 128,
+):
+    return FlashAttnFixedBlockWeightedAccumFunc.apply(
+        q,
+        k,
+        v,
+        weights,
+        softmax_scale,
+        deterministic,
+        m_block_size,
+        n_block_size,
     )
 
 

@@ -304,6 +304,10 @@ class FlashAttentionForwardSm100:
         mMixedSelfMass: Optional[cute.Tensor] = None,
         mMixedHSAReadout: Optional[cute.Tensor] = None,
         mMixedHSAStartMass: Optional[cute.Tensor] = None,
+        mFixedBlockWeight: Optional[cute.Tensor] = None,
+        mFixedBlockAccum: Optional[cute.Tensor] = None,
+        fixedBlockQueryStart: Int32 | int = 0,
+        fixedBlockSkipOutput: cutlass.Constexpr[bool] = False,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -650,6 +654,10 @@ class FlashAttentionForwardSm100:
             mMixedSelfMass,
             mMixedHSAReadout,
             mMixedHSAStartMass,
+            mFixedBlockWeight,
+            mFixedBlockAccum,
+            fixedBlockQueryStart,
+            fixedBlockSkipOutput,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -699,6 +707,10 @@ class FlashAttentionForwardSm100:
         mMixedSelfMass: Optional[cute.Tensor],
         mMixedHSAReadout: Optional[cute.Tensor],
         mMixedHSAStartMass: Optional[cute.Tensor],
+        mFixedBlockWeight: Optional[cute.Tensor],
+        mFixedBlockAccum: Optional[cute.Tensor],
+        fixedBlockQueryStart: Int32,
+        fixedBlockSkipOutput: cutlass.Constexpr[bool],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1051,6 +1063,7 @@ class FlashAttentionForwardSm100:
                     mMixedSelfMass,
                     mMixedHSAReadout,
                     mMixedHSAStartMass,
+                    fixedBlockSkipOutput,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1136,6 +1149,10 @@ class FlashAttentionForwardSm100:
                 mMixedSelfMass,
                 mMixedHSAReadout,
                 mMixedHSAStartMass,
+                mFixedBlockWeight,
+                mFixedBlockAccum,
+                fixedBlockQueryStart,
+                fixedBlockSkipOutput,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2137,6 +2154,10 @@ class FlashAttentionForwardSm100:
         mMixedSelfMass: Optional[cute.Tensor] = None,
         mMixedHSAReadout: Optional[cute.Tensor] = None,
         mMixedHSAStartMass: Optional[cute.Tensor] = None,
+        mFixedBlockWeight: Optional[cute.Tensor] = None,
+        mFixedBlockAccum: Optional[cute.Tensor] = None,
+        fixedBlockQueryStart: Int32 = Int32(0),
+        fixedBlockSkipOutput: cutlass.Constexpr[bool] = False,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2303,6 +2324,10 @@ class FlashAttentionForwardSm100:
                         mMixedSelfMass,
                         mMixedHSAReadout,
                         mMixedHSAStartMass,
+                        mFixedBlockWeight,
+                        mFixedBlockAccum,
+                        fixedBlockQueryStart,
+                        fixedBlockSkipOutput,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2471,6 +2496,10 @@ class FlashAttentionForwardSm100:
         mMixedSelfMass: Optional[cute.Tensor] = None,
         mMixedHSAReadout: Optional[cute.Tensor] = None,
         mMixedHSAStartMass: Optional[cute.Tensor] = None,
+        mFixedBlockWeight: Optional[cute.Tensor] = None,
+        mFixedBlockAccum: Optional[cute.Tensor] = None,
+        fixedBlockQueryStart: Int32 = Int32(0),
+        fixedBlockSkipOutput: cutlass.Constexpr[bool] = False,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2563,8 +2592,29 @@ class FlashAttentionForwardSm100:
                             )
                         )
                         tOrO_frg[j] = local + hsa
-            copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
-        cute.arch.fence_view_async_shared()
+            if const_expr(mFixedBlockAccum is not None):
+                for j in cutlass.range(cute.size(tOrO_frg), unroll_full=True):
+                    row_coord = tOcO_t2r_i[j][0]
+                    dim_idx = tOcO_t2r_i[j][1]
+                    row_idx = m_tile_idx * self.m_block_size + row_coord
+                    global_row_idx = row_idx + fixedBlockQueryStart
+                    if (
+                        row_idx < seqlen_q
+                        and global_row_idx < mFixedBlockAccum.shape[1]
+                        and dim_idx < mFixedBlockAccum.shape[3]
+                    ):
+                        weight = Float32(mFixedBlockWeight[batch_idx, row_idx, head_idx])
+                        utils.atomic_add_fp32(
+                            weight * Float32(tOrO_frg[j]),
+                            utils.elem_pointer(
+                                mFixedBlockAccum,
+                                (batch_idx, global_row_idx, head_idx, dim_idx),
+                            ),
+                        )
+            if const_expr(not fixedBlockSkipOutput):
+                copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+        if const_expr(not fixedBlockSkipOutput):
+            cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
@@ -2642,6 +2692,7 @@ class FlashAttentionForwardSm100:
         mMixedSelfMass: Optional[cute.Tensor] = None,
         mMixedHSAReadout: Optional[cute.Tensor] = None,
         mMixedHSAStartMass: Optional[cute.Tensor] = None,
+        fixedBlockSkipOutput: cutlass.Constexpr[bool] = False,
     ):
         epi_consumer_phase = Int32(0)
         tile_scheduler = TileSchedulerCls()
@@ -2664,19 +2715,22 @@ class FlashAttentionForwardSm100:
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
                 if const_expr(self.use_tma_O):
-                    store_O, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_O, 0, cute.make_layout(1), sO, gO
-                    )
+                    if const_expr(not fixedBlockSkipOutput):
+                        store_O, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_O, 0, cute.make_layout(1), sO, gO
+                        )
                     for stage in cutlass.range(self.q_stage, unroll_full=True):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
                         pipeline_o_epi.consumer_wait_w_index_phase(stage, epi_consumer_phase)
                         # 2. copy O0 / O1 to gmem
-                        store_O(src_idx=stage, dst_idx=stage)
-                        cute.arch.cp_async_bulk_commit_group()
+                        if const_expr(not fixedBlockSkipOutput):
+                            store_O(src_idx=stage, dst_idx=stage)
+                            cute.arch.cp_async_bulk_commit_group()
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # Ensure O0 / O1 buffer is ready to be released
-                        cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
+                        if const_expr(not fixedBlockSkipOutput):
+                            # Ensure O0 / O1 buffer is ready to be released
+                            cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
                         pipeline_o_epi.consumer_release_w_index(stage)
                 else:
                     tidx = cute.arch.thread_idx()[0] % (
@@ -2688,10 +2742,11 @@ class FlashAttentionForwardSm100:
                         pipeline_o_epi.consumer_wait_w_index_phase(stage, epi_consumer_phase)
                         # 2. copy O0 / O1 to gmem
                         m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                        self._store_O_to_gmem(
-                            sO[None, None, stage], gO[None, None, stage], mO_cur, gmem_tiled_copy_O,
-                            tidx, seqlen.seqlen_q, m_tile_idx,
-                        )
+                        if const_expr(not fixedBlockSkipOutput):
+                            self._store_O_to_gmem(
+                                sO[None, None, stage], gO[None, None, stage], mO_cur, gmem_tiled_copy_O,
+                                tidx, seqlen.seqlen_q, m_tile_idx,
+                            )
                         pipeline_o_epi.consumer_release_w_index(stage)
 
                 epi_consumer_phase ^= 1

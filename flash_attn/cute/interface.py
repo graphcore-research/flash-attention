@@ -1769,6 +1769,7 @@ class FlashAttnFixedBlockWeightedAccumFunc(torch.autograd.Function):
         deterministic: bool = False,
         m_block_size: int = 128,
         n_block_size: int = 128,
+        save_output_for_backward: bool = False,
     ):
         accum = torch.zeros(
             q.shape[0],
@@ -1786,7 +1787,7 @@ class FlashAttnFixedBlockWeightedAccumFunc(torch.autograd.Function):
             device=q.device,
             dtype=q.dtype,
         )
-        _flash_attn_fwd(
+        local_out, lse = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1796,32 +1797,42 @@ class FlashAttnFixedBlockWeightedAccumFunc(torch.autograd.Function):
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             out=dummy_out,
+            return_lse=save_output_for_backward,
             fixed_block_weight=weights,
             fixed_block_accum=accum,
             fixed_block_query_start=0,
-            fixed_block_skip_output=True,
+            fixed_block_skip_output=not save_output_for_backward,
         )
-        ctx.save_for_backward(q, k, v, weights)
+        if save_output_for_backward:
+            if lse is None:
+                raise RuntimeError("fixed-block saved backward requires LSE from forward")
+            ctx.save_for_backward(q, k, v, weights, local_out, lse)
+        else:
+            ctx.save_for_backward(q, k, v, weights)
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
         ctx.m_block_size = int(m_block_size)
         ctx.n_block_size = int(n_block_size)
+        ctx.save_output_for_backward = bool(save_output_for_backward)
         return accum.to(dtype=q.dtype)
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, weights = ctx.saved_tensors
-        local_out, lse = _flash_attn_fwd(
-            q,
-            k,
-            v,
-            softmax_scale=ctx.softmax_scale,
-            causal=False,
-            num_splits=1,
-            m_block_size=ctx.m_block_size,
-            n_block_size=ctx.n_block_size,
-            return_lse=True,
-        )
+        if ctx.save_output_for_backward:
+            q, k, v, weights, local_out, lse = ctx.saved_tensors
+        else:
+            q, k, v, weights = ctx.saved_tensors
+            local_out, lse = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                softmax_scale=ctx.softmax_scale,
+                causal=False,
+                num_splits=1,
+                m_block_size=ctx.m_block_size,
+                n_block_size=ctx.n_block_size,
+                return_lse=True,
+            )
         grad_local = dout.to(dtype=local_out.dtype) * weights.to(
             dtype=local_out.dtype
         ).unsqueeze(-1)
@@ -1844,7 +1855,7 @@ class FlashAttnFixedBlockWeightedAccumFunc(torch.autograd.Function):
             grad_weights = (
                 dout.to(dtype=torch.float32) * local_out.to(dtype=torch.float32)
             ).sum(dim=-1).to(dtype=weights.dtype)
-        return dq, dk, dv, grad_weights, None, None, None, None
+        return dq, dk, dv, grad_weights, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -2018,6 +2029,7 @@ def flash_attn_fixed_block_weighted_accum_func(
     deterministic: bool = False,
     m_block_size: int = 128,
     n_block_size: int = 128,
+    save_output_for_backward: bool = False,
 ):
     return FlashAttnFixedBlockWeightedAccumFunc.apply(
         q,
@@ -2028,6 +2040,7 @@ def flash_attn_fixed_block_weighted_accum_func(
         deterministic,
         m_block_size,
         n_block_size,
+        save_output_for_backward,
     )
 
 

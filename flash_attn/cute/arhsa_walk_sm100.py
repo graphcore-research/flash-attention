@@ -5860,6 +5860,188 @@ class ARHSADirectStartWeightedValueQueryWarpForwardSm100:
                     mOut[query_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
 
 
+class ARHSADirectStartWeightedValueTensorCoreD64Sm100:
+    """Grouped sparse 16x16 start tiles times D64 value tiles via MMA."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256, tiles_per_cta: int = 1):
+        if int(num_threads) != 256:
+            raise ValueError("D64 tensor-core direct readout requires 256 threads")
+        if int(tiles_per_cta) not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("tiles_per_cta must be one of 1, 2, 4, 8, 16, 32")
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.tiles_per_cta = int(tiles_per_cta)
+
+    @cute.jit
+    def __call__(
+        self,
+        mWeights: cute.Tensor,
+        mValue: cute.Tensor,
+        mRows: cute.Tensor,
+        mQueryRowPtr: cute.Tensor,
+        mQueryEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        block_size: Int32,
+        key_tiles: Int32,
+        key_tile_groups: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mWeights,
+            mValue,
+            mRows,
+            mQueryRowPtr,
+            mQueryEntryIndex,
+            mOut,
+            block_size,
+            key_tiles,
+            key_tile_groups,
+            total_tasks,
+        ).launch(
+            grid=[total_tasks, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mWeights: cute.Tensor,
+        mValue: cute.Tensor,
+        mRows: cute.Tensor,
+        mQueryRowPtr: cute.Tensor,
+        mQueryEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        block_size: Int32,
+        key_tiles: Int32,
+        key_tile_groups: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = Int32(block_idx)
+        num_heads = Int32(mValue.shape[1])
+        n_outputs = Int32(mOut.shape[0])
+        n_value_rows = Int32(mValue.shape[0])
+        head_idx = task_idx % num_heads
+        task_div_heads = task_idx // num_heads
+        key_tile_group = task_div_heads % key_tile_groups
+        query_tile = task_div_heads // key_tile_groups
+        query_base = query_tile * Int32(16)
+        block_base = (query_base // block_size) * block_size
+
+        smem = cutlass.utils.SmemAllocator()
+        sAttn = smem.allocate_tensor(
+            mValue.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mValue.element_type, 16),
+                (16, 16),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sVAll = smem.allocate_tensor(
+            mValue.element_type,
+            cute.tile_to_shape(
+                sm80_utils.get_smem_layout_atom(mValue.element_type, 16),
+                (self.warps_per_cta * 8, 16),
+                (0, 1),
+            ),
+            byte_alignment=16,
+        )
+        sV = cute.local_tile(sVAll, (8, 16), (warp_idx, 0))
+
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(mValue.element_type, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 8, 16),
+        )
+        thr_mma = tiled_mma.get_slice(lane)
+        smem_copy_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            mValue.element_type,
+        )
+        smem_thr_copy_attn = cute_utils.make_tiled_copy_A(smem_copy_atom, tiled_mma).get_slice(lane)
+        smem_thr_copy_v = cute_utils.make_tiled_copy_B(smem_copy_atom, tiled_mma).get_slice(lane)
+        tSrAttn = cute_utils.mma_make_fragment_A(sAttn, thr_mma)
+        tSrV = cute_utils.mma_make_fragment_B(sV, thr_mma)
+        tSsAttn = smem_thr_copy_attn.partition_S(sAttn)
+        tSsV = smem_thr_copy_v.partition_S(sV)
+        acc_shape = thr_mma.partition_shape_C((16, 8))
+        c_tile = cute.make_identity_tensor((16, 8))
+        tCc = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(c_tile))
+        acc = cute.make_fragment(acc_shape, Float32)
+        acc.fill(0.0)
+        dim_tile = Int32(warp_idx)
+
+        for tile_offset in cutlass.range_constexpr(self.tiles_per_cta):
+            key_tile = key_tile_group * Int32(self.tiles_per_cta) + Int32(tile_offset)
+            if key_tile < key_tiles:
+                key_base = block_base + key_tile * Int32(16)
+                for elem_idx in cutlass.range(tidx, Int32(16) * Int32(16), self.num_threads, unroll=1):
+                    row_idx = elem_idx // Int32(16)
+                    col_idx = elem_idx - row_idx * Int32(16)
+                    sAttn[row_idx, col_idx] = Float32(0.0).to(sAttn.element_type)
+                cute.arch.barrier()
+
+                if tidx < Int32(16):
+                    row_local = Int32(tidx)
+                    query_idx = query_base + row_local
+                    if query_idx < n_outputs:
+                        start = Int32(mQueryRowPtr[query_idx])
+                        end = Int32(mQueryRowPtr[query_idx + 1])
+                        for ptr in cutlass.range(start, end, unroll=1):
+                            entry_idx = Int32(mQueryEntryIndex[ptr])
+                            value_row = Int32(mRows[entry_idx])
+                            if value_row >= key_base and value_row < key_base + Int32(16):
+                                col_idx = value_row - key_base
+                                current = Float32(sAttn[row_local, col_idx])
+                                weight = Float32(mWeights[entry_idx, head_idx])
+                                sAttn[row_local, col_idx] = (current + weight).to(sAttn.element_type)
+                cute.arch.barrier()
+
+                for elem_idx in cutlass.range(lane, Int32(8) * Int32(16), cute.arch.WARP_SIZE, unroll=1):
+                    dim_local = elem_idx // Int32(16)
+                    col_idx = elem_idx - dim_local * Int32(16)
+                    value_idx = key_base + col_idx
+                    dim_idx = dim_tile * Int32(8) + dim_local
+                    value_val = Float32(0.0).to(sV.element_type)
+                    if value_idx < n_value_rows:
+                        value_val = mValue[value_idx, head_idx, dim_idx]
+                    sV[dim_local, col_idx] = value_val
+                cute.arch.sync_warp()
+
+                sm80_utils.gemm(
+                    thr_mma,
+                    acc,
+                    tSrAttn,
+                    tSrV,
+                    tSsAttn,
+                    tSsV,
+                    smem_thr_copy_attn,
+                    smem_thr_copy_v,
+                )
+                cute.arch.barrier()
+
+        acc_mn = layout_utils.reshape_acc_to_mn(acc)
+        for mi in cutlass.range_constexpr(cute.size(tCc.shape[0])):
+            for ni in cutlass.range_constexpr(cute.size(tCc.shape[1])):
+                row_local = tCc[mi, ni][0]
+                dim_local = tCc[mi, ni][1]
+                query_idx = query_base + row_local
+                if query_idx < n_outputs:
+                    dim_idx = dim_tile * Int32(8) + dim_local
+                    cute_utils.atomic_add_fp32(
+                        acc_mn[mi, ni],
+                        cute_utils.elem_pointer(mOut, (query_idx, head_idx, dim_idx)),
+                    )
+
+
 class ARHSADirectStartWeightedValueBackwardSm100:
     """Backward for direct start-weighted value readout."""
 
@@ -20575,6 +20757,115 @@ def run_arhsa_direct_start_weighted_value_query_warp_forward(
     return out
 
 
+def run_arhsa_direct_start_weighted_value_tensor_core_forward(
+    weights: torch.Tensor,
+    value: torch.Tensor,
+    rows: torch.Tensor,
+    query_row_ptr: torch.Tensor,
+    query_entry_index: torch.Tensor,
+    n_outputs: int,
+    *,
+    block_size: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run fused fixed-block direct readout using tensor-core 16x16x8 MMA tiles."""
+    _require_cute_runtime()
+    if weights.device.type != "cuda":
+        raise ValueError("weights must be a CUDA tensor")
+    if weights.ndim != 2:
+        raise ValueError(f"weights must have shape [n_entries, n_heads], got {tuple(weights.shape)}")
+    if value.ndim != 3:
+        raise ValueError(f"value must have shape [n_rows, n_heads, head_dim], got {tuple(value.shape)}")
+    if value.shape[1] != weights.shape[1]:
+        raise ValueError("weights and value head dimensions must match")
+    if value.shape[2] != 64:
+        raise ValueError("tensor-core direct readout requires head_dim=64")
+    if weights.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
+        raise ValueError("tensor-core direct readout currently requires bfloat16 weights/value")
+    if rows.shape != (weights.shape[0],):
+        raise ValueError("rows must have shape [n_entries]")
+    n_outputs = int(n_outputs)
+    block_size = int(block_size)
+    if n_outputs < 0:
+        raise ValueError("n_outputs must be non-negative")
+    if block_size <= 0 or block_size % 16 != 0:
+        raise ValueError("block_size must be a positive multiple of 16")
+    if query_row_ptr.shape != (n_outputs + 1,):
+        raise ValueError(f"query_row_ptr must have shape [{n_outputs + 1}]")
+    if query_entry_index.shape != (weights.shape[0],):
+        raise ValueError("query_entry_index must have shape [n_entries]")
+    if out is None:
+        out = torch.zeros(
+            (n_outputs, value.shape[1], value.shape[2]),
+            dtype=torch.float32,
+            device=value.device,
+        )
+    if out.shape != (n_outputs, value.shape[1], value.shape[2]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype != torch.float32:
+        raise ValueError("tensor-core direct readout requires float32 out for tile accumulation")
+
+    weights = weights.contiguous()
+    value = value.contiguous()
+    out = out.contiguous()
+    out.zero_()
+    rows = rows.to(device=weights.device, dtype=torch.int32).contiguous()
+    query_row_ptr = query_row_ptr.to(device=weights.device, dtype=torch.int32).contiguous()
+    query_entry_index = query_entry_index.to(device=weights.device, dtype=torch.int32).contiguous()
+    query_tiles = (n_outputs + 15) // 16
+    key_tiles = block_size // 16
+    tiles_per_cta = int(os.environ.get("HSA_CUTE_DIRECT_START_TENSOR_CORE_KEY_TILES_PER_CTA", "32"))
+    if tiles_per_cta not in {1, 2, 4, 8, 16, 32}:
+        raise ValueError("HSA_CUTE_DIRECT_START_TENSOR_CORE_KEY_TILES_PER_CTA must be one of 1, 2, 4, 8, 16, 32")
+    key_tile_groups = (key_tiles + tiles_per_cta - 1) // tiles_per_cta
+    total_tasks = int(query_tiles * key_tile_groups * value.shape[1])
+    if total_tasks == 0:
+        return out
+
+    compile_key = (
+        "arhsa_direct_start_weighted_value_tensor_core_d64",
+        weights.dtype,
+        value.dtype,
+        out.dtype,
+        value.shape[1],
+        block_size,
+        tiles_per_cta,
+        torch.cuda.get_device_capability(weights.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_direct_start_weighted_value_tensor_core_forward.compile_cache:
+        op = ARHSADirectStartWeightedValueTensorCoreD64Sm100(tiles_per_cta=tiles_per_cta)
+        run_arhsa_direct_start_weighted_value_tensor_core_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(weights),
+            to_cute_tensor(value),
+            to_cute_tensor(rows, assumed_align=4),
+            to_cute_tensor(query_row_ptr, assumed_align=4),
+            to_cute_tensor(query_entry_index, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(block_size),
+            Int32(key_tiles),
+            Int32(key_tile_groups),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_direct_start_weighted_value_tensor_core_forward.compile_cache[compile_key](
+        weights,
+        value,
+        rows,
+        query_row_ptr,
+        query_entry_index,
+        out,
+        Int32(block_size),
+        Int32(key_tiles),
+        Int32(key_tile_groups),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_direct_start_weighted_value_backward(
     weights: torch.Tensor,
     value: torch.Tensor,
@@ -29949,6 +30240,9 @@ run_arhsa_direct_start_weighted_value_forward.compile_cache = get_jit_cache(
 )
 run_arhsa_direct_start_weighted_value_query_warp_forward.compile_cache = get_jit_cache(
     "arhsa_direct_start_weighted_value_query_warp_forward_v1"
+)
+run_arhsa_direct_start_weighted_value_tensor_core_forward.compile_cache = get_jit_cache(
+    "arhsa_direct_start_weighted_value_tensor_core_d64_v1"
 )
 run_arhsa_direct_start_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_direct_start_weighted_value_backward_v1"

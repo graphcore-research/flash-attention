@@ -6042,6 +6042,253 @@ class ARHSADirectStartWeightedValueTensorCoreD64Sm100:
                     )
 
 
+class ARHSABlockFlashSparseWeightedAddForwardSm100:
+    """Sparse slot-weighted add for fixed-block FlashAttention outputs."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mQueries: cute.Tensor,
+        mOut: cute.Tensor,
+        seq_len: Int32,
+        query_start: Int32,
+        tail_len: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mBlockOut,
+            mWeights,
+            mQueries,
+            mOut,
+            seq_len,
+            query_start,
+            tail_len,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mQueries: cute.Tensor,
+        mOut: cute.Tensor,
+        seq_len: Int32,
+        query_start: Int32,
+        tail_len: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mBlockOut.shape[1])
+            head_dim = Int32(mBlockOut.shape[2])
+            elems_per_entry = num_heads * head_dim
+            entry_idx = task_idx // elems_per_entry
+            rem = task_idx - entry_idx * elems_per_entry
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            query_idx = Int32(mQueries[entry_idx])
+            batch_idx = query_idx // seq_len
+            query_pos = query_idx - batch_idx * seq_len
+            if query_pos >= query_start:
+                row_idx = batch_idx * tail_len + query_pos - query_start
+                contrib = Float32(mWeights[entry_idx, head_idx]) * Float32(
+                    mBlockOut[row_idx, head_idx, dim_idx]
+                )
+                cute_utils.atomic_add_fp32(
+                    contrib,
+                    cute_utils.elem_pointer(mOut, (row_idx, head_idx, dim_idx)),
+                )
+
+
+class ARHSABlockFlashSparseWeightedQueryForwardD64Sm100:
+    """Query-owned sparse slot-weighted add for D64 block FlashAttention outputs."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 64):
+        if int(num_threads) not in (64, 128, 256):
+            raise ValueError("num_threads must be one of 64, 128, or 256")
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta * 2)
+        self.kernel(
+            mBlockOut,
+            mWeights,
+            mRowPtr,
+            mEntryIndex,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        half_warp = lane // Int32(16)
+        lane16 = lane - half_warp * Int32(16)
+        task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
+        if task_idx < total_tasks:
+            num_heads = Int32(mBlockOut.shape[1])
+            row_idx = task_idx // num_heads
+            head_idx = task_idx - row_idx * num_heads
+            start = Int32(mRowPtr[row_idx])
+            end = Int32(mRowPtr[row_idx + 1])
+            entry_count = end - start
+
+            weight_partial = Float32.zero
+            for entry_offset in cutlass.range(lane16, entry_count, Int32(16), unroll=1):
+                entry_idx = Int32(mEntryIndex[start + entry_offset])
+                weight_partial += Float32(mWeights[entry_idx, head_idx])
+            weight_sum = cute_utils.warp_reduce(
+                weight_partial,
+                lambda a, b: a + b,
+                width=16,
+            )
+
+            dim0 = lane16 * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            mOut[row_idx, head_idx, dim0] = (
+                weight_sum * Float32(mBlockOut[row_idx, head_idx, dim0])
+            ).to(mOut.element_type)
+            mOut[row_idx, head_idx, dim1] = (
+                weight_sum * Float32(mBlockOut[row_idx, head_idx, dim1])
+            ).to(mOut.element_type)
+            mOut[row_idx, head_idx, dim2] = (
+                weight_sum * Float32(mBlockOut[row_idx, head_idx, dim2])
+            ).to(mOut.element_type)
+            mOut[row_idx, head_idx, dim3] = (
+                weight_sum * Float32(mBlockOut[row_idx, head_idx, dim3])
+            ).to(mOut.element_type)
+
+
+class ARHSABlockFlashSparseWeightedAddBackwardSm100:
+    """Backward for sparse slot-weighted fixed-block FlashAttention add."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mQueries: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mGradBlockOut: cute.Tensor,
+        mGradWeights: cute.Tensor,
+        seq_len: Int32,
+        query_start: Int32,
+        tail_len: Int32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mBlockOut,
+            mWeights,
+            mQueries,
+            mGradOut,
+            mGradBlockOut,
+            mGradWeights,
+            seq_len,
+            query_start,
+            tail_len,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mBlockOut: cute.Tensor,
+        mWeights: cute.Tensor,
+        mQueries: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mGradBlockOut: cute.Tensor,
+        mGradWeights: cute.Tensor,
+        seq_len: Int32,
+        query_start: Int32,
+        tail_len: Int32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mBlockOut.shape[1])
+            head_dim = Int32(mBlockOut.shape[2])
+            entry_idx = task_idx // num_heads
+            head_idx = task_idx - entry_idx * num_heads
+            query_idx = Int32(mQueries[entry_idx])
+            batch_idx = query_idx // seq_len
+            query_pos = query_idx - batch_idx * seq_len
+            grad_weight = Float32.zero
+            if query_pos >= query_start:
+                row_idx = batch_idx * tail_len + query_pos - query_start
+                weight = Float32(mWeights[entry_idx, head_idx])
+                for dim_idx in cutlass.range(head_dim, unroll=8):
+                    grad = Float32(mGradOut[row_idx, head_idx, dim_idx])
+                    block_val = Float32(mBlockOut[row_idx, head_idx, dim_idx])
+                    grad_weight += grad * block_val
+                    cute_utils.atomic_add_fp32(
+                        weight * grad,
+                        cute_utils.elem_pointer(
+                            mGradBlockOut,
+                            (row_idx, head_idx, dim_idx),
+                        ),
+                    )
+            mGradWeights[entry_idx, head_idx] = grad_weight.to(mGradWeights.element_type)
+
+
 class ARHSADirectStartWeightedValueBackwardSm100:
     """Backward for direct start-weighted value readout."""
 
@@ -20947,6 +21194,267 @@ def run_arhsa_direct_start_weighted_value_backward(
     return grad_weights, grad_value
 
 
+def run_arhsa_block_flash_sparse_weighted_add_forward(
+    block_out: torch.Tensor,
+    weights: torch.Tensor,
+    queries: torch.Tensor,
+    *,
+    seq_len: int,
+    query_start: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse ``out[query] += weight * block_out[query]`` for one block-flash slot."""
+    _require_cute_runtime()
+    if block_out.device.type != "cuda":
+        raise ValueError("block_out must be a CUDA tensor")
+    if block_out.ndim != 3:
+        raise ValueError(f"block_out must have shape [tail_rows, n_heads, head_dim], got {tuple(block_out.shape)}")
+    if weights.ndim != 2 or weights.shape[1] != block_out.shape[1]:
+        raise ValueError("weights must have shape [n_entries, n_heads] matching block_out")
+    if queries.shape != (weights.shape[0],):
+        raise ValueError("queries must have shape [n_entries]")
+    if block_out.dtype not in _CUTE_BACKWARD_DTYPES or weights.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"block_out/weights dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    seq_len = int(seq_len)
+    query_start = int(query_start)
+    if seq_len <= 0 or query_start < 0:
+        raise ValueError("seq_len must be positive and query_start must be non-negative")
+    tail_len = seq_len - query_start
+    if tail_len <= 0:
+        raise ValueError("query_start must be smaller than seq_len")
+    if int(block_out.shape[0]) % tail_len != 0:
+        raise ValueError("block_out rows must be a multiple of seq_len - query_start")
+    if out is None:
+        out = torch.zeros_like(block_out, dtype=torch.float32)
+    if out.shape != block_out.shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype != torch.float32:
+        raise ValueError("out must be float32 because the kernel uses fp32 atomics")
+
+    block_out = block_out.contiguous()
+    weights = weights.contiguous()
+    queries = queries.to(device=block_out.device, dtype=torch.int32).contiguous()
+    out = out.contiguous()
+    out.zero_()
+    total_tasks = int(weights.shape[0] * block_out.shape[1] * block_out.shape[2])
+    if total_tasks == 0:
+        return out
+
+    num_threads = int(os.environ.get("HSA_CUTE_BLOCK_FLASH_SPARSE_ADD_THREADS", "256"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_BLOCK_FLASH_SPARSE_ADD_THREADS must be 128, 256, or 512")
+    compile_key = (
+        "arhsa_block_flash_sparse_weighted_add_forward",
+        block_out.dtype,
+        weights.dtype,
+        out.dtype,
+        block_out.shape[1],
+        block_out.shape[2],
+        num_threads,
+        torch.cuda.get_device_capability(block_out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_block_flash_sparse_weighted_add_forward.compile_cache:
+        op = ARHSABlockFlashSparseWeightedAddForwardSm100(num_threads=num_threads)
+        run_arhsa_block_flash_sparse_weighted_add_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(block_out),
+            to_cute_tensor(weights),
+            to_cute_tensor(queries, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(seq_len),
+            Int32(query_start),
+            Int32(tail_len),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_block_flash_sparse_weighted_add_forward.compile_cache[compile_key](
+        block_out,
+        weights,
+        queries,
+        out,
+        Int32(seq_len),
+        Int32(query_start),
+        Int32(tail_len),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_block_flash_sparse_weighted_query_forward(
+    block_out: torch.Tensor,
+    weights: torch.Tensor,
+    row_ptr: torch.Tensor,
+    entry_index: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Query-owned sparse weighted add for one D64 block-flash slot."""
+    _require_cute_runtime()
+    if block_out.device.type != "cuda":
+        raise ValueError("block_out must be a CUDA tensor")
+    if block_out.ndim != 3 or block_out.shape[2] != 64:
+        raise ValueError(f"block_out must have shape [rows, n_heads, 64], got {tuple(block_out.shape)}")
+    if weights.ndim != 2 or weights.shape[1] != block_out.shape[1]:
+        raise ValueError("weights must have shape [n_entries, n_heads] matching block_out")
+    if row_ptr.shape != (block_out.shape[0] + 1,):
+        raise ValueError(f"row_ptr must have shape [{block_out.shape[0] + 1}]")
+    if entry_index.shape != (weights.shape[0],):
+        raise ValueError("entry_index must have shape [n_entries]")
+    if block_out.dtype not in _CUTE_BACKWARD_DTYPES or weights.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"block_out/weights dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty_like(block_out)
+    if out.shape != block_out.shape:
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype != block_out.dtype:
+        raise ValueError("out dtype must match block_out dtype")
+
+    block_out = block_out.contiguous()
+    weights = weights.contiguous()
+    row_ptr = row_ptr.to(device=block_out.device, dtype=torch.int32).contiguous()
+    entry_index = entry_index.to(device=block_out.device, dtype=torch.int32).contiguous()
+    out = out.contiguous()
+    total_tasks = int(block_out.shape[0] * block_out.shape[1])
+    if total_tasks == 0:
+        return out
+
+    num_threads = int(os.environ.get("HSA_CUTE_BLOCK_FLASH_SPARSE_QUERY_THREADS", "64"))
+    if num_threads not in {64, 128, 256}:
+        raise ValueError("HSA_CUTE_BLOCK_FLASH_SPARSE_QUERY_THREADS must be 64, 128, or 256")
+    compile_key = (
+        "arhsa_block_flash_sparse_weighted_query_forward_d64",
+        block_out.dtype,
+        weights.dtype,
+        out.dtype,
+        block_out.shape[1],
+        num_threads,
+        torch.cuda.get_device_capability(block_out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_block_flash_sparse_weighted_query_forward.compile_cache:
+        op = ARHSABlockFlashSparseWeightedQueryForwardD64Sm100(num_threads=num_threads)
+        run_arhsa_block_flash_sparse_weighted_query_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(block_out),
+            to_cute_tensor(weights),
+            to_cute_tensor(row_ptr, assumed_align=4),
+            to_cute_tensor(entry_index, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_block_flash_sparse_weighted_query_forward.compile_cache[compile_key](
+        block_out,
+        weights,
+        row_ptr,
+        entry_index,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
+def run_arhsa_block_flash_sparse_weighted_add_backward(
+    block_out: torch.Tensor,
+    weights: torch.Tensor,
+    queries: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    seq_len: int,
+    query_start: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward for sparse block-flash weighted add."""
+    _require_cute_runtime()
+    if block_out.device.type != "cuda":
+        raise ValueError("block_out must be a CUDA tensor")
+    if block_out.ndim != 3:
+        raise ValueError(f"block_out must have shape [tail_rows, n_heads, head_dim], got {tuple(block_out.shape)}")
+    if weights.ndim != 2 or weights.shape[1] != block_out.shape[1]:
+        raise ValueError("weights must have shape [n_entries, n_heads] matching block_out")
+    if queries.shape != (weights.shape[0],):
+        raise ValueError("queries must have shape [n_entries]")
+    if grad_out.shape != block_out.shape:
+        raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
+    for tensor_name, tensor in (
+        ("block_out", block_out),
+        ("weights", weights),
+        ("grad_out", grad_out),
+    ):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES and tensor.dtype != torch.float32:
+            raise ValueError(f"{tensor_name} dtype is not supported: {tensor.dtype}")
+    seq_len = int(seq_len)
+    query_start = int(query_start)
+    if seq_len <= 0 or query_start < 0:
+        raise ValueError("seq_len must be positive and query_start must be non-negative")
+    tail_len = seq_len - query_start
+    if tail_len <= 0:
+        raise ValueError("query_start must be smaller than seq_len")
+    if int(block_out.shape[0]) % tail_len != 0:
+        raise ValueError("block_out rows must be a multiple of seq_len - query_start")
+
+    block_out = block_out.contiguous()
+    weights = weights.contiguous()
+    queries = queries.to(device=block_out.device, dtype=torch.int32).contiguous()
+    grad_out = grad_out.contiguous()
+    grad_block_out = torch.zeros_like(block_out, dtype=torch.float32)
+    grad_weights = torch.empty_like(weights, dtype=torch.float32)
+    total_tasks = int(weights.shape[0] * block_out.shape[1])
+    if total_tasks == 0:
+        return grad_block_out, grad_weights
+
+    num_threads = int(os.environ.get("HSA_CUTE_BLOCK_FLASH_SPARSE_ADD_BWD_THREADS", "256"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_BLOCK_FLASH_SPARSE_ADD_BWD_THREADS must be 128, 256, or 512")
+    compile_key = (
+        "arhsa_block_flash_sparse_weighted_add_backward",
+        block_out.dtype,
+        weights.dtype,
+        grad_out.dtype,
+        grad_block_out.dtype,
+        grad_weights.dtype,
+        block_out.shape[1],
+        block_out.shape[2],
+        num_threads,
+        torch.cuda.get_device_capability(block_out.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_block_flash_sparse_weighted_add_backward.compile_cache:
+        op = ARHSABlockFlashSparseWeightedAddBackwardSm100(num_threads=num_threads)
+        run_arhsa_block_flash_sparse_weighted_add_backward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(block_out),
+            to_cute_tensor(weights),
+            to_cute_tensor(queries, assumed_align=4),
+            to_cute_tensor(grad_out),
+            to_cute_tensor(grad_block_out),
+            to_cute_tensor(grad_weights),
+            Int32(seq_len),
+            Int32(query_start),
+            Int32(tail_len),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_block_flash_sparse_weighted_add_backward.compile_cache[compile_key](
+        block_out,
+        weights,
+        queries,
+        grad_out,
+        grad_block_out,
+        grad_weights,
+        Int32(seq_len),
+        Int32(query_start),
+        Int32(tail_len),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return grad_block_out, grad_weights
+
+
 def run_arhsa_v3_compact_beam_readout(
     beam_rows: torch.Tensor,
     beam_mass: torch.Tensor,
@@ -30246,6 +30754,15 @@ run_arhsa_direct_start_weighted_value_tensor_core_forward.compile_cache = get_ji
 )
 run_arhsa_direct_start_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_direct_start_weighted_value_backward_v1"
+)
+run_arhsa_block_flash_sparse_weighted_add_forward.compile_cache = get_jit_cache(
+    "arhsa_block_flash_sparse_weighted_add_forward_v1"
+)
+run_arhsa_block_flash_sparse_weighted_query_forward.compile_cache = get_jit_cache(
+    "arhsa_block_flash_sparse_weighted_query_forward_d64_v1"
+)
+run_arhsa_block_flash_sparse_weighted_add_backward.compile_cache = get_jit_cache(
+    "arhsa_block_flash_sparse_weighted_add_backward_v1"
 )
 run_arhsa_v3_compact_beam_readout.compile_cache = get_jit_cache(
     "arhsa_v3_compact_beam_readout"

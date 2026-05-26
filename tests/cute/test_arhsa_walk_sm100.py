@@ -475,6 +475,98 @@ def test_arhsa_direct_start_weighted_value_tensor_core_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_block_flash_sparse_weighted_add_matches_reference():
+    pytest.importorskip("cutlass")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        run_arhsa_block_flash_sparse_weighted_add_backward,
+        run_arhsa_block_flash_sparse_weighted_add_forward,
+        run_arhsa_block_flash_sparse_weighted_query_forward,
+    )
+
+    device = torch.device("cuda")
+    seq_len = 8
+    query_start = 4
+    batch_size = 2
+    tail_len = seq_len - query_start
+    n_heads = 2
+    head_dim = 5
+    block_out = torch.randn(
+        batch_size * tail_len,
+        n_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(7, n_heads, device=device, dtype=torch.bfloat16)
+    queries = torch.tensor([4, 5, 7, 12, 13, 14, 15], device=device, dtype=torch.int64)
+    rows = torch.div(queries, seq_len, rounding_mode="floor") * tail_len + (
+        queries.remainder(seq_len) - query_start
+    )
+
+    got = run_arhsa_block_flash_sparse_weighted_add_forward(
+        block_out,
+        weights,
+        queries,
+        seq_len=seq_len,
+        query_start=query_start,
+    )
+    expected = torch.zeros_like(got)
+    expected.index_add_(
+        0,
+        rows,
+        weights.float().unsqueeze(-1) * block_out[rows].float(),
+    )
+    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+    grad_out = torch.randn_like(got)
+    grad_block, grad_weights = run_arhsa_block_flash_sparse_weighted_add_backward(
+        block_out,
+        weights,
+        queries,
+        grad_out,
+        seq_len=seq_len,
+        query_start=query_start,
+    )
+    expected_grad_block = torch.zeros_like(grad_block)
+    expected_grad_block.index_add_(
+        0,
+        rows,
+        weights.float().unsqueeze(-1) * grad_out[rows].float(),
+    )
+    expected_grad_weights = (grad_out[rows].float() * block_out[rows].float()).sum(
+        dim=-1,
+    )
+    torch.testing.assert_close(grad_block, expected_grad_block, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(grad_weights, expected_grad_weights, atol=1e-5, rtol=1e-5)
+
+    block_out_d64 = torch.randn(
+        batch_size * tail_len,
+        n_heads,
+        64,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    expected_d64 = torch.zeros_like(block_out_d64, dtype=torch.float32)
+    expected_d64.index_add_(
+        0,
+        rows,
+        weights.float().unsqueeze(-1) * block_out_d64[rows].float(),
+    )
+    row_counts = torch.bincount(rows, minlength=batch_size * tail_len)
+    row_ptr = torch.empty(batch_size * tail_len + 1, device=device, dtype=torch.long)
+    row_ptr[0] = 0
+    row_ptr[1:] = row_counts.cumsum(0)
+    entry_order = torch.argsort(rows).to(torch.int32)
+    got_query = run_arhsa_block_flash_sparse_weighted_query_forward(
+        block_out_d64,
+        weights,
+        row_ptr.to(torch.int32),
+        entry_order,
+    )
+    torch.testing.assert_close(got_query.float(), expected_d64, atol=1.6e-2, rtol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_arhsa_leaf_readout_query_value_pack_matches_torch_reference():
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (

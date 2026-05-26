@@ -2002,6 +2002,117 @@ class ARHSAV3StartScoreH2Sm100:
                 mOut[start_idx, 1] = (dot1 + bias1).to(mOut.element_type)
 
 
+class ARHSAV3StartScoreSegmentedD64HeadPairSm100:
+    """Segmented D64 v3 start-score forward, computing one head-pair per CTA.
+
+    The exact ARMIXED start table is sorted by query and level. This kernel
+    uses that structure to keep the query vector resident while scanning all
+    start rows for a query-level segment, instead of reloading the same q vector
+    for every sampled row.
+    """
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.halfwarps_per_cta = num_threads // 16
+        self.starts_per_iter = self.halfwarps_per_cta // 2
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mQLevels,
+            mRowRepr,
+            mStartFeatureRows,
+            mStartLevelBegin,
+            mStartLevelEnd,
+            mDownBias,
+            mOut,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[total_tasks, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mRowRepr: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mDownBias: cute.Tensor,
+        mOut: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = Int32(block_idx)
+        if task_idx < total_tasks:
+            n_levels = Int32(mQLevels.shape[1])
+            n_heads = Int32(mQLevels.shape[2])
+            head_pairs = n_heads // Int32(2)
+            pair_idx = task_idx % head_pairs
+            query_level_idx = task_idx // head_pairs
+            query_idx = query_level_idx // n_levels
+            level = query_level_idx - query_idx * n_levels
+            begin = Int32(mStartLevelBegin[query_level_idx])
+            end = Int32(mStartLevelEnd[query_level_idx])
+
+            worker = tidx // Int32(16)
+            lane = tidx % cute.arch.WARP_SIZE
+            lane16 = lane % Int32(16)
+            local_head = worker % Int32(2)
+            start_slot = worker // Int32(2)
+            head_idx = pair_idx * Int32(2) + local_head
+            dim0 = lane16 * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+
+            q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+            q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+            q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+            q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+            bias = Float32(mDownBias[0])
+            if Int32(mDownBias.shape[0]) > Int32(1):
+                bias = Float32(mDownBias[head_idx])
+
+            for start_idx in cutlass.range(
+                begin + start_slot,
+                end,
+                Int32(self.starts_per_iter),
+                unroll=1,
+            ):
+                feature_row = Int32(mStartFeatureRows[start_idx])
+                partial = (
+                    q0 * Float32(mRowRepr[feature_row, head_idx, dim0])
+                    + q1 * Float32(mRowRepr[feature_row, head_idx, dim1])
+                    + q2 * Float32(mRowRepr[feature_row, head_idx, dim2])
+                    + q3 * Float32(mRowRepr[feature_row, head_idx, dim3])
+                )
+                acc = cute_utils.warp_reduce(partial, lambda a, b: a + b, width=16)
+                if lane16 == Int32(0):
+                    dot = Float32((acc * scale).to(mRowRepr.element_type))
+                    mOut[start_idx, head_idx] = (dot + bias).to(mOut.element_type)
+
+
 class ARHSAV3StartScoreGradRowOnlyH2Sm100:
     """Per-start grad-row accumulation for packed v3 two-head start scores."""
 
@@ -2077,6 +2188,89 @@ class ARHSAV3StartScoreGradRowOnlyH2Sm100:
                 )
 
 
+class ARHSAV3StartScoreGradRowOnlyD64HeadPairSm100:
+    """D64 per-start grad-row accumulation, computing one head-pair per warp."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mQLevels: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mQLevels,
+            mGradOut,
+            mStartFeatureRows,
+            mStartQueryIndex,
+            mStartLevels,
+            mGradRow,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQLevels: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartQueryIndex: cute.Tensor,
+        mStartLevels: cute.Tensor,
+        mGradRow: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+        if task_idx < total_tasks:
+            n_starts = Int32(mStartFeatureRows.shape[0])
+            pair_idx = task_idx // n_starts
+            start_idx = task_idx - pair_idx * n_starts
+            feature_row = Int32(mStartFeatureRows[start_idx])
+            query_idx = Int32(mStartQueryIndex[start_idx])
+            level = Int32(mStartLevels[start_idx])
+            local_head = lane // Int32(16)
+            dim_group = lane - local_head * Int32(16)
+            head_idx = pair_idx * Int32(2) + local_head
+            dim0 = dim_group * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            grad = Float32(mGradOut[start_idx, head_idx]) * scale
+            q0 = Float32(mQLevels[query_idx, level, head_idx, dim0])
+            q1 = Float32(mQLevels[query_idx, level, head_idx, dim1])
+            q2 = Float32(mQLevels[query_idx, level, head_idx, dim2])
+            q3 = Float32(mQLevels[query_idx, level, head_idx, dim3])
+            copy_utils.atomic_add_fp32x4(
+                grad * q0,
+                grad * q1,
+                grad * q2,
+                grad * q3,
+                cute_utils.elem_pointer(mGradRow, (feature_row, head_idx, dim0)),
+            )
+
+
 class ARHSAV3StartScoreGradQSegmentH2Sm100:
     """Query-level segmented grad-q reduction for packed v3 two-head starts."""
 
@@ -2150,6 +2344,103 @@ class ARHSAV3StartScoreGradQSegmentH2Sm100:
                     acc1 += grad1 * Float32(mRowRepr[feature_row, 1, dim_idx])
                 mGradQ[query_idx, level, 0, dim_idx] = acc0.to(mGradQ.element_type)
                 mGradQ[query_idx, level, 1, dim_idx] = acc1.to(mGradQ.element_type)
+
+
+class ARHSAV3StartScoreGradQSegmentD64HeadPairSm100:
+    """D64 segmented grad-q accumulation, computing one head-pair per CTA."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 128):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mGradQ: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mRowRepr,
+            mGradOut,
+            mStartFeatureRows,
+            mStartLevelBegin,
+            mStartLevelEnd,
+            mGradQ,
+            scale,
+            total_tasks,
+        ).launch(
+            grid=[total_tasks, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mRowRepr: cute.Tensor,
+        mGradOut: cute.Tensor,
+        mStartFeatureRows: cute.Tensor,
+        mStartLevelBegin: cute.Tensor,
+        mStartLevelEnd: cute.Tensor,
+        mGradQ: cute.Tensor,
+        scale: Float32,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = Int32(block_idx)
+        if task_idx < total_tasks:
+            n_levels = Int32(mGradQ.shape[1])
+            n_heads = Int32(mGradQ.shape[2])
+            head_pairs = n_heads // Int32(2)
+            pair_idx = task_idx % head_pairs
+            query_level_idx = task_idx // head_pairs
+            query_idx = query_level_idx // n_levels
+            level = query_level_idx - query_idx * n_levels
+            start = Int32(mStartLevelBegin[query_level_idx])
+            end = Int32(mStartLevelEnd[query_level_idx])
+            warp_idx = tidx // cute.arch.WARP_SIZE
+            lane = tidx % cute.arch.WARP_SIZE
+            local_head = lane // Int32(16)
+            dim_group = lane - local_head * Int32(16)
+            head_idx = pair_idx * Int32(2) + local_head
+            dim0 = dim_group * Int32(4)
+            dim1 = dim0 + Int32(1)
+            dim2 = dim0 + Int32(2)
+            dim3 = dim0 + Int32(3)
+            acc0 = Float32.zero
+            acc1 = Float32.zero
+            acc2 = Float32.zero
+            acc3 = Float32.zero
+            for ptr in cutlass.range(
+                start + warp_idx,
+                end,
+                Int32(self.warps_per_cta),
+                unroll=1,
+            ):
+                feature_row = Int32(mStartFeatureRows[ptr])
+                grad = Float32(mGradOut[ptr, head_idx]) * scale
+                acc0 += grad * Float32(mRowRepr[feature_row, head_idx, dim0])
+                acc1 += grad * Float32(mRowRepr[feature_row, head_idx, dim1])
+                acc2 += grad * Float32(mRowRepr[feature_row, head_idx, dim2])
+                acc3 += grad * Float32(mRowRepr[feature_row, head_idx, dim3])
+            if start < end:
+                copy_utils.atomic_add_fp32x4(
+                    acc0,
+                    acc1,
+                    acc2,
+                    acc3,
+                    cute_utils.elem_pointer(mGradQ, (query_idx, level, head_idx, dim0)),
+                )
 
 
 class ARHSAV3OpenScoreH2Sm100:
@@ -17091,6 +17382,115 @@ def run_arhsa_v3_start_score_forward(
     return out
 
 
+def run_arhsa_v3_start_score_forward_segmented(
+    q_levels: torch.Tensor,
+    row_repr: torch.Tensor,
+    start_feature_rows: torch.Tensor,
+    start_level_begin: torch.Tensor,
+    start_level_end: torch.Tensor,
+    down_bias: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run segmented packed-v3 D64 start-score dots plus bias."""
+    _require_cute_runtime()
+    if q_levels.device.type != "cuda":
+        raise ValueError("q_levels must be a CUDA tensor")
+    if q_levels.ndim != 4:
+        raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
+    if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
+        raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim] matching q_levels")
+    if int(row_repr.shape[1]) % 2 != 0:
+        raise ValueError("segmented v3 start-score forward requires an even number of heads")
+    if int(row_repr.shape[2]) != 64:
+        raise ValueError("segmented v3 start-score forward currently requires head_dim == 64")
+    n_starts = int(start_feature_rows.numel())
+    qlevel_tasks = int(q_levels.shape[0] * q_levels.shape[1])
+    if start_level_begin.shape != (qlevel_tasks,) or start_level_end.shape != (qlevel_tasks,):
+        raise ValueError(
+            "start_level_begin/end must have shape [n_queries * n_levels], "
+            f"got {tuple(start_level_begin.shape)} / {tuple(start_level_end.shape)}"
+        )
+    if down_bias.reshape(-1).numel() not in {1, int(row_repr.shape[1])}:
+        raise ValueError("down_bias must be scalar or have one value per head")
+    if q_levels.dtype not in _CUTE_BACKWARD_DTYPES or row_repr.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"q_levels/row_repr dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if out is None:
+        out = torch.empty(
+            (n_starts, row_repr.shape[1]),
+            dtype=torch.promote_types(row_repr.dtype, down_bias.dtype),
+            device=row_repr.device,
+        )
+    if out.shape != (n_starts, row_repr.shape[1]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    q_levels = q_levels.contiguous()
+    row_repr = row_repr.contiguous()
+    start_feature_rows = start_feature_rows.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    start_level_begin = start_level_begin.to(
+        device=q_levels.device,
+        dtype=torch.int32,
+    ).contiguous()
+    start_level_end = start_level_end.to(device=q_levels.device, dtype=torch.int32).contiguous()
+    down_bias = down_bias.reshape(-1).to(device=q_levels.device).contiguous()
+    out = out.contiguous()
+    total_tasks = int(qlevel_tasks * (row_repr.shape[1] // 2))
+    if total_tasks == 0:
+        return out
+
+    scale = float(q_levels.shape[-1] ** 0.5)
+    num_threads = int(os.environ.get("HSA_CUTE_V3_START_SCORE_SEG_FORWARD_THREADS", "128"))
+    if num_threads not in {128, 256, 512}:
+        raise ValueError("HSA_CUTE_V3_START_SCORE_SEG_FORWARD_THREADS must be 128, 256, or 512")
+    compile_key = (
+        "arhsa_v3_start_score_segmented_d64_head_pair",
+        q_levels.dtype,
+        row_repr.dtype,
+        down_bias.dtype,
+        out.dtype,
+        q_levels.shape[1],
+        q_levels.shape[2],
+        q_levels.shape[3],
+        down_bias.numel(),
+        num_threads,
+        torch.cuda.get_device_capability(q_levels.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_v3_start_score_forward_segmented.compile_cache:
+        op = ARHSAV3StartScoreSegmentedD64HeadPairSm100(num_threads=num_threads)
+        run_arhsa_v3_start_score_forward_segmented.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(q_levels),
+            to_cute_tensor(row_repr),
+            to_cute_tensor(start_feature_rows, assumed_align=4),
+            to_cute_tensor(start_level_begin, assumed_align=4),
+            to_cute_tensor(start_level_end, assumed_align=4),
+            to_cute_tensor(down_bias),
+            to_cute_tensor(out),
+            Float32(scale),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_v3_start_score_forward_segmented.compile_cache[compile_key](
+        q_levels,
+        row_repr,
+        start_feature_rows,
+        start_level_begin,
+        start_level_end,
+        down_bias,
+        out,
+        Float32(scale),
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_v3_start_score_backward_segmented(
     q_levels: torch.Tensor,
     row_repr: torch.Tensor,
@@ -17111,8 +17511,17 @@ def run_arhsa_v3_start_score_backward_segmented(
         raise ValueError(f"q_levels must have shape [n_queries, n_levels, n_heads, head_dim], got {tuple(q_levels.shape)}")
     if row_repr.ndim != 3 or row_repr.shape[1:] != q_levels.shape[2:]:
         raise ValueError("row_repr must have shape [n_rows, n_heads, head_dim] matching q_levels")
-    if row_repr.shape[1] != 2:
-        raise ValueError("segmented v3 start-score backward currently requires exactly two heads")
+    use_d64_head_pair = (
+        int(row_repr.shape[1]) % 2 == 0
+        and int(row_repr.shape[2]) == 64
+        and os.environ.get("HSA_V3_START_SCORE_SEGMENTED_BACKWARD_D64", "0")
+        not in {"0", "false", "False", ""}
+    )
+    if row_repr.shape[1] != 2 and not use_d64_head_pair:
+        raise ValueError(
+            "segmented v3 start-score backward currently requires two heads "
+            "or an even-head D64 tensor"
+        )
     if grad_out.shape != (start_feature_rows.numel(), row_repr.shape[1]):
         raise ValueError(f"grad_out shape mismatch: got {tuple(grad_out.shape)}")
     qlevel_tasks = int(q_levels.shape[0] * q_levels.shape[1])
@@ -17138,6 +17547,8 @@ def run_arhsa_v3_start_score_backward_segmented(
         pass
     else:
         grad_q = torch.empty_like(q_levels, dtype=torch.float32)
+    if use_d64_head_pair:
+        grad_q.zero_()
     if row_repr.dtype == torch.float32:
         grad_row = torch.zeros_like(row_repr) if grad_row is None else grad_row.zero_()
     elif grad_row is not None and grad_row.dtype == torch.float32:
@@ -17173,8 +17584,15 @@ def run_arhsa_v3_start_score_backward_segmented(
 
     row_tasks = int(start_feature_rows.numel())
     if row_tasks > 0:
+        effective_row_tasks = (
+            row_tasks * (int(row_repr.shape[1]) // 2)
+            if use_d64_head_pair
+            else row_tasks
+        )
         row_key = (
-            "arhsa_v3_start_score_grad_row_only_h2",
+            "arhsa_v3_start_score_grad_row_only_d64_head_pair"
+            if use_d64_head_pair
+            else "arhsa_v3_start_score_grad_row_only_h2",
             q_levels.dtype,
             grad_out.dtype,
             grad_row.dtype,
@@ -17184,7 +17602,13 @@ def run_arhsa_v3_start_score_backward_segmented(
             torch.cuda.get_device_capability(q_levels.device),
         )
         if row_key not in run_arhsa_v3_start_score_backward_segmented.compile_cache:
-            row_op = ARHSAV3StartScoreGradRowOnlyH2Sm100(num_threads=num_threads)
+            row_op = (
+                ARHSAV3StartScoreGradRowOnlyD64HeadPairSm100(
+                    num_threads=num_threads
+                )
+                if use_d64_head_pair
+                else ARHSAV3StartScoreGradRowOnlyH2Sm100(num_threads=num_threads)
+            )
             run_arhsa_v3_start_score_backward_segmented.compile_cache[row_key] = cute.compile(
                 row_op,
                 to_cute_tensor(q_levels),
@@ -17194,7 +17618,7 @@ def run_arhsa_v3_start_score_backward_segmented(
                 to_cute_tensor(start_levels, assumed_align=4),
                 to_cute_tensor(grad_row),
                 Float32(scale),
-                Int32(row_tasks),
+                Int32(effective_row_tasks),
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -17206,13 +17630,20 @@ def run_arhsa_v3_start_score_backward_segmented(
             start_levels,
             grad_row,
             Float32(scale),
-            Int32(row_tasks),
+            Int32(effective_row_tasks),
             current_stream,
         )
 
     if qlevel_tasks > 0:
+        effective_q_tasks = (
+            qlevel_tasks * (int(row_repr.shape[1]) // 2)
+            if use_d64_head_pair
+            else qlevel_tasks
+        )
         q_key = (
-            "arhsa_v3_start_score_grad_q_segment_h2",
+            "arhsa_v3_start_score_grad_q_segment_d64_head_pair"
+            if use_d64_head_pair
+            else "arhsa_v3_start_score_grad_q_segment_h2",
             row_repr.dtype,
             grad_out.dtype,
             grad_q.dtype,
@@ -17223,7 +17654,13 @@ def run_arhsa_v3_start_score_backward_segmented(
             torch.cuda.get_device_capability(q_levels.device),
         )
         if q_key not in run_arhsa_v3_start_score_backward_segmented.compile_cache:
-            q_op = ARHSAV3StartScoreGradQSegmentH2Sm100(num_threads=num_threads)
+            q_op = (
+                ARHSAV3StartScoreGradQSegmentD64HeadPairSm100(
+                    num_threads=num_threads
+                )
+                if use_d64_head_pair
+                else ARHSAV3StartScoreGradQSegmentH2Sm100(num_threads=num_threads)
+            )
             run_arhsa_v3_start_score_backward_segmented.compile_cache[q_key] = cute.compile(
                 q_op,
                 to_cute_tensor(row_repr),
@@ -17233,7 +17670,7 @@ def run_arhsa_v3_start_score_backward_segmented(
                 to_cute_tensor(start_level_end, assumed_align=4),
                 to_cute_tensor(grad_q),
                 Float32(scale),
-                Int32(qlevel_tasks),
+                Int32(effective_q_tasks),
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -17245,7 +17682,7 @@ def run_arhsa_v3_start_score_backward_segmented(
             start_level_end,
             grad_q,
             Float32(scale),
-            Int32(qlevel_tasks),
+            Int32(effective_q_tasks),
             current_stream,
         )
 
@@ -28545,6 +28982,9 @@ run_arhsa_sampled_node_dot.compile_cache = get_jit_cache("arhsa_sampled_node_dot
 run_arhsa_sampled_node_dot_backward.compile_cache = get_jit_cache("arhsa_sampled_node_dot_backward")
 run_arhsa_v3_start_score_forward.compile_cache = get_jit_cache(
     "arhsa_v3_start_score_forward"
+)
+run_arhsa_v3_start_score_forward_segmented.compile_cache = get_jit_cache(
+    "arhsa_v3_start_score_forward_segmented_d64_head_pair_v1"
 )
 run_arhsa_v3_start_score_backward_segmented.compile_cache = get_jit_cache(
     "arhsa_v3_start_score_backward_segmented"

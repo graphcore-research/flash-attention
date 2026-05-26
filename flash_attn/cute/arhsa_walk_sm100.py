@@ -5750,6 +5750,116 @@ class ARHSADirectStartWeightedValueForwardSm100:
             )
 
 
+class ARHSADirectStartWeightedValueQueryWarpForwardSm100:
+    """Query/head-owned direct start readout without atomics or dense staging."""
+
+    arch = 100
+
+    def __init__(
+        self,
+        *,
+        num_threads: int = 64,
+        head_dim_is_64: bool = False,
+    ):
+        self.num_threads = num_threads
+        self.warps_per_cta = num_threads // 32
+        self.head_dim_is_64 = head_dim_is_64
+
+    @cute.jit
+    def __call__(
+        self,
+        mWeights: cute.Tensor,
+        mValue: cute.Tensor,
+        mRows: cute.Tensor,
+        mQueryRowPtr: cute.Tensor,
+        mQueryEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+        stream: cuda.CUstream,
+    ):
+        if cutlass.const_expr(self.head_dim_is_64):
+            grid_x = cute.ceil_div(total_tasks, self.warps_per_cta * 2)
+        else:
+            grid_x = cute.ceil_div(total_tasks, self.warps_per_cta)
+        self.kernel(
+            mWeights,
+            mValue,
+            mRows,
+            mQueryRowPtr,
+            mQueryEntryIndex,
+            mOut,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mWeights: cute.Tensor,
+        mValue: cute.Tensor,
+        mRows: cute.Tensor,
+        mQueryRowPtr: cute.Tensor,
+        mQueryEntryIndex: cute.Tensor,
+        mOut: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        if cutlass.const_expr(self.head_dim_is_64):
+            half_warp = lane // Int32(16)
+            lane16 = lane - half_warp * Int32(16)
+            task_idx = block_idx * Int32(self.warps_per_cta * 2) + warp_idx * Int32(2) + half_warp
+            if task_idx < total_tasks:
+                num_heads = Int32(mValue.shape[1])
+                query_idx = task_idx // num_heads
+                head_idx = task_idx - query_idx * num_heads
+                start = Int32(mQueryRowPtr[query_idx])
+                end = Int32(mQueryRowPtr[query_idx + 1])
+
+                dim0 = lane16 * Int32(4)
+                dim1 = dim0 + Int32(1)
+                dim2 = dim0 + Int32(2)
+                dim3 = dim0 + Int32(3)
+                acc0 = Float32.zero
+                acc1 = Float32.zero
+                acc2 = Float32.zero
+                acc3 = Float32.zero
+                for ptr in cutlass.range(start, end, unroll=1):
+                    entry_idx = Int32(mQueryEntryIndex[ptr])
+                    row_idx = Int32(mRows[entry_idx])
+                    weight = Float32(mWeights[entry_idx, head_idx])
+                    acc0 += weight * Float32(mValue[row_idx, head_idx, dim0])
+                    acc1 += weight * Float32(mValue[row_idx, head_idx, dim1])
+                    acc2 += weight * Float32(mValue[row_idx, head_idx, dim2])
+                    acc3 += weight * Float32(mValue[row_idx, head_idx, dim3])
+                mOut[query_idx, head_idx, dim0] = acc0.to(mOut.element_type)
+                mOut[query_idx, head_idx, dim1] = acc1.to(mOut.element_type)
+                mOut[query_idx, head_idx, dim2] = acc2.to(mOut.element_type)
+                mOut[query_idx, head_idx, dim3] = acc3.to(mOut.element_type)
+        else:
+            task_idx = block_idx * Int32(self.warps_per_cta) + warp_idx
+            if task_idx < total_tasks:
+                num_heads = Int32(mValue.shape[1])
+                head_dim = Int32(mValue.shape[2])
+                query_idx = task_idx // num_heads
+                head_idx = task_idx - query_idx * num_heads
+                start = Int32(mQueryRowPtr[query_idx])
+                end = Int32(mQueryRowPtr[query_idx + 1])
+                for dim_idx in cutlass.range(lane, head_dim, cute.arch.WARP_SIZE, unroll=2):
+                    acc = Float32.zero
+                    for ptr in cutlass.range(start, end, unroll=1):
+                        entry_idx = Int32(mQueryEntryIndex[ptr])
+                        row_idx = Int32(mRows[entry_idx])
+                        weight = Float32(mWeights[entry_idx, head_idx])
+                        acc += weight * Float32(mValue[row_idx, head_idx, dim_idx])
+                    mOut[query_idx, head_idx, dim_idx] = acc.to(mOut.element_type)
+
+
 class ARHSADirectStartWeightedValueBackwardSm100:
     """Backward for direct start-weighted value readout."""
 
@@ -20368,6 +20478,103 @@ def run_arhsa_direct_start_weighted_value_forward(
     return out
 
 
+def run_arhsa_direct_start_weighted_value_query_warp_forward(
+    weights: torch.Tensor,
+    value: torch.Tensor,
+    rows: torch.Tensor,
+    query_row_ptr: torch.Tensor,
+    query_entry_index: torch.Tensor,
+    n_outputs: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run query-owned direct fixed-block start readout without atomics."""
+    _require_cute_runtime()
+    if weights.device.type != "cuda":
+        raise ValueError("weights must be a CUDA tensor")
+    if weights.ndim != 2:
+        raise ValueError(f"weights must have shape [n_entries, n_heads], got {tuple(weights.shape)}")
+    if value.ndim != 3:
+        raise ValueError(f"value must have shape [n_rows, n_heads, head_dim], got {tuple(value.shape)}")
+    if value.shape[1] != weights.shape[1]:
+        raise ValueError("weights and value head dimensions must match")
+    if rows.shape != (weights.shape[0],):
+        raise ValueError("rows must have shape [n_entries]")
+    n_outputs = int(n_outputs)
+    if query_row_ptr.shape != (n_outputs + 1,):
+        raise ValueError(f"query_row_ptr must have shape [{n_outputs + 1}]")
+    if query_entry_index.shape != (weights.shape[0],):
+        raise ValueError("query_entry_index must have shape [n_entries]")
+    for tensor_name, tensor in (("weights", weights), ("value", value)):
+        if tensor.dtype not in _CUTE_BACKWARD_DTYPES:
+            raise ValueError(f"{tensor_name} dtype must be one of {_CUTE_BACKWARD_DTYPES}")
+    if n_outputs < 0:
+        raise ValueError("n_outputs must be non-negative")
+    if out is None:
+        out = torch.empty(
+            (n_outputs, value.shape[1], value.shape[2]),
+            dtype=value.dtype,
+            device=value.device,
+        )
+    if out.shape != (n_outputs, value.shape[1], value.shape[2]):
+        raise ValueError(f"out shape mismatch: got {tuple(out.shape)}")
+    if out.dtype not in _CUTE_BACKWARD_DTYPES:
+        raise ValueError(f"out dtype must be one of {_CUTE_BACKWARD_DTYPES}, got {out.dtype}")
+
+    weights = weights.contiguous()
+    value = value.contiguous()
+    out = out.contiguous()
+    rows = rows.to(device=weights.device, dtype=torch.int32).contiguous()
+    query_row_ptr = query_row_ptr.to(device=weights.device, dtype=torch.int32).contiguous()
+    query_entry_index = query_entry_index.to(device=weights.device, dtype=torch.int32).contiguous()
+    total_tasks = int(n_outputs * value.shape[1])
+    if total_tasks == 0:
+        return out
+
+    num_threads = int(os.environ.get("HSA_CUTE_DIRECT_START_QUERY_WARP_THREADS", "64"))
+    if num_threads not in {64, 128, 256}:
+        raise ValueError("HSA_CUTE_DIRECT_START_QUERY_WARP_THREADS must be 64, 128, or 256")
+    compile_key = (
+        "arhsa_direct_start_weighted_value_query_warp_forward",
+        weights.dtype,
+        value.dtype,
+        out.dtype,
+        value.shape[1],
+        value.shape[2],
+        value.shape[2] == 64,
+        num_threads,
+        torch.cuda.get_device_capability(weights.device),
+    )
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if compile_key not in run_arhsa_direct_start_weighted_value_query_warp_forward.compile_cache:
+        op = ARHSADirectStartWeightedValueQueryWarpForwardSm100(
+            num_threads=num_threads,
+            head_dim_is_64=value.shape[2] == 64,
+        )
+        run_arhsa_direct_start_weighted_value_query_warp_forward.compile_cache[compile_key] = cute.compile(
+            op,
+            to_cute_tensor(weights),
+            to_cute_tensor(value),
+            to_cute_tensor(rows, assumed_align=4),
+            to_cute_tensor(query_row_ptr, assumed_align=4),
+            to_cute_tensor(query_entry_index, assumed_align=4),
+            to_cute_tensor(out),
+            Int32(total_tasks),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+    run_arhsa_direct_start_weighted_value_query_warp_forward.compile_cache[compile_key](
+        weights,
+        value,
+        rows,
+        query_row_ptr,
+        query_entry_index,
+        out,
+        Int32(total_tasks),
+        current_stream,
+    )
+    return out
+
+
 def run_arhsa_direct_start_weighted_value_backward(
     weights: torch.Tensor,
     value: torch.Tensor,
@@ -29739,6 +29946,9 @@ run_arhsa_grouped_weighted_value_backward.compile_cache = get_jit_cache(
 )
 run_arhsa_direct_start_weighted_value_forward.compile_cache = get_jit_cache(
     "arhsa_direct_start_weighted_value_forward_v1"
+)
+run_arhsa_direct_start_weighted_value_query_warp_forward.compile_cache = get_jit_cache(
+    "arhsa_direct_start_weighted_value_query_warp_forward_v1"
 )
 run_arhsa_direct_start_weighted_value_backward.compile_cache = get_jit_cache(
     "arhsa_direct_start_weighted_value_backward_v1"

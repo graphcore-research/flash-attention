@@ -386,6 +386,46 @@ def test_arhsa_leaf_readout_query_warp_matches_torch_reference(head_dim_v):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_arhsa_direct_start_weighted_value_query_warp_matches_reference():
+    pytest.importorskip("cutlass")
+    from flash_attn.cute.arhsa_walk_sm100 import (
+        build_query_leaf_csr,
+        run_arhsa_direct_start_weighted_value_query_warp_forward,
+    )
+
+    device = torch.device("cuda")
+    n_outputs = 5
+    n_rows = 7
+    n_heads = 2
+    head_dim = 64
+    weights = torch.randn(9, n_heads, device=device, dtype=torch.bfloat16)
+    rows = torch.tensor([0, 2, 1, 3, 5, 4, 6, 2, 0], device=device, dtype=torch.int64)
+    queries = torch.tensor([0, 0, 1, 1, 1, 3, 3, 3, 4], device=device, dtype=torch.int64)
+    value = torch.randn(n_rows, n_heads, head_dim, device=device, dtype=torch.bfloat16)
+    query_row_ptr, query_entry_index = build_query_leaf_csr(
+        queries,
+        n_queries=n_outputs,
+    )
+
+    got = run_arhsa_direct_start_weighted_value_query_warp_forward(
+        weights,
+        value,
+        rows,
+        query_row_ptr,
+        query_entry_index,
+        n_outputs,
+    )
+    expected = torch.zeros(n_outputs, n_heads, head_dim, device=device, dtype=torch.float32)
+    expected.index_add_(
+        0,
+        queries,
+        weights.float().unsqueeze(-1) * value[rows].float(),
+    )
+
+    torch.testing.assert_close(got.float(), expected, atol=1.6e-2, rtol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_arhsa_leaf_readout_query_value_pack_matches_torch_reference():
     pytest.importorskip("cutlass")
     from flash_attn.cute.arhsa_walk_sm100 import (

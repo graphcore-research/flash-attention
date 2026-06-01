@@ -3052,6 +3052,8 @@ def _flash_attn_bwd(
             print({"phase": "bwd_launch_start"}, flush=True)
         q_col_runtime = to_tvm_ffi_fp4x2_tensor(q_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
         k_col_runtime = to_tvm_ffi_fp4x2_tensor(k_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
+        q_col_scale_runtime = q_col_scale_fp4.detach().view(torch.uint8).contiguous() if use_fp4_bwd_qk else None
+        k_col_scale_runtime = k_col_scale_fp4.detach().view(torch.uint8).contiguous() if use_fp4_bwd_qk else None
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
             k.detach(),
@@ -3064,8 +3066,8 @@ def _flash_attn_bwd(
             dv if not dKV_postprocess else dv_accum,
             q_col_runtime,
             k_col_runtime,
-            q_col_scale_fp4,
-            k_col_scale_fp4,
+            q_col_scale_runtime,
+            k_col_scale_runtime,
             softmax_scale,
             current_stream,
             cu_seqlens_q,

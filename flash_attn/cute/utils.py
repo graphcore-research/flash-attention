@@ -2016,6 +2016,95 @@ def ex2_emulation_2_linear(x: Float32, y: Float32, *, loc=None, ip=None) -> Tupl
     return x_out, y_out
 
 
+def _select_pwl_coeffs(frac: Float32, slopes: Tuple[float, ...], intercepts: Tuple[float, ...]):
+    pieces = len(slopes)
+    c1 = slopes[0]
+    c0 = intercepts[0]
+    for i in range(1, pieces):
+        mask = frac >= (float(i) / float(pieces))
+        c1 = select_(mask, slopes[i], c1)
+        c0 = select_(mask, intercepts[i], c0)
+    return c1, c0
+
+
+@dsl_user_op
+def ex2_emulation_2_pwl4(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """exp2 via 4-piece uniform PWL with register-local coefficients."""
+    slopes = (
+        0.756828460010884,
+        0.900025789481496,
+        1.070317072537335,
+        1.272828677970284,
+    )
+    intercepts = (
+        1.000000000000000,
+        0.964200667632347,
+        0.879055026104427,
+        0.727171322029716,
+    )
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    fx, fy = xy_frac
+    c1_x, c0_x = _select_pwl_coeffs(fx, slopes, intercepts)
+    c1_y, c0_y = _select_pwl_coeffs(fy, slopes, intercepts)
+    frac_ex2_x = fx * c1_x + c0_x
+    frac_ex2_y = fy * c1_y + c0_y
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2_x, loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2_y, loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_pwl8(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """exp2 via 8-piece uniform PWL with register-local coefficients."""
+    slopes = (
+        0.724061861322062,
+        0.789595058699707,
+        0.861059517186309,
+        0.938992061776684,
+        1.023978104278765,
+        1.116656040795906,
+        1.217722047215307,
+        1.327935308725261,
+    )
+    intercepts = (
+        1.000000000000000,
+        0.991808350327794,
+        0.973942235706144,
+        0.944717531484753,
+        0.902224510233713,
+        0.844300799910499,
+        0.768501295095948,
+        0.672064691274739,
+    )
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    fx, fy = xy_frac
+    c1_x, c0_x = _select_pwl_coeffs(fx, slopes, intercepts)
+    c1_y, c0_y = _select_pwl_coeffs(fy, slopes, intercepts)
+    frac_ex2_x = fx * c1_x + c0_x
+    frac_ex2_y = fy * c1_y + c0_y
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2_x, loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2_y, loc=loc, ip=ip)
+    return x_out, y_out
+
+
 @dsl_user_op
 def exp2f_identity_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     return x, y

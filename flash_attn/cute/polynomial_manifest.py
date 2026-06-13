@@ -66,7 +66,7 @@ SIGMOID_D3 = PolynomialSpec(
         0.0033893585205078125,
     ),
     backend_targets=("cute", "device", "output_gate"),
-    notes="Shared D3 sigmoid fit for FA4 sigmoid attention, output gate, and device-side activations.",
+    notes="Shared D3 sigmoid fit for FA4 sigmoid attention and device-side activations.",
 )
 
 SIGMOID_GRAD_D5_BF16 = PolynomialSpec(

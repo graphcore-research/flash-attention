@@ -173,6 +173,26 @@ _CURRENT_DEFAULT_STRUCTS = {
     ("gelu_bwd", 5): "GELU_BWD_D5_ODD_BF16",
 }
 
+_CURRENT_STRUCT_TEMPLATES = {
+    "tanh_fwd": "TANH_FWD_D{degree}_ODD_BF16",
+    "sigmoid_fwd": "SIGMOID_FWD_D{degree}_ODD_BF16",
+    "sigmoid_bwd": "SIGMOID_BWD_D{degree}_EVEN_BF16",
+    "swish_fwd": "SWISH_FWD_D{degree}_ODD_BF16",
+    "swish_bwd": "SWISH_BWD_D{degree}_ODD_BF16",
+    "gelu_fwd": "GELU_FWD_D{degree}_ODD_BF16",
+    "gelu_bwd": "GELU_BWD_D{degree}_ODD_BF16",
+}
+
+_AUDIT_NAME_PREFIXES = {
+    "tanh_fwd": "softcap_tanh",
+    "sigmoid_fwd": "sigmoid",
+    "sigmoid_bwd": "sigmoid_grad",
+    "swish_fwd": "swish_fwd",
+    "swish_bwd": "swish_grad",
+    "gelu_fwd": "gelu_fwd",
+    "gelu_bwd": "gelu_bwd",
+}
+
 STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_odd_bf16.cuh"
 SOLLYA_STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_sollya_bf16.cuh"
 SOLLYA_SWEEP_JSON = (
@@ -520,6 +540,37 @@ def _check_composed_struct(errors: list[str], header_text: str, struct_name: str
             )
 
 
+def _current_struct_name(family: str, degree: int) -> str | None:
+    template = _CURRENT_STRUCT_TEMPLATES.get(family)
+    if template is None:
+        return None
+    return template.format(degree=degree)
+
+
+def _current_audit_name(family: str, degree: int) -> str:
+    prefix = _AUDIT_NAME_PREFIXES.get(family, family)
+    return f"{prefix}_d{degree}_current"
+
+
+def _check_current_struct_exists(errors: list[str], header_text: str, struct_name: str) -> None:
+    try:
+        _extract_bf16_struct(header_text, struct_name)
+    except ValueError as error:
+        errors.append(str(error))
+
+
+def _current_swish_spec(degree: int) -> ComposedPolynomialSpec:
+    return ComposedPolynomialSpec(
+        name=f"swish_d{degree}_composed_current",
+        target="swish(x)",
+        composed_from=f"SIGMOID_FWD_D{degree}_ODD_BF16",
+        backend_targets=("spline_ops", "device"),
+        notes="Swish forward composes x with the matching current sigmoid header row.",
+        source="current",
+        degree=degree,
+    )
+
+
 def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tuple[str, ...]:
     current_header_text = STRUCT_HEADER.read_text()
     sollya_header_text: str | None = None
@@ -529,6 +580,8 @@ def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tu
     for family, degree, coeff_source in selections:
         header_text = current_header_text
         struct_name = _CURRENT_DEFAULT_STRUCTS.get((family, degree))
+        if coeff_source == "current" and struct_name is None:
+            struct_name = _current_struct_name(family, degree)
         if coeff_source != "current" or struct_name is None:
             if sweep_data is None:
                 sweep_data = _load_sollya_sweep_data()
@@ -539,13 +592,22 @@ def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tu
             struct_key = "current_struct" if coeff_source == "current" else "sollya_struct"
             struct_name = row[struct_key]
         if family == "swish_fwd":
+            spec = (
+                get_swish_forward_spec(degree=degree, coeff_source=coeff_source)
+                if coeff_source != "current"
+                else _current_swish_spec(degree)
+            )
             _check_composed_struct(
                 errors,
                 header_text,
                 struct_name,
-                get_swish_forward_spec(degree=degree, coeff_source=coeff_source),
+                spec,
             )
             audited.append(f"swish_fwd_d{degree}_{coeff_source}")
+            continue
+        if coeff_source == "current" and (family, degree) not in _CURRENT_DEFAULT_STRUCTS:
+            _check_current_struct_exists(errors, header_text, struct_name)
+            audited.append(_current_audit_name(family, degree))
             continue
         spec = {
             "tanh_fwd": get_softcap_tanh_forward_spec,

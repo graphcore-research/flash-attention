@@ -106,9 +106,10 @@ def test_selection_audit_current_defaults_does_not_require_sweep_json(tmp_path, 
         (
             ("tanh_fwd", 4, "current"),
             ("sigmoid_fwd", 3, "current"),
+            ("sigmoid_bwd", 3, "current"),
         )
     )
-    assert audited == ("softcap_tanh_d4", "sigmoid_d3")
+    assert audited == ("softcap_tanh_d4", "sigmoid_d3", "sigmoid_grad_d3_current")
 
 
 def test_default_swish_and_gelu_specs_match_manifest():

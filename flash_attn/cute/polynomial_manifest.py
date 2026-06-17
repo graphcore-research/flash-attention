@@ -481,8 +481,33 @@ def _check_composed_struct(errors: list[str], header_text: str, struct_name: str
         errors.append(f"Could not find composed struct {struct_name}")
         return
     body = match.group(1)
-    if spec.composed_from not in body:
-        errors.append(f"{struct_name}: expected composed source {spec.composed_from}")
+    if spec.composed_from in body:
+        return
+
+    try:
+        source_clamp, source_coeffs = _extract_bf16_struct(header_text, spec.composed_from)
+        target_clamp, target_coeffs = _extract_bf16_struct(header_text, struct_name)
+    except ValueError as error:
+        errors.append(f"{struct_name}: expected composed source {spec.composed_from}: {error}")
+        return
+
+    if not math.isclose(target_clamp, source_clamp, rel_tol=0.0, abs_tol=1e-9):
+        errors.append(
+            f"{struct_name}: clamp {target_clamp} != composed source "
+            f"{spec.composed_from} clamp {source_clamp}"
+        )
+    if len(target_coeffs) != len(source_coeffs):
+        errors.append(
+            f"{struct_name}: coeff length {len(target_coeffs)} != composed source "
+            f"{spec.composed_from} length {len(source_coeffs)}"
+        )
+        return
+    for idx, (got, want) in enumerate(zip(target_coeffs, source_coeffs)):
+        if not math.isclose(got, want, rel_tol=0.0, abs_tol=1e-9):
+            errors.append(
+                f"{struct_name}: c{idx} {got} != composed source "
+                f"{spec.composed_from} c{idx} {want}"
+            )
 
 
 def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tuple[str, ...]:

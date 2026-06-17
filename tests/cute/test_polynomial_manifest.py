@@ -8,6 +8,7 @@ from flash_attn.cute.polynomial_manifest import (
     SWISH_D3_COMPOSED,
     SWISH_GRAD_D4_BF16,
     audit_polynomial_selection,
+    audit_active_polynomials,
     assert_active_polynomials_in_sync,
     evaluate_centered_sigmoid_forward,
     evaluate_odd_factorized_derivative,
@@ -29,6 +30,11 @@ from flash_attn.cute.polynomial_manifest import (
 
 def test_active_polynomials_match_bf16_header():
     assert_active_polynomials_in_sync()
+
+
+def test_current_bf16_swish_fused_form_matches_sigmoid_coefficients():
+    errors = audit_active_polynomials()
+    assert not errors
 
 
 def test_output_gate_defaults_share_sigmoid_manifest():

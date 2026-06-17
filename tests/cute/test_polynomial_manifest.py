@@ -1,5 +1,6 @@
 import math
 
+import flash_attn.cute.polynomial_manifest as polynomial_manifest
 from flash_attn.cute.polynomial_manifest import (
     GELU_BWD_D5_BF16,
     GELU_FWD_D5_BF16,
@@ -95,6 +96,19 @@ def test_selection_audit_checks_current_and_sollya_headers():
         "swish_fwd_d6_sollya",
         "gelu_fwd_d3_sollya",
     )
+
+
+def test_selection_audit_current_defaults_does_not_require_sweep_json(tmp_path, monkeypatch):
+    missing_sweep = tmp_path / "missing_sollya_device_bf16.json"
+    monkeypatch.setattr(polynomial_manifest, "SOLLYA_SWEEP_JSON", missing_sweep)
+
+    audited = audit_polynomial_selection(
+        (
+            ("tanh_fwd", 4, "current"),
+            ("sigmoid_fwd", 3, "current"),
+        )
+    )
+    assert audited == ("softcap_tanh_d4", "sigmoid_d3")
 
 
 def test_default_swish_and_gelu_specs_match_manifest():

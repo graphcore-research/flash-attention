@@ -163,6 +163,16 @@ ACTIVE_POLYNOMIALS: tuple[PolynomialSpec, ...] = (
 )
 ACTIVE_COMPOSED_POLYNOMIALS: tuple[ComposedPolynomialSpec, ...] = (SWISH_D3_COMPOSED,)
 
+_CURRENT_DEFAULT_STRUCTS = {
+    ("tanh_fwd", 4): "TANH_FWD_D4_ODD_BF16",
+    ("sigmoid_fwd", 3): "SIGMOID_FWD_D3_ODD_BF16",
+    ("sigmoid_bwd", 5): "SIGMOID_BWD_D5_EVEN_BF16",
+    ("swish_fwd", 3): "SWISH_FWD_D3_ODD_BF16",
+    ("swish_bwd", 4): "SWISH_BWD_D4_ODD_BF16",
+    ("gelu_fwd", 5): "GELU_FWD_D5_ODD_BF16",
+    ("gelu_bwd", 5): "GELU_BWD_D5_ODD_BF16",
+}
+
 STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_odd_bf16.cuh"
 SOLLYA_STRUCT_HEADER = Path(__file__).resolve().parents[3] / "autonumerics_zero" / "spline_ops" / "spline_structs_sollya_bf16.cuh"
 SOLLYA_SWEEP_JSON = (
@@ -512,15 +522,22 @@ def _check_composed_struct(errors: list[str], header_text: str, struct_name: str
 
 def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tuple[str, ...]:
     current_header_text = STRUCT_HEADER.read_text()
-    sollya_header_text = SOLLYA_STRUCT_HEADER.read_text()
-    sweep_data = _load_sollya_sweep_data()
+    sollya_header_text: str | None = None
+    sweep_data: dict[str, object] | None = None
     errors: list[str] = []
     audited: list[str] = []
     for family, degree, coeff_source in selections:
-        row = sweep_data["families"][family][f"D{degree}"]
-        header_text = current_header_text if coeff_source == "current" else sollya_header_text
-        struct_key = "current_struct" if coeff_source == "current" else "sollya_struct"
-        struct_name = row[struct_key]
+        header_text = current_header_text
+        struct_name = _CURRENT_DEFAULT_STRUCTS.get((family, degree))
+        if coeff_source != "current" or struct_name is None:
+            if sweep_data is None:
+                sweep_data = _load_sollya_sweep_data()
+            if coeff_source == "sollya" and sollya_header_text is None:
+                sollya_header_text = SOLLYA_STRUCT_HEADER.read_text()
+            row = sweep_data["families"][family][f"D{degree}"]
+            header_text = current_header_text if coeff_source == "current" else sollya_header_text
+            struct_key = "current_struct" if coeff_source == "current" else "sollya_struct"
+            struct_name = row[struct_key]
         if family == "swish_fwd":
             _check_composed_struct(
                 errors,

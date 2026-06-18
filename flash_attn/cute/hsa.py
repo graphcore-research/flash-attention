@@ -37,6 +37,22 @@ def _move_nested_tensors(value, *, device):
     return value
 
 
+def _cuda_device_index(device: torch.device | str) -> int:
+    resolved = torch.device(device)
+    if resolved.index is not None:
+        return int(resolved.index)
+    return int(torch.cuda.current_device())
+
+
+@lru_cache(maxsize=None)
+def _cuda_device_major_capability(device_index: int) -> int:
+    return int(torch.cuda.get_device_capability(device_index)[0])
+
+
+def _is_sm100_or_newer(device: torch.device | str) -> bool:
+    return _cuda_device_major_capability(_cuda_device_index(device)) >= 10
+
+
 @dataclass
 class HSAStreamPack:
     """Dense FA4 substream metadata for one exact HSA component."""
@@ -919,6 +935,27 @@ _SUM_TOK_SCHEDULE_CACHE: OrderedDict[tuple[Any, ...], HSASchedule] = OrderedDict
 
 def _ensure_int32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.int32 else x.to(dtype=torch.int32)
+
+
+def _normalize_hsa_optional_metadata(
+    keep_ids: Optional[torch.Tensor],
+    hash_ids: Optional[torch.Tensor],
+    *,
+    device: torch.device,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if keep_ids is None or hash_ids is None:
+        return None, None
+    keep_ids = _ensure_int32(keep_ids)
+    hash_ids = _ensure_int32(hash_ids)
+    if keep_ids.device != device:
+        keep_ids = keep_ids.to(device=device)
+    if hash_ids.device != device:
+        hash_ids = hash_ids.to(device=device)
+    if not keep_ids.is_contiguous():
+        keep_ids = keep_ids.contiguous()
+    if not hash_ids.is_contiguous():
+        hash_ids = hash_ids.contiguous()
+    return keep_ids, hash_ids
 
 
 def _empty_int32(device) -> torch.Tensor:
@@ -4611,19 +4648,108 @@ def _get_precomputed_cached_generalized_forward_payload(
     return None
 
 
+_CACHED_GENERALIZED_FORWARD_PAYLOAD_ABSENT = object()
+
+
+def _cached_generalized_forward_payload_env_key() -> tuple[tuple[str, str], ...]:
+    names = (
+        "FLASH_ATTN_HSA_RUNTIME_FORWARD_ONLY",
+        "FLASH_ATTN_HSA_USE_MONOLITHIC_BWD",
+        "FLASH_ATTN_HSA_USE_PACKED_BWD",
+        "FLASH_ATTN_HSA_USE_HYBRID_BWD",
+        "FLASH_ATTN_HSA_AUTO_LEGACY_PACKED_BWD_MIN_SEQLEN",
+        "FLASH_ATTN_HSA_USE_SYNTHETIC_GRID",
+        "FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD",
+        "FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_Q",
+        "FLASH_ATTN_HSA_SYNTHETIC_LOGICAL_BLOCK_K",
+        "FLASH_ATTN_HSA_SYNTHETIC_MAX_PACKED_K",
+        "FLASH_ATTN_HSA_SYNTHETIC_MAX_DIRECT_SEGMENTS",
+        "FLASH_ATTN_HSA_ALLOW_CACHED_GENERALIZED_FORWARD_FALLBACK",
+    )
+    return tuple((name, os.environ.get(name, "")) for name in names)
+
+
+def _resolve_precomputed_cached_generalized_forward_payload_fast(
+    schedule: HSASchedule,
+    *,
+    forward_block_q: int,
+    device: torch.device | str,
+) -> Optional[dict]:
+    if os.environ.get("FLASH_ATTN_HSA_USE_MONOLITHIC_BWD", "0") == "1":
+        return None
+    if os.environ.get("FLASH_ATTN_HSA_ALLOW_CACHED_GENERALIZED_FORWARD_FALLBACK", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        return None
+    payload_container = getattr(schedule, "_precomputed_forward_direct_plan_payload", None)
+    if not isinstance(payload_container, dict):
+        return None
+    cache_key = (
+        str(torch.device(device)),
+        int(forward_block_q),
+        id(payload_container),
+    )
+    cache = getattr(schedule, "_resolved_cached_generalized_forward_payload_fast_cache", None)
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        return None if cached is _CACHED_GENERALIZED_FORWARD_PAYLOAD_ABSENT else cached
+    resolved = _get_precomputed_cached_generalized_forward_payload(
+        schedule,
+        forward_block_q=forward_block_q,
+        logical_block_q=-1,
+        logical_block_k=-1,
+        max_packed_k=-1,
+        max_direct_segments=-1,
+        device=device,
+        allow_same_forward_block_fallback=True,
+    )
+    if cache is None:
+        cache = {}
+        setattr(schedule, "_resolved_cached_generalized_forward_payload_fast_cache", cache)
+    cache[cache_key] = (
+        resolved
+        if resolved is not None
+        else _CACHED_GENERALIZED_FORWARD_PAYLOAD_ABSENT
+    )
+    return resolved
+
+
 def _resolve_precomputed_cached_generalized_forward_payload(
     schedule: HSASchedule,
     q: torch.Tensor,
     k: torch.Tensor,
 ) -> Optional[dict]:
+    forward_block_q = _get_hsa_forward_q_block_size(q, k)
+    fast_resolved = _resolve_precomputed_cached_generalized_forward_payload_fast(
+        schedule,
+        forward_block_q=forward_block_q,
+        device=q.device,
+    )
+    if fast_resolved is not None:
+        return fast_resolved
     backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
     if backward_mode == "monolithic_sentence":
         return None
-    forward_block_q = _get_hsa_forward_q_block_size(q, k)
+    cache_key = (
+        str(torch.device(q.device)),
+        int(forward_block_q),
+        _cached_generalized_forward_payload_env_key(),
+    )
+    cache = getattr(schedule, "_resolved_cached_generalized_forward_payload_cache", None)
+    if cache is not None and cache_key in cache:
+        cached = cache[cache_key]
+        return None if cached is _CACHED_GENERALIZED_FORWARD_PAYLOAD_ABSENT else cached
+
     use_env_matched_lookup = (
         _use_hsa_synthetic_grid()
         and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_FWD", "0") == "1"
     )
+    resolved: Optional[dict] = None
     if use_env_matched_lookup:
         logical_block_q = _get_hsa_synthetic_logical_block_size("q")
         logical_block_k = _get_hsa_synthetic_logical_block_size("k")
@@ -4640,24 +4766,40 @@ def _resolve_precomputed_cached_generalized_forward_payload(
             device=q.device,
             allow_same_forward_block_fallback=allow_forward_block_fallback,
         )
-        if resolved is not None:
-            return resolved
-    allow_general_fallback = os.environ.get(
-        "FLASH_ATTN_HSA_ALLOW_CACHED_GENERALIZED_FORWARD_FALLBACK",
-        "1",
-    ).strip().lower() not in {"0", "false", "off", "no"}
-    if not allow_general_fallback:
-        return None
-    return _get_precomputed_cached_generalized_forward_payload(
-        schedule,
-        forward_block_q=forward_block_q,
-        logical_block_q=-1,
-        logical_block_k=-1,
-        max_packed_k=-1,
-        max_direct_segments=-1,
-        device=q.device,
-        allow_same_forward_block_fallback=True,
+    if resolved is None:
+        allow_general_fallback = os.environ.get(
+            "FLASH_ATTN_HSA_ALLOW_CACHED_GENERALIZED_FORWARD_FALLBACK",
+            "1",
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        if allow_general_fallback:
+            resolved = _get_precomputed_cached_generalized_forward_payload(
+                schedule,
+                forward_block_q=forward_block_q,
+                logical_block_q=-1,
+                logical_block_k=-1,
+                max_packed_k=-1,
+                max_direct_segments=-1,
+                device=q.device,
+                allow_same_forward_block_fallback=True,
+            )
+    if cache is None:
+        cache = {}
+        setattr(schedule, "_resolved_cached_generalized_forward_payload_cache", cache)
+    cache[cache_key] = (
+        resolved
+        if resolved is not None
+        else _CACHED_GENERALIZED_FORWARD_PAYLOAD_ABSENT
     )
+    return resolved
+
+
+def _enable_cached_generalized_fused_backward(schedule: HSASchedule) -> bool:
+    fused_bwd_env = os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "auto").strip().lower()
+    if fused_bwd_env in {"0", "false", "off", "no"}:
+        return False
+    if fused_bwd_env in {"1", "true", "on", "yes"}:
+        return True
+    return int(getattr(schedule, "seqlen", 0)) >= 32768
 
 
 def _can_use_cached_generalized_synthetic_micro_bwd(
@@ -8157,6 +8299,13 @@ def _has_zero_upstream_grad(dout: torch.Tensor) -> bool:
     # The sparse kernels are not needed when the caller provides an exact zero
     # upstream gradient. Returning exact zeros here avoids launching the sparse
     # backward on a case where the true result is known.
+    if os.environ.get("FLASH_ATTN_HSA_CHECK_ZERO_UPSTREAM_GRAD", "0").strip().lower() not in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }:
+        return False
     return not bool(torch.any(dout).item())
 
 
@@ -8367,7 +8516,9 @@ def _run_hsa_cached_generalized_backward(
         )
 
 
-class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
+class _FlashAttnHSASM100DispatchFunc(torch.autograd.Function):
+    """Single SM100 HSA dispatch point for cached-2D and block-sparse execution."""
+
     @staticmethod
     def forward(
         ctx,
@@ -8381,6 +8532,110 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         deterministic: bool,
         return_lse: bool,
     ):
+        cached_forward_payload = _resolve_precomputed_cached_generalized_forward_payload(
+            schedule,
+            q,
+            k,
+        )
+        if isinstance(cached_forward_payload, dict):
+            from flash_attn.cute.hsa_cached_2d_forward_analysis import (
+                can_use_cached_generalized_fused_backward,
+                run_cached_generalized_packed_forward,
+            )
+
+            ctx.hsa_forward_kind = "cached_generalized"
+            ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
+            ctx.cached_forward_payload = cached_forward_payload
+            ctx.use_cached_generalized_fused_bwd = (
+                ctx.hsa_backward_mode != "monolithic_sentence"
+                and _enable_cached_generalized_fused_backward(schedule)
+                and can_use_cached_generalized_fused_backward(
+                    cached_forward_payload,
+                    q,
+                    k,
+                    v,
+                    deterministic=deterministic,
+                )
+            )
+            ctx.block_sparse_runtime = None
+            ctx.use_synthetic_grid = False
+            ctx.synthetic_forward_prob_token = 0
+            wants_synthetic_micro_bwd = (
+                not ctx.use_cached_generalized_fused_bwd
+                and ctx.hsa_backward_mode in {"sparse_mask", "legacy_packed"}
+                and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+            )
+            if (
+                not ctx.use_cached_generalized_fused_bwd
+                and (ctx.hsa_backward_mode != "legacy_packed" or wants_synthetic_micro_bwd)
+            ):
+                runtime_require_backward = False if wants_synthetic_micro_bwd else None
+                if runtime_require_backward is None:
+                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
+                else:
+                    try:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            schedule,
+                            q,
+                            k,
+                            require_backward=runtime_require_backward,
+                        )
+                    except TypeError:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            schedule,
+                            q,
+                            k,
+                        )
+                ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
+                    schedule,
+                    q,
+                    k,
+                    runtime=ctx.block_sparse_runtime,
+                )
+                ctx.synthetic_forward_prob_token = getattr(
+                    ctx.block_sparse_runtime,
+                    "synthetic_forward_prob_token",
+                    0,
+                )
+            ctx.use_synthetic_micro_bwd = (
+                wants_synthetic_micro_bwd
+                and ctx.use_synthetic_grid
+                and _can_use_cached_generalized_synthetic_micro_bwd(
+                    schedule,
+                    ctx.block_sparse_runtime,
+                    q,
+                    k,
+                    v,
+                )
+            )
+            setattr(schedule, "_last_cached_generalized_fused_bwd_used", False)
+            out, lse = run_cached_generalized_packed_forward(
+                cached_forward_payload,
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                return_lse=True,
+            )
+            ctx.schedule = schedule
+            if ctx.use_synthetic_micro_bwd:
+                ctx.keep_ids, ctx.hash_ids = _normalize_hsa_optional_metadata(
+                    keep_ids,
+                    hash_ids,
+                    device=q.device,
+                )
+            else:
+                ctx.keep_ids = None
+                ctx.hash_ids = None
+            ctx.softmax_scale = softmax_scale
+            ctx.deterministic = deterministic
+            ctx.save_for_backward(q, k, v, out, lse)
+            if return_lse:
+                ctx.mark_non_differentiable(lse)
+                return out, lse
+            return out
+
+        ctx.hsa_forward_kind = "block_sparse"
         ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
         ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
             schedule,
@@ -8416,8 +8671,20 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
             )
         ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
         ctx.schedule = schedule
-        ctx.keep_ids = keep_ids
-        ctx.hash_ids = hash_ids
+        ctx.use_synthetic_micro_bwd = (
+            ctx.hsa_backward_mode == "sparse_mask"
+            and ctx.use_synthetic_grid
+            and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
+        )
+        if ctx.use_synthetic_micro_bwd:
+            ctx.keep_ids, ctx.hash_ids = _normalize_hsa_optional_metadata(
+                keep_ids,
+                hash_ids,
+                device=q.device,
+            )
+        else:
+            ctx.keep_ids = None
+            ctx.hash_ids = None
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
         ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
@@ -8440,6 +8707,97 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if ctx.hsa_forward_kind == "cached_generalized":
+            q, k, v, out, lse = ctx.saved_tensors
+            if _has_zero_upstream_grad(dout):
+                dq, dk, dv = _zero_hsa_grads(q, k, v)
+                setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+                return dq, dk, dv, None, None, None, None, None, None
+            if ctx.use_cached_generalized_fused_bwd:
+                from flash_attn.cute.hsa_cached_2d_forward_analysis import run_cached_generalized_packed_backward
+
+                dq, dk, dv = run_cached_generalized_packed_backward(
+                    ctx.cached_forward_payload,
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    softmax_scale=ctx.softmax_scale,
+                    deterministic=ctx.deterministic,
+                )
+                setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", True)
+            elif ctx.use_synthetic_micro_bwd:
+                if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
+                    try:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            ctx.schedule,
+                            q,
+                            k,
+                            require_backward=True,
+                        )
+                    except TypeError:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            ctx.schedule,
+                            q,
+                            k,
+                        )
+                from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
+
+                dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ctx.schedule,
+                    ctx.softmax_scale,
+                    ctx.deterministic,
+                    ctx.keep_ids,
+                    ctx.hash_ids,
+                    forward_prob_token=ctx.synthetic_forward_prob_token,
+                    runtime=ctx.block_sparse_runtime,
+                )
+                setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+            else:
+                if ctx.hsa_backward_mode != "legacy_packed" and getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
+                    try:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            ctx.schedule,
+                            q,
+                            k,
+                            require_backward=True,
+                        )
+                    except TypeError:
+                        ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
+                            ctx.schedule,
+                            q,
+                            k,
+                        )
+                dq, dk, dv = _run_hsa_cached_generalized_backward(
+                    q,
+                    k,
+                    v,
+                    out,
+                    dout,
+                    lse,
+                    ctx.schedule,
+                    ctx.softmax_scale,
+                    ctx.deterministic,
+                    ctx.keep_ids,
+                    ctx.hash_ids,
+                    runtime=ctx.block_sparse_runtime,
+                )
+                setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
+            return dq, dk, dv, None, None, None, None, None, None
+
         q, k, v, out, lse, sentence_lse, sentence_q_stream, sentence_k_stream, sentence_v_stream, sentence_out_stream = (
             ctx.saved_tensors
         )
@@ -8460,7 +8818,7 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
         sentence_out_stream = sentence_out_stream if sentence_out_stream.numel() > 0 else None
 
         if ctx.hsa_backward_mode == "sparse_mask":
-            if ctx.use_synthetic_grid and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1":
+            if ctx.use_synthetic_micro_bwd:
                 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
 
                 dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
@@ -8541,200 +8899,6 @@ class _FlashAttnHSABlockSparseFunc(torch.autograd.Function):
                 runtime=ctx.block_sparse_runtime,
             )
         return dq, dk, dv, None, None, None, None, None, None
-
-
-class _FlashAttnHSACachedGeneralizedForwardFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        keep_ids: Optional[torch.Tensor],
-        hash_ids: Optional[torch.Tensor],
-        schedule: HSASchedule,
-        cached_forward_payload: dict[str, Any],
-        softmax_scale: float,
-        deterministic: bool,
-        return_lse: bool,
-    ):
-        from flash_attn.cute.hsa_cached_2d_forward_analysis import (
-            can_use_cached_generalized_fused_backward,
-            run_cached_generalized_packed_forward,
-        )
-
-        ctx.hsa_backward_mode = _get_hsa_blocksparse_backward_mode(schedule)
-        ctx.cached_forward_payload = cached_forward_payload
-        fused_bwd_env = os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_FUSED_BWD", "auto").strip().lower()
-        if fused_bwd_env in {"0", "false", "off", "no"}:
-            enable_cached_generalized_fused_bwd = False
-        elif fused_bwd_env in {"1", "true", "on", "yes"}:
-            enable_cached_generalized_fused_bwd = True
-        else:
-            enable_cached_generalized_fused_bwd = int(getattr(schedule, "seqlen", 0)) >= 32768
-        ctx.use_cached_generalized_fused_bwd = (
-            ctx.hsa_backward_mode != "monolithic_sentence"
-            and enable_cached_generalized_fused_bwd
-            and can_use_cached_generalized_fused_backward(
-                cached_forward_payload,
-                q,
-                k,
-                v,
-                deterministic=deterministic,
-            )
-        )
-        ctx.block_sparse_runtime = None
-        ctx.use_synthetic_grid = False
-        ctx.synthetic_forward_prob_token = 0
-        wants_synthetic_micro_bwd = (
-            not ctx.use_cached_generalized_fused_bwd
-            and ctx.hsa_backward_mode in {"sparse_mask", "legacy_packed"}
-            and os.environ.get("FLASH_ATTN_HSA_SYNTHETIC_MICRO_BWD", "0") == "1"
-        )
-        if (
-            not ctx.use_cached_generalized_fused_bwd
-            and (ctx.hsa_backward_mode != "legacy_packed" or wants_synthetic_micro_bwd)
-        ):
-            runtime_require_backward = False if wants_synthetic_micro_bwd else None
-            if runtime_require_backward is None:
-                ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(schedule, q, k)
-            else:
-                try:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        schedule,
-                        q,
-                        k,
-                        require_backward=runtime_require_backward,
-                    )
-                except TypeError:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        schedule,
-                        q,
-                        k,
-                    )
-            ctx.use_synthetic_grid = _can_use_hsa_synthetic_grid_for_inputs(
-                schedule,
-                q,
-                k,
-                runtime=ctx.block_sparse_runtime,
-            )
-            ctx.synthetic_forward_prob_token = getattr(ctx.block_sparse_runtime, "synthetic_forward_prob_token", 0)
-        ctx.use_synthetic_micro_bwd = (
-            wants_synthetic_micro_bwd
-            and ctx.use_synthetic_grid
-            and _can_use_cached_generalized_synthetic_micro_bwd(schedule, ctx.block_sparse_runtime, q, k, v)
-        )
-        setattr(schedule, "_last_cached_generalized_fused_bwd_used", False)
-        out, lse = run_cached_generalized_packed_forward(
-            cached_forward_payload,
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            return_lse=True,
-        )
-        ctx.schedule = schedule
-        ctx.keep_ids = keep_ids
-        ctx.hash_ids = hash_ids
-        ctx.softmax_scale = softmax_scale
-        ctx.deterministic = deterministic
-        ctx.save_for_backward(q, k, v, out, lse)
-        if return_lse:
-            ctx.mark_non_differentiable(lse)
-            return out, lse
-        return out
-
-    @staticmethod
-    def backward(ctx, dout, *args):
-        q, k, v, out, lse = ctx.saved_tensors
-        if _has_zero_upstream_grad(dout):
-            dq, dk, dv = _zero_hsa_grads(q, k, v)
-            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
-            return dq, dk, dv, None, None, None, None, None, None, None
-        if ctx.use_cached_generalized_fused_bwd:
-            from flash_attn.cute.hsa_cached_2d_forward_analysis import run_cached_generalized_packed_backward
-
-            dq, dk, dv = run_cached_generalized_packed_backward(
-                ctx.cached_forward_payload,
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                softmax_scale=ctx.softmax_scale,
-                deterministic=ctx.deterministic,
-            )
-            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", True)
-        elif ctx.use_synthetic_micro_bwd:
-            if getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
-                try:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        ctx.schedule,
-                        q,
-                        k,
-                        require_backward=True,
-                    )
-                except TypeError:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        ctx.schedule,
-                        q,
-                        k,
-                    )
-            from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import run_hsa_bwd_sm100_synthetic_grid
-
-            dq, dk, dv = run_hsa_bwd_sm100_synthetic_grid(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                None,
-                None,
-                None,
-                None,
-                None,
-                ctx.schedule,
-                ctx.softmax_scale,
-                ctx.deterministic,
-                ctx.keep_ids,
-                ctx.hash_ids,
-                forward_prob_token=ctx.synthetic_forward_prob_token,
-                runtime=ctx.block_sparse_runtime,
-            )
-            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
-        else:
-            if ctx.hsa_backward_mode != "legacy_packed" and getattr(ctx.block_sparse_runtime, "backward_sparse", None) is None:
-                try:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        ctx.schedule,
-                        q,
-                        k,
-                        require_backward=True,
-                    )
-                except TypeError:
-                    ctx.block_sparse_runtime = _get_hsa_block_sparse_runtime(
-                        ctx.schedule,
-                        q,
-                        k,
-                    )
-            dq, dk, dv = _run_hsa_cached_generalized_backward(
-                q,
-                k,
-                v,
-                out,
-                dout,
-                lse,
-                ctx.schedule,
-                ctx.softmax_scale,
-                ctx.deterministic,
-                ctx.keep_ids,
-                ctx.hash_ids,
-                runtime=ctx.block_sparse_runtime,
-            )
-            setattr(ctx.schedule, "_last_cached_generalized_fused_bwd_used", False)
-        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 class _FlashAttnHSASparseExactFunc(torch.autograd.Function):
@@ -8838,41 +9002,31 @@ def flash_attn_hsa_sparse_func(
         )
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(q.shape[-1])
-    normalized_keep_ids = None
-    normalized_hash_ids = None
-    if keep_ids is not None and hash_ids is not None:
-        normalized_keep_ids = _ensure_int32(keep_ids)
-        normalized_hash_ids = _ensure_int32(hash_ids)
-        if normalized_keep_ids.device != q.device:
-            normalized_keep_ids = normalized_keep_ids.to(device=q.device)
-        if normalized_hash_ids.device != q.device:
-            normalized_hash_ids = normalized_hash_ids.to(device=q.device)
-        if not normalized_keep_ids.is_contiguous():
-            normalized_keep_ids = normalized_keep_ids.contiguous()
-        if not normalized_hash_ids.is_contiguous():
-            normalized_hash_ids = normalized_hash_ids.contiguous()
 
-    if torch.cuda.get_device_capability(q.device)[0] >= 10:
-        cached_forward_payload = _resolve_precomputed_cached_generalized_forward_payload(hsa_schedule, q, k)
-        if isinstance(cached_forward_payload, dict):
-            return _FlashAttnHSACachedGeneralizedForwardFunc.apply(
+    if _is_sm100_or_newer(q.device):
+        if not (q.requires_grad or k.requires_grad or v.requires_grad):
+            cached_forward_payload = _resolve_precomputed_cached_generalized_forward_payload(
+                hsa_schedule,
                 q,
                 k,
-                v,
-                normalized_keep_ids,
-                normalized_hash_ids,
-                hsa_schedule,
-                cached_forward_payload,
-                scale,
-                deterministic,
-                return_lse,
             )
-        return _FlashAttnHSABlockSparseFunc.apply(
+            if isinstance(cached_forward_payload, dict):
+                from flash_attn.cute.hsa_cached_2d_forward_analysis import run_cached_generalized_packed_forward
+
+                return run_cached_generalized_packed_forward(
+                    cached_forward_payload,
+                    q,
+                    k,
+                    v,
+                    softmax_scale=scale,
+                    return_lse=return_lse,
+                )
+        return _FlashAttnHSASM100DispatchFunc.apply(
             q,
             k,
             v,
-            normalized_keep_ids,
-            normalized_hash_ids,
+            keep_ids,
+            hash_ids,
             hsa_schedule,
             scale,
             deterministic,

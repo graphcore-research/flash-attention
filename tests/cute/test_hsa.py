@@ -4219,6 +4219,69 @@ def test_hsa_blocksparse_forward_unpacked_direct_flag_routes_direct_kernel(monke
     assert sentence_out_stream.numel() == 0
 
 
+def test_hsa_sm100_dispatch_prefers_cached_generalized_payload(monkeypatch):
+    import flash_attn.cute.hsa as hsa_module
+    import flash_attn.cute.hsa_cached_2d_forward_analysis as cached_module
+
+    class _Schedule:
+        pass
+
+    q = torch.randn(1, 2, 1, 4, dtype=torch.float32)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    lse = torch.zeros(1, 1, 2, dtype=torch.float32)
+    schedule = _Schedule()
+    payload = {"status": "ready"}
+    calls = {"cached": 0}
+
+    def _cached_forward(cached_payload, q_arg, k_arg, v_arg, *, softmax_scale=None, return_lse=False):
+        assert cached_payload is payload
+        assert q_arg is q
+        assert k_arg is k
+        assert v_arg is v
+        assert softmax_scale == pytest.approx(0.5)
+        assert return_lse is True
+        calls["cached"] += 1
+        return v_arg + 1.0, lse
+
+    monkeypatch.setattr(
+        hsa_module,
+        "_resolve_precomputed_cached_generalized_forward_payload",
+        lambda schedule_arg, q_arg, k_arg: payload,
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_get_hsa_blocksparse_backward_mode",
+        lambda schedule_arg: "legacy_packed",
+    )
+    monkeypatch.setattr(
+        hsa_module,
+        "_get_hsa_block_sparse_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("block-sparse runtime should not be built")),
+    )
+    monkeypatch.setattr(
+        cached_module,
+        "can_use_cached_generalized_fused_backward",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(cached_module, "run_cached_generalized_packed_forward", _cached_forward)
+
+    out = hsa_module._FlashAttnHSASM100DispatchFunc.apply(
+        q,
+        k,
+        v,
+        None,
+        None,
+        schedule,
+        0.5,
+        False,
+        False,
+    )
+
+    assert calls["cached"] == 1
+    assert torch.equal(out, v + 1.0)
+
+
 def test_benchmark_hsa_unpacked_direct_env_sets_flag():
     benchmark_hsa = _load_benchmark_hsa_module()
     case = next(candidate for candidate in benchmark_hsa.ALL_CASES if candidate.name == "mixed-small")

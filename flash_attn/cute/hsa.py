@@ -1,6 +1,8 @@
 import math
 import os
 import time
+from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional
@@ -912,12 +914,50 @@ class HSASchedule:
         )
 
 
+_SUM_TOK_SCHEDULE_CACHE: OrderedDict[tuple[Any, ...], HSASchedule] = OrderedDict()
+
+
 def _ensure_int32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.int32 else x.to(dtype=torch.int32)
 
 
 def _empty_int32(device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int32, device=device)
+
+
+def _hsa_sum_tok_schedule_cache_size() -> int:
+    raw = os.environ.get("FLASH_ATTN_HSA_SUM_TOK_SCHEDULE_CACHE_SIZE", "4")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 4
+
+
+def _hsa_sum_tok_schedule_cache_debug() -> bool:
+    return os.environ.get("FLASH_ATTN_HSA_SUM_TOK_SCHEDULE_CACHE_DEBUG", "0").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _hsa_sum_tok_sequence_shape_key(
+    levels: list[int],
+    seg_by_level: list[list[int]],
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    segment_change_points: list[tuple[int, ...]] = []
+    for level_seg_ids in seg_by_level:
+        changes: list[int] = []
+        if level_seg_ids:
+            prev = level_seg_ids[0]
+            for pos, seg in enumerate(level_seg_ids[1:], start=1):
+                if seg != prev:
+                    changes.append(pos)
+                    prev = seg
+        segment_change_points.append(tuple(changes))
+    return tuple(levels), tuple(segment_change_points)
 
 
 def _tag_aux_tensor(
@@ -1559,6 +1599,384 @@ def build_hsa_schedule_from_support(support: torch.Tensor) -> HSASchedule:
         document_prefix_stream=empty_stream,
         section_self_indices=empty_int,
         document_self_indices=empty_int,
+    )
+
+
+def infer_hsa_sum_tok_metadata(
+    input_batch: torch.Tensor,
+    *,
+    eos_id: Optional[int] = None,
+    ht_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Infer hsa_sum_tok hierarchy metadata from inserted summary tokens.
+
+    The gc-training ``hsa_sum_tok`` experiment represents a balanced hierarchy
+    by inserting one hierarchy-token id repeatedly: the first marker after a
+    normal token is level 1, the next consecutive marker is level 2, etc.  This
+    returns the same compact metadata used by that experiment:
+
+    * ``token_level``: ``[B, T]`` int32, 0 for normal tokens and >0 for
+      hierarchy markers.
+    * ``seg_ids``: ``[B, N, T]`` int32, per-level segment id, or -1 when a
+      token is not visible at that level.
+    """
+    if input_batch.ndim != 2:
+        raise ValueError(
+            f"input_batch must have shape [batch, seqlen], got {tuple(input_batch.shape)}"
+        )
+
+    input_batch = input_batch.to(dtype=torch.long)
+    bsz, seqlen = input_batch.shape
+    device = input_batch.device
+
+    is_ht = input_batch == int(ht_id)
+    pos = torch.arange(seqlen, device=device, dtype=torch.long).expand(bsz, seqlen)
+    last_non_ht = torch.where(is_ht, torch.full_like(pos, -1), pos).cummax(dim=1).values
+    token_level = torch.where(is_ht, pos - last_non_ht, torch.zeros_like(pos))
+
+    # Fixed upper bound keeps the metadata rank stable for compiled callers.
+    n_levels = (seqlen + 1).bit_length() + 1 if seqlen >= 1 else 2
+    max_token_level = int(token_level.max().item()) if token_level.numel() else 0
+    if max_token_level >= n_levels:
+        raise ValueError(
+            "HSA sum-token hierarchy depth exceeds fixed metadata depth: "
+            f"max token level {max_token_level}, fixed depth {n_levels}."
+        )
+
+    increments = torch.zeros(bsz, n_levels, seqlen, dtype=torch.long, device=device)
+    ht_increment = token_level > 0
+    increments.scatter_add_(
+        1,
+        (token_level - 1).clamp_min(0)[:, None, :],
+        ht_increment[:, None, :].long(),
+    )
+    if eos_id is not None:
+        increments += input_batch.eq(int(eos_id))[:, None, :].long()
+
+    raw_seg_ids = increments.cumsum(dim=2) - increments
+    num_actual_levels = (
+        torch.ones(bsz, dtype=torch.long, device=device)
+        if seqlen == 0
+        else token_level.max(dim=1).values + 1
+    )
+    level_idx = torch.arange(n_levels, device=device)[None, :, None]
+    invalid_token_levels = level_idx < token_level[:, None, :]
+    padded_levels = level_idx >= num_actual_levels[:, None, None]
+    seg_ids = raw_seg_ids.masked_fill(invalid_token_levels | padded_levels, -1)
+    return token_level.to(torch.int32), seg_ids.to(torch.int32)
+
+
+def compute_hsa_sum_tok_mask(
+    token_level: torch.Tensor,
+    seg_ids: torch.Tensor,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Return the exact boolean hsa_sum_tok attention support mask.
+
+    This is a reference/debug path.  Use
+    ``build_hsa_schedule_from_sum_tok_metadata`` for packed sparse execution,
+    because it avoids materializing ``[B, T, T]``.
+    """
+    token_level = _ensure_int32(token_level)
+    seg_ids = _ensure_int32(seg_ids)
+    if token_level.ndim != 2 or seg_ids.ndim != 3:
+        raise ValueError(
+            "token_level must be [B, T] and seg_ids must be [B, N, T], "
+            f"got {tuple(token_level.shape)} and {tuple(seg_ids.shape)}"
+        )
+    bsz, seqlen = token_level.shape
+    if seg_ids.shape[0] != bsz or seg_ids.shape[2] != seqlen:
+        raise ValueError(
+            "seg_ids shape must match token_level batch/seqlen, "
+            f"got {tuple(seg_ids.shape)} for {tuple(token_level.shape)}"
+        )
+
+    b = torch.arange(bsz, device=token_level.device)[:, None, None]
+    q_idx = torch.arange(seqlen, device=token_level.device)[None, :, None]
+    k_idx = torch.arange(seqlen, device=token_level.device)[None, None, :]
+    q_level = token_level[b, q_idx]
+    k_level = token_level[b, k_idx]
+    allowed = torch.zeros((bsz, seqlen, seqlen), device=token_level.device, dtype=torch.bool)
+
+    for level in range(int(seg_ids.shape[1])):
+        q_seg = seg_ids[b, level, q_idx]
+        k_seg = seg_ids[b, level, k_idx]
+        same_seg = q_seg.ne(-1) & k_seg.ne(-1) & q_seg.eq(k_seg)
+        key_is_ancestor_or_same = k_level.eq(level) & q_level.le(level) & same_seg
+        key_is_descendant_or_same = q_level.eq(level) & k_level.le(level) & same_seg
+        allowed = allowed | key_is_ancestor_or_same | key_is_descendant_or_same
+
+    if causal:
+        pos = torch.arange(seqlen, device=token_level.device)
+        allowed = allowed & (pos[None, :, None] >= pos[None, None, :])
+    return allowed
+
+
+def build_hsa_schedule_from_sum_tok_metadata(
+    token_level: torch.Tensor,
+    seg_ids: torch.Tensor,
+    *,
+    causal: bool = True,
+) -> HSASchedule:
+    """Build a packed HSA sparse schedule from hsa_sum_tok metadata.
+
+    This ports the gc-training ``hsa_sum_tok`` adjacency predicate onto the
+    packed HSA backend without constructing a dense mask.  The resulting
+    schedule uses the generic cross-edge CSR path and leaves the specialized
+    sentence/section/document dense streams empty.
+    """
+    token_level = _ensure_int32(token_level)
+    seg_ids = _ensure_int32(seg_ids)
+    if token_level.ndim != 2 or seg_ids.ndim != 3:
+        raise ValueError(
+            "token_level must be [B, T] and seg_ids must be [B, N, T], "
+            f"got {tuple(token_level.shape)} and {tuple(seg_ids.shape)}"
+        )
+    bsz, seqlen = token_level.shape
+    if seg_ids.shape[0] != bsz or seg_ids.shape[2] != seqlen:
+        raise ValueError(
+            "seg_ids shape must match token_level batch/seqlen, "
+            f"got {tuple(seg_ids.shape)} for {tuple(token_level.shape)}"
+        )
+
+    device = token_level.device
+    total_rows = bsz * seqlen
+    n_levels = int(seg_ids.shape[1])
+    token_level_cpu = token_level.detach().cpu()
+    seg_ids_cpu = seg_ids.detach().cpu()
+    sequence_entries: list[
+        tuple[
+            list[int],
+            list[list[int]],
+            tuple[tuple[int, ...], tuple[tuple[int, ...], ...]],
+        ]
+    ] = []
+    for batch_idx in range(bsz):
+        levels = [int(x) for x in token_level_cpu[batch_idx].tolist()]
+        seg_by_level = [
+            [int(x) for x in seg_ids_cpu[batch_idx, level].tolist()]
+            for level in range(n_levels)
+        ]
+        sequence_key = _hsa_sum_tok_sequence_shape_key(levels, seg_by_level)
+        sequence_entries.append((levels, seg_by_level, sequence_key))
+
+    cache_size = _hsa_sum_tok_schedule_cache_size()
+    cache_key: tuple[Any, ...] | None = None
+    if cache_size > 0:
+        cache_key = (
+            str(device),
+            int(bsz),
+            int(seqlen),
+            int(n_levels),
+            bool(causal),
+            tuple(sequence_key for _, _, sequence_key in sequence_entries),
+        )
+        cached_schedule = _SUM_TOK_SCHEDULE_CACHE.get(cache_key)
+        if cached_schedule is not None:
+            _SUM_TOK_SCHEDULE_CACHE.move_to_end(cache_key)
+            if _hsa_sum_tok_schedule_cache_debug():
+                print(
+                    "[hsa.py] hsa_sum_tok schedule cache hit "
+                    f"batch={bsz} seqlen={seqlen} entries={len(_SUM_TOK_SCHEDULE_CACHE)}",
+                    flush=True,
+                )
+            return cached_schedule
+        if _hsa_sum_tok_schedule_cache_debug():
+            print(
+                "[hsa.py] hsa_sum_tok schedule cache miss "
+                f"batch={bsz} seqlen={seqlen} entries={len(_SUM_TOK_SCHEDULE_CACHE)}",
+                flush=True,
+            )
+
+    def _build_one_sequence_csr(
+        levels: list[int],
+        seg_by_level: list[list[int]],
+    ) -> tuple[list[int], list[int], list[int], list[int]]:
+        row_ptr_host: list[int] = [0]
+        col_idx_host: list[int] = []
+        t_rows: list[list[int]] = [[] for _ in range(seqlen)]
+
+        ancestor_keys: list[dict[int, list[int]]] = [dict() for _ in range(n_levels)]
+        descendant_keys: list[dict[int, list[int]]] = [dict() for _ in range(n_levels)]
+        for key_pos, key_level in enumerate(levels):
+            for level, level_seg_ids in enumerate(seg_by_level):
+                seg = level_seg_ids[key_pos]
+                if seg < 0:
+                    continue
+                if key_level == level:
+                    ancestor_keys[level].setdefault(seg, []).append(key_pos)
+                if key_level <= level:
+                    descendant_keys[level].setdefault(seg, []).append(key_pos)
+
+        for q_pos, q_level in enumerate(levels):
+            keys: list[int] = []
+            if 0 <= q_level < n_levels:
+                q_seg = seg_by_level[q_level][q_pos]
+                if q_seg >= 0:
+                    candidates = descendant_keys[q_level].get(q_seg, ())
+                    if causal:
+                        keys.extend(candidates[: bisect_right(candidates, q_pos)])
+                    else:
+                        keys.extend(candidates)
+            for level in range(max(0, q_level + 1), n_levels):
+                q_seg = seg_by_level[level][q_pos]
+                if q_seg >= 0:
+                    candidates = ancestor_keys[level].get(q_seg, ())
+                    if causal:
+                        keys.extend(candidates[: bisect_right(candidates, q_pos)])
+                    else:
+                        keys.extend(candidates)
+            keys.sort()
+            col_idx_host.extend(keys)
+            row_ptr_host.append(len(col_idx_host))
+            for key_pos in keys:
+                t_rows[key_pos].append(q_pos)
+
+        t_row_ptr_host: list[int] = [0]
+        t_col_idx_host: list[int] = []
+        for row in t_rows:
+            t_col_idx_host.extend(row)
+            t_row_ptr_host.append(len(t_col_idx_host))
+        return row_ptr_host, col_idx_host, t_row_ptr_host, t_col_idx_host
+
+    sequence_cache: dict[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]], tuple[list[int], list[int], list[int], list[int]]] = {}
+    section_row_ptr_host: list[int] = [0]
+    section_col_idx_host: list[int] = []
+    section_t_row_ptr_host: list[int] = [0]
+    section_t_col_idx_host: list[int] = []
+
+    for levels, seg_by_level, sequence_key in sequence_entries:
+        local = sequence_cache.get(sequence_key)
+        if local is None:
+            local = _build_one_sequence_csr(levels, seg_by_level)
+            sequence_cache[sequence_key] = local
+        local_row_ptr, local_col_idx, local_t_row_ptr, local_t_col_idx = local
+
+        col_offset = len(section_col_idx_host)
+        section_col_idx_host.extend(local_col_idx)
+        section_row_ptr_host.extend(col_offset + ptr for ptr in local_row_ptr[1:])
+
+        t_col_offset = len(section_t_col_idx_host)
+        section_t_col_idx_host.extend(local_t_col_idx)
+        section_t_row_ptr_host.extend(t_col_offset + ptr for ptr in local_t_row_ptr[1:])
+
+    section_row_ptr = torch.tensor(section_row_ptr_host, dtype=torch.int32, device=device)
+    section_col_idx = (
+        torch.tensor(section_col_idx_host, dtype=torch.int32, device=device)
+        if section_col_idx_host
+        else _empty_int32(device)
+    )
+    section_t_row_ptr = torch.tensor(section_t_row_ptr_host, dtype=torch.int32, device=device)
+    section_t_col_idx = (
+        torch.tensor(section_t_col_idx_host, dtype=torch.int32, device=device)
+        if section_t_col_idx_host
+        else _empty_int32(device)
+    )
+    empty_row_ptr = torch.zeros(total_rows + 1, dtype=torch.int32, device=device)
+    empty_int = _empty_int32(device)
+
+    empty_segments: list[list[int]] = []
+    sentence_segment_ptr, sentence_segment_pos, sentence_segment_id, sentence_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+    section_segment_ptr, section_segment_pos, section_segment_id, section_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+    document_segment_ptr, document_segment_pos, document_segment_id, document_segment_offset = _build_segment_metadata(
+        empty_segments,
+        total_rows,
+        device,
+    )
+
+    block_size = 128
+    empty_descriptors = _build_block_descriptors(
+        batch_size=bsz,
+        seqlen=seqlen,
+        block_size=block_size,
+        sentence_segments_flat=empty_segments,
+        section_segments_flat=empty_segments,
+        document_segments_flat=empty_segments,
+        device=device,
+    )
+    empty_stream = _make_stream_pack(
+        query_indices=[],
+        key_indices=[],
+        row_indices=[],
+        cu_seqlens_q=[0],
+        cu_seqlens_k=[0],
+        max_seqlen_q=0,
+        max_seqlen_k=0,
+        device=device,
+    )
+
+    schedule = HSASchedule(
+        batch_size_value=bsz,
+        seqlen_value=seqlen,
+        block_size_value=block_size,
+        sentence_start=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        sentence_len=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        section_row_ptr=section_row_ptr,
+        section_col_idx=section_col_idx,
+        document_row_ptr=empty_row_ptr,
+        document_col_idx=empty_int,
+        sentence_q_start=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        sentence_q_len=torch.zeros(total_rows, dtype=torch.int32, device=device),
+        section_t_row_ptr=section_t_row_ptr,
+        section_t_col_idx=section_t_col_idx,
+        document_t_row_ptr=empty_row_ptr,
+        document_t_col_idx=empty_int,
+        sentence_segment_ptr=sentence_segment_ptr,
+        sentence_segment_pos=sentence_segment_pos,
+        sentence_segment_id=sentence_segment_id,
+        sentence_segment_offset=sentence_segment_offset,
+        section_segment_ptr=section_segment_ptr,
+        section_segment_pos=section_segment_pos,
+        section_segment_id=section_segment_id,
+        section_segment_offset=section_segment_offset,
+        section_self_allowed=torch.zeros(total_rows, dtype=torch.bool, device=device),
+        document_segment_ptr=document_segment_ptr,
+        document_segment_pos=document_segment_pos,
+        document_segment_id=document_segment_id,
+        document_segment_offset=document_segment_offset,
+        document_self_allowed=torch.zeros(total_rows, dtype=torch.bool, device=device),
+        forward_descriptors=empty_descriptors,
+        backward_descriptors=empty_descriptors,
+        sentence_stream=empty_stream,
+        section_prefix_stream=empty_stream,
+        document_prefix_stream=empty_stream,
+        section_self_indices=empty_int,
+        document_self_indices=empty_int,
+    )
+    if cache_key is not None:
+        _SUM_TOK_SCHEDULE_CACHE[cache_key] = schedule
+        _SUM_TOK_SCHEDULE_CACHE.move_to_end(cache_key)
+        while len(_SUM_TOK_SCHEDULE_CACHE) > cache_size:
+            _SUM_TOK_SCHEDULE_CACHE.popitem(last=False)
+    return schedule
+
+
+def build_hsa_sum_tok_schedule(
+    input_batch: torch.Tensor,
+    *,
+    eos_id: Optional[int] = None,
+    ht_id: int,
+    causal: bool = True,
+) -> HSASchedule:
+    """Infer hsa_sum_tok metadata from token ids and build a packed schedule."""
+    token_level, seg_ids = infer_hsa_sum_tok_metadata(
+        input_batch,
+        eos_id=eos_id,
+        ht_id=ht_id,
+    )
+    return build_hsa_schedule_from_sum_tok_metadata(
+        token_level,
+        seg_ids,
+        causal=causal,
     )
 
 

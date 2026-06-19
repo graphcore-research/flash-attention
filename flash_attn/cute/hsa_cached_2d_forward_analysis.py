@@ -6,6 +6,16 @@ from typing import Any
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON_LSE_PUBLIC_TO_FLAT = True
+except Exception:  # pragma: no cover - optional Triton runtime
+    triton = None
+    tl = None
+    _HAS_TRITON_LSE_PUBLIC_TO_FLAT = False
+
 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _can_use_synthetic_2d_masked_fwd,
     _run_cached_cast_two_rows_kernel,
@@ -14,6 +24,7 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_cached_finalize_output_rows_kernel,
     _run_cached_init_output_rows_kernel,
     _run_cached_lse_flat_to_public_kernel,
+    _run_cached_lse_public_to_flat_kernel,
     _run_cached_zero_three_rows_kernel,
     _run_cached_zero_two_rows_kernel,
     _run_cached_zero_rows_kernel,
@@ -31,6 +42,28 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
 from flash_attn.cute.hsa_explicit_2d_sparse_analysis import _partition_packed_rows_by_support
 
 
+if _HAS_TRITON_LSE_PUBLIC_TO_FLAT:
+
+    @triton.jit
+    def _triton_lse_public_to_flat_kernel(
+        src_public_lse,
+        dst_flat_lse,
+        total_elems: tl.constexpr,
+        seqlen: tl.constexpr,
+        num_heads: tl.constexpr,
+        block_elems: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block_elems + tl.arange(0, block_elems)
+        mask = offsets < total_elems
+        head_idx = offsets % num_heads
+        flat_row = offsets // num_heads
+        batch_idx = flat_row // seqlen
+        token_idx = flat_row - batch_idx * seqlen
+        src_offsets = batch_idx * num_heads * seqlen + head_idx * seqlen + token_idx
+        values = tl.load(src_public_lse + src_offsets, mask=mask, other=0.0)
+        tl.store(dst_flat_lse + offsets, values, mask=mask)
+
+
 @dataclass(frozen=True)
 class CachedPackingPolicy:
     direct_density_threshold: float = 0.85
@@ -39,7 +72,7 @@ class CachedPackingPolicy:
     max_rows_per_group: int = 16
     tile_k: int = 32
     max_union_k_direct: int = 64
-    max_union_k_2d: int = 128
+    max_union_k_2d: int = 1024
     union_kernel: str = "tc16x32"
     exact_kernel_family: str = "tc8x8"
     exact_min_rows: int = 6
@@ -986,8 +1019,8 @@ def _coerce_cached_packing_policy(
         raise ValueError("tile_k must be one of 16 or 32")
     if int(resolved.max_union_k_direct) <= 0 or int(resolved.max_union_k_direct) > 128:
         raise ValueError("max_union_k_direct must be between 1 and 128")
-    if int(resolved.max_union_k_2d) <= 0 or int(resolved.max_union_k_2d) > 128:
-        raise ValueError("max_union_k_2d must be between 1 and 128")
+    if int(resolved.max_union_k_2d) <= 0 or int(resolved.max_union_k_2d) > 1024:
+        raise ValueError("max_union_k_2d must be between 1 and 1024")
     if int(resolved.max_union_k_direct) > int(resolved.max_union_k_2d):
         raise ValueError("max_union_k_direct must be <= max_union_k_2d")
     if str(resolved.union_kernel) not in {"tc16x32", "scalar"}:
@@ -2676,6 +2709,147 @@ def _get_cached_all_row_idx(payload: dict[str, Any], device: torch.device) -> to
     return row_idx
 
 
+def _payload_row_device(payload: dict[str, Any], fallback: Any | None = None) -> torch.device:
+    device = getattr(fallback, "device", None)
+    if isinstance(device, torch.device):
+        return device
+    for key in (
+        "fused_q_row_idx",
+        "exact_dense_q_row_idx",
+        "range_tc_scatter_q_row_idx",
+        "range_scatter_q_row_idx",
+        "range_packed_q_row_idx",
+        "q_row_idx",
+    ):
+        tensor = payload.get(key)
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+    return torch.device("cpu")
+
+
+def _valid_unique_payload_rows(
+    row_idx: torch.Tensor,
+    *,
+    total_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    rows = row_idx.reshape(-1).to(device=device, dtype=torch.int32)
+    if int(rows.numel()) == 0:
+        return rows
+    rows = rows[(rows >= 0) & (rows < int(total_rows))]
+    if int(rows.numel()) == 0:
+        return rows
+    return torch.unique(rows, sorted=True)
+
+
+def _get_direct_final_base_row_idx(
+    payload: dict[str, Any],
+    device: torch.device,
+    *,
+    base_source: str = "auto",
+) -> torch.Tensor:
+    total_rows = int(payload["total_rows"])
+    if base_source == "auto":
+        base_source = (
+            "fused"
+            if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
+            else "exact_dense"
+        )
+    key_name = "fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"
+    row_idx = payload.get(key_name)
+    if not isinstance(row_idx, torch.Tensor):
+        return torch.empty((0,), dtype=torch.int32, device=device)
+    workspace = payload.setdefault("_workspace", {})
+    cache_key = ("direct_final_base_rows", str(device), base_source, total_rows, int(row_idx.data_ptr()))
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, torch.Tensor) and cached.device == device:
+        return cached
+    rows = _valid_unique_payload_rows(row_idx, total_rows=total_rows, device=device)
+    if isinstance(workspace, dict):
+        workspace[cache_key] = rows
+    return rows
+
+
+def _get_direct_final_residual_row_idx(
+    payload: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    total_rows = int(payload["total_rows"])
+    row_tensors = [
+        payload.get("range_tc_scatter_q_row_idx"),
+        payload.get("range_scatter_q_row_idx"),
+        payload.get("range_packed_q_row_idx"),
+    ]
+    tensors = [tensor for tensor in row_tensors if isinstance(tensor, torch.Tensor) and int(tensor.numel()) > 0]
+    if not tensors:
+        return torch.empty((0,), dtype=torch.int32, device=device)
+    workspace = payload.setdefault("_workspace", {})
+    cache_key = (
+        "direct_final_residual_rows",
+        str(device),
+        total_rows,
+        tuple(int(tensor.data_ptr()) for tensor in tensors),
+    )
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, torch.Tensor) and cached.device == device:
+        return cached
+    rows = _valid_unique_payload_rows(
+        torch.cat([tensor.reshape(-1).to(device=device, dtype=torch.int32) for tensor in tensors]),
+        total_rows=total_rows,
+        device=device,
+    )
+    if isinstance(workspace, dict):
+        workspace[cache_key] = rows
+    return rows
+
+
+def _get_direct_final_missing_init_row_idx(
+    payload: dict[str, Any],
+    device: torch.device,
+    *,
+    base_source: str = "auto",
+) -> torch.Tensor:
+    total_rows = int(payload["total_rows"])
+    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    residual_rows = _get_direct_final_residual_row_idx(payload, device)
+    if int(residual_rows.numel()) == 0:
+        return residual_rows
+    workspace = payload.setdefault("_workspace", {})
+    cache_key = (
+        "direct_final_missing_init_rows",
+        str(device),
+        base_source,
+        total_rows,
+        int(base_rows.data_ptr()) if int(base_rows.numel()) > 0 else 0,
+        int(residual_rows.data_ptr()),
+    )
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, torch.Tensor) and cached.device == device:
+        return cached
+    if int(base_rows.numel()) == 0:
+        missing_rows = residual_rows
+    else:
+        missing_rows = residual_rows[~torch.isin(residual_rows, base_rows)]
+    if isinstance(workspace, dict):
+        workspace[cache_key] = missing_rows
+    return missing_rows
+
+
+def _direct_final_base_residual_union_row_count(
+    payload: dict[str, Any],
+    device: torch.device,
+    *,
+    base_source: str = "auto",
+) -> int:
+    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    residual_rows = _get_direct_final_residual_row_idx(payload, device)
+    if int(base_rows.numel()) == 0:
+        return int(residual_rows.numel())
+    if int(residual_rows.numel()) == 0:
+        return int(base_rows.numel())
+    return int(torch.unique(torch.cat([base_rows, residual_rows]), sorted=False).numel())
+
+
 def _slice_cached_flat_row_idx(
     payload: dict[str, Any],
     *,
@@ -2796,6 +2970,125 @@ def _finalize_cached_backward_kv_grads(
     return dk, dv
 
 
+def _can_use_triton_lse_public_to_flat(
+    q: torch.Tensor,
+    q_flat: torch.Tensor,
+    lse: torch.Tensor,
+) -> bool:
+    if not _HAS_TRITON_LSE_PUBLIC_TO_FLAT:
+        return False
+    if not _is_env_enabled("FLASH_ATTN_HSA_CACHED_BWD_TRITON_LSE_PUBLIC_TO_FLAT", default="on"):
+        return False
+    if q.ndim != 4 or lse.ndim != 3:
+        return False
+    if not (q_flat.is_cuda and lse.is_cuda):
+        return False
+    if lse.dtype != torch.float32 or not lse.is_contiguous():
+        return False
+    batch = int(q.shape[0])
+    seqlen = int(q.shape[1])
+    num_heads = int(q.shape[2])
+    if num_heads not in (8, 16):
+        return False
+    return (
+        int(lse.shape[0]) == batch
+        and int(lse.shape[1]) == num_heads
+        and int(lse.shape[2]) == seqlen
+        and int(q_flat.shape[0]) == batch * seqlen
+    )
+
+
+def _run_triton_lse_public_to_flat(
+    src_public_lse: torch.Tensor,
+    dst_flat_lse: torch.Tensor,
+) -> None:
+    if not _HAS_TRITON_LSE_PUBLIC_TO_FLAT:
+        raise RuntimeError("Triton public-LSE-to-flat kernel is unavailable")
+    batch = int(src_public_lse.shape[0])
+    num_heads = int(src_public_lse.shape[1])
+    seqlen = int(src_public_lse.shape[2])
+    total_elems = batch * seqlen * num_heads
+    block_elems = 2048
+    grid = (triton.cdiv(total_elems, block_elems),)
+    _triton_lse_public_to_flat_kernel[grid](
+        src_public_lse,
+        dst_flat_lse,
+        total_elems,
+        seqlen,
+        num_heads,
+        block_elems,
+        num_warps=4,
+    )
+
+
+def _get_cached_lse_flat_for_backward_buffer(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    num_heads: int,
+) -> torch.Tensor:
+    workspace = payload.setdefault("_workspace", {})
+    shape = (int(q_flat.shape[0]), int(num_heads))
+    cache_key = ("lse_flat_for_backward", str(q_flat.device), shape)
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if (
+        isinstance(cached, torch.Tensor)
+        and tuple(cached.shape) == shape
+        and cached.device == q_flat.device
+        and cached.dtype == torch.float32
+    ):
+        return cached
+    lse_flat = torch.empty(shape, dtype=torch.float32, device=q_flat.device)
+    if isinstance(workspace, dict):
+        workspace[cache_key] = lse_flat
+    return lse_flat
+
+
+def _flatten_cached_lse_for_backward(
+    q: torch.Tensor,
+    q_flat: torch.Tensor,
+    lse: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    triton_checked: bool = False,
+) -> torch.Tensor:
+    if lse.ndim == 2 and int(lse.shape[0]) == int(q_flat.shape[0]):
+        return lse.float() if lse.dtype != torch.float32 else lse
+    if triton_checked or _can_use_triton_lse_public_to_flat(q, q_flat, lse):
+        expected_shape = (int(q_flat.shape[0]), int(q.shape[2]))
+        if (
+            out is not None
+            and tuple(out.shape) == expected_shape
+            and out.device == lse.device
+            and out.dtype == torch.float32
+            and out.is_contiguous()
+        ):
+            lse_flat = out
+        else:
+            lse_flat = torch.empty(expected_shape, dtype=torch.float32, device=lse.device)
+        _run_triton_lse_public_to_flat(lse, lse_flat)
+        return lse_flat
+    if (
+        q.ndim == 4
+        and _is_env_enabled("FLASH_ATTN_HSA_CACHED_BWD_CUTE_LSE_PUBLIC_TO_FLAT", default="off")
+        and q_flat.is_cuda
+        and lse.is_cuda
+        and lse.ndim == 3
+        and int(lse.shape[0]) == int(q.shape[0])
+        and int(lse.shape[1]) == int(q.shape[2])
+        and int(lse.shape[2]) == int(q.shape[1])
+    ):
+        lse_flat = torch.empty(
+            (int(q_flat.shape[0]), int(q.shape[2])),
+            dtype=torch.float32,
+            device=lse.device,
+        )
+        _run_cached_lse_public_to_flat_kernel(lse, lse_flat)
+        return lse_flat
+    if q.ndim == 4:
+        return lse.permute(0, 2, 1).contiguous().view(-1, q.shape[2]).float()
+    return lse.transpose(0, 1).contiguous().float()
+
+
 def _cached_backward_dq_overwrites_all_rows(payload: dict[str, Any], q_flat: torch.Tensor) -> bool:
     if str(payload.get("residual_mode", "")) != "fused_tail":
         return False
@@ -2836,6 +3129,68 @@ def _zero_cached_backward_kv_accum_buffers(
         return
     dk_acc.zero_()
     dv_acc.zero_()
+
+
+def _zero_cached_backward_kv_final_buffers(
+    payload: dict[str, Any],
+    k_flat: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+) -> None:
+    if k_flat.is_cuda:
+        all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
+        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+            _run_cached_zero_two_rows_kernel(all_row_idx, dk, dv)
+            return
+        _run_cached_zero_rows_kernel(all_row_idx, dk)
+        _run_cached_zero_rows_kernel(all_row_idx, dv)
+        return
+    dk.zero_()
+    dv.zero_()
+
+
+def _can_use_cached_backward_key_owned_dkdv(backward_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+        return False
+    if str(backward_payload.get("backward_kernel_family", "")) != "cached_tc8x8_fused":
+        return False
+    required = (
+        "owned_k_row_idx",
+        "owned_occurrence_ptr",
+        "owned_occurrence_kind",
+        "owned_occurrence_range_idx",
+        "owned_occurrence_tile_idx",
+        "owned_occurrence_col_idx",
+    )
+    if not all(isinstance(backward_payload.get(key), torch.Tensor) for key in required):
+        return False
+    return int(backward_payload["owned_k_row_idx"].numel()) > 0
+
+
+def _cached_backward_key_owned_overwrites_all_kv_rows(
+    backward_payload: dict[str, Any] | None,
+    k_flat: torch.Tensor,
+) -> bool:
+    if not _can_use_cached_backward_key_owned_dkdv(backward_payload):
+        return False
+    owned_k_row_idx = backward_payload["owned_k_row_idx"]
+    # The payload builder materializes this list from a Python dict keyed by
+    # key row, then sorts it. Equal cardinality means every KV row has exactly
+    # one owning CTA and the key-owned kernel overwrites the whole DK/DV output.
+    return int(owned_k_row_idx.numel()) == int(k_flat.shape[0])
+
+
+def _auto_use_cached_backward_key_owned_dkdv(
+    backward_payload: dict[str, Any] | None,
+    k_flat: torch.Tensor,
+) -> bool:
+    if not _cached_backward_key_owned_overwrites_all_kv_rows(backward_payload, k_flat):
+        return False
+    try:
+        max_rows = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED_MAX_ROWS", "2048"))
+    except ValueError:
+        max_rows = 2048
+    return int(k_flat.shape[0]) <= max(0, max_rows)
 
 
 def _zero_cached_backward_accum_buffers(
@@ -3077,6 +3432,7 @@ def _run_cached_masked_payload_forward(
     lse_flat: torch.Tensor,
     *,
     softmax_scale: float,
+    force_combine_scatter: bool = False,
 ) -> tuple[int, int, int, int]:
     packed_q = int(payload["packed_q"])
     packed_k = int(payload["support_rows"])
@@ -3193,6 +3549,25 @@ def _run_cached_masked_payload_forward(
             else:
                 kernel_kind = "packed"
         if kernel_kind == "tc_scatter":
+            if force_combine_scatter:
+                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    payload["q_row_idx"][group_start:group_end],
+                    payload["k_row_idx"][group_start:group_end],
+                    payload["q_length"][group_start:group_end],
+                    payload["k_length"][group_start:group_end],
+                    payload["mask_words"][group_start:group_end],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
+                tc_groups, tc_rows = _cached_union_range_counts(payload, group_start=group_start, group_end=group_end)
+                union_tc_group_count += tc_groups
+                union_tc_row_count += tc_rows
+                return
             _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
                 q_flat,
                 k_flat,
@@ -3220,6 +3595,22 @@ def _run_cached_masked_payload_forward(
                 )
                 union_scalar_group_count += scalar_groups
                 union_scalar_row_count += scalar_rows
+            if force_combine_scatter:
+                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    payload["q_row_idx"][group_start:group_end],
+                    payload["k_row_idx"][group_start:group_end],
+                    payload["q_length"][group_start:group_end],
+                    payload["k_length"][group_start:group_end],
+                    payload["mask_words"][group_start:group_end],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
+                return
             _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
                 q_flat,
                 k_flat,
@@ -3510,16 +3901,33 @@ def _cached_direct_final_residual_support_reason(
         return base_reason
     if str(payload.get("residual_mode", "")) != "fused_tail":
         return "requires_fused_tail_residual_mode"
-    if int(payload.get("range_packed_group_count", 0)) != 0:
-        return "packed_residual_groups_present"
-    if int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0]) != 0:
-        return "packed_residual_tensor_present"
+    base_output_row_count = int(payload.get("fused_output_row_count", 0))
+    if base_output_row_count <= 0:
+        base_output_row_count = int(payload.get("exact_dense_output_row_count", 0))
     residual_row_count = int(payload.get("range_tc_scatter_row_count", 0)) + int(
         payload.get("range_scatter_row_count", 0)
     )
+    packed_group_count = int(payload.get("range_packed_group_count", 0))
+    packed_tensor_count = int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0])
+    if packed_group_count != 0 or packed_tensor_count != 0:
+        grouped_keys = (
+            "range_tc_scatter_q_row_idx",
+            "range_scatter_q_row_idx",
+            "range_packed_q_row_idx",
+        )
+        if not all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
+            return "missing_grouped_residual_tensors"
+        if base_output_row_count != int(payload["total_rows"]):
+            device = _payload_row_device(payload, q_flat)
+            union_row_count = _direct_final_base_residual_union_row_count(payload, device)
+            if union_row_count != int(payload["total_rows"]):
+                if residual_row_count != 0:
+                    return "mixed_residual_incomplete_direct_final_row_coverage"
+                return "packed_residual_incomplete_direct_final_row_coverage"
+        return None
     if residual_row_count <= 0:
         return "missing_scatter_residual_rows"
-    covered_rows = int(payload.get("fused_output_row_count", 0)) + residual_row_count
+    covered_rows = base_output_row_count + residual_row_count
     if covered_rows != int(payload["total_rows"]):
         return "incomplete_direct_final_row_coverage"
     grouped_keys = (
@@ -3598,6 +4006,8 @@ def _run_cached_direct_final_residual_forward(
     out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
     fused_range_count = 0
     fused_row_count = 0
+    exact_range_count = 0
+    exact_row_count = 0
     if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0:
         fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(
             payload,
@@ -3608,6 +4018,53 @@ def _run_cached_direct_final_residual_forward(
             lse_final_flat,
             softmax_scale=float(softmax_scale),
         )
+    if fused_range_count <= 0 and int(getattr(payload.get("exact_dense_q_row_idx"), "shape", [0])[0]) > 0:
+        exact_range_count, exact_row_count = _run_cached_exact_dense_ranges(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            out_final_flat,
+            lse_final_flat,
+            softmax_scale=float(softmax_scale),
+        )
+    base_row_count = int(fused_row_count) if int(fused_row_count) > 0 else int(exact_row_count)
+    residual_row_count = int(payload.get("range_tc_scatter_row_count", 0)) + int(
+        payload.get("range_scatter_row_count", 0)
+    )
+    packed_group_count = int(payload.get("range_packed_group_count", 0))
+    packed_tensor_count = int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0])
+    force_combine_scatter = (
+        residual_row_count > 0
+        and (packed_group_count > 0 or packed_tensor_count > 0)
+    )
+    has_packed_residual = packed_group_count > 0 or packed_tensor_count > 0
+    base_source = "fused" if int(fused_row_count) > 0 else "exact_dense"
+    initialized_residual_rows = 0
+    if has_packed_residual and base_row_count != int(payload["total_rows"]):
+        union_row_count = _direct_final_base_residual_union_row_count(
+            payload,
+            out_final_flat.device,
+            base_source=base_source,
+        )
+        if union_row_count != int(payload["total_rows"]):
+            reason = (
+                "mixed_residual_incomplete_direct_final_runtime_coverage"
+                if force_combine_scatter
+                else "packed_residual_incomplete_direct_final_runtime_coverage"
+            )
+            if _is_env_forced_on(env_name):
+                raise RuntimeError(f"cached_direct_final_residual_fwd_{reason}")
+            _record_cached_forward_path(payload, path="split_fallback", reason=reason)
+            return None
+        init_row_idx = _get_direct_final_missing_init_row_idx(
+            payload,
+            out_final_flat.device,
+            base_source=base_source,
+        )
+        initialized_residual_rows = int(init_row_idx.numel())
+        if initialized_residual_rows > 0:
+            _run_cached_init_output_rows_kernel(init_row_idx, out_final_flat, lse_final_flat)
     union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count = (
         _run_cached_masked_payload_forward(
             payload,
@@ -3617,12 +4074,17 @@ def _run_cached_direct_final_residual_forward(
             out_final_flat,
             lse_final_flat,
             softmax_scale=float(softmax_scale),
+            force_combine_scatter=force_combine_scatter,
         )
     )
-    residual_row_count = int(payload.get("range_tc_scatter_row_count", 0)) + int(
-        payload.get("range_scatter_row_count", 0)
+    output_coverage = (
+        int(payload["total_rows"])
+        if has_packed_residual and base_row_count != int(payload["total_rows"])
+        else base_row_count
+        if force_combine_scatter
+        else base_row_count + residual_row_count
     )
-    if int(fused_row_count) + residual_row_count != int(payload["total_rows"]):
+    if output_coverage != int(payload["total_rows"]):
         if _is_env_forced_on(env_name):
             raise RuntimeError("cached_direct_final_residual_fwd_incomplete_runtime_coverage")
         _record_cached_forward_path(payload, path="split_fallback", reason="incomplete_runtime_coverage")
@@ -3634,9 +4096,13 @@ def _run_cached_direct_final_residual_forward(
         scalar_group_count=union_scalar_group_count,
         scalar_row_count=union_scalar_row_count,
     )
-    _record_exact_dense_runtime_geometry(payload, exact_range_count=0, exact_row_count=0)
+    _record_exact_dense_runtime_geometry(payload, exact_range_count=exact_range_count, exact_row_count=exact_row_count)
     _record_fused_runtime_geometry(payload, fused_range_count=fused_range_count, fused_row_count=fused_row_count)
-    _record_cached_forward_path(payload, path="direct_final_residual")
+    _record_cached_forward_path(
+        payload,
+        path="direct_final_residual",
+        initialized_residual_rows=initialized_residual_rows,
+    )
     return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
 
 
@@ -4456,12 +4922,19 @@ def run_cached_generalized_packed_backward(
     v_flat = _flatten_row_tensor(v)
     out_flat = _flatten_row_tensor(out)
     dout_flat = _flatten_row_tensor(dout)
-    if lse.ndim == 2 and int(lse.shape[0]) == int(q_flat.shape[0]):
-        lse_flat = lse.float() if lse.dtype != torch.float32 else lse
-    elif q.ndim == 4:
-        lse_flat = lse.permute(0, 2, 1).contiguous().view(-1, q.shape[2]).float()
-    else:
-        lse_flat = lse.transpose(0, 1).contiguous().float()
+    use_triton_lse_flat = _can_use_triton_lse_public_to_flat(q, q_flat, lse)
+    lse_flat_out = (
+        _get_cached_lse_flat_for_backward_buffer(payload, q_flat, int(q.shape[2]))
+        if use_triton_lse_flat
+        else None
+    )
+    lse_flat = _flatten_cached_lse_for_backward(
+        q,
+        q_flat,
+        lse,
+        out=lse_flat_out,
+        triton_checked=use_triton_lse_flat,
+    )
     if softmax_scale is None:
         softmax_scale = q_flat.shape[-1] ** (-0.5)
 
@@ -4515,22 +4988,33 @@ def run_cached_generalized_packed_backward(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
             "1",
         ).strip().lower() not in {"0", "false", "off", "no"}
+        key_owned_mode = _env_mode("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED", default="auto")
+        use_key_owned_dkdv = key_owned_mode != "off"
         use_direct_dq = _use_cached_backward_direct_dq(payload, q_flat)
-        if use_direct_dq:
-            dq = torch.empty_like(q_flat)
-            dk_acc, dv_acc = _get_cached_backward_kv_accum_buffers(payload, k_flat, v_flat)
-            _zero_cached_backward_kv_accum_buffers(payload, k_flat, dk_acc, dv_acc)
-            dq_rows = dq
-        else:
-            dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
-            _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
-            dq_rows = dq_acc
         backward_payload = None
-        if not use_tile_atomic_dkdv:
+        if use_key_owned_dkdv or not use_tile_atomic_dkdv:
             backward_payload = payload.get("cached_generalized_backward_payload")
             if (
                 not isinstance(backward_payload, dict)
                 or backward_payload.get("status") != "ready"
+            ):
+                backward_payload = build_cached_generalized_backward_payload(payload)
+                if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
+                    if use_key_owned_dkdv:
+                        use_key_owned_dkdv = False
+                    else:
+                        raise RuntimeError("cached_generalized_fused_backward_missing_payload")
+                payload["cached_generalized_backward_payload"] = backward_payload
+        if use_key_owned_dkdv and not _can_use_cached_backward_key_owned_dkdv(backward_payload):
+            use_key_owned_dkdv = False
+        if use_key_owned_dkdv and key_owned_mode == "auto" and not _auto_use_cached_backward_key_owned_dkdv(
+            backward_payload,
+            k_flat,
+        ):
+            use_key_owned_dkdv = False
+        if not use_key_owned_dkdv and not use_tile_atomic_dkdv:
+            if (
+                not isinstance(backward_payload, dict)
                 or "range_local_k_ptr" not in backward_payload
                 or "range_local_k_row_idx" not in backward_payload
                 or "exact_tile_local_k_idx" not in backward_payload
@@ -4540,7 +5024,39 @@ def run_cached_generalized_packed_backward(
                 if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
                     raise RuntimeError("cached_generalized_fused_backward_missing_payload")
                 payload["cached_generalized_backward_payload"] = backward_payload
+        if (not use_key_owned_dkdv) and use_direct_dq:
+            dq = torch.empty_like(q_flat)
+            dk_acc, dv_acc = _get_cached_backward_kv_accum_buffers(payload, k_flat, v_flat)
+            _zero_cached_backward_kv_accum_buffers(payload, k_flat, dk_acc, dv_acc)
+            dq_rows = dq
+        elif not use_key_owned_dkdv:
+            dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
+            _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
+            dq_rows = dq_acc
+        elif use_direct_dq:
+            dq = torch.empty_like(q_flat)
+            dk = torch.empty_like(k_flat)
+            dv = torch.empty_like(v_flat)
+            if not _cached_backward_key_owned_overwrites_all_kv_rows(backward_payload, k_flat):
+                _zero_cached_backward_kv_final_buffers(payload, k_flat, dk, dv)
+            dq_rows = dq
+            dk_acc = dk
+            dv_acc = dv
+        else:
+            dq_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)[0]
+            if q_flat.is_cuda:
+                _run_cached_zero_rows_kernel(_get_cached_all_row_idx(payload, q_flat.device), dq_acc)
+            else:
+                dq_acc.zero_()
+            dk = torch.empty_like(k_flat)
+            dv = torch.empty_like(v_flat)
+            if not _cached_backward_key_owned_overwrites_all_kv_rows(backward_payload, k_flat):
+                _zero_cached_backward_kv_final_buffers(payload, k_flat, dk, dv)
+            dq_rows = dq_acc
+            dk_acc = dk
+            dv_acc = dv
         from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+            _run_cached_generalized_fused_bwd_dkdv_kernel,
             _run_cached_generalized_fused_bwd_dkdv_range_kernel,
             _run_cached_generalized_fused_bwd_dq_kernel,
         )
@@ -4563,7 +5079,42 @@ def run_cached_generalized_packed_backward(
             dk_acc,
             dv_acc,
             softmax_scale=float(softmax_scale),
+            compute_dkdv=not use_key_owned_dkdv,
         )
+        if use_key_owned_dkdv:
+            _run_cached_generalized_fused_bwd_dkdv_kernel(
+                q_flat,
+                k_flat,
+                v_flat,
+                out_flat,
+                dout_flat,
+                lse_flat,
+                payload["fused_q_row_idx"],
+                payload["fused_q_length"],
+                payload["fused_tail_mask_words"],
+                backward_payload["owned_k_row_idx"],
+                backward_payload["owned_occurrence_ptr"],
+                backward_payload["owned_occurrence_kind"],
+                backward_payload["owned_occurrence_range_idx"],
+                backward_payload["owned_occurrence_tile_idx"],
+                backward_payload["owned_occurrence_col_idx"],
+                dk_acc,
+                dv_acc,
+                softmax_scale=float(softmax_scale),
+            )
+            if use_direct_dq:
+                return (
+                    dq.view_as(q),
+                    dk.view_as(k),
+                    dv.view_as(v),
+                )
+            dq = torch.empty_like(q_flat)
+            _run_cached_cast_rows_kernel(dq_acc, _get_cached_all_row_idx(payload, q_flat.device), dq)
+            return (
+                dq.view_as(q),
+                dk.view_as(k),
+                dv.view_as(v),
+            )
         if (not use_tile_atomic_dkdv) and int(backward_payload["range_local_k_row_idx"].numel()) > 0:
             _run_cached_generalized_fused_bwd_dkdv_range_kernel(
                 q_flat,

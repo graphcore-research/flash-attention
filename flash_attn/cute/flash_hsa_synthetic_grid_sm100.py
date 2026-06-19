@@ -1627,6 +1627,56 @@ class FlashHSACachedLSEFlatToPublicSm100:
             ).to(mDstPublicLSE.element_type)
 
 
+class FlashHSACachedLSEPublicToFlatSm100:
+    """Convert public FA LSE layout [B, H, T] to cached flat layout [B*T, H]."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcPublicLSE: cute.Tensor,
+        mDstFlatLSE: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        batch = mSrcPublicLSE.shape[0]
+        seqlen = mSrcPublicLSE.shape[2]
+        total_tasks = batch * seqlen
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcPublicLSE,
+            mDstFlatLSE,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcPublicLSE: cute.Tensor,
+        mDstFlatLSE: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            seqlen = Int32(mSrcPublicLSE.shape[2])
+            batch_idx = task_idx // seqlen
+            token_idx = task_idx - batch_idx * seqlen
+            flat_row = batch_idx * seqlen + token_idx
+            for head_idx in range(mSrcPublicLSE.shape[1]):
+                mDstFlatLSE[flat_row, head_idx] = Float32(
+                    mSrcPublicLSE[batch_idx, head_idx, token_idx]
+                ).to(mDstFlatLSE.element_type)
+
+
 class FlashHSASyntheticMicroFwdDenseSm100:
     """Specialized forward kernel for one-launch synthetic 2xK buckets."""
 
@@ -4533,6 +4583,43 @@ def _run_cached_lse_flat_to_public_kernel(
 
 _run_cached_lse_flat_to_public_kernel.compile_cache = get_jit_cache(
     "hsa_cached_lse_flat_to_public"
+)
+
+
+def _run_cached_lse_public_to_flat_kernel(
+    src_public_lse: torch.Tensor,
+    dst_flat_lse: torch.Tensor,
+) -> None:
+    _require_cute_runtime()
+    compile_key = (
+        "cached_lse_public_to_flat_v3_rowwise",
+        src_public_lse.dtype,
+        dst_flat_lse.dtype,
+        src_public_lse.shape[0],
+        src_public_lse.shape[1],
+        src_public_lse.shape[2],
+        dst_flat_lse.shape[0],
+        dst_flat_lse.shape[1],
+        torch.cuda.get_device_capability(src_public_lse.device),
+    )
+    if compile_key not in _run_cached_lse_public_to_flat_kernel.compile_cache:
+        kernel = FlashHSACachedLSEPublicToFlatSm100()
+        _run_cached_lse_public_to_flat_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(src_public_lse, assumed_align=4),
+            to_cute_tensor(dst_flat_lse, assumed_align=4),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_cached_lse_public_to_flat_kernel.compile_cache[compile_key](
+        src_public_lse,
+        dst_flat_lse,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_cached_lse_public_to_flat_kernel.compile_cache = get_jit_cache(
+    "hsa_cached_lse_public_to_flat"
 )
 
 
@@ -17450,9 +17537,14 @@ def _can_use_synthetic_2d_masked_fwd(
     packed_q: int,
     packed_k: int,
 ) -> bool:
+    try:
+        max_packed_k = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GATHER_MAX_PACKED_K", "1024"))
+    except ValueError:
+        max_packed_k = 128
+    max_packed_k = max(1, min(max_packed_k, 1024))
     return (
         0 < packed_q <= 16
-        and 0 < packed_k <= 128
+        and 0 < packed_k <= max_packed_k
         and q_rows.dtype in (torch.float16, torch.bfloat16)
         and k_rows.dtype == q_rows.dtype
         and v_rows.dtype == q_rows.dtype
@@ -18101,6 +18193,7 @@ class FlashHSACachedGeneralizedFusedBwdDQSm100:
         mTailKRowIdx: cute.Tensor,
         mTailMaskWords: cute.Tensor,
         softmax_scale: Float32,
+        compute_dkdv: Int32,
         mdQRows: cute.Tensor,
         mdKRows: cute.Tensor,
         mdVRows: cute.Tensor,
@@ -18123,6 +18216,7 @@ class FlashHSACachedGeneralizedFusedBwdDQSm100:
             mTailKRowIdx,
             mTailMaskWords,
             softmax_scale,
+            compute_dkdv,
             mdQRows,
             mdKRows,
             mdVRows,
@@ -18149,6 +18243,7 @@ class FlashHSACachedGeneralizedFusedBwdDQSm100:
         mTailKRowIdx: cute.Tensor,
         mTailMaskWords: cute.Tensor,
         softmax_scale: Float32,
+        compute_dkdv: Int32,
         mdQRows: cute.Tensor,
         mdKRows: cute.Tensor,
         mdVRows: cute.Tensor,
@@ -18342,25 +18437,26 @@ class FlashHSACachedGeneralizedFusedBwdDQSm100:
                 sDQ[row_idx, dim_idx] = dq_val
             cute.arch.barrier()
 
-            for elem_idx in cutlass.range(lane, Int32(logical_tile_k) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
-                tile_col = elem_idx // Int32(64)
-                dim_idx = elem_idx - tile_col * Int32(64)
-                global_k_row = Int32(mExactKRowIdx[tile_idx, tile_col])
-                if global_k_row >= Int32(0):
-                    dk_val = Float32(0.0)
-                    dv_val = Float32(0.0)
-                    for row_idx in range(logical_rows):
-                        if row_idx < q_length:
-                            dk_val += Float32(sDS[row_idx, tile_col]) * Float32(sQ[row_idx, dim_idx])
-                            dv_val += Float32(sProb[row_idx, tile_col]) * Float32(sdO[row_idx, dim_idx])
-                    utils.atomic_add_fp32(
-                        dk_val,
-                        utils.elem_pointer(mdKRows, (global_k_row, head_idx, dim_idx)),
-                    )
-                    utils.atomic_add_fp32(
-                        dv_val,
-                        utils.elem_pointer(mdVRows, (global_k_row, head_idx, dim_idx)),
-                    )
+            if compute_dkdv != Int32(0):
+                for elem_idx in cutlass.range(lane, Int32(logical_tile_k) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+                    tile_col = elem_idx // Int32(64)
+                    dim_idx = elem_idx - tile_col * Int32(64)
+                    global_k_row = Int32(mExactKRowIdx[tile_idx, tile_col])
+                    if global_k_row >= Int32(0):
+                        dk_val = Float32(0.0)
+                        dv_val = Float32(0.0)
+                        for row_idx in range(logical_rows):
+                            if row_idx < q_length:
+                                dk_val += Float32(sDS[row_idx, tile_col]) * Float32(sQ[row_idx, dim_idx])
+                                dv_val += Float32(sProb[row_idx, tile_col]) * Float32(sdO[row_idx, dim_idx])
+                        utils.atomic_add_fp32(
+                            dk_val,
+                            utils.elem_pointer(mdKRows, (global_k_row, head_idx, dim_idx)),
+                        )
+                        utils.atomic_add_fp32(
+                            dv_val,
+                            utils.elem_pointer(mdVRows, (global_k_row, head_idx, dim_idx)),
+                        )
             cute.arch.barrier()
 
         tail_tile_begin = Int32(mTailTilePtr[range_idx])
@@ -18459,25 +18555,26 @@ class FlashHSACachedGeneralizedFusedBwdDQSm100:
                 sDQ[row_idx, dim_idx] = dq_val
             cute.arch.barrier()
 
-            for elem_idx in cutlass.range(lane, Int32(logical_tile_k) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
-                tile_col = elem_idx // Int32(64)
-                dim_idx = elem_idx - tile_col * Int32(64)
-                global_k_row = Int32(mTailKRowIdx[tile_idx, tile_col])
-                if global_k_row >= Int32(0):
-                    dk_val = Float32(0.0)
-                    dv_val = Float32(0.0)
-                    for row_idx in range(logical_rows):
-                        if row_idx < q_length:
-                            dk_val += Float32(sDS[row_idx, tile_col]) * Float32(sQ[row_idx, dim_idx])
-                            dv_val += Float32(sProb[row_idx, tile_col]) * Float32(sdO[row_idx, dim_idx])
-                    utils.atomic_add_fp32(
-                        dk_val,
-                        utils.elem_pointer(mdKRows, (global_k_row, head_idx, dim_idx)),
-                    )
-                    utils.atomic_add_fp32(
-                        dv_val,
-                        utils.elem_pointer(mdVRows, (global_k_row, head_idx, dim_idx)),
-                    )
+            if compute_dkdv != Int32(0):
+                for elem_idx in cutlass.range(lane, Int32(logical_tile_k) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
+                    tile_col = elem_idx // Int32(64)
+                    dim_idx = elem_idx - tile_col * Int32(64)
+                    global_k_row = Int32(mTailKRowIdx[tile_idx, tile_col])
+                    if global_k_row >= Int32(0):
+                        dk_val = Float32(0.0)
+                        dv_val = Float32(0.0)
+                        for row_idx in range(logical_rows):
+                            if row_idx < q_length:
+                                dk_val += Float32(sDS[row_idx, tile_col]) * Float32(sQ[row_idx, dim_idx])
+                                dv_val += Float32(sProb[row_idx, tile_col]) * Float32(sdO[row_idx, dim_idx])
+                        utils.atomic_add_fp32(
+                            dk_val,
+                            utils.elem_pointer(mdKRows, (global_k_row, head_idx, dim_idx)),
+                        )
+                        utils.atomic_add_fp32(
+                            dv_val,
+                            utils.elem_pointer(mdVRows, (global_k_row, head_idx, dim_idx)),
+                        )
             cute.arch.barrier()
 
         for elem_idx in cutlass.range(lane, Int32(logical_rows) * Int32(64), cute.arch.WARP_SIZE, unroll=1):
@@ -18739,17 +18836,17 @@ class FlashHSACachedGeneralizedFusedBwdKeyOwnedSm100:
 
         if active_key and key_row >= Int32(0):
             if dim0 < mdKRows.shape[2]:
-                mdKRows[key_row, head_idx, dim0] = dk0
-                mdVRows[key_row, head_idx, dim0] = dv0
+                mdKRows[key_row, head_idx, dim0] = dk0.to(mdKRows.element_type)
+                mdVRows[key_row, head_idx, dim0] = dv0.to(mdVRows.element_type)
             if dim1 < mdKRows.shape[2]:
-                mdKRows[key_row, head_idx, dim1] = dk1
-                mdVRows[key_row, head_idx, dim1] = dv1
+                mdKRows[key_row, head_idx, dim1] = dk1.to(mdKRows.element_type)
+                mdVRows[key_row, head_idx, dim1] = dv1.to(mdVRows.element_type)
             if dim2 < mdKRows.shape[2]:
-                mdKRows[key_row, head_idx, dim2] = dk2
-                mdVRows[key_row, head_idx, dim2] = dv2
+                mdKRows[key_row, head_idx, dim2] = dk2.to(mdKRows.element_type)
+                mdVRows[key_row, head_idx, dim2] = dv2.to(mdVRows.element_type)
             if dim3 < mdKRows.shape[2]:
-                mdKRows[key_row, head_idx, dim3] = dk3
-                mdVRows[key_row, head_idx, dim3] = dv3
+                mdKRows[key_row, head_idx, dim3] = dk3.to(mdKRows.element_type)
+                mdVRows[key_row, head_idx, dim3] = dv3.to(mdVRows.element_type)
 
 
 class FlashHSACachedGeneralizedFusedBwdRangeOwnedSm100:
@@ -19061,10 +19158,12 @@ def _run_cached_generalized_fused_bwd_dq_kernel(
     dv_rows: torch.Tensor,
     *,
     softmax_scale: float,
+    compute_dkdv: bool = True,
 ):
     _require_cute_runtime()
     compile_key = (
-        "cached_generalized_fused_bwd_dq_v3",
+        "cached_generalized_fused_bwd_dq_v4",
+        bool(compute_dkdv),
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -19100,6 +19199,7 @@ def _run_cached_generalized_fused_bwd_dq_kernel(
             to_cute_tensor(tail_k_row_idx, assumed_align=4),
             to_cute_tensor(tail_mask_words, assumed_align=4, leading_dim=2),
             Float32(softmax_scale),
+            Int32(1 if compute_dkdv else 0),
             to_cute_tensor(dq_rows, assumed_align=4),
             to_cute_tensor(dk_rows, assumed_align=4),
             to_cute_tensor(dv_rows, assumed_align=4),
@@ -19121,6 +19221,7 @@ def _run_cached_generalized_fused_bwd_dq_kernel(
         tail_k_row_idx,
         tail_mask_words,
         Float32(softmax_scale),
+        Int32(1 if compute_dkdv else 0),
         dq_rows,
         dk_rows,
         dv_rows,

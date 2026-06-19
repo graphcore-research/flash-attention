@@ -1,11 +1,121 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import flash_attn.cute.hsa_cached_2d_forward_analysis as cached_2d
+
+
+def test_cached_lse_public_to_flat_triton_gate_rejects_cpu():
+    q = torch.empty((2, 16, 8, 64), dtype=torch.bfloat16)
+    q_flat = q.reshape(-1, 8, 64)
+    lse = torch.empty((2, 8, 16), dtype=torch.float32)
+
+    assert not cached_2d._can_use_triton_lse_public_to_flat(q, q_flat, lse)
+
+
+def test_cached_lse_public_to_flat_triton_matches_pytorch_and_reuses_buffer(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton public-LSE-to-flat test")
+    if not cached_2d._HAS_TRITON_LSE_PUBLIC_TO_FLAT:
+        pytest.skip("Triton unavailable")
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_BWD_TRITON_LSE_PUBLIC_TO_FLAT", raising=False)
+    q = torch.empty((2, 128, 8, 64), dtype=torch.bfloat16, device="cuda")
+    q_flat = q.reshape(-1, 8, 64)
+    lse = torch.randn((2, 8, 128), dtype=torch.float32, device="cuda")
+    ref = lse.permute(0, 2, 1).contiguous().view(-1, 8).float()
+
+    payload = {}
+    lse_flat = cached_2d._get_cached_lse_flat_for_backward_buffer(payload, q_flat, 8)
+    lse_flat_again = cached_2d._get_cached_lse_flat_for_backward_buffer(payload, q_flat, 8)
+    assert lse_flat_again.data_ptr() == lse_flat.data_ptr()
+
+    got = cached_2d._flatten_cached_lse_for_backward(q, q_flat, lse, out=lse_flat)
+    torch.cuda.synchronize()
+
+    assert got.data_ptr() == lse_flat.data_ptr()
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+
+def test_cached_packing_policy_allows_wide_2d_union_but_not_wide_direct():
+    assert cached_2d.CachedPackingPolicy().max_union_k_2d == 1024
+
+    policy = cached_2d._coerce_cached_packing_policy(
+        cached_2d.CachedPackingPolicy(max_union_k_direct=128, max_union_k_2d=1024)
+    )
+    assert policy.max_union_k_2d == 1024
+
+    try:
+        cached_2d._coerce_cached_packing_policy(
+            cached_2d.CachedPackingPolicy(max_union_k_direct=256, max_union_k_2d=512)
+        )
+    except ValueError as exc:
+        assert "max_union_k_direct" in str(exc)
+    else:
+        raise AssertionError("expected max_union_k_direct >128 to be rejected")
+
+
+def test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload():
+    assert not cached_2d._can_use_cached_backward_key_owned_dkdv(None)
+
+    payload = {
+        "status": "ready",
+        "backward_kernel_family": "cached_tc8x8_fused",
+        "owned_k_row_idx": torch.tensor([0], dtype=torch.int32),
+        "owned_occurrence_ptr": torch.tensor([0, 1], dtype=torch.int32),
+        "owned_occurrence_kind": torch.tensor([0], dtype=torch.int32),
+        "owned_occurrence_range_idx": torch.tensor([0], dtype=torch.int32),
+        "owned_occurrence_tile_idx": torch.tensor([0], dtype=torch.int32),
+        "owned_occurrence_col_idx": torch.tensor([0], dtype=torch.int32),
+    }
+
+    assert cached_2d._can_use_cached_backward_key_owned_dkdv(payload)
+    payload["owned_k_row_idx"] = torch.empty((0,), dtype=torch.int32)
+    assert not cached_2d._can_use_cached_backward_key_owned_dkdv(payload)
+
+
+def test_cached_backward_key_owned_overwrite_gate_requires_all_kv_rows():
+    payload = {
+        "status": "ready",
+        "backward_kernel_family": "cached_tc8x8_fused",
+        "owned_k_row_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "owned_occurrence_ptr": torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        "owned_occurrence_kind": torch.tensor([0, 0, 1], dtype=torch.int32),
+        "owned_occurrence_range_idx": torch.tensor([0, 0, 1], dtype=torch.int32),
+        "owned_occurrence_tile_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "owned_occurrence_col_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+    }
+    k_flat = torch.empty((3, 2, 64), dtype=torch.bfloat16)
+    assert cached_2d._cached_backward_key_owned_overwrites_all_kv_rows(payload, k_flat)
+
+    k_flat = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    assert not cached_2d._cached_backward_key_owned_overwrites_all_kv_rows(payload, k_flat)
+
+
+def test_cached_backward_key_owned_auto_gate_is_small_all_owned_only(monkeypatch):
+    payload = {
+        "status": "ready",
+        "backward_kernel_family": "cached_tc8x8_fused",
+        "owned_k_row_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "owned_occurrence_ptr": torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        "owned_occurrence_kind": torch.tensor([0, 0, 1], dtype=torch.int32),
+        "owned_occurrence_range_idx": torch.tensor([0, 0, 1], dtype=torch.int32),
+        "owned_occurrence_tile_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "owned_occurrence_col_idx": torch.tensor([0, 1, 2], dtype=torch.int32),
+    }
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED_MAX_ROWS", "3")
+    assert cached_2d._auto_use_cached_backward_key_owned_dkdv(
+        payload,
+        torch.empty((3, 2, 64), dtype=torch.bfloat16),
+    )
+    assert not cached_2d._auto_use_cached_backward_key_owned_dkdv(
+        payload,
+        torch.empty((4, 2, 64), dtype=torch.bfloat16),
+    )
 
 
 def test_cached_2d_range_annotation_materializes_kernel_descriptors(monkeypatch):
@@ -107,7 +217,7 @@ def test_cached_2d_monolithic_forward_requires_complete_fused_tail_payload():
         "exact_kernel_family": "tc8x8",
         "exact_dense_rows_per_range": 8,
         "exact_dense_keys_per_tile": 8,
-        "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]], dtype=torch.int32),
         "q_row_idx": torch.empty((0, 16), dtype=torch.int32),
         "fused_output_row_count": 3,
         "geometry": {"fused_total_coverage_frac": 1.0},
@@ -136,7 +246,7 @@ def test_cached_2d_direct_final_residual_allows_scatter_only_full_coverage():
         "exact_kernel_family": "tc8x8",
         "exact_dense_rows_per_range": 8,
         "exact_dense_keys_per_tile": 8,
-        "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]], dtype=torch.int32),
         "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
         "fused_output_row_count": 4,
         "range_tc_scatter_row_count": 1,
@@ -164,7 +274,43 @@ def test_cached_2d_direct_final_residual_allows_scatter_only_full_coverage():
     )
 
 
-def test_cached_2d_direct_final_residual_rejects_packed_residual_groups():
+def test_cached_2d_direct_final_residual_allows_exact_dense_base_coverage():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "fused_output_row_count": 0,
+        "exact_dense_output_row_count": 4,
+        "range_tc_scatter_row_count": 1,
+        "range_scatter_row_count": 1,
+        "range_packed_group_count": 0,
+        "range_tc_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.0},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+
+
+def test_cached_2d_direct_final_residual_allows_packed_residual_with_full_fused_coverage():
     payload = {
         "total_rows": 6,
         "residual_mode": "fused_tail",
@@ -173,13 +319,13 @@ def test_cached_2d_direct_final_residual_rejects_packed_residual_groups():
         "exact_dense_keys_per_tile": 8,
         "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
         "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
-        "fused_output_row_count": 4,
-        "range_tc_scatter_row_count": 1,
-        "range_scatter_row_count": 1,
+        "fused_output_row_count": 6,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 0,
         "range_packed_group_count": 1,
-        "range_tc_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
-        "range_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
-        "range_packed_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.tensor([[4, 5, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
         "geometry": {"fused_total_coverage_frac": 0.8},
     }
 
@@ -195,5 +341,130 @@ def test_cached_2d_direct_final_residual_rejects_packed_residual_groups():
             FakeCudaTensor(),
             FakeCudaTensor(),
         )
-        == "packed_residual_groups_present"
+        is None
+    )
+
+    payload["fused_output_row_count"] = 4
+    payload["fused_q_row_idx"] = torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32)
+    payload["range_packed_q_row_idx"] = torch.tensor([[4, 5, -1, -1, -1, -1, -1, -1]], dtype=torch.int32)
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+
+    payload["fused_output_row_count"] = 6
+    payload["fused_q_row_idx"] = torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]], dtype=torch.int32)
+    payload["range_scatter_row_count"] = 1
+    payload["range_scatter_q_row_idx"] = torch.tensor([[4, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32)
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+
+    payload["fused_output_row_count"] = 4
+    payload["fused_q_row_idx"] = torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32)
+    payload["range_packed_q_row_idx"] = torch.tensor([[3, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32)
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        == "mixed_residual_incomplete_direct_final_row_coverage"
+    )
+
+
+def test_cached_2d_direct_final_residual_initializes_missing_packed_rows():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
+        "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "fused_output_row_count": 4,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 0,
+        "range_packed_group_count": 1,
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.tensor([[4, 5, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+    missing = cached_2d._get_direct_final_missing_init_row_idx(payload, torch.device("cpu"))
+    assert missing.tolist() == [4, 5]
+
+
+def test_cached_2d_direct_final_residual_initializes_missing_mixed_rows():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
+        "q_row_idx": torch.empty((2, 16), dtype=torch.int32),
+        "fused_output_row_count": 4,
+        "range_tc_scatter_row_count": 1,
+        "range_scatter_row_count": 0,
+        "range_packed_group_count": 1,
+        "range_tc_scatter_q_row_idx": torch.tensor([[4, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.tensor([[5, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+    missing = cached_2d._get_direct_final_missing_init_row_idx(payload, torch.device("cpu"))
+    assert missing.tolist() == [4, 5]
+
+    payload["range_packed_q_row_idx"] = torch.tensor([[3, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32)
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        == "mixed_residual_incomplete_direct_final_row_coverage"
     )

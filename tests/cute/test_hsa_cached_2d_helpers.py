@@ -138,7 +138,7 @@ def test_cached_packing_policy_allows_wide_2d_union_but_not_wide_direct():
         raise AssertionError("expected max_union_k_direct >128 to be rejected")
 
 
-def test_synthetic_2d_masked_fwd_gate_allows_k2048_d64_and_d128(monkeypatch):
+def test_synthetic_2d_masked_fwd_gate_allows_k2048_d64_and_caps_d128(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for direct 2D gate test")
 
@@ -146,15 +146,113 @@ def test_synthetic_2d_masked_fwd_gate_allows_k2048_d64_and_d128(monkeypatch):
 
     monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_GATHER_MAX_PACKED_K", raising=False)
     monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_GATHER_D128", raising=False)
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K", raising=False)
     q64 = torch.empty((1, 8, 64), dtype=torch.bfloat16, device="cuda")
     assert _can_use_synthetic_2d_masked_fwd(q64, q64, q64, packed_q=16, packed_k=2048)
     assert not _can_use_synthetic_2d_masked_fwd(q64, q64, q64, packed_q=16, packed_k=2049)
 
     q128 = torch.empty((1, 8, 128), dtype=torch.bfloat16, device="cuda")
-    assert _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=2048)
+    assert _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=128)
+    assert not _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=129)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K", "256")
+    assert _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=256)
+    assert not _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=257)
+
+    payload = {
+        "union_kernel": "tc16x32",
+        "packed_q": 16,
+        "tile_k": 32,
+        "support_rows": 128,
+        "q_length": torch.full((1,), 16, dtype=torch.int32, device="cuda"),
+    }
+    range_entry = {"family": "union_2d", "scatter_only": True}
+    assert cached_2d._can_use_cached_union_tc(
+        payload,
+        q128,
+        q128,
+        q128,
+        group_start=0,
+        group_end=1,
+        range_entry=range_entry,
+    )
+    payload["support_rows"] = 129
+    assert not cached_2d._can_use_cached_union_tc(
+        payload,
+        q128,
+        q128,
+        q128,
+        group_start=0,
+        group_end=1,
+        range_entry=range_entry,
+    )
 
     monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_GATHER_D128", "0")
-    assert not _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=2048)
+    assert not _can_use_synthetic_2d_masked_fwd(q128, q128, q128, packed_q=16, packed_k=128)
+
+
+def test_synthetic_2d_masked_gather_scatter_tc_d128_matches_scalar(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for D128 TC direct 2D correctness test")
+
+    from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+        _run_synthetic_2d_masked_gather_scatter_fwd_kernel,
+        _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel,
+    )
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_GATHER_D128", raising=False)
+    torch.manual_seed(124)
+    groups, packed_q, packed_k, num_heads, head_dim = 1, 16, 32, 2, 128
+    softmax_scale = head_dim**-0.5
+    q_rows = torch.randn(groups * packed_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k_rows = torch.randn(groups * packed_k, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    v_rows = torch.randn(groups * packed_k, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    q_row_idx = torch.arange(groups * packed_q, dtype=torch.int32, device="cuda").view(groups, packed_q)
+    k_row_idx = torch.arange(groups * packed_k, dtype=torch.int32, device="cuda").view(groups, packed_k)
+    q_length = torch.full((groups,), packed_q, dtype=torch.int32, device="cuda")
+    k_length = torch.full((groups,), packed_k, dtype=torch.int32, device="cuda")
+    mask_words_cpu = torch.zeros((groups, packed_q, (packed_k + 31) // 32), dtype=torch.int32)
+    for q_idx in range(packed_q):
+        for k_idx in range(packed_k):
+            if (k_idx + 3 * q_idx) % 5 != 0:
+                word_idx, bit_idx = divmod(k_idx, 32)
+                mask_words_cpu[0, q_idx, word_idx] |= 1 << bit_idx
+    mask_words = mask_words_cpu.to("cuda")
+    out_scalar = torch.empty((groups * packed_q, num_heads, head_dim), dtype=torch.float32, device="cuda")
+    lse_scalar = torch.empty((groups * packed_q, num_heads), dtype=torch.float32, device="cuda")
+    out_tc = torch.empty_like(out_scalar)
+    lse_tc = torch.empty_like(lse_scalar)
+
+    _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        out_scalar,
+        lse_scalar,
+        softmax_scale=softmax_scale,
+    )
+    _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
+        q_rows,
+        k_rows,
+        v_rows,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        out_tc,
+        lse_tc,
+        softmax_scale=softmax_scale,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_tc, out_scalar, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(lse_tc, lse_scalar, rtol=1e-5, atol=2e-5)
 
 
 def test_synthetic_2d_masked_gather_d128_matches_dense_partial_mask(monkeypatch):
@@ -214,6 +312,26 @@ def test_synthetic_2d_masked_gather_d128_matches_dense_partial_mask(monkeypatch)
 
     torch.testing.assert_close(out, ref_out, rtol=0, atol=2e-5)
     torch.testing.assert_close(lse, ref_lse, rtol=0, atol=2e-5)
+
+
+def test_cached_fused_grad_helper_auto_gate_uses_row_threshold(monkeypatch):
+    name = "FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(f"{name}_MAX_ROWS", raising=False)
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_HELPER_MAX_ROWS", raising=False)
+
+    assert cached_2d._use_cached_fused_grad_helper(name, torch.arange(4096, dtype=torch.int32))
+    assert not cached_2d._use_cached_fused_grad_helper(name, torch.arange(4097, dtype=torch.int32))
+
+    monkeypatch.setenv(f"{name}_MAX_ROWS", "8")
+    assert cached_2d._use_cached_fused_grad_helper(name, torch.arange(8, dtype=torch.int32))
+    assert not cached_2d._use_cached_fused_grad_helper(name, torch.arange(9, dtype=torch.int32))
+
+    monkeypatch.setenv(name, "1")
+    assert cached_2d._use_cached_fused_grad_helper(name, torch.arange(9, dtype=torch.int32))
+
+    monkeypatch.setenv(name, "0")
+    assert not cached_2d._use_cached_fused_grad_helper(name, torch.arange(8, dtype=torch.int32))
 
 
 def test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload():
@@ -554,6 +672,34 @@ def test_cached_2d_monolithic_forward_requires_complete_fused_tail_payload():
     assert cached_2d._cached_monolithic_forward_support_reason(payload, FakeCudaTensor(), FakeCudaTensor(), FakeCudaTensor()) is None
 
 
+def test_cached_2d_forward_prefers_monolithic_clean_fused_tail(monkeypatch):
+    payload = {
+        "status": "ready",
+        "packed_q": 16,
+        "support_rows": 32,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
+        "exact_dense_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+    }
+    q = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    calls = []
+
+    def monolithic(*args, **kwargs):
+        calls.append("monolithic")
+        return "monolithic"
+
+    def direct_final(*args, **kwargs):
+        raise AssertionError("direct-final residual path should not run for clean fused-tail payloads")
+
+    monkeypatch.setattr(cached_2d, "_run_cached_monolithic_fused_tail_forward", monolithic)
+    monkeypatch.setattr(cached_2d, "_run_cached_direct_final_residual_forward", direct_final)
+
+    assert cached_2d.run_cached_direct_2d_forward(payload, q, k, v) == "monolithic"
+    assert calls == ["monolithic"]
+
+
 def test_cached_2d_direct_final_residual_allows_scatter_only_full_coverage():
     payload = {
         "total_rows": 6,
@@ -603,8 +749,14 @@ def test_cached_2d_direct_final_residual_allows_exact_dense_base_coverage():
         "range_tc_scatter_row_count": 1,
         "range_scatter_row_count": 1,
         "range_packed_group_count": 0,
-        "range_tc_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
-        "range_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.tensor(
+            [[4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]],
+            dtype=torch.int32,
+        ),
+        "range_scatter_q_row_idx": torch.tensor(
+            [[5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]],
+            dtype=torch.int32,
+        ),
         "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
         "geometry": {"fused_total_coverage_frac": 0.0},
     }

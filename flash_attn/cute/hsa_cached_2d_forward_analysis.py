@@ -138,6 +138,24 @@ def _is_env_enabled(name: str, default: str = "auto") -> bool:
     return _env_mode(name, default=default) != "off"
 
 
+def _use_cached_fused_grad_helper(name: str, row_idx: torch.Tensor, *, default_max_rows: int = 4096) -> bool:
+    mode = _env_mode(name)
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    try:
+        max_rows = int(
+            os.environ.get(
+                f"{name}_MAX_ROWS",
+                os.environ.get("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_HELPER_MAX_ROWS", str(default_max_rows)),
+            )
+        )
+    except ValueError:
+        max_rows = default_max_rows
+    return int(row_idx.numel()) <= max(0, max_rows)
+
+
 def _extract_bucket_live_row_supports(
     direct_plan: dict[str, Any],
     row_plan: dict[str, Any],
@@ -3316,7 +3334,7 @@ def _finalize_cached_backward_grads(
     dq = torch.empty_like(q_flat)
     dk = torch.empty_like(k_flat)
     dv = torch.empty_like(v_flat)
-    if q_flat.is_cuda and _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE"):
+    if q_flat.is_cuda and _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE", row_idx):
         _run_cached_cast_three_rows_kernel(dq_acc, dk_acc, dv_acc, row_idx, dq, dk, dv)
     else:
         _run_cached_cast_rows_kernel(dq_acc, row_idx, dq)
@@ -3335,7 +3353,7 @@ def _finalize_cached_backward_kv_grads(
     row_idx = _get_cached_all_row_idx(payload, k_flat.device)
     dk = torch.empty_like(k_flat)
     dv = torch.empty_like(v_flat)
-    if k_flat.is_cuda and _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE"):
+    if k_flat.is_cuda and _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE", row_idx):
         _run_cached_cast_two_rows_kernel(dk_acc, dv_acc, row_idx, dk, dv)
     else:
         _run_cached_cast_rows_kernel(dk_acc, row_idx, dk)
@@ -3510,7 +3528,7 @@ def _zero_cached_backward_kv_accum_buffers(
 ) -> None:
     if k_flat.is_cuda:
         all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
-        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+        if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
             return
         _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
@@ -3528,7 +3546,7 @@ def _zero_cached_backward_kv_final_buffers(
 ) -> None:
     if k_flat.is_cuda:
         all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
-        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+        if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_two_rows_kernel(all_row_idx, dk, dv)
             return
         _run_cached_zero_rows_kernel(all_row_idx, dk)
@@ -3592,13 +3610,13 @@ def _zero_cached_backward_accum_buffers(
     if q_flat.is_cuda:
         all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
         if _cached_backward_dq_overwrites_all_rows(payload, q_flat):
-            if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+            if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
                 _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
                 return
             _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
             _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
             return
-        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+        if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_three_rows_kernel(all_row_idx, dq_acc, dk_acc, dv_acc)
             return
         _run_cached_zero_rows_kernel(all_row_idx, dq_acc)
@@ -3638,7 +3656,11 @@ def _can_use_cached_union_tc(
         return False
     if int(payload["packed_q"]) != 16 or int(payload.get("tile_k", 32)) != 32:
         return False
-    if int(q_flat.shape[-1]) != 64 or int(k_flat.shape[-1]) != 64 or int(v_flat.shape[-1]) != 64:
+    if (
+        int(q_flat.shape[-1]) not in (64, 128)
+        or int(k_flat.shape[-1]) != int(q_flat.shape[-1])
+        or int(v_flat.shape[-1]) != int(q_flat.shape[-1])
+    ):
         return False
     if int(payload["support_rows"]) <= 0 or int(payload["support_rows"]) > 128:
         return False

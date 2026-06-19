@@ -57,6 +57,7 @@ from .hsa_explicit_2d_sparse_analysis import (
 )
 from .hsa_cached_2d_forward_analysis import (
     CachedPackingPolicy,
+    attach_precomputed_cached_generalized_forward_payload,
     build_cached_direct_2d_forward_payload,
     build_cached_generalized_packed_forward_payload,
     run_cached_direct_2d_forward,
@@ -153,6 +154,7 @@ __all__ = [
     "CachedPackingPolicy",
     "build_cached_direct_2d_forward_payload",
     "build_cached_generalized_packed_forward_payload",
+    "attach_precomputed_cached_generalized_forward_payload",
     "scatter_explicit_packed_rows",
     "run_cached_direct_2d_forward",
     "run_cached_generalized_packed_forward",

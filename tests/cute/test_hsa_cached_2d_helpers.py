@@ -55,6 +55,50 @@ def test_cached_2d_flat_row_idx_uses_precomputed_payload_slice():
     assert row_idx.tolist() == [2, -1, 3, 4]
 
 
+def test_attach_precomputed_cached_payload_preserves_container_and_clears_caches():
+    class Schedule:
+        pass
+
+    schedule = Schedule()
+    schedule._precomputed_forward_direct_plan_payload = {
+        "version": 7,
+        "entries": [
+            {
+                "forward_block_q": 128,
+                "logical_block_q": 64,
+                "logical_block_k": 64,
+                "max_packed_k": 128,
+                "max_direct_segments": 4,
+                "direct_execution_plan": {"kept": True},
+            }
+        ],
+    }
+    schedule._precomputed_cached_generalized_forward_payload_device_cache = {"stale": object()}
+    schedule._resolved_cached_generalized_forward_payload_fast_cache = {"stale": object()}
+    schedule._resolved_cached_generalized_forward_payload_cache = {"stale": object()}
+    cached_payload = {"status": "ready", "reason": "unit"}
+
+    returned = cached_2d.attach_precomputed_cached_generalized_forward_payload(
+        schedule,
+        cached_payload,
+        forward_block_q=128,
+        logical_block_q=64,
+        logical_block_k=64,
+        max_packed_k=128,
+        max_direct_segments=4,
+    )
+
+    assert returned is schedule
+    container = schedule._precomputed_forward_direct_plan_payload
+    assert container["version"] == 7
+    assert len(container["entries"]) == 1
+    assert container["entries"][0]["direct_execution_plan"] == {"kept": True}
+    assert container["entries"][0]["cached_generalized_forward_payload"] is cached_payload
+    assert not hasattr(schedule, "_precomputed_cached_generalized_forward_payload_device_cache")
+    assert not hasattr(schedule, "_resolved_cached_generalized_forward_payload_fast_cache")
+    assert not hasattr(schedule, "_resolved_cached_generalized_forward_payload_cache")
+
+
 def test_cached_2d_monolithic_forward_requires_complete_fused_tail_payload():
     q = torch.empty((4, 2, 64), dtype=torch.bfloat16)
     payload = {

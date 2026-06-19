@@ -8,6 +8,7 @@ import torch
 
 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _can_use_synthetic_2d_masked_fwd,
+    _run_cached_cast_two_rows_kernel,
     _run_cached_cast_three_rows_kernel,
     _run_cached_cast_rows_kernel,
     _run_cached_finalize_output_rows_kernel,
@@ -20,6 +21,7 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_synthetic_2d_exact_tail_gather_scatter_tc_fwd_kernel,
     _run_synthetic_combine_scatter_rows_kernel,
     _run_synthetic_2d_masked_fwd_kernel,
+    _run_synthetic_2d_masked_gather_combine_fwd_kernel,
     _run_synthetic_2d_masked_gather_fwd_kernel,
     _run_synthetic_2d_masked_gather_scatter_fwd_kernel,
     _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel,
@@ -1249,7 +1251,7 @@ def _finalize_generalized_cached_forward_payload(
     exact_keys_per_tile: int = 16,
     exact_min_rows: int = 8,
     residual_mode: str = "masked_union",
-    include_mask_bool: bool = True,
+    include_mask_bool: bool = False,
 ) -> dict[str, Any]:
     group_count = len(group_q_rows)
     exact_ranges = [] if exact_ranges is None else exact_ranges
@@ -1483,6 +1485,7 @@ def _finalize_generalized_cached_forward_payload(
             "fused_tail_hardware_fill": float(fused_tail_live_pairs) / max(1, fused_tail_slots),
             "tail_only_range_count": int(tail_only_range_count),
             "legacy_residual_fallback_range_count": int(legacy_union_group_count),
+            "cached_payload_includes_mask_bool": bool(include_mask_bool),
         }
     )
     payload = {
@@ -1550,7 +1553,7 @@ def build_cached_generalized_packed_forward_payload(
     *,
     policy: CachedPackingPolicy | None = None,
     policy_overrides: dict[str, Any] | None = None,
-    include_mask_bool: bool = True,
+    include_mask_bool: bool = False,
 ) -> dict[str, Any]:
     q_flat = _flatten_row_tensor(q)
     k_flat = _flatten_row_tensor(k)
@@ -1946,7 +1949,7 @@ def build_cached_direct_2d_forward_payload(
     max_merged_support_rows: int = 128,
     max_merged_support_growth_ratio: float = 999.0,
     max_merged_support_increase: int = 1_000_000,
-    include_mask_bool: bool = True,
+    include_mask_bool: bool = False,
 ) -> dict[str, Any]:
     q_flat = _flatten_row_tensor(q)
     k_flat = _flatten_row_tensor(k)
@@ -2205,6 +2208,77 @@ def build_cached_direct_2d_forward_payload(
         if isinstance(backward_payload, dict):
             payload["cached_generalized_backward_payload"] = backward_payload
     return payload
+
+
+def attach_precomputed_cached_generalized_forward_payload(
+    schedule: Any,
+    cached_payload: dict[str, Any],
+    *,
+    forward_block_q: int,
+    logical_block_q: int = -1,
+    logical_block_k: int = -1,
+    max_packed_k: int = -1,
+    max_direct_segments: int = -1,
+    replace: bool = True,
+) -> Any:
+    """Attach a prebuilt cached generalized payload to a schedule.
+
+    This keeps schedule/payload construction out of the per-step path while
+    preserving the resolver format consumed by the HSA runtime.
+    """
+
+    if not isinstance(cached_payload, dict) or cached_payload.get("status") != "ready":
+        raise ValueError("cached_payload must be a ready cached generalized forward payload")
+    entry = {
+        "forward_block_q": int(forward_block_q),
+        "logical_block_q": int(logical_block_q),
+        "logical_block_k": int(logical_block_k),
+        "max_packed_k": int(max_packed_k),
+        "max_direct_segments": int(max_direct_segments),
+        "cached_generalized_forward_payload": cached_payload,
+    }
+    container = getattr(schedule, "_precomputed_forward_direct_plan_payload", None)
+    next_container = dict(container) if isinstance(container, dict) else {}
+    entries = []
+    if isinstance(container, dict) and isinstance(container.get("entries"), list):
+        entries = list(container["entries"])
+    match_key = (
+        int(forward_block_q),
+        int(logical_block_q),
+        int(logical_block_k),
+        int(max_packed_k),
+        int(max_direct_segments),
+    )
+    replaced = False
+    if replace:
+        for idx, existing in enumerate(entries):
+            if not isinstance(existing, dict):
+                continue
+            existing_key = (
+                int(existing.get("forward_block_q", -1)),
+                int(existing.get("logical_block_q", -1)),
+                int(existing.get("logical_block_k", -1)),
+                int(existing.get("max_packed_k", -1)),
+                int(existing.get("max_direct_segments", -1)),
+            )
+            if existing_key == match_key:
+                merged = dict(existing)
+                merged.update(entry)
+                entries[idx] = merged
+                replaced = True
+                break
+    if not replaced:
+        entries.append(entry)
+    next_container["entries"] = entries
+    setattr(schedule, "_precomputed_forward_direct_plan_payload", next_container)
+    for attr in (
+        "_precomputed_cached_generalized_forward_payload_device_cache",
+        "_resolved_cached_generalized_forward_payload_fast_cache",
+        "_resolved_cached_generalized_forward_payload_cache",
+    ):
+        if hasattr(schedule, attr):
+            delattr(schedule, attr)
+    return schedule
 
 
 def _build_cached_generalized_masked_union_row_compact_backward_payload(
@@ -2660,6 +2734,28 @@ def _get_cached_backward_accum_buffers(
     return buffers
 
 
+def _get_cached_backward_kv_accum_buffers(
+    payload: dict[str, Any],
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace = _get_cached_backward_workspace(payload)
+    key = (
+        "backward_kv_accum",
+        str(k_flat.device),
+        k_flat.shape,
+        v_flat.shape,
+    )
+    buffers = workspace.get(key)
+    if buffers is None:
+        buffers = (
+            torch.empty_like(k_flat, dtype=torch.float32),
+            torch.empty_like(v_flat, dtype=torch.float32),
+        )
+        workspace[key] = buffers
+    return buffers
+
+
 def _finalize_cached_backward_grads(
     payload: dict[str, Any],
     q_flat: torch.Tensor,
@@ -2682,6 +2778,24 @@ def _finalize_cached_backward_grads(
     return dq, dk, dv
 
 
+def _finalize_cached_backward_kv_grads(
+    payload: dict[str, Any],
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    row_idx = _get_cached_all_row_idx(payload, k_flat.device)
+    dk = torch.empty_like(k_flat)
+    dv = torch.empty_like(v_flat)
+    if k_flat.is_cuda and _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE"):
+        _run_cached_cast_two_rows_kernel(dk_acc, dv_acc, row_idx, dk, dv)
+    else:
+        _run_cached_cast_rows_kernel(dk_acc, row_idx, dk)
+        _run_cached_cast_rows_kernel(dv_acc, row_idx, dv)
+    return dk, dv
+
+
 def _cached_backward_dq_overwrites_all_rows(payload: dict[str, Any], q_flat: torch.Tensor) -> bool:
     if str(payload.get("residual_mode", "")) != "fused_tail":
         return False
@@ -2696,6 +2810,32 @@ def _cached_backward_dq_overwrites_all_rows(payload: dict[str, Any], q_flat: tor
     if int(fused_q_row_idx.shape[0]) <= 0:
         return False
     return True
+
+
+def _use_cached_backward_direct_dq(payload: dict[str, Any], q_flat: torch.Tensor) -> bool:
+    if not q_flat.is_cuda:
+        return False
+    if not _is_env_enabled("FLASH_ATTN_HSA_CACHED_DIRECT_DQ_BWD"):
+        return False
+    return _cached_backward_dq_overwrites_all_rows(payload, q_flat)
+
+
+def _zero_cached_backward_kv_accum_buffers(
+    payload: dict[str, Any],
+    k_flat: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+) -> None:
+    if k_flat.is_cuda:
+        all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
+        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+            _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
+            return
+        _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
+        _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
+        return
+    dk_acc.zero_()
+    dv_acc.zero_()
 
 
 def _zero_cached_backward_accum_buffers(
@@ -3097,6 +3237,28 @@ def _run_cached_masked_payload_forward(
             return
         if kernel_kind != "packed":
             raise RuntimeError(f"unsupported cached 2D range kernel kind: {kernel_kind}")
+        if _can_use_synthetic_2d_masked_fwd(
+            q_flat,
+            k_flat,
+            v_flat,
+            packed_q=packed_q,
+            packed_k=packed_k,
+        ):
+            _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                q_flat,
+                k_flat,
+                v_flat,
+                payload["q_row_idx"][group_start:group_end],
+                payload["k_row_idx"][group_start:group_end],
+                payload["q_length"][group_start:group_end],
+                payload["k_length"][group_start:group_end],
+                payload["mask_words"][group_start:group_end],
+                out_flat,
+                lse_flat,
+                softmax_scale=float(softmax_scale),
+                tile_k=tile_k,
+            )
+            return
         packed_out, packed_lse = _run_range_packed(group_start, group_end)
         range_group_count = group_end - group_start
         packed_out_flat = packed_out.view(range_group_count * packed_q, packed_out.shape[2], packed_out.shape[3]).contiguous()
@@ -3136,7 +3298,7 @@ def _run_cached_masked_payload_forward(
             packed_q=packed_q,
             packed_k=packed_k,
         ):
-            packed_out, packed_lse = _run_synthetic_2d_masked_gather_fwd_kernel(
+            _run_synthetic_2d_masked_gather_combine_fwd_kernel(
                 q_flat,
                 k_flat,
                 v_flat,
@@ -3145,9 +3307,12 @@ def _run_cached_masked_payload_forward(
                 q_length,
                 k_length,
                 mask_words,
+                out_flat,
+                lse_flat,
                 softmax_scale=float(softmax_scale),
                 tile_k=tile_k,
             )
+            return
         else:
             if pack_buffers is None:
                 pack_buffers = _get_cached_direct_2d_pack_buffers(payload, q_flat, k_flat, v_flat)
@@ -4300,8 +4465,6 @@ def run_cached_generalized_packed_backward(
     if softmax_scale is None:
         softmax_scale = q_flat.shape[-1] ** (-0.5)
 
-    dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
-    _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
     if q_flat.is_cuda:
         backward_payload = payload.get("cached_generalized_backward_payload")
         if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":
@@ -4313,6 +4476,8 @@ def run_cached_generalized_packed_backward(
                 _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel,
             )
 
+            dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
+            _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
             _run_synthetic_direct_row_micro_bwd_kernel_row_compact_one_kernel(
                 q_flat,
                 k_flat,
@@ -4350,6 +4515,16 @@ def run_cached_generalized_packed_backward(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
             "1",
         ).strip().lower() not in {"0", "false", "off", "no"}
+        use_direct_dq = _use_cached_backward_direct_dq(payload, q_flat)
+        if use_direct_dq:
+            dq = torch.empty_like(q_flat)
+            dk_acc, dv_acc = _get_cached_backward_kv_accum_buffers(payload, k_flat, v_flat)
+            _zero_cached_backward_kv_accum_buffers(payload, k_flat, dk_acc, dv_acc)
+            dq_rows = dq
+        else:
+            dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
+            _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
+            dq_rows = dq_acc
         backward_payload = None
         if not use_tile_atomic_dkdv:
             backward_payload = payload.get("cached_generalized_backward_payload")
@@ -4384,7 +4559,7 @@ def run_cached_generalized_packed_backward(
             payload["fused_tail_tile_ptr"],
             payload["fused_tail_k_row_idx"],
             payload["fused_tail_mask_words"],
-            dq_acc,
+            dq_rows,
             dk_acc,
             dv_acc,
             softmax_scale=float(softmax_scale),
@@ -4411,6 +4586,13 @@ def run_cached_generalized_packed_backward(
                 softmax_scale=float(softmax_scale),
                 local_k_chunk=local_k_chunk,
             )
+        if use_direct_dq:
+            dk, dv = _finalize_cached_backward_kv_grads(payload, k_flat, v_flat, dk_acc, dv_acc)
+            return (
+                dq.view_as(q),
+                dk.view_as(k),
+                dv.view_as(v),
+            )
         dq, dk, dv = _finalize_cached_backward_grads(payload, q_flat, k_flat, v_flat, dq_acc, dk_acc, dv_acc)
         return (
             dq.view_as(q),
@@ -4418,6 +4600,8 @@ def run_cached_generalized_packed_backward(
             dv.view_as(v),
         )
 
+    dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
+    _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
     fused_q_row_idx = payload["fused_q_row_idx"]
     fused_q_length = payload["fused_q_length"]
     exact_tile_range_idx = _get_tile_range_index(payload, ptr_key="fused_exact_tile_ptr")

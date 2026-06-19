@@ -17,6 +17,14 @@ missing residual-row init, packed residual rows, and mixed scatter+packed
 residuals. The support predicate still rejects duplicate residual rows inside a
 single residual kernel and incomplete mixed residual coverage.
 
+Direct-final residual timing used `_run_cached_direct_final_residual_forward`
+with support predicate checks, rows=1024, heads=8, D=64, support rows=32:
+
+| case | ms | repeat max diff |
+|---|---:|---:|
+| scatter-only full coverage | 0.087682 | 0 |
+| mixed scatter+packed safe coverage | 0.142681 | 0 |
+
 Online combine still uses an FP32 work buffer followed by a final cast. The final
 cast is not safely fused by changing the combine destination to BF16: a
 two-combine probe with BF16 as the work buffer changed final BF16 output by

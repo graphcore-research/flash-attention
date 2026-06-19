@@ -82,6 +82,23 @@ def _flatten_row_tensor(rows: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"expected rank-3 or rank-4 row tensor, got shape {tuple(rows.shape)}")
 
 
+def _env_mode(name: str, default: str = "auto") -> str:
+    value = os.environ.get(name, default).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return "on"
+    if value in {"0", "false", "no", "off"}:
+        return "off"
+    return "auto"
+
+
+def _is_env_forced_on(name: str) -> bool:
+    return _env_mode(name) == "on"
+
+
+def _is_env_enabled(name: str, default: str = "auto") -> bool:
+    return _env_mode(name, default=default) != "off"
+
+
 def _extract_bucket_live_row_supports(
     direct_plan: dict[str, Any],
     row_plan: dict[str, Any],
@@ -1308,6 +1325,12 @@ def _finalize_generalized_cached_forward_payload(
             family_scatter_only_rows[family] = family_scatter_only_rows.get(family, 0) + q_count
 
     if exact_range_count > 0:
+        exact_output_row_count = sum(
+            1
+            for range_entry in exact_ranges
+            for q_row in range_entry.get("q_rows", [])
+            if int(q_row) >= 0
+        )
         exact_q_row_idx, exact_q_length, exact_tile_ptr, exact_k_row_idx = _materialize_exact_dense_range_tensors(
             device=device,
             exact_ranges=exact_ranges,
@@ -1326,8 +1349,15 @@ def _finalize_generalized_cached_forward_payload(
         exact_tile_count = 0
         exact_hardware_slots = 0
         exact_coverage_frac = 0.0
+        exact_output_row_count = 0
         residual_live_pairs = int(geometry_base.get("cached_generalized_live_pairs", 0))
     if fused_range_count > 0:
+        fused_output_row_count = sum(
+            1
+            for range_entry in fused_ranges
+            for q_row in range_entry.get("q_rows", [])
+            if int(q_row) >= 0
+        )
         (
             fused_q_row_idx,
             fused_q_length,
@@ -1360,6 +1390,7 @@ def _finalize_generalized_cached_forward_payload(
         fused_tail_mask_words = torch.empty((0, int(exact_rows_per_range), 1), dtype=torch.int32, device=device)
         tail_only_range_count = 0
         fused_total_live_pairs = int(exact_live_pairs) + int(residual_live_pairs)
+        fused_output_row_count = 0
         fused_tail_tile_count = 0
         fused_tail_slots = 0
     legacy_union_group_count = sum(1 for family in group_families if family == "union_2d")
@@ -1427,6 +1458,7 @@ def _finalize_generalized_cached_forward_payload(
             "union_scalar_fallback_row_count": 0,
             "exact_dense_range_count": exact_range_count,
             "exact_dense_tile_count": exact_tile_count,
+            "exact_dense_output_row_count": int(exact_output_row_count),
             "exact_dense_live_pairs": int(exact_live_pairs),
             "exact_dense_slots": int(exact_hardware_slots),
             "exact_dense_hardware_fill": float(exact_live_pairs) / max(1, exact_hardware_slots),
@@ -1436,6 +1468,7 @@ def _finalize_generalized_cached_forward_payload(
             "exact_kernel_family": str(exact_kernel_family),
             "residual_mode": str(residual_mode),
             "fused_range_count": int(fused_range_count),
+            "fused_output_row_count": int(fused_output_row_count),
             "fused_exact_live_pairs": int(fused_exact_live_pairs),
             "fused_tail_live_pairs": int(fused_tail_live_pairs),
             "fused_exact_coverage_frac": float(fused_exact_live_pairs) / max(1, int(geometry_base.get("cached_generalized_live_pairs", 0))),
@@ -1481,6 +1514,7 @@ def _finalize_generalized_cached_forward_payload(
         "exact_dense_q_length": exact_q_length.contiguous(),
         "exact_dense_tile_ptr": exact_tile_ptr.contiguous(),
         "exact_dense_k_row_idx": exact_k_row_idx.contiguous(),
+        "exact_dense_output_row_count": int(exact_output_row_count),
         "exact_dense_rows_per_range": int(exact_rows_per_range),
         "exact_dense_keys_per_tile": int(exact_keys_per_tile),
         "exact_dense_min_rows": int(exact_min_rows),
@@ -1488,6 +1522,7 @@ def _finalize_generalized_cached_forward_payload(
         "residual_mode": str(residual_mode),
         "fused_q_row_idx": fused_q_row_idx.contiguous(),
         "fused_q_length": fused_q_length.contiguous(),
+        "fused_output_row_count": int(fused_output_row_count),
         "fused_exact_tile_ptr": fused_exact_tile_ptr.contiguous(),
         "fused_exact_k_row_idx": fused_exact_k_row_idx.contiguous(),
         "fused_tail_tile_ptr": fused_tail_tile_ptr.contiguous(),
@@ -2780,7 +2815,7 @@ def _run_cached_fused_exact_tail_ranges(
         lse_flat,
         softmax_scale=float(softmax_scale),
     )
-    return int(fused_q_row_idx.shape[0]), int(fused_q_length.sum().item())
+    return int(fused_q_row_idx.shape[0]), int(payload.get("fused_output_row_count", 0))
 
 
 def _run_cached_exact_dense_ranges(
@@ -2825,7 +2860,7 @@ def _run_cached_exact_dense_ranges(
         softmax_scale=float(softmax_scale),
         kernel_family=exact_family,
     )
-    return int(exact_q_row_idx.shape[0]), int(exact_q_length.sum().item())
+    return int(exact_q_row_idx.shape[0]), int(payload.get("exact_dense_output_row_count", 0))
 
 
 def _run_cached_masked_payload_forward(
@@ -3147,6 +3182,101 @@ def _run_cached_masked_payload_forward(
     return union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
 
 
+def _format_cached_forward_result(
+    q: torch.Tensor,
+    out_final_flat: torch.Tensor,
+    lse_final_flat: torch.Tensor,
+    *,
+    return_lse: bool,
+    lse_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if q.ndim == 4:
+        out = out_final_flat.view(q.shape[0], q.shape[1], q.shape[2], out_final_flat.shape[2])
+        if not return_lse:
+            return out
+        if str(lse_layout) == "flat":
+            return out, lse_final_flat
+        lse = lse_final_flat.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+        return out, lse
+    if not return_lse:
+        return out_final_flat
+    if str(lse_layout) == "flat":
+        return out_final_flat, lse_final_flat
+    return out_final_flat, lse_final_flat.transpose(0, 1).contiguous()
+
+
+def _cached_monolithic_forward_support_reason(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> str | None:
+    if not q_flat.is_cuda:
+        return "requires_cuda"
+    if q_flat.dtype not in {torch.float16, torch.bfloat16}:
+        return f"unsupported_q_dtype_{q_flat.dtype}"
+    if k_flat.dtype != q_flat.dtype or v_flat.dtype != q_flat.dtype:
+        return "mixed_qkv_dtype"
+    if int(q_flat.shape[-1]) != 64 or int(k_flat.shape[-1]) != 64 or int(v_flat.shape[-1]) != 64:
+        return "requires_head_dim_64"
+    if str(payload.get("residual_mode", "")) != "fused_tail":
+        return "requires_fused_tail_residual_mode"
+    if str(payload.get("exact_kernel_family", "")) != "tc8x8":
+        return "requires_tc8x8_exact_kernel"
+    if int(payload.get("exact_dense_rows_per_range", 0)) != 8 or int(payload.get("exact_dense_keys_per_tile", 0)) != 8:
+        return "requires_8x8_exact_tail_tiles"
+    fused_q_row_idx = payload.get("fused_q_row_idx")
+    if not isinstance(fused_q_row_idx, torch.Tensor) or int(fused_q_row_idx.shape[0]) <= 0:
+        return "missing_fused_ranges"
+    if int(getattr(payload.get("q_row_idx"), "shape", [0])[0]) != 0:
+        return "residual_groups_present"
+    if int(payload.get("fused_output_row_count", -1)) != int(payload["total_rows"]):
+        return "incomplete_fused_output_row_coverage"
+    geometry = payload.get("geometry")
+    if isinstance(geometry, dict) and float(geometry.get("fused_total_coverage_frac", 0.0)) < 0.999999:
+        return "incomplete_fused_pair_coverage"
+    return None
+
+
+def _run_cached_monolithic_fused_tail_forward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    *,
+    softmax_scale: float,
+    return_lse: bool,
+    lse_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    env_name = "FLASH_ATTN_HSA_CACHED_MONOLITHIC_FWD"
+    if not _is_env_enabled(env_name):
+        return None
+    support_reason = _cached_monolithic_forward_support_reason(payload, q_flat, k_flat, v_flat)
+    if support_reason is not None:
+        if _is_env_forced_on(env_name):
+            raise RuntimeError(f"cached_monolithic_fwd_unsupported_{support_reason}")
+        return None
+    out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
+    fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(
+        payload,
+        q_flat,
+        k_flat,
+        v_flat,
+        out_final_flat,
+        lse_final_flat,
+        softmax_scale=float(softmax_scale),
+    )
+    if fused_range_count <= 0 or fused_row_count != int(payload["total_rows"]):
+        if _is_env_forced_on(env_name):
+            raise RuntimeError("cached_monolithic_fwd_failed_incomplete_runtime_coverage")
+        return None
+    _record_fused_runtime_geometry(payload, fused_range_count=fused_range_count, fused_row_count=fused_row_count)
+    _record_exact_dense_runtime_geometry(payload, exact_range_count=0, exact_row_count=0)
+    _record_union_runtime_geometry(payload, tc_group_count=0, tc_row_count=0, scalar_group_count=0, scalar_row_count=0)
+    return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
+
+
 def run_cached_direct_2d_forward(
     payload: dict[str, Any],
     q: torch.Tensor,
@@ -3172,6 +3302,19 @@ def run_cached_direct_2d_forward(
     has_fused_ranges = int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
     if not has_exact_dense and not has_fused_ranges and int(payload["q_row_idx"].shape[0]) <= 0:
         raise RuntimeError("cached_direct_2d_forward_empty")
+
+    monolithic_result = _run_cached_monolithic_fused_tail_forward(
+        payload,
+        q,
+        q_flat,
+        k_flat,
+        v_flat,
+        softmax_scale=float(softmax_scale),
+        return_lse=return_lse,
+        lse_layout=lse_layout,
+    )
+    if monolithic_result is not None:
+        return monolithic_result
 
     out_flat, lse_flat = _get_cached_direct_2d_output_buffers(payload, q_flat, v_flat)
     all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
@@ -3227,20 +3370,7 @@ def run_cached_direct_2d_forward(
     )
     out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
     _run_cached_finalize_output_rows_kernel(out_flat, lse_flat, all_row_idx, out_final_flat, lse_final_flat)
-    if q.ndim == 4:
-        out = out_final_flat.view(q.shape[0], q.shape[1], q.shape[2], v.shape[3])
-        if not return_lse:
-            return out
-        if str(lse_layout) == "flat":
-            return out, lse_final_flat
-        lse = lse_final_flat.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
-        return out, lse
-    out = out_final_flat
-    if not return_lse:
-        return out
-    if str(lse_layout) == "flat":
-        return out, lse_final_flat
-    return out, lse_final_flat.transpose(0, 1).contiguous()
+    return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
 
 
 def run_cached_generalized_packed_forward(
@@ -3286,6 +3416,8 @@ def can_use_cached_generalized_fused_backward(
     *,
     deterministic: bool = False,
 ) -> bool:
+    if not _is_env_enabled("FLASH_ATTN_HSA_CACHED_MONOLITHIC_BWD"):
+        return False
     if payload.get("status") != "ready" or deterministic:
         return False
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -3937,6 +4069,8 @@ def run_cached_generalized_packed_backward(
     softmax_scale: float | None = None,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not _is_env_enabled("FLASH_ATTN_HSA_CACHED_MONOLITHIC_BWD"):
+        raise RuntimeError("cached_generalized_fused_backward_disabled")
     if not can_use_cached_generalized_fused_backward(payload, q, k, v, deterministic=deterministic):
         raise RuntimeError("cached_generalized_fused_backward_unsupported")
 

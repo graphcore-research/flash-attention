@@ -53,3 +53,33 @@ def test_cached_2d_flat_row_idx_uses_precomputed_payload_slice():
     )
 
     assert row_idx.tolist() == [2, -1, 3, 4]
+
+
+def test_cached_2d_monolithic_forward_requires_complete_fused_tail_payload():
+    q = torch.empty((4, 2, 64), dtype=torch.bfloat16)
+    payload = {
+        "total_rows": 4,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "fused_output_row_count": 3,
+        "geometry": {"fused_total_coverage_frac": 1.0},
+    }
+
+    assert cached_2d._cached_monolithic_forward_support_reason(payload, q, q, q) == "requires_cuda"
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (4, 2, 64)
+
+    assert (
+        cached_2d._cached_monolithic_forward_support_reason(payload, FakeCudaTensor(), FakeCudaTensor(), FakeCudaTensor())
+        == "incomplete_fused_output_row_coverage"
+    )
+
+    payload["fused_output_row_count"] = 4
+    assert cached_2d._cached_monolithic_forward_support_reason(payload, FakeCudaTensor(), FakeCudaTensor(), FakeCudaTensor()) is None

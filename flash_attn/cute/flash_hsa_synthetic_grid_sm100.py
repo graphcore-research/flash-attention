@@ -3114,6 +3114,878 @@ class FlashHSASynthetic2DMaskedGatherCombineFwdSm100:
                     mLSERows[global_q_row, head_idx] = next_lse.to(mLSERows.element_type)
 
 
+class FlashHSASynthetic2DMaskedFwdD128Sm100:
+    """Masked packed forward for 128-wide Q/K/V buckets."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQPacked.shape[0]
+        grid_y = mQPacked.shape[2]
+        self.kernel(
+            mQPacked,
+            mKPacked,
+            mVPacked,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQPacked: cute.Tensor,
+        mKPacked: cute.Tensor,
+        mVPacked: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQPacked.element_type,
+            cute.make_layout((self.rows_per_cta, 128)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKPacked.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVPacked.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+        dim2 = lane + cute.arch.WARP_SIZE * Int32(2)
+        dim3 = lane + cute.arch.WARP_SIZE * Int32(3)
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(128), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(128)
+            dim_idx = elem_idx - row_idx * Int32(128)
+            if row_idx < q_length:
+                sQ[row_idx, dim_idx] = mQPacked[bucket_idx, row_idx, head_idx, dim_idx]
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            active_row = row_idx < q_length
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+            out2 = Float32(0.0)
+            out3 = Float32(0.0)
+
+            for tile_start in range(0, mKPacked.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(128), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(128)
+                    dim_idx = elem_idx - tile_row * Int32(128)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        sK[tile_row, dim_idx] = mKPacked[bucket_idx, global_key, head_idx, dim_idx]
+                        sV[tile_row, dim_idx] = mVPacked[bucket_idx, global_key, head_idx, dim_idx]
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 128, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    chunk_out2 = Float32(0.0)
+                    chunk_out3 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutPacked.shape[3]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutPacked.shape[3]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                        if dim2 < mOutPacked.shape[3]:
+                            chunk_out2 += prob_k * Float32(sV[k_rel, dim2])
+                        if dim3 < mOutPacked.shape[3]:
+                            chunk_out3 += prob_k * Float32(sV[k_rel, dim3])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    out2 = out2 * prev_scale + chunk_out2 * chunk_scale
+                    out3 = out3 * prev_scale + chunk_out3 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                if row_max == -Float32.inf or row_sum == Float32(0.0):
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim2 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim2] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim3 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim3] = Float32(0.0).to(mOutPacked.element_type)
+                else:
+                    inv_row_sum = Float32(1.0) / row_sum
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = (out0 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = (out1 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim2 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim2] = (out2 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim3 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim3] = (out3 * inv_row_sum).to(mOutPacked.element_type)
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSEPacked.element_type)
+            else:
+                if lane == Int32(0):
+                    mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                if dim0 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                if dim1 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                if dim2 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim2] = Float32(0.0).to(mOutPacked.element_type)
+                if dim3 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim3] = Float32(0.0).to(mOutPacked.element_type)
+
+
+class FlashHSASynthetic2DMaskedGatherFwdD128Sm100:
+    """Masked forward that gathers 128-wide Q/K/V rows in-kernel."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQRowIdx.shape[0]
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutPacked,
+            mLSEPacked,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutPacked: cute.Tensor,
+        mLSEPacked: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQRows.element_type,
+            cute.make_layout((self.rows_per_cta, 128)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+        dim2 = lane + cute.arch.WARP_SIZE * Int32(2)
+        dim3 = lane + cute.arch.WARP_SIZE * Int32(3)
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(128), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(128)
+            dim_idx = elem_idx - row_idx * Int32(128)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    sQ[row_idx, dim_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            active_row = row_idx < q_length
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+            out2 = Float32(0.0)
+            out3 = Float32(0.0)
+
+            for tile_start in range(0, mKRowIdx.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(128), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(128)
+                    dim_idx = elem_idx - tile_row * Int32(128)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        global_k_row = Int32(mKRowIdx[bucket_idx, global_key])
+                        if global_k_row >= Int32(0):
+                            sK[tile_row, dim_idx] = mKRows[global_k_row, head_idx, dim_idx]
+                            sV[tile_row, dim_idx] = mVRows[global_k_row, head_idx, dim_idx]
+                        else:
+                            sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                            sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 128, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    chunk_out2 = Float32(0.0)
+                    chunk_out3 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutPacked.shape[3]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutPacked.shape[3]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                        if dim2 < mOutPacked.shape[3]:
+                            chunk_out2 += prob_k * Float32(sV[k_rel, dim2])
+                        if dim3 < mOutPacked.shape[3]:
+                            chunk_out3 += prob_k * Float32(sV[k_rel, dim3])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    out2 = out2 * prev_scale + chunk_out2 * chunk_scale
+                    out3 = out3 * prev_scale + chunk_out3 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                if row_max == -Float32.inf or row_sum == Float32(0.0):
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim2 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim2] = Float32(0.0).to(mOutPacked.element_type)
+                    if dim3 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim3] = Float32(0.0).to(mOutPacked.element_type)
+                else:
+                    inv_row_sum = Float32(1.0) / row_sum
+                    if dim0 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim0] = (out0 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim1 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim1] = (out1 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim2 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim2] = (out2 * inv_row_sum).to(mOutPacked.element_type)
+                    if dim3 < mOutPacked.shape[3]:
+                        mOutPacked[bucket_idx, row_idx, head_idx, dim3] = (out3 * inv_row_sum).to(mOutPacked.element_type)
+                    if lane == Int32(0):
+                        mLSEPacked[bucket_idx, row_idx, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSEPacked.element_type)
+            else:
+                if lane == Int32(0):
+                    mLSEPacked[bucket_idx, row_idx, head_idx] = -Float32.inf
+                if dim0 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim0] = Float32(0.0).to(mOutPacked.element_type)
+                if dim1 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim1] = Float32(0.0).to(mOutPacked.element_type)
+                if dim2 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim2] = Float32(0.0).to(mOutPacked.element_type)
+                if dim3 < mOutPacked.shape[3]:
+                    mOutPacked[bucket_idx, row_idx, head_idx, dim3] = Float32(0.0).to(mOutPacked.element_type)
+
+
+class FlashHSASynthetic2DMaskedGatherScatterFwdD128Sm100:
+    """Masked gather+scatter forward for 128-wide Q/K/V rows."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQRowIdx.shape[0]
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutRows,
+            mLSERows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQRows.element_type,
+            cute.make_layout((self.rows_per_cta, 128)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+        dim2 = lane + cute.arch.WARP_SIZE * Int32(2)
+        dim3 = lane + cute.arch.WARP_SIZE * Int32(3)
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(128), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(128)
+            dim_idx = elem_idx - row_idx * Int32(128)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    sQ[row_idx, dim_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            global_q_row = Int32(-1)
+            active_row = Boolean(False)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                active_row = global_q_row >= Int32(0)
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+            out2 = Float32(0.0)
+            out3 = Float32(0.0)
+
+            for tile_start in range(0, mKRowIdx.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(128), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(128)
+                    dim_idx = elem_idx - tile_row * Int32(128)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        global_k_row = Int32(mKRowIdx[bucket_idx, global_key])
+                        if global_k_row >= Int32(0):
+                            sK[tile_row, dim_idx] = mKRows[global_k_row, head_idx, dim_idx]
+                            sV[tile_row, dim_idx] = mVRows[global_k_row, head_idx, dim_idx]
+                        else:
+                            sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                            sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 128, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    chunk_out2 = Float32(0.0)
+                    chunk_out3 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutRows.shape[2]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutRows.shape[2]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                        if dim2 < mOutRows.shape[2]:
+                            chunk_out2 += prob_k * Float32(sV[k_rel, dim2])
+                        if dim3 < mOutRows.shape[2]:
+                            chunk_out3 += prob_k * Float32(sV[k_rel, dim3])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    out2 = out2 * prev_scale + chunk_out2 * chunk_scale
+                    out3 = out3 * prev_scale + chunk_out3 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                if row_max == -Float32.inf or row_sum == Float32(0.0):
+                    if lane == Int32(0):
+                        mLSERows[global_q_row, head_idx] = -Float32.inf
+                    if dim0 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim0] = Float32(0.0).to(mOutRows.element_type)
+                    if dim1 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim1] = Float32(0.0).to(mOutRows.element_type)
+                    if dim2 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim2] = Float32(0.0).to(mOutRows.element_type)
+                    if dim3 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim3] = Float32(0.0).to(mOutRows.element_type)
+                else:
+                    inv_row_sum = Float32(1.0) / row_sum
+                    if dim0 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim0] = (out0 * inv_row_sum).to(mOutRows.element_type)
+                    if dim1 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim1] = (out1 * inv_row_sum).to(mOutRows.element_type)
+                    if dim2 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim2] = (out2 * inv_row_sum).to(mOutRows.element_type)
+                    if dim3 < mOutRows.shape[2]:
+                        mOutRows[global_q_row, head_idx, dim3] = (out3 * inv_row_sum).to(mOutRows.element_type)
+                    if lane == Int32(0):
+                        mLSERows[global_q_row, head_idx] = (
+                            row_max + ssa_to_scalar(cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True))
+                        ).to(mLSERows.element_type)
+
+
+class FlashHSASynthetic2DMaskedGatherCombineFwdD128Sm100:
+    """Masked gather forward that online-combines 128-wide rows into an existing FP32 destination."""
+
+    arch = 100
+
+    def __init__(self, *, rows_per_cta: int, tile_k: int = 32):
+        self.rows_per_cta = rows_per_cta
+        self.tile_k = tile_k
+        self.num_threads = 32 * rows_per_cta
+
+    @cute.jit
+    def __call__(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        grid_x = mQRowIdx.shape[0]
+        grid_y = mQRows.shape[1]
+        self.kernel(
+            mQRows,
+            mKRows,
+            mVRows,
+            mQRowIdx,
+            mKRowIdx,
+            mQLength,
+            mKLength,
+            mMaskWords,
+            softmax_scale,
+            mOutRows,
+            mLSERows,
+        ).launch(
+            grid=[grid_x, grid_y, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mQRows: cute.Tensor,
+        mKRows: cute.Tensor,
+        mVRows: cute.Tensor,
+        mQRowIdx: cute.Tensor,
+        mKRowIdx: cute.Tensor,
+        mQLength: cute.Tensor,
+        mKLength: cute.Tensor,
+        mMaskWords: cute.Tensor,
+        softmax_scale: Float32,
+        mOutRows: cute.Tensor,
+        mLSERows: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bucket_idx, head_idx, _ = cute.arch.block_idx()
+        warp_idx = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        smem = cutlass.utils.SmemAllocator()
+        sQ = smem.allocate_tensor(
+            mQRows.element_type,
+            cute.make_layout((self.rows_per_cta, 128)),
+            byte_alignment=16,
+        )
+        sK = smem.allocate_tensor(
+            mKRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        sV = smem.allocate_tensor(
+            mVRows.element_type,
+            cute.make_layout((self.tile_k, 128)),
+            byte_alignment=16,
+        )
+        dim0 = lane
+        dim1 = lane + cute.arch.WARP_SIZE
+        dim2 = lane + cute.arch.WARP_SIZE * Int32(2)
+        dim3 = lane + cute.arch.WARP_SIZE * Int32(3)
+
+        q_length = Int32(mQLength[bucket_idx])
+        for elem_idx in cutlass.range(tidx, Int32(self.rows_per_cta) * Int32(128), self.num_threads, unroll=1):
+            row_idx = elem_idx // Int32(128)
+            dim_idx = elem_idx - row_idx * Int32(128)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                if global_q_row >= Int32(0):
+                    sQ[row_idx, dim_idx] = mQRows[global_q_row, head_idx, dim_idx]
+                else:
+                    sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+            else:
+                sQ[row_idx, dim_idx] = Float32(0.0).to(sQ.element_type)
+        cute.arch.barrier()
+
+        if warp_idx < Int32(self.rows_per_cta):
+            row_idx = warp_idx
+            global_q_row = Int32(-1)
+            active_row = Boolean(False)
+            if row_idx < q_length:
+                global_q_row = Int32(mQRowIdx[bucket_idx, row_idx])
+                active_row = global_q_row >= Int32(0)
+            k_length = Int32(mKLength[bucket_idx])
+            row_max = -Float32.inf
+            row_sum = Float32(0.0)
+            out0 = Float32(0.0)
+            out1 = Float32(0.0)
+            out2 = Float32(0.0)
+            out3 = Float32(0.0)
+
+            for tile_start in range(0, mKRowIdx.shape[1], self.tile_k):
+                for elem_idx in cutlass.range(tidx, Int32(self.tile_k) * Int32(128), self.num_threads, unroll=1):
+                    tile_row = elem_idx // Int32(128)
+                    dim_idx = elem_idx - tile_row * Int32(128)
+                    global_key = Int32(tile_start) + tile_row
+                    if global_key < k_length:
+                        global_k_row = Int32(mKRowIdx[bucket_idx, global_key])
+                        if global_k_row >= Int32(0):
+                            sK[tile_row, dim_idx] = mKRows[global_k_row, head_idx, dim_idx]
+                            sV[tile_row, dim_idx] = mVRows[global_k_row, head_idx, dim_idx]
+                        else:
+                            sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                            sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                    else:
+                        sK[tile_row, dim_idx] = Float32(0.0).to(sK.element_type)
+                        sV[tile_row, dim_idx] = Float32(0.0).to(sV.element_type)
+                cute.arch.barrier()
+
+                global_key = Int32(tile_start) + lane
+                key_valid = Boolean(False)
+                score = -Float32.inf
+                if active_row and lane < Int32(self.tile_k) and global_key < k_length:
+                    word_idx = global_key // Int32(32)
+                    bit_idx = global_key % Int32(32)
+                    mask_word = cutlass.Uint32(mMaskWords[bucket_idx, row_idx, word_idx])
+                    bit = utils.shr_u32(mask_word, cutlass.Uint32(bit_idx)) & cutlass.Uint32(1)
+                    key_valid = bit != cutlass.Uint32(0)
+                    if key_valid:
+                        score = Float32(0.0)
+                        for dim_idx in range(0, 128, 4):
+                            score += Float32(sQ[row_idx, dim_idx + 0]) * Float32(sK[lane, dim_idx + 0])
+                            score += Float32(sQ[row_idx, dim_idx + 1]) * Float32(sK[lane, dim_idx + 1])
+                            score += Float32(sQ[row_idx, dim_idx + 2]) * Float32(sK[lane, dim_idx + 2])
+                            score += Float32(sQ[row_idx, dim_idx + 3]) * Float32(sK[lane, dim_idx + 3])
+                        score *= softmax_scale
+                chunk_max = utils.warp_reduce(score, utils.fmax)
+                if chunk_max != -Float32.inf:
+                    prob = Float32(0.0)
+                    if key_valid:
+                        prob = cute.math.exp2((score - chunk_max) * Float32(_LOG2_E), fastmath=True)
+                    chunk_sum = utils.warp_reduce(prob, lambda a, b: a + b)
+                    chunk_out0 = Float32(0.0)
+                    chunk_out1 = Float32(0.0)
+                    chunk_out2 = Float32(0.0)
+                    chunk_out3 = Float32(0.0)
+                    for k_rel in range(cute.arch.WARP_SIZE):
+                        prob_k = utils.shuffle_sync(prob, k_rel)
+                        if dim0 < mOutRows.shape[2]:
+                            chunk_out0 += prob_k * Float32(sV[k_rel, dim0])
+                        if dim1 < mOutRows.shape[2]:
+                            chunk_out1 += prob_k * Float32(sV[k_rel, dim1])
+                        if dim2 < mOutRows.shape[2]:
+                            chunk_out2 += prob_k * Float32(sV[k_rel, dim2])
+                        if dim3 < mOutRows.shape[2]:
+                            chunk_out3 += prob_k * Float32(sV[k_rel, dim3])
+                    next_max = row_max if row_max > chunk_max else chunk_max
+                    prev_scale = Float32(0.0) if row_max == -Float32.inf else cute.math.exp2(
+                        (row_max - next_max) * Float32(_LOG2_E),
+                        fastmath=True,
+                    )
+                    chunk_scale = cute.math.exp2((chunk_max - next_max) * Float32(_LOG2_E), fastmath=True)
+                    out0 = out0 * prev_scale + chunk_out0 * chunk_scale
+                    out1 = out1 * prev_scale + chunk_out1 * chunk_scale
+                    out2 = out2 * prev_scale + chunk_out2 * chunk_scale
+                    out3 = out3 * prev_scale + chunk_out3 * chunk_scale
+                    row_sum = row_sum * prev_scale + chunk_sum * chunk_scale
+                    row_max = next_max
+                cute.arch.barrier()
+
+            if active_row:
+                row_lse = -Float32.inf
+                row_out0 = Float32(0.0)
+                row_out1 = Float32(0.0)
+                row_out2 = Float32(0.0)
+                row_out3 = Float32(0.0)
+                if row_max != -Float32.inf and row_sum != Float32(0.0):
+                    inv_row_sum = Float32(1.0) / row_sum
+                    row_out0 = out0 * inv_row_sum
+                    row_out1 = out1 * inv_row_sum
+                    row_out2 = out2 * inv_row_sum
+                    row_out3 = out3 * inv_row_sum
+                    row_lse = row_max + ssa_to_scalar(
+                        cute.math.log(scalar_to_ssa(row_sum, Float32), fastmath=True)
+                    )
+                prev_lse = Float32(mLSERows[global_q_row, head_idx])
+                max_lse = prev_lse if prev_lse > row_lse else row_lse
+                next_lse = -Float32.inf
+                prev_weight = Float32(0.0)
+                row_weight = Float32(0.0)
+                if max_lse != -Float32.inf:
+                    log2_e = math.log2(math.e)
+                    prev_scale = cute.math.exp2(prev_lse * log2_e - max_lse * log2_e, fastmath=True)
+                    row_scale = cute.math.exp2(row_lse * log2_e - max_lse * log2_e, fastmath=True)
+                    sum_scale = prev_scale + row_scale
+                    next_lse = ssa_to_scalar(cute.math.log(scalar_to_ssa(sum_scale, Float32), fastmath=True)) + max_lse
+                    inv_sum = Float32(0.0) if (sum_scale == Float32(0.0) or sum_scale != sum_scale) else Float32(1.0) / sum_scale
+                    prev_weight = prev_scale * inv_sum
+                    row_weight = row_scale * inv_sum
+                if dim0 < mOutRows.shape[2]:
+                    prev_out0 = Float32(mOutRows[global_q_row, head_idx, dim0])
+                    mOutRows[global_q_row, head_idx, dim0] = (prev_out0 * prev_weight + row_out0 * row_weight).to(
+                        mOutRows.element_type
+                    )
+                if dim1 < mOutRows.shape[2]:
+                    prev_out1 = Float32(mOutRows[global_q_row, head_idx, dim1])
+                    mOutRows[global_q_row, head_idx, dim1] = (prev_out1 * prev_weight + row_out1 * row_weight).to(
+                        mOutRows.element_type
+                    )
+                if dim2 < mOutRows.shape[2]:
+                    prev_out2 = Float32(mOutRows[global_q_row, head_idx, dim2])
+                    mOutRows[global_q_row, head_idx, dim2] = (prev_out2 * prev_weight + row_out2 * row_weight).to(
+                        mOutRows.element_type
+                    )
+                if dim3 < mOutRows.shape[2]:
+                    prev_out3 = Float32(mOutRows[global_q_row, head_idx, dim3])
+                    mOutRows[global_q_row, head_idx, dim3] = (prev_out3 * prev_weight + row_out3 * row_weight).to(
+                        mOutRows.element_type
+                    )
+                if lane == Int32(0):
+                    mLSERows[global_q_row, head_idx] = next_lse.to(mLSERows.element_type)
+
+
 class FlashHSASynthetic2DMaskedGatherScatterTCFwdSm100:
     """Benchmark-only gather+scatter forward with TC score tiles for 16x32 union buckets."""
 
@@ -17538,19 +18410,24 @@ def _can_use_synthetic_2d_masked_fwd(
     packed_k: int,
 ) -> bool:
     try:
-        max_packed_k = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GATHER_MAX_PACKED_K", "1024"))
+        max_packed_k = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GATHER_MAX_PACKED_K", "2048"))
     except ValueError:
         max_packed_k = 128
-    max_packed_k = max(1, min(max_packed_k, 1024))
+    max_packed_k = max(1, min(max_packed_k, 2048))
+    head_dim = int(q_rows.shape[-1])
+    if head_dim == 128:
+        d128_mode = os.environ.get("FLASH_ATTN_HSA_CACHED_GATHER_D128", "1").strip().lower()
+        if d128_mode in {"0", "false", "off", "no"}:
+            return False
     return (
         0 < packed_q <= 16
         and 0 < packed_k <= max_packed_k
         and q_rows.dtype in (torch.float16, torch.bfloat16)
         and k_rows.dtype == q_rows.dtype
         and v_rows.dtype == q_rows.dtype
-        and q_rows.shape[-1] == 64
-        and k_rows.shape[-1] == 64
-        and v_rows.shape[-1] == 64
+        and head_dim in (64, 128)
+        and int(k_rows.shape[-1]) == head_dim
+        and int(v_rows.shape[-1]) == head_dim
         and q_rows.is_cuda
         and k_rows.is_cuda
         and v_rows.is_cuda
@@ -17570,8 +18447,17 @@ def _run_synthetic_2d_masked_fwd_kernel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cute_runtime()
     rows_per_cta = int(q_packed.shape[1])
+    head_dim = int(q_packed.shape[3])
+    if head_dim == 128:
+        kernel_name = "synthetic_2d_masked_fwd_d128_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedFwdD128Sm100
+    elif head_dim == 64:
+        kernel_name = "synthetic_2d_masked_fwd_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedFwdSm100
+    else:
+        raise RuntimeError("synthetic_2d_masked_fwd_unsupported_head_dim")
     compile_key = (
-        "synthetic_2d_masked_fwd_v1",
+        kernel_name,
         q_packed.dtype,
         k_packed.dtype,
         v_packed.dtype,
@@ -17596,7 +18482,7 @@ def _run_synthetic_2d_masked_fwd_kernel(
         device=q_packed.device,
     )
     if compile_key not in _run_synthetic_2d_masked_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
+        kernel = kernel_cls(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_packed),
@@ -17644,8 +18530,17 @@ def _run_synthetic_2d_masked_gather_fwd_kernel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cute_runtime()
     rows_per_cta = int(q_row_idx.shape[1])
+    head_dim = int(q_rows.shape[2])
+    if head_dim == 128:
+        kernel_name = "synthetic_2d_masked_gather_fwd_d128_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherFwdD128Sm100
+    elif head_dim == 64:
+        kernel_name = "synthetic_2d_masked_gather_fwd_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherFwdSm100
+    else:
+        raise RuntimeError("synthetic_2d_masked_gather_fwd_unsupported_head_dim")
     compile_key = (
-        "synthetic_2d_masked_gather_fwd_v1",
+        kernel_name,
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -17670,7 +18565,7 @@ def _run_synthetic_2d_masked_gather_fwd_kernel(
         device=q_rows.device,
     )
     if compile_key not in _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedGatherFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
+        kernel = kernel_cls(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_gather_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -17724,8 +18619,17 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
 ) -> None:
     _require_cute_runtime()
     rows_per_cta = int(q_row_idx.shape[1])
+    head_dim = int(q_rows.shape[2])
+    if head_dim == 128:
+        kernel_name = "synthetic_2d_masked_gather_scatter_fwd_d128_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherScatterFwdD128Sm100
+    elif head_dim == 64:
+        kernel_name = "synthetic_2d_masked_gather_scatter_fwd_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherScatterFwdSm100
+    else:
+        raise RuntimeError("synthetic_2d_masked_gather_scatter_fwd_unsupported_head_dim")
     compile_key = (
-        "synthetic_2d_masked_gather_scatter_fwd_v1",
+        kernel_name,
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -17742,7 +18646,7 @@ def _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
         torch.cuda.get_device_capability(q_rows.device),
     )
     if compile_key not in _run_synthetic_2d_masked_gather_scatter_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedGatherScatterFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
+        kernel = kernel_cls(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_gather_scatter_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -17797,8 +18701,17 @@ def _run_synthetic_2d_masked_gather_combine_fwd_kernel(
 ) -> None:
     _require_cute_runtime()
     rows_per_cta = int(q_row_idx.shape[1])
+    head_dim = int(q_rows.shape[2])
+    if head_dim == 128:
+        kernel_name = "synthetic_2d_masked_gather_combine_fwd_d128_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherCombineFwdD128Sm100
+    elif head_dim == 64:
+        kernel_name = "synthetic_2d_masked_gather_combine_fwd_v1"
+        kernel_cls = FlashHSASynthetic2DMaskedGatherCombineFwdSm100
+    else:
+        raise RuntimeError("synthetic_2d_masked_gather_combine_fwd_unsupported_head_dim")
     compile_key = (
-        "synthetic_2d_masked_gather_combine_fwd_v1",
+        kernel_name,
         q_rows.dtype,
         k_rows.dtype,
         v_rows.dtype,
@@ -17815,7 +18728,7 @@ def _run_synthetic_2d_masked_gather_combine_fwd_kernel(
         torch.cuda.get_device_capability(q_rows.device),
     )
     if compile_key not in _run_synthetic_2d_masked_gather_combine_fwd_kernel.compile_cache:
-        kernel = FlashHSASynthetic2DMaskedGatherCombineFwdSm100(rows_per_cta=rows_per_cta, tile_k=tile_k)
+        kernel = kernel_cls(rows_per_cta=rows_per_cta, tile_k=tile_k)
         _run_synthetic_2d_masked_gather_combine_fwd_kernel.compile_cache[compile_key] = cute.compile(
             kernel,
             to_cute_tensor(q_rows),
@@ -17872,6 +18785,8 @@ def _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
     rows_per_cta = int(q_row_idx.shape[1])
     if rows_per_cta != 16 or int(tile_k) != 32:
         raise RuntimeError("synthetic_2d_masked_gather_scatter_tc_fwd_unsupported_shape")
+    if int(q_rows.shape[2]) != 64 or int(k_rows.shape[2]) != 64 or int(v_rows.shape[2]) != 64:
+        raise RuntimeError("synthetic_2d_masked_gather_scatter_tc_fwd_unsupported_head_dim")
     compile_key = (
         "synthetic_2d_masked_gather_scatter_tc_fwd_v1",
         q_rows.dtype,

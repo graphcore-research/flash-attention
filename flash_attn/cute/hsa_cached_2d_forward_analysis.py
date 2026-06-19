@@ -1034,6 +1034,43 @@ def _coerce_cached_packing_policy(
     return resolved
 
 
+def _runtime_payload_cache(runtime: Any, name: str) -> dict[Any, dict[str, Any]] | None:
+    if runtime is None:
+        return None
+    cache = getattr(runtime, name, None)
+    if cache is None:
+        cache = {}
+        setattr(runtime, name, cache)
+    if not isinstance(cache, dict):
+        return None
+    return cache
+
+
+def _cached_payload_shape_key(
+    *,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    direct_plan: dict[str, Any],
+    row_plan: dict[str, Any],
+    policy_key: tuple[tuple[str, Any], ...],
+    include_mask_bool: bool,
+) -> tuple[Any, ...]:
+    return (
+        str(q_flat.device),
+        tuple(q_flat.shape),
+        tuple(k_flat.shape),
+        tuple(v_flat.shape),
+        q_flat.dtype,
+        k_flat.dtype,
+        v_flat.dtype,
+        id(direct_plan),
+        id(row_plan),
+        policy_key,
+        bool(include_mask_bool),
+    )
+
+
 def _summarize_bucket_support_geometry(
     q_rows: list[int],
     support_lists: list[list[int]],
@@ -1607,6 +1644,21 @@ def build_cached_generalized_packed_forward_payload(
         return {"status": "not_applicable", "reason": "cached direct execution plan is missing a row-compact plan"}
 
     device = q_flat.device
+    policy_key = tuple(sorted(asdict(resolved_policy).items()))
+    payload_cache = _runtime_payload_cache(runtime, "_cached_generalized_packed_forward_payload_cache")
+    payload_cache_key = _cached_payload_shape_key(
+        q_flat=q_flat,
+        k_flat=k_flat,
+        v_flat=v_flat,
+        direct_plan=direct_plan,
+        row_plan=row_plan,
+        policy_key=policy_key,
+        include_mask_bool=include_mask_bool,
+    )
+    if payload_cache is not None:
+        cached_payload = payload_cache.get(payload_cache_key)
+        if isinstance(cached_payload, dict):
+            return cached_payload
     group_q_rows: list[list[int]] = []
     group_k_rows: list[list[int]] = []
     group_mask_words: list[torch.Tensor] = []
@@ -1943,7 +1995,7 @@ def build_cached_generalized_packed_forward_payload(
         },
         "cached_pack_policy": asdict(resolved_policy),
     }
-    return _finalize_generalized_cached_forward_payload(
+    payload = _finalize_generalized_cached_forward_payload(
         device=device,
         q_flat=q_flat,
         k_flat=k_flat,
@@ -1970,6 +2022,9 @@ def build_cached_generalized_packed_forward_payload(
         residual_mode=str(resolved_policy.residual_mode),
         include_mask_bool=include_mask_bool,
     )
+    if payload_cache is not None and payload.get("status") == "ready":
+        payload_cache[payload_cache_key] = payload
+    return payload
 
 
 def build_cached_direct_2d_forward_payload(
@@ -2000,6 +2055,25 @@ def build_cached_direct_2d_forward_payload(
         raise ValueError("max_rows_per_group must be positive")
 
     device = q_flat.device
+    payload_cache = _runtime_payload_cache(runtime, "_cached_direct_2d_forward_payload_cache")
+    payload_cache_key = _cached_payload_shape_key(
+        q_flat=q_flat,
+        k_flat=k_flat,
+        v_flat=v_flat,
+        direct_plan=direct_plan,
+        row_plan=row_plan,
+        policy_key=(
+            ("max_rows_per_group", int(max_rows_per_group)),
+            ("max_merged_support_rows", int(max_merged_support_rows)),
+            ("max_merged_support_growth_ratio", float(max_merged_support_growth_ratio)),
+            ("max_merged_support_increase", int(max_merged_support_increase)),
+        ),
+        include_mask_bool=include_mask_bool,
+    )
+    if payload_cache is not None:
+        cached_payload = payload_cache.get(payload_cache_key)
+        if isinstance(cached_payload, dict):
+            return cached_payload
     group_q_rows: list[list[int]] = []
     group_k_rows: list[list[int]] = []
     group_mask_words: list[torch.Tensor] = []
@@ -2240,6 +2314,8 @@ def build_cached_direct_2d_forward_payload(
         backward_payload = build_cached_generalized_backward_payload(payload)
         if isinstance(backward_payload, dict):
             payload["cached_generalized_backward_payload"] = backward_payload
+    if payload_cache is not None:
+        payload_cache[payload_cache_key] = payload
     return payload
 
 
@@ -2604,6 +2680,13 @@ def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[s
             owned_occurrence_col_idx.append(int(col_idx))
         owned_occurrence_ptr.append(len(owned_occurrence_kind))
 
+    exact_tile_local_k_idx_tensor = torch.tensor(exact_tile_local_k_idx, dtype=torch.int32, device=device)
+    if exact_tile_local_k_idx_tensor.ndim == 1:
+        exact_tile_local_k_idx_tensor = exact_tile_local_k_idx_tensor.reshape(0, 8)
+    tail_tile_local_k_idx_tensor = torch.tensor(tail_tile_local_k_idx, dtype=torch.int32, device=device)
+    if tail_tile_local_k_idx_tensor.ndim == 1:
+        tail_tile_local_k_idx_tensor = tail_tile_local_k_idx_tensor.reshape(0, 8)
+
     return {
         "status": "ready",
         "backward_kernel_family": "cached_tc8x8_fused",
@@ -2613,8 +2696,8 @@ def build_cached_generalized_backward_payload(payload: dict[str, Any]) -> dict[s
         "max_local_k_per_range": max_local_k_per_range,
         "range_local_k_ptr": torch.tensor(range_local_k_ptr, dtype=torch.int32, device=device).contiguous(),
         "range_local_k_row_idx": torch.tensor(range_local_k_row_idx, dtype=torch.int32, device=device).contiguous(),
-        "exact_tile_local_k_idx": torch.tensor(exact_tile_local_k_idx, dtype=torch.int32, device=device).contiguous(),
-        "tail_tile_local_k_idx": torch.tensor(tail_tile_local_k_idx, dtype=torch.int32, device=device).contiguous(),
+        "exact_tile_local_k_idx": exact_tile_local_k_idx_tensor.contiguous(),
+        "tail_tile_local_k_idx": tail_tile_local_k_idx_tensor.contiguous(),
         "owned_k_row_idx": torch.tensor(owned_k_row_idx, dtype=torch.int32, device=device).contiguous(),
         "owned_occurrence_ptr": torch.tensor(owned_occurrence_ptr, dtype=torch.int32, device=device).contiguous(),
         "owned_occurrence_kind": torch.tensor(owned_occurrence_kind, dtype=torch.int32, device=device).contiguous(),
@@ -2848,6 +2931,64 @@ def _direct_final_base_residual_union_row_count(
     if int(residual_rows.numel()) == 0:
         return int(base_rows.numel())
     return int(torch.unique(torch.cat([base_rows, residual_rows]), sorted=False).numel())
+
+
+def _direct_final_requires_online_combine(
+    payload: dict[str, Any],
+    device: torch.device,
+    *,
+    base_source: str = "auto",
+) -> bool:
+    total_rows = int(payload["total_rows"])
+    row_tensors = [
+        payload.get("fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"),
+        payload.get("range_tc_scatter_q_row_idx"),
+        payload.get("range_scatter_q_row_idx"),
+        payload.get("range_packed_q_row_idx"),
+    ]
+    cache_key = (
+        "direct_final_requires_online_combine",
+        str(device),
+        base_source,
+        total_rows,
+        tuple(int(tensor.data_ptr()) if isinstance(tensor, torch.Tensor) else 0 for tensor in row_tensors),
+    )
+    workspace = payload.setdefault("_workspace", {})
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, bool):
+        return cached
+    source_rows: list[torch.Tensor] = []
+    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    if int(base_rows.numel()) > 0:
+        source_rows.append(base_rows)
+    for key in (
+        "range_tc_scatter_q_row_idx",
+        "range_scatter_q_row_idx",
+        "range_packed_q_row_idx",
+    ):
+        tensor = payload.get(key)
+        if not isinstance(tensor, torch.Tensor) or int(tensor.numel()) == 0:
+            continue
+        rows = tensor.reshape(-1).to(device=device, dtype=torch.int32)
+        rows = rows[(rows >= 0) & (rows < total_rows)]
+        if int(rows.numel()) == 0:
+            continue
+        unique_rows = torch.unique(rows, sorted=True)
+        if int(unique_rows.numel()) != int(rows.numel()):
+            if isinstance(workspace, dict):
+                workspace[cache_key] = True
+            return True
+        source_rows.append(unique_rows)
+    seen: torch.Tensor | None = None
+    for rows in source_rows:
+        if seen is not None and int(seen.numel()) > 0 and bool(torch.isin(rows, seen).any().item()):
+            if isinstance(workspace, dict):
+                workspace[cache_key] = True
+            return True
+        seen = rows if seen is None else torch.unique(torch.cat([seen, rows]), sorted=True)
+    if isinstance(workspace, dict):
+        workspace[cache_key] = False
+    return False
 
 
 def _slice_cached_flat_row_idx(
@@ -3108,9 +3249,25 @@ def _cached_backward_dq_overwrites_all_rows(payload: dict[str, Any], q_flat: tor
 def _use_cached_backward_direct_dq(payload: dict[str, Any], q_flat: torch.Tensor) -> bool:
     if not q_flat.is_cuda:
         return False
-    if not _is_env_enabled("FLASH_ATTN_HSA_CACHED_DIRECT_DQ_BWD"):
+    mode = _env_mode("FLASH_ATTN_HSA_CACHED_DIRECT_DQ_BWD", default="auto")
+    if mode == "off":
         return False
-    return _cached_backward_dq_overwrites_all_rows(payload, q_flat)
+    if not _cached_backward_dq_overwrites_all_rows(payload, q_flat):
+        return False
+    if mode == "on":
+        return True
+    row_count = int(q_flat.shape[0])
+    try:
+        tiny_rows = int(os.environ.get("FLASH_ATTN_HSA_CACHED_DIRECT_DQ_BWD_TINY_ROWS", "128"))
+    except ValueError:
+        tiny_rows = 128
+    if row_count <= max(0, tiny_rows):
+        return True
+    try:
+        min_rows = int(os.environ.get("FLASH_ATTN_HSA_CACHED_DIRECT_DQ_BWD_MIN_ROWS", "4096"))
+    except ValueError:
+        min_rows = 4096
+    return row_count >= max(0, min_rows)
 
 
 def _zero_cached_backward_kv_accum_buffers(
@@ -3249,6 +3406,8 @@ def _can_use_cached_union_tc(
         return False
     if int(payload["packed_q"]) != 16 or int(payload.get("tile_k", 32)) != 32:
         return False
+    if int(q_flat.shape[-1]) != 64 or int(k_flat.shape[-1]) != 64 or int(v_flat.shape[-1]) != 64:
+        return False
     if int(payload["support_rows"]) <= 0 or int(payload["support_rows"]) > 128:
         return False
     if not _can_use_synthetic_2d_masked_fwd(
@@ -3314,6 +3473,7 @@ def _record_cached_forward_path(
     *,
     path: str,
     reason: str | None = None,
+    **metrics: int | float | str,
 ) -> None:
     geometry = payload.get("geometry")
     if not isinstance(geometry, dict):
@@ -3321,6 +3481,8 @@ def _record_cached_forward_path(
     geometry["cached_forward_runtime_path"] = str(path)
     if reason is not None:
         geometry["cached_forward_runtime_fallback_reason"] = str(reason)
+    for key, value in metrics.items():
+        geometry[f"cached_forward_runtime_{key}"] = value
 
 
 def _run_cached_fused_exact_tail_ranges(
@@ -3744,38 +3906,70 @@ def _run_cached_masked_payload_forward(
     if all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
         tc_q_row_idx = payload["range_tc_scatter_q_row_idx"]
         if int(tc_q_row_idx.shape[0]) > 0:
-            _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
-                q_flat,
-                k_flat,
-                v_flat,
-                tc_q_row_idx,
-                payload["range_tc_scatter_k_row_idx"],
-                payload["range_tc_scatter_q_length"],
-                payload["range_tc_scatter_k_length"],
-                payload["range_tc_scatter_mask_words"],
-                out_flat,
-                lse_flat,
-                softmax_scale=float(softmax_scale),
-                tile_k=tile_k,
-            )
+            if force_combine_scatter:
+                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    tc_q_row_idx,
+                    payload["range_tc_scatter_k_row_idx"],
+                    payload["range_tc_scatter_q_length"],
+                    payload["range_tc_scatter_k_length"],
+                    payload["range_tc_scatter_mask_words"],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
+            else:
+                _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    tc_q_row_idx,
+                    payload["range_tc_scatter_k_row_idx"],
+                    payload["range_tc_scatter_q_length"],
+                    payload["range_tc_scatter_k_length"],
+                    payload["range_tc_scatter_mask_words"],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
             union_tc_group_count += int(payload.get("range_tc_scatter_group_count", int(tc_q_row_idx.shape[0])))
             union_tc_row_count += int(payload.get("range_tc_scatter_row_count", 0))
         scatter_q_row_idx = payload["range_scatter_q_row_idx"]
         if int(scatter_q_row_idx.shape[0]) > 0:
-            _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
-                q_flat,
-                k_flat,
-                v_flat,
-                scatter_q_row_idx,
-                payload["range_scatter_k_row_idx"],
-                payload["range_scatter_q_length"],
-                payload["range_scatter_k_length"],
-                payload["range_scatter_mask_words"],
-                out_flat,
-                lse_flat,
-                softmax_scale=float(softmax_scale),
-                tile_k=tile_k,
-            )
+            if force_combine_scatter:
+                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    scatter_q_row_idx,
+                    payload["range_scatter_k_row_idx"],
+                    payload["range_scatter_q_length"],
+                    payload["range_scatter_k_length"],
+                    payload["range_scatter_mask_words"],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
+            else:
+                _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    scatter_q_row_idx,
+                    payload["range_scatter_k_row_idx"],
+                    payload["range_scatter_q_length"],
+                    payload["range_scatter_k_length"],
+                    payload["range_scatter_mask_words"],
+                    out_flat,
+                    lse_flat,
+                    softmax_scale=float(softmax_scale),
+                    tile_k=tile_k,
+                )
             union_scalar_group_count += int(payload.get("range_scatter_union_group_count", 0))
             union_scalar_row_count += int(payload.get("range_scatter_union_row_count", 0))
         _run_grouped_packed(
@@ -3924,6 +4118,13 @@ def _cached_direct_final_residual_support_reason(
                 if residual_row_count != 0:
                     return "mixed_residual_incomplete_direct_final_row_coverage"
                 return "packed_residual_incomplete_direct_final_row_coverage"
+        device = _payload_row_device(payload, q_flat)
+        base_source = "fused" if base_output_row_count > 0 else "exact_dense"
+        if _direct_final_requires_online_combine(payload, device, base_source=base_source) and not _is_env_enabled(
+            "FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_ONLINE_COMBINE",
+            default="off",
+        ):
+            return "direct_final_online_combine_requires_fp32_accum"
         return None
     if residual_row_count <= 0:
         return "missing_scatter_residual_rows"
@@ -4988,7 +5189,7 @@ def run_cached_generalized_packed_backward(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
             "1",
         ).strip().lower() not in {"0", "false", "off", "no"}
-        key_owned_mode = _env_mode("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED", default="auto")
+        key_owned_mode = _env_mode("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED", default="off")
         use_key_owned_dkdv = key_owned_mode != "off"
         use_direct_dq = _use_cached_backward_direct_dq(payload, q_flat)
         backward_payload = None
@@ -5079,7 +5280,7 @@ def run_cached_generalized_packed_backward(
             dk_acc,
             dv_acc,
             softmax_scale=float(softmax_scale),
-            compute_dkdv=not use_key_owned_dkdv,
+            compute_dkdv=(not use_key_owned_dkdv) and use_tile_atomic_dkdv,
         )
         if use_key_owned_dkdv:
             _run_cached_generalized_fused_bwd_dkdv_kernel(

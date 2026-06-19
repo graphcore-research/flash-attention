@@ -12,7 +12,9 @@ from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _run_cached_cast_rows_kernel,
     _run_cached_finalize_output_rows_kernel,
     _run_cached_init_output_rows_kernel,
+    _run_cached_lse_flat_to_public_kernel,
     _run_cached_zero_three_rows_kernel,
+    _run_cached_zero_two_rows_kernel,
     _run_cached_zero_rows_kernel,
     _run_synthetic_2d_exact_gather_scatter_tc_fwd_kernel,
     _run_synthetic_2d_exact_tail_gather_scatter_tc_fwd_kernel,
@@ -2680,6 +2682,22 @@ def _finalize_cached_backward_grads(
     return dq, dk, dv
 
 
+def _cached_backward_dq_overwrites_all_rows(payload: dict[str, Any], q_flat: torch.Tensor) -> bool:
+    if str(payload.get("residual_mode", "")) != "fused_tail":
+        return False
+    if int(payload.get("fused_output_row_count", -1)) != int(payload.get("total_rows", -2)):
+        return False
+    if int(payload.get("total_rows", -1)) != int(q_flat.shape[0]):
+        return False
+    fused_q_row_idx = payload.get("fused_q_row_idx")
+    fused_q_length = payload.get("fused_q_length")
+    if not isinstance(fused_q_row_idx, torch.Tensor) or not isinstance(fused_q_length, torch.Tensor):
+        return False
+    if int(fused_q_row_idx.shape[0]) <= 0:
+        return False
+    return True
+
+
 def _zero_cached_backward_accum_buffers(
     payload: dict[str, Any],
     q_flat: torch.Tensor,
@@ -2689,6 +2707,13 @@ def _zero_cached_backward_accum_buffers(
 ) -> None:
     if q_flat.is_cuda:
         all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
+        if _cached_backward_dq_overwrites_all_rows(payload, q_flat):
+            if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+                _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
+                return
+            _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
+            _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
+            return
         if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
             _run_cached_zero_three_rows_kernel(all_row_idx, dq_acc, dk_acc, dv_acc)
             return
@@ -3222,6 +3247,30 @@ def _run_cached_masked_payload_forward(
     return union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
 
 
+def format_cached_public_lse(
+    q: torch.Tensor,
+    lse_final_flat: torch.Tensor,
+) -> torch.Tensor:
+    if q.ndim == 4:
+        if (
+            q.is_cuda
+            and lse_final_flat.is_cuda
+            and lse_final_flat.ndim == 2
+            and lse_final_flat.is_contiguous()
+            and int(lse_final_flat.shape[0]) == int(q.shape[0]) * int(q.shape[1])
+            and int(lse_final_flat.shape[1]) == int(q.shape[2])
+        ):
+            public_lse = torch.empty(
+                (q.shape[0], q.shape[2], q.shape[1]),
+                device=lse_final_flat.device,
+                dtype=lse_final_flat.dtype,
+            )
+            _run_cached_lse_flat_to_public_kernel(lse_final_flat, public_lse)
+            return public_lse
+        return lse_final_flat.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+    return lse_final_flat.transpose(0, 1).contiguous()
+
+
 def _format_cached_forward_result(
     q: torch.Tensor,
     out_final_flat: torch.Tensor,
@@ -3236,13 +3285,12 @@ def _format_cached_forward_result(
             return out
         if str(lse_layout) == "flat":
             return out, lse_final_flat
-        lse = lse_final_flat.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
-        return out, lse
+        return out, format_cached_public_lse(q, lse_final_flat)
     if not return_lse:
         return out_final_flat
     if str(lse_layout) == "flat":
         return out_final_flat, lse_final_flat
-    return out_final_flat, lse_final_flat.transpose(0, 1).contiguous()
+    return out_final_flat, format_cached_public_lse(q, lse_final_flat)
 
 
 def _cached_monolithic_forward_support_reason(

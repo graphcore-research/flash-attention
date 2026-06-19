@@ -8540,6 +8540,7 @@ class _FlashAttnHSASM100DispatchFunc(torch.autograd.Function):
         if isinstance(cached_forward_payload, dict):
             from flash_attn.cute.hsa_cached_2d_forward_analysis import (
                 can_use_cached_generalized_fused_backward,
+                format_cached_public_lse,
                 run_cached_generalized_packed_forward,
             )
 
@@ -8632,7 +8633,7 @@ class _FlashAttnHSASM100DispatchFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
             ctx.save_for_backward(q, k, v, out, lse)
             if return_lse:
-                public_lse = lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+                public_lse = format_cached_public_lse(q, lse)
                 ctx.mark_non_differentiable(public_lse)
                 return out, public_lse
             return out

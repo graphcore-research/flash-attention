@@ -8616,6 +8616,7 @@ class _FlashAttnHSASM100DispatchFunc(torch.autograd.Function):
                 v,
                 softmax_scale=softmax_scale,
                 return_lse=True,
+                lse_layout="flat",
             )
             ctx.schedule = schedule
             if ctx.use_synthetic_micro_bwd:
@@ -8631,8 +8632,9 @@ class _FlashAttnHSASM100DispatchFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
             ctx.save_for_backward(q, k, v, out, lse)
             if return_lse:
-                ctx.mark_non_differentiable(lse)
-                return out, lse
+                public_lse = lse.view(q.shape[0], q.shape[1], q.shape[2]).permute(0, 2, 1).contiguous()
+                ctx.mark_non_differentiable(public_lse)
+                return out, public_lse
             return out
 
         ctx.hsa_forward_kind = "block_sparse"

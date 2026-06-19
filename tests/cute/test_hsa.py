@@ -4229,18 +4229,19 @@ def test_hsa_sm100_dispatch_prefers_cached_generalized_payload(monkeypatch):
     q = torch.randn(1, 2, 1, 4, dtype=torch.float32)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    lse = torch.zeros(1, 1, 2, dtype=torch.float32)
+    lse = torch.arange(2, dtype=torch.float32).view(2, 1)
     schedule = _Schedule()
     payload = {"status": "ready"}
     calls = {"cached": 0}
 
-    def _cached_forward(cached_payload, q_arg, k_arg, v_arg, *, softmax_scale=None, return_lse=False):
+    def _cached_forward(cached_payload, q_arg, k_arg, v_arg, *, softmax_scale=None, return_lse=False, lse_layout="public"):
         assert cached_payload is payload
         assert q_arg is q
         assert k_arg is k
         assert v_arg is v
         assert softmax_scale == pytest.approx(0.5)
         assert return_lse is True
+        assert lse_layout == "flat"
         calls["cached"] += 1
         return v_arg + 1.0, lse
 
@@ -4280,6 +4281,23 @@ def test_hsa_sm100_dispatch_prefers_cached_generalized_payload(monkeypatch):
 
     assert calls["cached"] == 1
     assert torch.equal(out, v + 1.0)
+
+    out_with_lse, public_lse = hsa_module._FlashAttnHSASM100DispatchFunc.apply(
+        q,
+        k,
+        v,
+        None,
+        None,
+        schedule,
+        0.5,
+        False,
+        True,
+    )
+
+    assert calls["cached"] == 2
+    assert torch.equal(out_with_lse, v + 1.0)
+    assert public_lse.shape == (1, 1, 2)
+    assert torch.equal(public_lse, lse.view(1, 2, 1).permute(0, 2, 1).contiguous())
 
 
 def test_benchmark_hsa_unpacked_direct_env_sets_flag():

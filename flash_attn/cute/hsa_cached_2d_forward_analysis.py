@@ -1150,11 +1150,11 @@ def _merge_support_segments(segments: list[list[int]]) -> list[int]:
         return []
     if len(segments) == 1:
         return [int(value) for value in segments[0]]
-    flat_values = [int(value) for segment in segments for value in segment]
-    if not flat_values:
-        return []
-    merged_values = torch.unique(torch.tensor(flat_values, dtype=torch.int32), sorted=True)
-    return [int(value) for value in merged_values.tolist()]
+    merged_values: set[int] = set()
+    for segment in segments:
+        for value in segment:
+            merged_values.add(int(value))
+    return sorted(merged_values)
 
 
 def _choose_cached_packing_family(
@@ -2815,14 +2815,47 @@ def _valid_unique_payload_rows(
     *,
     total_rows: int,
     device: torch.device,
+    row_length: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    rows = row_idx.reshape(-1).to(device=device, dtype=torch.int32)
-    if int(rows.numel()) == 0:
-        return rows
-    rows = rows[(rows >= 0) & (rows < int(total_rows))]
+    rows = _valid_payload_rows(row_idx, total_rows=total_rows, device=device, row_length=row_length)
     if int(rows.numel()) == 0:
         return rows
     return torch.unique(rows, sorted=True)
+
+
+def _valid_payload_rows(
+    row_idx: torch.Tensor,
+    *,
+    total_rows: int,
+    device: torch.device,
+    row_length: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if (
+        isinstance(row_length, torch.Tensor)
+        and row_idx.ndim >= 2
+        and int(row_length.numel()) == int(row_idx.shape[0])
+    ):
+        rows_per_group = int(row_idx.shape[1])
+        offsets = torch.arange(rows_per_group, dtype=torch.int32, device=device).view(1, rows_per_group)
+        lengths = row_length.to(device=device, dtype=torch.int32).view(-1, 1)
+        row_matrix = row_idx.to(device=device, dtype=torch.int32)
+        rows = row_matrix[offsets < lengths].reshape(-1)
+    else:
+        rows = row_idx.reshape(-1).to(device=device, dtype=torch.int32)
+    if int(rows.numel()) == 0:
+        return rows
+    rows = rows[(rows >= 0) & (rows < int(total_rows))]
+    return rows
+
+
+def _looks_like_padded_row_idx(row_idx: torch.Tensor) -> bool:
+    if row_idx.ndim < 2 or int(row_idx.numel()) == 0:
+        return False
+    valid = row_idx >= 0
+    if not bool((~valid).any().item()):
+        return False
+    seen_padding = (~valid).to(dtype=torch.int32).cumsum(dim=1) > 0
+    return not bool((valid & seen_padding).any().item())
 
 
 def _get_direct_final_base_row_idx(
@@ -2839,15 +2872,71 @@ def _get_direct_final_base_row_idx(
             else "exact_dense"
         )
     key_name = "fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"
+    length_key = "fused_q_length" if base_source == "fused" else "exact_dense_q_length"
     row_idx = payload.get(key_name)
     if not isinstance(row_idx, torch.Tensor):
         return torch.empty((0,), dtype=torch.int32, device=device)
+    row_length = payload.get(length_key)
+    if not isinstance(row_length, torch.Tensor):
+        row_length = None
     workspace = payload.setdefault("_workspace", {})
-    cache_key = ("direct_final_base_rows", str(device), base_source, total_rows, int(row_idx.data_ptr()))
+    cache_key = (
+        "direct_final_base_rows",
+        str(device),
+        base_source,
+        total_rows,
+        int(row_idx.data_ptr()),
+        int(row_length.data_ptr()) if isinstance(row_length, torch.Tensor) else 0,
+    )
     cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
     if isinstance(cached, torch.Tensor) and cached.device == device:
         return cached
-    rows = _valid_unique_payload_rows(row_idx, total_rows=total_rows, device=device)
+    rows = _valid_unique_payload_rows(row_idx, total_rows=total_rows, device=device, row_length=row_length)
+    if isinstance(workspace, dict):
+        workspace[cache_key] = rows
+    return rows
+
+
+def _get_direct_final_base_output_row_idx(
+    payload: dict[str, Any],
+    device: torch.device,
+    *,
+    base_source: str = "auto",
+) -> torch.Tensor:
+    total_rows = int(payload["total_rows"])
+    if base_source == "auto":
+        base_source = (
+            "fused"
+            if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
+            else "exact_dense"
+        )
+    key_name = "fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"
+    length_key = "fused_q_length" if base_source == "fused" else "exact_dense_q_length"
+    row_idx = payload.get(key_name)
+    if not isinstance(row_idx, torch.Tensor):
+        return torch.empty((0,), dtype=torch.int32, device=device)
+    row_length = payload.get(length_key)
+    if not isinstance(row_length, torch.Tensor):
+        row_length = None
+    base_output_row_count = _direct_final_base_output_row_count(payload, base_source=base_source)
+    workspace = payload.setdefault("_workspace", {})
+    cache_key = (
+        "direct_final_base_output_rows",
+        str(device),
+        base_source,
+        total_rows,
+        base_output_row_count,
+        int(row_idx.data_ptr()),
+        int(row_length.data_ptr()) if isinstance(row_length, torch.Tensor) else 0,
+    )
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, torch.Tensor) and cached.device == device:
+        return cached
+    rows = _valid_payload_rows(row_idx, total_rows=total_rows, device=device, row_length=row_length)
+    if base_output_row_count > 0 and int(rows.numel()) > base_output_row_count:
+        rows = rows[:base_output_row_count]
+    if int(rows.numel()) > 0:
+        rows = torch.unique(rows, sorted=True)
     if isinstance(workspace, dict):
         workspace[cache_key] = rows
     return rows
@@ -2858,12 +2947,17 @@ def _get_direct_final_residual_row_idx(
     device: torch.device,
 ) -> torch.Tensor:
     total_rows = int(payload["total_rows"])
-    row_tensors = [
-        payload.get("range_tc_scatter_q_row_idx"),
-        payload.get("range_scatter_q_row_idx"),
-        payload.get("range_packed_q_row_idx"),
+    row_entries = [
+        ("range_tc_scatter_q_row_idx", "range_tc_scatter_q_length", "range_tc_scatter_row_count"),
+        ("range_scatter_q_row_idx", "range_scatter_q_length", "range_scatter_row_count"),
+        ("range_packed_q_row_idx", "range_packed_q_length", "range_packed_group_count"),
     ]
-    tensors = [tensor for tensor in row_tensors if isinstance(tensor, torch.Tensor) and int(tensor.numel()) > 0]
+    tensors = [
+        payload.get(row_key)
+        for row_key, _length_key, count_key in row_entries
+        if int(payload.get(count_key, 0)) > 0
+    ]
+    tensors = [tensor for tensor in tensors if isinstance(tensor, torch.Tensor) and int(tensor.numel()) > 0]
     if not tensors:
         return torch.empty((0,), dtype=torch.int32, device=device)
     workspace = payload.setdefault("_workspace", {})
@@ -2871,19 +2965,106 @@ def _get_direct_final_residual_row_idx(
         "direct_final_residual_rows",
         str(device),
         total_rows,
-        tuple(int(tensor.data_ptr()) for tensor in tensors),
+        tuple(
+            (
+                int(payload[row_key].data_ptr()) if isinstance(payload.get(row_key), torch.Tensor) else 0,
+                int(payload[length_key].data_ptr()) if isinstance(payload.get(length_key), torch.Tensor) else 0,
+                int(payload.get(count_key, 0)),
+            )
+            for row_key, length_key, count_key in row_entries
+        ),
     )
     cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
     if isinstance(cached, torch.Tensor) and cached.device == device:
         return cached
+    row_chunks: list[torch.Tensor] = []
+    for row_key, length_key, count_key in row_entries:
+        if int(payload.get(count_key, 0)) <= 0:
+            continue
+        tensor = payload.get(row_key)
+        if not isinstance(tensor, torch.Tensor) or int(tensor.numel()) == 0:
+            continue
+        row_length = payload.get(length_key)
+        if not isinstance(row_length, torch.Tensor):
+            has_padding = bool((tensor < 0).any().item())
+            if has_padding and not _looks_like_padded_row_idx(tensor):
+                continue
+        row_chunks.append(
+            _valid_unique_payload_rows(
+                tensor,
+                total_rows=total_rows,
+                device=device,
+                row_length=row_length if isinstance(row_length, torch.Tensor) else None,
+            )
+        )
+    if not row_chunks:
+        rows = torch.empty((0,), dtype=torch.int32, device=device)
+        if isinstance(workspace, dict):
+            workspace[cache_key] = rows
+        return rows
     rows = _valid_unique_payload_rows(
-        torch.cat([tensor.reshape(-1).to(device=device, dtype=torch.int32) for tensor in tensors]),
+        torch.cat(row_chunks),
         total_rows=total_rows,
         device=device,
     )
     if isinstance(workspace, dict):
         workspace[cache_key] = rows
     return rows
+
+
+def _direct_final_has_duplicate_residual_rows_within_kernel(
+    payload: dict[str, Any],
+    device: torch.device,
+) -> bool:
+    total_rows = int(payload["total_rows"])
+    row_entries = [
+        ("range_tc_scatter_q_row_idx", "range_tc_scatter_q_length", "range_tc_scatter_row_count"),
+        ("range_scatter_q_row_idx", "range_scatter_q_length", "range_scatter_row_count"),
+        ("range_packed_q_row_idx", "range_packed_q_length", "range_packed_group_count"),
+    ]
+    workspace = payload.setdefault("_workspace", {})
+    cache_key = (
+        "direct_final_duplicate_residual_rows_within_kernel",
+        str(device),
+        total_rows,
+        tuple(
+            (
+                int(payload[row_key].data_ptr()) if isinstance(payload.get(row_key), torch.Tensor) else 0,
+                int(payload[length_key].data_ptr()) if isinstance(payload.get(length_key), torch.Tensor) else 0,
+                int(payload.get(count_key, 0)),
+            )
+            for row_key, length_key, count_key in row_entries
+        ),
+    )
+    cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
+    if isinstance(cached, bool):
+        return cached
+    for row_key, length_key, count_key in row_entries:
+        if int(payload.get(count_key, 0)) <= 0:
+            continue
+        row_idx = payload.get(row_key)
+        if not isinstance(row_idx, torch.Tensor) or int(row_idx.numel()) == 0:
+            continue
+        row_length = payload.get(length_key)
+        if not isinstance(row_length, torch.Tensor):
+            has_padding = bool((row_idx < 0).any().item())
+            if not has_padding or not _looks_like_padded_row_idx(row_idx):
+                continue
+        rows = _valid_payload_rows(
+            row_idx,
+            total_rows=total_rows,
+            device=device,
+            row_length=row_length if isinstance(row_length, torch.Tensor) else None,
+        )
+        if int(rows.numel()) <= 1:
+            continue
+        if int(torch.unique(rows, sorted=False).numel()) != int(rows.numel()):
+            if isinstance(workspace, dict):
+                workspace[cache_key] = True
+            return True
+    if isinstance(workspace, dict):
+        workspace[cache_key] = False
+    return False
 
 
 def _get_direct_final_missing_init_row_idx(
@@ -2893,7 +3074,7 @@ def _get_direct_final_missing_init_row_idx(
     base_source: str = "auto",
 ) -> torch.Tensor:
     total_rows = int(payload["total_rows"])
-    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    base_rows = _get_direct_final_base_output_row_idx(payload, device, base_source=base_source)
     residual_rows = _get_direct_final_residual_row_idx(payload, device)
     if int(residual_rows.numel()) == 0:
         return residual_rows
@@ -2903,6 +3084,7 @@ def _get_direct_final_missing_init_row_idx(
         str(device),
         base_source,
         total_rows,
+        _direct_final_base_output_row_count(payload, base_source=base_source),
         int(base_rows.data_ptr()) if int(base_rows.numel()) > 0 else 0,
         int(residual_rows.data_ptr()),
     )
@@ -2918,13 +3100,35 @@ def _get_direct_final_missing_init_row_idx(
     return missing_rows
 
 
+def _direct_final_base_output_row_count(payload: dict[str, Any], *, base_source: str = "auto") -> int:
+    if base_source == "auto":
+        base_source = (
+            "fused"
+            if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
+            else "exact_dense"
+        )
+    return int(payload.get("fused_output_row_count" if base_source == "fused" else "exact_dense_output_row_count", 0))
+
+
+def _trim_direct_final_base_rows_to_count(
+    base_rows: torch.Tensor,
+    payload: dict[str, Any],
+    *,
+    base_source: str = "auto",
+) -> torch.Tensor:
+    base_output_row_count = _direct_final_base_output_row_count(payload, base_source=base_source)
+    if base_output_row_count > 0 and int(base_rows.numel()) > base_output_row_count:
+        return base_rows[:base_output_row_count]
+    return base_rows
+
+
 def _direct_final_base_residual_union_row_count(
     payload: dict[str, Any],
     device: torch.device,
     *,
     base_source: str = "auto",
 ) -> int:
-    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    base_rows = _get_direct_final_base_output_row_idx(payload, device, base_source=base_source)
     residual_rows = _get_direct_final_residual_row_idx(payload, device)
     if int(base_rows.numel()) == 0:
         return int(residual_rows.numel())
@@ -2940,37 +3144,65 @@ def _direct_final_requires_online_combine(
     base_source: str = "auto",
 ) -> bool:
     total_rows = int(payload["total_rows"])
-    row_tensors = [
-        payload.get("fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"),
-        payload.get("range_tc_scatter_q_row_idx"),
-        payload.get("range_scatter_q_row_idx"),
-        payload.get("range_packed_q_row_idx"),
+    if base_source == "auto":
+        base_source = (
+            "fused"
+            if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0
+            else "exact_dense"
+        )
+    base_row_key = "fused_q_row_idx" if base_source == "fused" else "exact_dense_q_row_idx"
+    base_length_key = "fused_q_length" if base_source == "fused" else "exact_dense_q_length"
+    residual_entries = [
+        ("range_tc_scatter_q_row_idx", "range_tc_scatter_q_length", "range_tc_scatter_row_count"),
+        ("range_scatter_q_row_idx", "range_scatter_q_length", "range_scatter_row_count"),
+        ("range_packed_q_row_idx", "range_packed_q_length", "range_packed_group_count"),
     ]
     cache_key = (
         "direct_final_requires_online_combine",
         str(device),
         base_source,
         total_rows,
-        tuple(int(tensor.data_ptr()) if isinstance(tensor, torch.Tensor) else 0 for tensor in row_tensors),
+        _direct_final_base_output_row_count(payload, base_source=base_source),
+        (
+            int(payload[base_row_key].data_ptr()) if isinstance(payload.get(base_row_key), torch.Tensor) else 0,
+            int(payload[base_length_key].data_ptr()) if isinstance(payload.get(base_length_key), torch.Tensor) else 0,
+        ),
+        tuple(
+            (
+                int(payload[row_key].data_ptr()) if isinstance(payload.get(row_key), torch.Tensor) else 0,
+                int(payload[length_key].data_ptr()) if isinstance(payload.get(length_key), torch.Tensor) else 0,
+                int(payload.get(count_key, 0)),
+            )
+            for row_key, length_key, count_key in residual_entries
+        ),
     )
     workspace = payload.setdefault("_workspace", {})
     cached = workspace.get(cache_key) if isinstance(workspace, dict) else None
     if isinstance(cached, bool):
         return cached
     source_rows: list[torch.Tensor] = []
-    base_rows = _get_direct_final_base_row_idx(payload, device, base_source=base_source)
+    base_rows = _get_direct_final_base_output_row_idx(payload, device, base_source=base_source)
+    base_output_row_count = _direct_final_base_output_row_count(payload, base_source=base_source)
+    residual_rows = _get_direct_final_residual_row_idx(payload, device)
+    if base_output_row_count == total_rows and int(residual_rows.numel()) > 0:
+        if isinstance(workspace, dict):
+            workspace[cache_key] = True
+        return True
     if int(base_rows.numel()) > 0:
         source_rows.append(base_rows)
-    for key in (
-        "range_tc_scatter_q_row_idx",
-        "range_scatter_q_row_idx",
-        "range_packed_q_row_idx",
-    ):
-        tensor = payload.get(key)
+    for row_key, length_key, count_key in residual_entries:
+        if int(payload.get(count_key, 0)) <= 0:
+            continue
+        tensor = payload.get(row_key)
         if not isinstance(tensor, torch.Tensor) or int(tensor.numel()) == 0:
             continue
-        rows = tensor.reshape(-1).to(device=device, dtype=torch.int32)
-        rows = rows[(rows >= 0) & (rows < total_rows)]
+        row_length = payload.get(length_key)
+        rows = _valid_payload_rows(
+            tensor,
+            total_rows=total_rows,
+            device=device,
+            row_length=row_length if isinstance(row_length, torch.Tensor) else None,
+        )
         if int(rows.numel()) == 0:
             continue
         unique_rows = torch.unique(rows, sorted=True)
@@ -3344,9 +3576,9 @@ def _auto_use_cached_backward_key_owned_dkdv(
     if not _cached_backward_key_owned_overwrites_all_kv_rows(backward_payload, k_flat):
         return False
     try:
-        max_rows = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED_MAX_ROWS", "2048"))
+        max_rows = int(os.environ.get("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED_MAX_ROWS", "128"))
     except ValueError:
-        max_rows = 2048
+        max_rows = 128
     return int(k_flat.shape[0]) <= max(0, max_rows)
 
 
@@ -4103,41 +4335,66 @@ def _cached_direct_final_residual_support_reason(
     )
     packed_group_count = int(payload.get("range_packed_group_count", 0))
     packed_tensor_count = int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0])
-    if packed_group_count != 0 or packed_tensor_count != 0:
-        grouped_keys = (
-            "range_tc_scatter_q_row_idx",
-            "range_scatter_q_row_idx",
-            "range_packed_q_row_idx",
-        )
-        if not all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
-            return "missing_grouped_residual_tensors"
-        if base_output_row_count != int(payload["total_rows"]):
-            device = _payload_row_device(payload, q_flat)
-            union_row_count = _direct_final_base_residual_union_row_count(payload, device)
-            if union_row_count != int(payload["total_rows"]):
-                if residual_row_count != 0:
-                    return "mixed_residual_incomplete_direct_final_row_coverage"
-                return "packed_residual_incomplete_direct_final_row_coverage"
-        device = _payload_row_device(payload, q_flat)
-        base_source = "fused" if base_output_row_count > 0 else "exact_dense"
-        if _direct_final_requires_online_combine(payload, device, base_source=base_source) and not _is_env_enabled(
-            "FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_ONLINE_COMBINE",
-            default="off",
-        ):
-            return "direct_final_online_combine_requires_fp32_accum"
-        return None
-    if residual_row_count <= 0:
-        return "missing_scatter_residual_rows"
-    covered_rows = base_output_row_count + residual_row_count
-    if covered_rows != int(payload["total_rows"]):
-        return "incomplete_direct_final_row_coverage"
     grouped_keys = (
         "range_tc_scatter_q_row_idx",
         "range_scatter_q_row_idx",
         "range_packed_q_row_idx",
     )
-    if not all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
-        return "missing_grouped_residual_tensors"
+    if residual_row_count > 0 or packed_group_count != 0 or packed_tensor_count != 0:
+        if not all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
+            return "missing_grouped_residual_tensors"
+    device = _payload_row_device(payload, q_flat)
+    base_source = "fused" if int(payload.get("fused_output_row_count", 0)) > 0 else "exact_dense"
+    if _direct_final_has_duplicate_residual_rows_within_kernel(payload, device):
+        return "direct_final_duplicate_residual_rows_within_kernel"
+    requires_online_combine = _direct_final_requires_online_combine(
+        payload,
+        device,
+        base_source=base_source,
+    )
+    scatter_lengths_available = (
+        isinstance(payload.get("range_tc_scatter_q_length"), torch.Tensor)
+        or isinstance(payload.get("range_scatter_q_length"), torch.Tensor)
+    )
+    if (
+        residual_row_count > 0
+        and packed_group_count == 0
+        and packed_tensor_count == 0
+        and not scatter_lengths_available
+    ):
+        requires_online_combine = False
+    if packed_group_count != 0 or packed_tensor_count != 0:
+        if base_output_row_count != int(payload["total_rows"]):
+            union_row_count = _direct_final_base_residual_union_row_count(payload, device)
+            if union_row_count != int(payload["total_rows"]):
+                if residual_row_count != 0:
+                    return "mixed_residual_incomplete_direct_final_row_coverage"
+                return "packed_residual_incomplete_direct_final_row_coverage"
+        if requires_online_combine and not _is_env_enabled(
+            "FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_ONLINE_COMBINE",
+            default="on",
+        ):
+            return "direct_final_online_combine_requires_fp32_accum"
+        return None
+    if residual_row_count <= 0:
+        return "missing_scatter_residual_rows"
+    if requires_online_combine:
+        union_row_count = _direct_final_base_residual_union_row_count(
+            payload,
+            device,
+            base_source=base_source,
+        )
+        if union_row_count != int(payload["total_rows"]):
+            return "incomplete_direct_final_row_coverage"
+        if not _is_env_enabled(
+            "FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_ONLINE_COMBINE",
+            default="on",
+        ):
+            return "direct_final_online_combine_requires_fp32_accum"
+        return None
+    covered_rows = base_output_row_count + residual_row_count
+    if covered_rows != int(payload["total_rows"]):
+        return "incomplete_direct_final_row_coverage"
     return None
 
 
@@ -4204,7 +4461,20 @@ def _run_cached_direct_final_residual_forward(
         _record_cached_forward_path(payload, path="split_fallback", reason=support_reason)
         return None
 
-    out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
+    device = _payload_row_device(payload, q_flat)
+    base_output_row_count_hint = int(payload.get("fused_output_row_count", 0))
+    if base_output_row_count_hint <= 0:
+        base_output_row_count_hint = int(payload.get("exact_dense_output_row_count", 0))
+    base_source_hint = "fused" if int(payload.get("fused_output_row_count", 0)) > 0 else "exact_dense"
+    requires_online_combine = _direct_final_requires_online_combine(
+        payload,
+        device,
+        base_source=base_source_hint,
+    )
+    if requires_online_combine:
+        out_work_flat, lse_work_flat = _get_cached_direct_2d_output_buffers(payload, q_flat, v_flat)
+    else:
+        out_work_flat, lse_work_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
     fused_range_count = 0
     fused_row_count = 0
     exact_range_count = 0
@@ -4215,8 +4485,8 @@ def _run_cached_direct_final_residual_forward(
             q_flat,
             k_flat,
             v_flat,
-            out_final_flat,
-            lse_final_flat,
+            out_work_flat,
+            lse_work_flat,
             softmax_scale=float(softmax_scale),
         )
     if fused_range_count <= 0 and int(getattr(payload.get("exact_dense_q_row_idx"), "shape", [0])[0]) > 0:
@@ -4225,8 +4495,8 @@ def _run_cached_direct_final_residual_forward(
             q_flat,
             k_flat,
             v_flat,
-            out_final_flat,
-            lse_final_flat,
+            out_work_flat,
+            lse_work_flat,
             softmax_scale=float(softmax_scale),
         )
     base_row_count = int(fused_row_count) if int(fused_row_count) > 0 else int(exact_row_count)
@@ -4235,24 +4505,25 @@ def _run_cached_direct_final_residual_forward(
     )
     packed_group_count = int(payload.get("range_packed_group_count", 0))
     packed_tensor_count = int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0])
-    force_combine_scatter = (
+    force_combine_scatter = requires_online_combine or (
         residual_row_count > 0
         and (packed_group_count > 0 or packed_tensor_count > 0)
     )
     has_packed_residual = packed_group_count > 0 or packed_tensor_count > 0
     base_source = "fused" if int(fused_row_count) > 0 else "exact_dense"
     initialized_residual_rows = 0
-    if has_packed_residual and base_row_count != int(payload["total_rows"]):
+    needs_missing_init = force_combine_scatter and base_row_count != int(payload["total_rows"])
+    if needs_missing_init:
         union_row_count = _direct_final_base_residual_union_row_count(
             payload,
-            out_final_flat.device,
+            out_work_flat.device,
             base_source=base_source,
         )
         if union_row_count != int(payload["total_rows"]):
             reason = (
                 "mixed_residual_incomplete_direct_final_runtime_coverage"
-                if force_combine_scatter
-                else "packed_residual_incomplete_direct_final_runtime_coverage"
+                if has_packed_residual
+                else "incomplete_direct_final_runtime_coverage"
             )
             if _is_env_forced_on(env_name):
                 raise RuntimeError(f"cached_direct_final_residual_fwd_{reason}")
@@ -4260,27 +4531,27 @@ def _run_cached_direct_final_residual_forward(
             return None
         init_row_idx = _get_direct_final_missing_init_row_idx(
             payload,
-            out_final_flat.device,
+            out_work_flat.device,
             base_source=base_source,
         )
         initialized_residual_rows = int(init_row_idx.numel())
         if initialized_residual_rows > 0:
-            _run_cached_init_output_rows_kernel(init_row_idx, out_final_flat, lse_final_flat)
+            _run_cached_init_output_rows_kernel(init_row_idx, out_work_flat, lse_work_flat)
     union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count = (
         _run_cached_masked_payload_forward(
             payload,
             q_flat,
             k_flat,
             v_flat,
-            out_final_flat,
-            lse_final_flat,
+            out_work_flat,
+            lse_work_flat,
             softmax_scale=float(softmax_scale),
             force_combine_scatter=force_combine_scatter,
         )
     )
     output_coverage = (
         int(payload["total_rows"])
-        if has_packed_residual and base_row_count != int(payload["total_rows"])
+        if needs_missing_init
         else base_row_count
         if force_combine_scatter
         else base_row_count + residual_row_count
@@ -4303,8 +4574,17 @@ def _run_cached_direct_final_residual_forward(
         payload,
         path="direct_final_residual",
         initialized_residual_rows=initialized_residual_rows,
+        fp32_online_combine=bool(requires_online_combine),
     )
-    return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
+    if requires_online_combine:
+        out_final_flat = torch.empty(
+            (int(payload["total_rows"]), q_flat.shape[1], v_flat.shape[2]),
+            dtype=v_flat.dtype,
+            device=v_flat.device,
+        )
+        _run_cached_cast_rows_kernel(out_work_flat, _get_cached_all_row_idx(payload, q_flat.device), out_final_flat)
+        return _format_cached_forward_result(q, out_final_flat, lse_work_flat, return_lse=return_lse, lse_layout=lse_layout)
+    return _format_cached_forward_result(q, out_work_flat, lse_work_flat, return_lse=return_lse, lse_layout=lse_layout)
 
 
 def run_cached_direct_2d_forward(
@@ -5189,7 +5469,7 @@ def run_cached_generalized_packed_backward(
             "FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_TILE_ATOMICS",
             "1",
         ).strip().lower() not in {"0", "false", "off", "no"}
-        key_owned_mode = _env_mode("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED", default="off")
+        key_owned_mode = _env_mode("FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED", default="auto")
         use_key_owned_dkdv = key_owned_mode != "off"
         use_direct_dq = _use_cached_backward_direct_dq(payload, q_flat)
         backward_payload = None

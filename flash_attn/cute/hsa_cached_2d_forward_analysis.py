@@ -8,9 +8,11 @@ import torch
 
 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _can_use_synthetic_2d_masked_fwd,
+    _run_cached_cast_three_rows_kernel,
     _run_cached_cast_rows_kernel,
     _run_cached_finalize_output_rows_kernel,
     _run_cached_init_output_rows_kernel,
+    _run_cached_zero_three_rows_kernel,
     _run_cached_zero_rows_kernel,
     _run_synthetic_2d_exact_gather_scatter_tc_fwd_kernel,
     _run_synthetic_2d_exact_tail_gather_scatter_tc_fwd_kernel,
@@ -2669,10 +2671,34 @@ def _finalize_cached_backward_grads(
     dq = torch.empty_like(q_flat)
     dk = torch.empty_like(k_flat)
     dv = torch.empty_like(v_flat)
-    _run_cached_cast_rows_kernel(dq_acc, row_idx, dq)
-    _run_cached_cast_rows_kernel(dk_acc, row_idx, dk)
-    _run_cached_cast_rows_kernel(dv_acc, row_idx, dv)
+    if q_flat.is_cuda and _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE"):
+        _run_cached_cast_three_rows_kernel(dq_acc, dk_acc, dv_acc, row_idx, dq, dk, dv)
+    else:
+        _run_cached_cast_rows_kernel(dq_acc, row_idx, dq)
+        _run_cached_cast_rows_kernel(dk_acc, row_idx, dk)
+        _run_cached_cast_rows_kernel(dv_acc, row_idx, dv)
     return dq, dk, dv
+
+
+def _zero_cached_backward_accum_buffers(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    dq_acc: torch.Tensor,
+    dk_acc: torch.Tensor,
+    dv_acc: torch.Tensor,
+) -> None:
+    if q_flat.is_cuda:
+        all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
+        if _is_env_enabled("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO"):
+            _run_cached_zero_three_rows_kernel(all_row_idx, dq_acc, dk_acc, dv_acc)
+            return
+        _run_cached_zero_rows_kernel(all_row_idx, dq_acc)
+        _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
+        _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
+        return
+    dq_acc.zero_()
+    dk_acc.zero_()
+    dv_acc.zero_()
 
 
 def _cached_union_range_counts(
@@ -2761,6 +2787,20 @@ def _record_fused_runtime_geometry(
         return
     geometry["fused_runtime_range_count"] = int(fused_range_count)
     geometry["fused_runtime_row_count"] = int(fused_row_count)
+
+
+def _record_cached_forward_path(
+    payload: dict[str, Any],
+    *,
+    path: str,
+    reason: str | None = None,
+) -> None:
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    geometry["cached_forward_runtime_path"] = str(path)
+    if reason is not None:
+        geometry["cached_forward_runtime_fallback_reason"] = str(reason)
 
 
 def _run_cached_fused_exact_tail_ranges(
@@ -3238,6 +3278,47 @@ def _cached_monolithic_forward_support_reason(
     return None
 
 
+def _cached_direct_final_residual_support_reason(
+    payload: dict[str, Any],
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+) -> str | None:
+    base_reason = _cached_monolithic_forward_support_reason(payload, q_flat, k_flat, v_flat)
+    if base_reason is None:
+        return None
+    allowed_base_reasons = {
+        "missing_fused_ranges",
+        "residual_groups_present",
+        "incomplete_fused_output_row_coverage",
+        "incomplete_fused_pair_coverage",
+    }
+    if base_reason not in allowed_base_reasons:
+        return base_reason
+    if str(payload.get("residual_mode", "")) != "fused_tail":
+        return "requires_fused_tail_residual_mode"
+    if int(payload.get("range_packed_group_count", 0)) != 0:
+        return "packed_residual_groups_present"
+    if int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0]) != 0:
+        return "packed_residual_tensor_present"
+    residual_row_count = int(payload.get("range_tc_scatter_row_count", 0)) + int(
+        payload.get("range_scatter_row_count", 0)
+    )
+    if residual_row_count <= 0:
+        return "missing_scatter_residual_rows"
+    covered_rows = int(payload.get("fused_output_row_count", 0)) + residual_row_count
+    if covered_rows != int(payload["total_rows"]):
+        return "incomplete_direct_final_row_coverage"
+    grouped_keys = (
+        "range_tc_scatter_q_row_idx",
+        "range_scatter_q_row_idx",
+        "range_packed_q_row_idx",
+    )
+    if not all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
+        return "missing_grouped_residual_tensors"
+    return None
+
+
 def _run_cached_monolithic_fused_tail_forward(
     payload: dict[str, Any],
     q: torch.Tensor,
@@ -3255,7 +3336,9 @@ def _run_cached_monolithic_fused_tail_forward(
     support_reason = _cached_monolithic_forward_support_reason(payload, q_flat, k_flat, v_flat)
     if support_reason is not None:
         if _is_env_forced_on(env_name):
-            raise RuntimeError(f"cached_monolithic_fwd_unsupported_{support_reason}")
+            direct_final_reason = _cached_direct_final_residual_support_reason(payload, q_flat, k_flat, v_flat)
+            if direct_final_reason is not None:
+                raise RuntimeError(f"cached_monolithic_fwd_unsupported_{support_reason}")
         return None
     out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
     fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(
@@ -3274,6 +3357,73 @@ def _run_cached_monolithic_fused_tail_forward(
     _record_fused_runtime_geometry(payload, fused_range_count=fused_range_count, fused_row_count=fused_row_count)
     _record_exact_dense_runtime_geometry(payload, exact_range_count=0, exact_row_count=0)
     _record_union_runtime_geometry(payload, tc_group_count=0, tc_row_count=0, scalar_group_count=0, scalar_row_count=0)
+    _record_cached_forward_path(payload, path="monolithic_fused_tail")
+    return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
+
+
+def _run_cached_direct_final_residual_forward(
+    payload: dict[str, Any],
+    q: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    *,
+    softmax_scale: float,
+    return_lse: bool,
+    lse_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    env_name = "FLASH_ATTN_HSA_CACHED_MONOLITHIC_FWD"
+    if not _is_env_enabled(env_name):
+        return None
+    support_reason = _cached_direct_final_residual_support_reason(payload, q_flat, k_flat, v_flat)
+    if support_reason is not None:
+        if _is_env_forced_on(env_name):
+            raise RuntimeError(f"cached_direct_final_residual_fwd_unsupported_{support_reason}")
+        _record_cached_forward_path(payload, path="split_fallback", reason=support_reason)
+        return None
+
+    out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
+    fused_range_count = 0
+    fused_row_count = 0
+    if int(getattr(payload.get("fused_q_row_idx"), "shape", [0])[0]) > 0:
+        fused_range_count, fused_row_count = _run_cached_fused_exact_tail_ranges(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            out_final_flat,
+            lse_final_flat,
+            softmax_scale=float(softmax_scale),
+        )
+    union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count = (
+        _run_cached_masked_payload_forward(
+            payload,
+            q_flat,
+            k_flat,
+            v_flat,
+            out_final_flat,
+            lse_final_flat,
+            softmax_scale=float(softmax_scale),
+        )
+    )
+    residual_row_count = int(payload.get("range_tc_scatter_row_count", 0)) + int(
+        payload.get("range_scatter_row_count", 0)
+    )
+    if int(fused_row_count) + residual_row_count != int(payload["total_rows"]):
+        if _is_env_forced_on(env_name):
+            raise RuntimeError("cached_direct_final_residual_fwd_incomplete_runtime_coverage")
+        _record_cached_forward_path(payload, path="split_fallback", reason="incomplete_runtime_coverage")
+        return None
+    _record_union_runtime_geometry(
+        payload,
+        tc_group_count=union_tc_group_count,
+        tc_row_count=union_tc_row_count,
+        scalar_group_count=union_scalar_group_count,
+        scalar_row_count=union_scalar_row_count,
+    )
+    _record_exact_dense_runtime_geometry(payload, exact_range_count=0, exact_row_count=0)
+    _record_fused_runtime_geometry(payload, fused_range_count=fused_range_count, fused_row_count=fused_row_count)
+    _record_cached_forward_path(payload, path="direct_final_residual")
     return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
 
 
@@ -3315,6 +3465,19 @@ def run_cached_direct_2d_forward(
     )
     if monolithic_result is not None:
         return monolithic_result
+
+    direct_final_residual_result = _run_cached_direct_final_residual_forward(
+        payload,
+        q,
+        q_flat,
+        k_flat,
+        v_flat,
+        softmax_scale=float(softmax_scale),
+        return_lse=return_lse,
+        lse_layout=lse_layout,
+    )
+    if direct_final_residual_result is not None:
+        return direct_final_residual_result
 
     out_flat, lse_flat = _get_cached_direct_2d_output_buffers(payload, q_flat, v_flat)
     all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
@@ -3368,6 +3531,7 @@ def run_cached_direct_2d_forward(
         fused_range_count=fused_range_count,
         fused_row_count=fused_row_count,
     )
+    _record_cached_forward_path(payload, path="split_fallback")
     out_final_flat, lse_final_flat = _get_cached_direct_2d_final_buffers(payload, q_flat, v_flat)
     _run_cached_finalize_output_rows_kernel(out_flat, lse_flat, all_row_idx, out_final_flat, lse_final_flat)
     return _format_cached_forward_result(q, out_final_flat, lse_final_flat, return_lse=return_lse, lse_layout=lse_layout)
@@ -4089,15 +4253,7 @@ def run_cached_generalized_packed_backward(
         softmax_scale = q_flat.shape[-1] ** (-0.5)
 
     dq_acc, dk_acc, dv_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)
-    if q_flat.is_cuda:
-        all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
-        _run_cached_zero_rows_kernel(all_row_idx, dq_acc)
-        _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
-        _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
-    else:
-        dq_acc.zero_()
-        dk_acc.zero_()
-        dv_acc.zero_()
+    _zero_cached_backward_accum_buffers(payload, q_flat, dq_acc, dk_acc, dv_acc)
     if q_flat.is_cuda:
         backward_payload = payload.get("cached_generalized_backward_payload")
         if not isinstance(backward_payload, dict) or backward_payload.get("status") != "ready":

@@ -83,3 +83,73 @@ def test_cached_2d_monolithic_forward_requires_complete_fused_tail_payload():
 
     payload["fused_output_row_count"] = 4
     assert cached_2d._cached_monolithic_forward_support_reason(payload, FakeCudaTensor(), FakeCudaTensor(), FakeCudaTensor()) is None
+
+
+def test_cached_2d_direct_final_residual_allows_scatter_only_full_coverage():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "fused_output_row_count": 4,
+        "range_tc_scatter_row_count": 1,
+        "range_scatter_row_count": 1,
+        "range_packed_group_count": 0,
+        "range_tc_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+
+
+def test_cached_2d_direct_final_residual_rejects_packed_residual_groups():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "fused_output_row_count": 4,
+        "range_tc_scatter_row_count": 1,
+        "range_scatter_row_count": 1,
+        "range_packed_group_count": 1,
+        "range_tc_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        == "packed_residual_groups_present"
+    )

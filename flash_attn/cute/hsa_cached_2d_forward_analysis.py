@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - optional Triton runtime
 
 from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
     _can_use_synthetic_2d_masked_fwd,
+    _run_cached_cast_all_rows_kernel,
     _run_cached_cast_two_rows_kernel,
     _run_cached_cast_three_rows_kernel,
     _run_cached_cast_rows_kernel,
@@ -4604,7 +4605,13 @@ def _run_cached_direct_final_residual_forward(
             dtype=v_flat.dtype,
             device=v_flat.device,
         )
-        _run_cached_cast_rows_kernel(out_work_flat, _get_cached_all_row_idx(payload, q_flat.device), out_final_flat)
+        cast_mode = os.environ.get("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_CONTIG_CAST", "auto").strip().lower()
+        if cast_mode in {"0", "false", "no", "off", "indexed"}:
+            _run_cached_cast_rows_kernel(out_work_flat, _get_cached_all_row_idx(payload, q_flat.device), out_final_flat)
+        elif cast_mode in {"cute", "kernel"}:
+            _run_cached_cast_all_rows_kernel(out_work_flat, out_final_flat)
+        else:
+            out_final_flat.copy_(out_work_flat)
         return _format_cached_forward_result(q, out_final_flat, lse_work_flat, return_lse=return_lse, lse_layout=lse_layout)
     return _format_cached_forward_result(q, out_work_flat, lse_work_flat, return_lse=return_lse, lse_layout=lse_layout)
 

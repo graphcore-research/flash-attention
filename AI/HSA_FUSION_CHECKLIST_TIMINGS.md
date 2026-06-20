@@ -210,3 +210,72 @@ was leaving most of the available tensor-core throughput unused. The selector
 is intentionally narrow: non-full-span payloads, overlapping residuals, mixed
 packed+scatter residuals, and wider/unsupported shapes still use the existing
 safe paths and gates.
+
+## 2026-06-20 Online-Combine Cast-Out
+
+The overlapping-residual direct-final path keeps FP32 online softmax combine
+semantics unchanged, then casts the complete FP32 output buffer to the model
+dtype. The old cast used the indexed CuTe row-cast kernel even when the row set
+was exactly `0..total_rows-1`. A contiguous CuTe cast kernel was added for
+diagnostics, but the fastest correct path is PyTorch's contiguous
+`out_final_flat.copy_(out_work_flat)`, so `FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_CONTIG_CAST=auto`
+defaults to the PyTorch contiguous copy. `cute` forces the new contiguous CuTe
+kernel and `off`/`indexed` forces the old indexed CuTe kernel.
+
+Cast microbenchmark command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python - <<'PY'
+import torch
+from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import _run_cached_cast_all_rows_kernel, _run_cached_cast_rows_kernel
+
+def bench(fn, iters=50, warmup=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+for rows in (1024, 4096, 65536, 262144):
+    for d in (64, 128):
+        h = 8
+        src = torch.randn((rows, h, d), device="cuda", dtype=torch.float32)
+        dst_indexed = torch.empty((rows, h, d), device="cuda", dtype=torch.bfloat16)
+        dst_all = torch.empty_like(dst_indexed)
+        dst_torch = torch.empty_like(dst_indexed)
+        row_idx = torch.arange(rows, device="cuda", dtype=torch.int32)
+        _run_cached_cast_rows_kernel(src, row_idx, dst_indexed)
+        _run_cached_cast_all_rows_kernel(src, dst_all)
+        dst_torch.copy_(src)
+        torch.cuda.synchronize()
+        print(rows, d, bench(lambda: _run_cached_cast_rows_kernel(src, row_idx, dst_indexed)), bench(lambda: _run_cached_cast_all_rows_kernel(src, dst_all)), bench(lambda: dst_torch.copy_(src)))
+PY
+```
+
+| rows | H | D | indexed CuTe ms | contiguous CuTe ms | PyTorch contiguous copy ms | contig CuTe / indexed |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 8 | 64 | 0.020232 | 0.019469 | 0.004235 | 1.039x |
+| 1024 | 8 | 128 | 0.019303 | 0.018573 | 0.004225 | 1.039x |
+| 4096 | 8 | 64 | 0.021951 | 0.017553 | 0.004260 | 1.251x |
+| 4096 | 8 | 128 | 0.018764 | 0.017630 | 0.006255 | 1.064x |
+| 65536 | 8 | 64 | 0.154131 | 0.117412 | 0.030631 | 1.313x |
+| 65536 | 8 | 128 | 0.299721 | 0.231646 | 0.059352 | 1.294x |
+| 262144 | 8 | 64 | 0.602175 | 0.457474 | 0.113820 | 1.316x |
+| 262144 | 8 | 128 | 1.183752 | 0.910181 | 0.225020 | 1.301x |
+
+Validation:
+
+- `python -m py_compile flash_attn/cute/flash_hsa_synthetic_grid_sm100.py flash_attn/cute/hsa_cached_2d_forward_analysis.py tests/cute/test_hsa_cached_2d_helpers.py`
+  passed.
+- `git diff --check` passed.
+- `PYTHONPATH=. timeout 120s python -m pytest tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_online_combine_cast_mode_gate -q`
+  passed.
+- Existing backward gates were rechecked with:
+  `PYTHONPATH=. timeout 120s python -m pytest tests/cute/test_hsa_cached_2d_helpers.py::test_cached_fused_grad_helper_auto_gate_uses_row_threshold tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_overwrite_gate_requires_all_kv_rows tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_auto_gate_is_small_all_owned_only tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_direct_dq_auto_gate_uses_row_threshold -q`
+  and all 5 passed.

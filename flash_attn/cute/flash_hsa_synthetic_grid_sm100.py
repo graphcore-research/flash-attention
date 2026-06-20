@@ -1276,6 +1276,59 @@ class FlashHSACachedCastRowsSm100:
                 ).to(mDstRows.element_type)
 
 
+class FlashHSACachedCastAllRowsSm100:
+    """Cast a contiguous flat row tensor into a fresh output tensor."""
+
+    arch = 100
+
+    def __init__(self, *, num_threads: int = 256):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mSrcRows: cute.Tensor,
+        mDstRows: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        num_stream_rows = mSrcRows.shape[0]
+        num_heads = mSrcRows.shape[1]
+        head_dim = mSrcRows.shape[2]
+        total_tasks = num_stream_rows * num_heads * head_dim
+        grid_x = cute.ceil_div(total_tasks, self.num_threads)
+        self.kernel(
+            mSrcRows,
+            mDstRows,
+            total_tasks,
+        ).launch(
+            grid=[grid_x, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mSrcRows: cute.Tensor,
+        mDstRows: cute.Tensor,
+        total_tasks: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx, _, _ = cute.arch.block_idx()
+        task_idx = block_idx * self.num_threads + tidx
+        if task_idx < total_tasks:
+            num_heads = Int32(mSrcRows.shape[1])
+            head_dim = Int32(mSrcRows.shape[2])
+            elems_per_stream_row = num_heads * head_dim
+            row_idx = task_idx // elems_per_stream_row
+            rem = task_idx - row_idx * elems_per_stream_row
+            head_idx = rem // head_dim
+            dim_idx = rem - head_idx * head_dim
+            mDstRows[row_idx, head_idx, dim_idx] = Float32(
+                mSrcRows[row_idx, head_idx, dim_idx]
+            ).to(mDstRows.element_type)
+
+
 class FlashHSACachedZeroThreeRowsSm100:
     """Zero DQ/DK/DV row accumulators in one launch."""
 
@@ -5527,6 +5580,38 @@ def _run_cached_cast_rows_kernel(
 
 
 _run_cached_cast_rows_kernel.compile_cache = get_jit_cache("hsa_cached_cast_rows")
+
+
+def _run_cached_cast_all_rows_kernel(
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+) -> None:
+    _require_cute_runtime()
+    compile_key = (
+        "cached_cast_all_rows_v1",
+        src_rows.dtype,
+        dst_rows.dtype,
+        src_rows.shape[1],
+        src_rows.shape[2],
+        torch.cuda.get_device_capability(src_rows.device),
+    )
+    if compile_key not in _run_cached_cast_all_rows_kernel.compile_cache:
+        kernel = FlashHSACachedCastAllRowsSm100()
+        _run_cached_cast_all_rows_kernel.compile_cache[compile_key] = cute.compile(
+            kernel,
+            to_cute_tensor(src_rows, assumed_align=4),
+            to_cute_tensor(dst_rows),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            options="--enable-tvm-ffi",
+        )
+    _run_cached_cast_all_rows_kernel.compile_cache[compile_key](
+        src_rows,
+        dst_rows,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+
+
+_run_cached_cast_all_rows_kernel.compile_cache = get_jit_cache("hsa_cached_cast_all_rows")
 
 
 def _run_cached_zero_three_rows_kernel(

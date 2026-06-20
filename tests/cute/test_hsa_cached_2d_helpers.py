@@ -1241,6 +1241,101 @@ def test_cached_2d_direct_final_allows_serial_mixed_residual_overlap():
     assert missing.tolist() == [4, 5]
 
 
+def test_cached_2d_direct_final_online_combine_cast_mode_gate(monkeypatch):
+    payload = {
+        "total_rows": 2,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "exact_dense_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "q_row_idx": torch.empty((1, 16), dtype=torch.int32),
+        "q_length": torch.tensor([2], dtype=torch.int32),
+        "fused_output_row_count": 0,
+        "exact_dense_output_row_count": 0,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 2,
+        "range_packed_group_count": 0,
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_scatter_q_length": torch.tensor([2], dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.0},
+    }
+    q = torch.empty((2, 1, 64), dtype=torch.bfloat16)
+    k = torch.empty((2, 1, 64), dtype=torch.bfloat16)
+    v = torch.empty((2, 1, 64), dtype=torch.bfloat16)
+    work = torch.ones((2, 1, 64), dtype=torch.float32)
+    lse = torch.empty((2, 1), dtype=torch.float32)
+    calls = []
+
+    monkeypatch.setattr(cached_2d, "_cached_direct_final_residual_support_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_direct_final_requires_online_combine", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cached_2d, "_get_cached_direct_2d_output_buffers", lambda *args, **kwargs: (work, lse))
+    monkeypatch.setattr(cached_2d, "_direct_final_base_residual_union_row_count", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(
+        cached_2d,
+        "_get_direct_final_missing_init_row_idx",
+        lambda *args, **kwargs: torch.empty(0, dtype=torch.int32),
+    )
+    monkeypatch.setattr(cached_2d, "_run_cached_masked_payload_forward", lambda *args, **kwargs: (0, 0, 1, 2))
+    monkeypatch.setattr(cached_2d, "_record_union_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_exact_dense_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_fused_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_cached_forward_path", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_get_cached_all_row_idx", lambda *args, **kwargs: torch.arange(2, dtype=torch.int32))
+
+    def cast_all(src, dst):
+        calls.append(("all", src.shape, dst.shape))
+
+    def cast_indexed(src, row_idx, dst):
+        calls.append(("indexed", row_idx.tolist(), src.shape, dst.shape))
+
+    monkeypatch.setattr(cached_2d, "_run_cached_cast_all_rows_kernel", cast_all)
+    monkeypatch.setattr(cached_2d, "_run_cached_cast_rows_kernel", cast_indexed)
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_CONTIG_CAST", raising=False)
+    out = cached_2d._run_cached_direct_final_residual_forward(
+        payload,
+        q,
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        return_lse=False,
+        lse_layout="flat",
+    )
+    assert calls == []
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out.float(), torch.ones_like(out, dtype=torch.float32))
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_CONTIG_CAST", "cute")
+    cached_2d._run_cached_direct_final_residual_forward(
+        payload,
+        q,
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        return_lse=False,
+        lse_layout="flat",
+    )
+    assert calls[-1][0] == "all"
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_CONTIG_CAST", "0")
+    cached_2d._run_cached_direct_final_residual_forward(
+        payload,
+        q,
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        return_lse=False,
+        lse_layout="flat",
+    )
+    assert calls[-1][0] == "indexed"
+
+
 def test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel():
     payload = {
         "total_rows": 6,

@@ -1848,6 +1848,91 @@ def test_cached_2d_direct_final_dispatch_splits_duplicate_rows_inside_packed_res
     assert [int(call[2][0, 0, 0].item()) for call in calls] == [11, 22]
 
 
+def test_cached_2d_direct_final_packed_duplicate_split_preserves_fallback_padding(monkeypatch):
+    payload = {
+        "total_rows": 6,
+        "packed_q": 8,
+        "support_rows": 8,
+        "tile_k": 32,
+        "q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_scatter_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_scatter_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_scatter_row_count": 0,
+        "range_packed_q_row_idx": torch.tensor([[4, 4, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_packed_k_row_idx": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_packed_q_length": torch.tensor([2], dtype=torch.int32),
+        "range_packed_k_length": torch.tensor([2], dtype=torch.int32),
+        "range_packed_mask_words": torch.tensor([[[11], [22], [0], [0], [0], [0], [0], [0]]], dtype=torch.int32),
+        "range_packed_group_count": 1,
+    }
+    q = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    out = torch.empty((6, 2, 64), dtype=torch.float32)
+    lse = torch.empty((6, 2), dtype=torch.float32)
+    pack_calls = []
+    scatter_calls = []
+
+    monkeypatch.setattr(cached_2d, "_can_use_synthetic_2d_masked_fwd", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        cached_2d,
+        "_get_cached_direct_2d_pack_buffers",
+        lambda *args, **kwargs: (
+            torch.empty((8, 2, 64), dtype=torch.bfloat16),
+            torch.empty((8, 2, 64), dtype=torch.bfloat16),
+            torch.empty((8, 2, 64), dtype=torch.bfloat16),
+        ),
+    )
+
+    def pack_rows(_src, row_idx, _dst):
+        pack_calls.append(("q", row_idx.clone()))
+
+    def pack_kv(_src_k, _src_v, row_idx, _dst_k, _dst_v):
+        pack_calls.append(("kv", row_idx.clone()))
+
+    def masked_fwd(q_buf, _k_buf, _v_buf, q_length, _k_length, mask_words, **_kwargs):
+        assert q_buf.shape[0] == 1
+        assert q_length.tolist() == [1]
+        return (
+            torch.zeros((1, 8, 2, 64), dtype=torch.bfloat16),
+            torch.zeros((1, 8, 2), dtype=torch.float32),
+        )
+
+    def combine_scatter(_packed_out, _packed_lse, row_idx, _out, _lse):
+        scatter_calls.append(row_idx.clone())
+
+    monkeypatch.setattr(cached_2d, "_run_synthetic_pack_rows_kernel", pack_rows)
+    monkeypatch.setattr(cached_2d, "_run_synthetic_pack_kv_rows_kernel", pack_kv)
+    monkeypatch.setattr(cached_2d, "_run_synthetic_2d_masked_fwd_kernel", masked_fwd)
+    monkeypatch.setattr(cached_2d, "_run_synthetic_combine_scatter_rows_kernel", combine_scatter)
+
+    cached_2d._run_cached_masked_payload_forward(
+        payload,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=1.0,
+        force_combine_scatter=True,
+    )
+
+    q_pack_rows = [row_idx.tolist() for kind, row_idx in pack_calls if kind == "q"]
+    kv_pack_rows = [row_idx.tolist() for kind, row_idx in pack_calls if kind == "kv"]
+    assert q_pack_rows == [[4, -1, -1, -1, -1, -1, -1, -1], [4, -1, -1, -1, -1, -1, -1, -1]]
+    assert kv_pack_rows == [[0, 1, -1, -1, -1, -1, -1, -1], [0, 1, -1, -1, -1, -1, -1, -1]]
+    assert [row_idx.tolist() for row_idx in scatter_calls] == q_pack_rows
+
+
 def test_cached_2d_direct_final_allows_serial_duplicate_residual_groups():
     payload = {
         "total_rows": 6,

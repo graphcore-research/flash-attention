@@ -776,20 +776,22 @@ Status:
 
 ## 2026-06-20 Duplicate Residual Combine Serialization
 
-Residual direct-final now handles one more safe overlap case: duplicate output
-rows that appear across separate residual groups are split into duplicate-free
-dispatch ranges and routed through the existing FP32 online-softmax combine
-kernel. This preserves combine semantics while avoiding the old split/finalize
-fallback for serializable duplicate groups.
+Residual direct-final now handles serializable duplicate output rows both across
+separate residual groups and inside one residual group. Cross-group duplicates
+are split into duplicate-free dispatch ranges; within-group duplicates are split
+into duplicate-free column buckets. Both use the existing FP32 online-softmax
+combine kernel, preserving combine semantics while avoiding the old
+split/finalize fallback for serializable duplicate groups.
 
 The launch-count expansion is bounded by
 `FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES` (default 64). If a
 payload would need more serialized ranges, or if a single residual group
-contains the same output row twice, the support predicate still returns
+contains duplicates that exceed the cap, the support predicate still returns
 `direct_final_duplicate_residual_rows_within_kernel` and uses the safe fallback.
-The single-group case remains blocked because the current gather/combine kernel
-contract assumes one update per output row per launch; duplicate rows within one
-launch would require an in-kernel duplicate-row online-softmax reduction.
+A true single-launch variant remains blocked because the current gather/combine
+kernel contract assumes one update per output row per launch; duplicate rows
+within one launch would require an in-kernel duplicate-row online-softmax
+reduction.
 
 Validation:
 
@@ -855,7 +857,7 @@ Observed representative counters:
 
 | Point | Evidence | Status |
 |---|---|---|
-| 1. Duplicate rows inside one residual kernel | `within_group_reason=direct_final_duplicate_residual_rows_within_kernel`; cross-group duplicate rows produce `serial_group_dispatch_ranges=[(0,1),(1,2)]` and `serial_group_reason=None`; range cap `1` falls back with the same duplicate reason. | Fixed for cross-group duplicates; still blocked inside one kernel without an in-kernel duplicate-row online-softmax reduction. |
+| 1. Duplicate rows inside one residual kernel | Superseded by the duplicate-row serial dispatch patch below: `within_group_reason=None`, `within_group_dispatch_plan=[[0,1,[0]],[0,1,[1]]]`; range cap `1` still falls back with `direct_final_duplicate_residual_rows_within_kernel`. | Fixed for serializable cross-group and within-group duplicates; still not a single-launch duplicate-row online-softmax reduction. |
 | 2. 2D compact payload construction | 4K: `payload_s=0.521`, `compact_buckets=0`, `passthrough_buckets=256`, direct compact `0.239 ms` vs FA4 packed `3.442 ms` (`14.40x`). 16K: `payload_s=0.589`, `compact_buckets=1024`, `passthrough_buckets=0`, direct compact `1.608 ms` vs FA4 packed `12.905 ms` (`8.03x`). | Hot forward is fast with cached setup excluded; online Python payload build remains a setup-time blocker if rebuilt per step. |
 | 3. Backward split | `key_owned_auto_small=True` only for all-owned 128 KV rows; `key_owned_auto_large_129_rows=False`; `key_owned_auto_partial=False`; fused zero helper is true at 4096 rows and false at 65536 rows. | Gated; tile-atomic DK/DV remains default for common large/partial payloads. |
 | 4. FP32 online combine cast-out | Overlap profile reports `requires_online_combine=True`; disabling online combine returns `direct_final_online_combine_requires_fp32_accum`; enabling it returns `None`. | FP32 semantics preserved; cast-out remains required when overlap hits. |
@@ -863,10 +865,11 @@ Observed representative counters:
 | 6. AR-HSA readout backward | 16K query probe: `readout_bwd_cute_ms=0.244`, `fwd_bwd_cute_prealloc_ms=0.8713`, `reuse_forward_denom=False`; harness reports denom reuse available but not retained by caller. | Profiled; next win requires caller-level forward-denom retention or a new readout-backward algorithm. |
 
 Next concrete action from these counters: if training payloads rebuild 2D compact
-payloads in-step, move setup into preprocessing/cache first. If not, the next
-kernel-level target is the duplicate-row in-kernel online-softmax combine,
-because the existing gates show broad DK/DV non-atomic and BF16-combine
-shortcuts remain correctly blocked.
+payloads in-step, move setup into preprocessing/cache first. If not, the
+remaining duplicate-row kernel target is a true single-launch in-kernel
+online-softmax reduction; serializable duplicates already avoid split/finalize.
+The existing gates still show broad DK/DV non-atomic and BF16-combine shortcuts
+remain correctly blocked.
 
 ## 2026-06-20 Cached 2D Payload Cache Stats
 

@@ -819,3 +819,51 @@ PYTHONPATH=. timeout 180s python tests/cute/benchmark_hsa_2d_sparse.py \
 | case | payload_s | diagnostic_geometry_s | direct_2d_compact fwd ms | FA4 packed fwd ms | speedup |
 |---|---:|---:|---:|---:|---:|
 | compact_control-16384 | 0.637 | 1.030 | 1.575 | 12.187 | 7.74x |
+
+## 2026-06-20 Remaining HSA Fusion Profiling Harness
+
+Added `tests/cute/profile_hsa_remaining.py` as a bounded profiling harness for
+the six remaining fusion questions. It does not change production routing; it
+reports the current support gates and, when CUDA is available, runs
+representative 2D compact payload and optional AR-HSA readout probes.
+
+Gate-only smoke:
+
+```bash
+PYTHONPATH=. timeout 60s python tests/cute/profile_hsa_remaining.py --no-cuda --json
+```
+
+Representative 2D compact payload probes:
+
+```bash
+PYTHONPATH=. timeout 180s python tests/cute/profile_hsa_remaining.py \
+  --seqlens 4096 --benchmark-iters 2 --warmup-iters 1 --json
+
+PYTHONPATH=. timeout 240s python tests/cute/profile_hsa_remaining.py \
+  --seqlens 16384 --benchmark-iters 1 --warmup-iters 1 --json
+```
+
+Bounded AR-HSA readout probe:
+
+```bash
+PYTHONPATH=. timeout 240s python tests/cute/profile_hsa_remaining.py \
+  --seqlens 1024 --include-arhsa-probe --arhsa-queries 16384 \
+  --arhsa-iters 3 --arhsa-warmup 1 --json
+```
+
+Observed representative counters:
+
+| Point | Evidence | Status |
+|---|---|---|
+| 1. Duplicate rows inside one residual kernel | `within_group_reason=direct_final_duplicate_residual_rows_within_kernel`; cross-group duplicate rows produce `serial_group_dispatch_ranges=[(0,1),(1,2)]` and `serial_group_reason=None`; range cap `1` falls back with the same duplicate reason. | Fixed for cross-group duplicates; still blocked inside one kernel without an in-kernel duplicate-row online-softmax reduction. |
+| 2. 2D compact payload construction | 4K: `payload_s=0.521`, `compact_buckets=0`, `passthrough_buckets=256`, direct compact `0.239 ms` vs FA4 packed `3.442 ms` (`14.40x`). 16K: `payload_s=0.589`, `compact_buckets=1024`, `passthrough_buckets=0`, direct compact `1.608 ms` vs FA4 packed `12.905 ms` (`8.03x`). | Hot forward is fast with cached setup excluded; online Python payload build remains a setup-time blocker if rebuilt per step. |
+| 3. Backward split | `key_owned_auto_small=True` only for all-owned 128 KV rows; `key_owned_auto_large_129_rows=False`; `key_owned_auto_partial=False`; fused zero helper is true at 4096 rows and false at 65536 rows. | Gated; tile-atomic DK/DV remains default for common large/partial payloads. |
+| 4. FP32 online combine cast-out | Overlap profile reports `requires_online_combine=True`; disabling online combine returns `direct_final_online_combine_requires_fp32_accum`; enabling it returns `None`. | FP32 semantics preserved; cast-out remains required when overlap hits. |
+| 5. D128/wider routing | Target matrix `head_dim in {64,128}`, `support_k in {64,128,512}` reports one wide-D128 case: `head_dim=128,support_k=512` gated for focused probe. | Counted and gated; no new D128 wide route defaulted. |
+| 6. AR-HSA readout backward | 16K query probe: `readout_bwd_cute_ms=0.244`, `fwd_bwd_cute_prealloc_ms=0.8713`, `reuse_forward_denom=False`; harness reports denom reuse available but not retained by caller. | Profiled; next win requires caller-level forward-denom retention or a new readout-backward algorithm. |
+
+Next concrete action from these counters: if training payloads rebuild 2D compact
+payloads in-step, move setup into preprocessing/cache first. If not, the next
+kernel-level target is the duplicate-row in-kernel online-softmax combine,
+because the existing gates show broad DK/DV non-atomic and BF16-combine
+shortcuts remain correctly blocked.

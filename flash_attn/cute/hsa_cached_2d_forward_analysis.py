@@ -157,6 +157,10 @@ def _use_cached_fused_grad_helper(name: str, row_idx: torch.Tensor, *, default_m
     return int(row_idx.numel()) <= max(0, max_rows)
 
 
+def _use_torch_contiguous_grad_helpers() -> bool:
+    return _is_env_enabled("FLASH_ATTN_HSA_CACHED_TORCH_CONTIG_GRAD_HELPERS", default="on")
+
+
 def _extract_bucket_live_row_supports(
     direct_plan: dict[str, Any],
     row_plan: dict[str, Any],
@@ -3335,6 +3339,11 @@ def _finalize_cached_backward_grads(
     dq = torch.empty_like(q_flat)
     dk = torch.empty_like(k_flat)
     dv = torch.empty_like(v_flat)
+    if q_flat.is_cuda and _use_torch_contiguous_grad_helpers():
+        dq.copy_(dq_acc)
+        dk.copy_(dk_acc)
+        dv.copy_(dv_acc)
+        return dq, dk, dv
     if q_flat.is_cuda and _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE", row_idx):
         _run_cached_cast_three_rows_kernel(dq_acc, dk_acc, dv_acc, row_idx, dq, dk, dv)
     else:
@@ -3354,6 +3363,10 @@ def _finalize_cached_backward_kv_grads(
     row_idx = _get_cached_all_row_idx(payload, k_flat.device)
     dk = torch.empty_like(k_flat)
     dv = torch.empty_like(v_flat)
+    if k_flat.is_cuda and _use_torch_contiguous_grad_helpers():
+        dk.copy_(dk_acc)
+        dv.copy_(dv_acc)
+        return dk, dv
     if k_flat.is_cuda and _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_FINALIZE", row_idx):
         _run_cached_cast_two_rows_kernel(dk_acc, dv_acc, row_idx, dk, dv)
     else:
@@ -3528,6 +3541,10 @@ def _zero_cached_backward_kv_accum_buffers(
     dv_acc: torch.Tensor,
 ) -> None:
     if k_flat.is_cuda:
+        if _use_torch_contiguous_grad_helpers():
+            dk_acc.zero_()
+            dv_acc.zero_()
+            return
         all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
         if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
@@ -3546,6 +3563,10 @@ def _zero_cached_backward_kv_final_buffers(
     dv: torch.Tensor,
 ) -> None:
     if k_flat.is_cuda:
+        if _use_torch_contiguous_grad_helpers():
+            dk.zero_()
+            dv.zero_()
+            return
         all_row_idx = _get_cached_all_row_idx(payload, k_flat.device)
         if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_two_rows_kernel(all_row_idx, dk, dv)
@@ -3611,11 +3632,20 @@ def _zero_cached_backward_accum_buffers(
     if q_flat.is_cuda:
         all_row_idx = _get_cached_all_row_idx(payload, q_flat.device)
         if _cached_backward_dq_overwrites_all_rows(payload, q_flat):
+            if _use_torch_contiguous_grad_helpers():
+                dk_acc.zero_()
+                dv_acc.zero_()
+                return
             if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
                 _run_cached_zero_two_rows_kernel(all_row_idx, dk_acc, dv_acc)
                 return
             _run_cached_zero_rows_kernel(all_row_idx, dk_acc)
             _run_cached_zero_rows_kernel(all_row_idx, dv_acc)
+            return
+        if _use_torch_contiguous_grad_helpers():
+            dq_acc.zero_()
+            dk_acc.zero_()
+            dv_acc.zero_()
             return
         if _use_cached_fused_grad_helper("FLASH_ATTN_HSA_CACHED_FUSED_GRAD_ZERO", all_row_idx):
             _run_cached_zero_three_rows_kernel(all_row_idx, dq_acc, dk_acc, dv_acc)
@@ -5555,7 +5585,10 @@ def run_cached_generalized_packed_backward(
         else:
             dq_acc = _get_cached_backward_accum_buffers(payload, q_flat, k_flat, v_flat)[0]
             if q_flat.is_cuda:
-                _run_cached_zero_rows_kernel(_get_cached_all_row_idx(payload, q_flat.device), dq_acc)
+                if _use_torch_contiguous_grad_helpers():
+                    dq_acc.zero_()
+                else:
+                    _run_cached_zero_rows_kernel(_get_cached_all_row_idx(payload, q_flat.device), dq_acc)
             else:
                 dq_acc.zero_()
             dk = torch.empty_like(k_flat)
@@ -5619,7 +5652,10 @@ def run_cached_generalized_packed_backward(
                     dv.view_as(v),
                 )
             dq = torch.empty_like(q_flat)
-            _run_cached_cast_rows_kernel(dq_acc, _get_cached_all_row_idx(payload, q_flat.device), dq)
+            if _use_torch_contiguous_grad_helpers():
+                dq.copy_(dq_acc)
+            else:
+                _run_cached_cast_rows_kernel(dq_acc, _get_cached_all_row_idx(payload, q_flat.device), dq)
             return (
                 dq.view_as(q),
                 dk.view_as(k),

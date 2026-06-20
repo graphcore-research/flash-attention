@@ -279,3 +279,92 @@ Validation:
 - Existing backward gates were rechecked with:
   `PYTHONPATH=. timeout 120s python -m pytest tests/cute/test_hsa_cached_2d_helpers.py::test_cached_fused_grad_helper_auto_gate_uses_row_threshold tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_overwrite_gate_requires_all_kv_rows tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_auto_gate_is_small_all_owned_only tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_direct_dq_auto_gate_uses_row_threshold -q`
   and all 5 passed.
+
+## 2026-06-20 Mixed Residual Coverage and Backward Helpers
+
+Mixed packed+scatter / non-full-span residual direct-final was inspected again.
+The current support predicate already allows direct-final when the base rows and
+all residual row groups have a full `total_rows` union, including serial overlap
+across scatter and packed groups. It initializes residual-only missing rows and
+uses FP32 online combine when rows overlap across base/residual or across
+residual families.
+
+Still blocked:
+
+- Rows missing from the base+residual union cannot be direct-finalized safely.
+  The split fallback initializes every row, computes whatever base/residual work
+  exists, then runs `_run_cached_finalize_output_rows_kernel` over all rows.
+  In direct-final mode there is no computed output/LSE contribution for missing
+  rows; initializing them would create zero/invalid rows rather than attention
+  results. The existing tests keep this blocked:
+  `mixed_residual_incomplete_direct_final_row_coverage` and
+  `packed_residual_incomplete_direct_final_row_coverage`.
+- Duplicate rows inside one residual kernel remain blocked by
+  `_direct_final_has_duplicate_residual_rows_within_kernel`. The current combine
+  kernels support serial online-softmax combination across separate base /
+  scatter / packed launches, but not unordered duplicate updates within a
+  single residual kernel launch. Covered by
+  `test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel`.
+
+Backward helper dispatch was then measured because all-row zero/finalize helper
+paths still used indexed CuTe row kernels. PyTorch contiguous `copy_` / `zero_`
+is faster for all tested row counts, so
+`FLASH_ATTN_HSA_CACHED_TORCH_CONTIG_GRAD_HELPERS=on` is now the default. Set it
+to `off` to force the previous CuTe helper behavior.
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python - <<'PY'
+import torch
+from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+    _run_cached_cast_rows_kernel, _run_cached_cast_two_rows_kernel,
+    _run_cached_cast_three_rows_kernel, _run_cached_zero_rows_kernel,
+    _run_cached_zero_two_rows_kernel, _run_cached_zero_three_rows_kernel,
+)
+
+def bench(fn, iters=50, warmup=10):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+for rows in (4096, 65536, 262144):
+    for d in (64, 128):
+        h = 8
+        row_idx = torch.arange(rows, device="cuda", dtype=torch.int32)
+        a = torch.randn((rows, h, d), device="cuda", dtype=torch.float32)
+        b = torch.randn_like(a)
+        c = torch.randn_like(a)
+        da = torch.empty((rows, h, d), device="cuda", dtype=torch.bfloat16)
+        db = torch.empty_like(da)
+        dc = torch.empty_like(da)
+        print(rows, d, bench(lambda: _run_cached_cast_three_rows_kernel(a,b,c,row_idx,da,db,dc)), bench(lambda: (da.copy_(a), db.copy_(b), dc.copy_(c))), bench(lambda: _run_cached_zero_three_rows_kernel(row_idx,a,b,c)), bench(lambda: (a.zero_(), b.zero_(), c.zero_())))
+PY
+```
+
+Representative timings:
+
+| rows | D | CuTe cast3 ms | torch copy3 ms | CuTe zero3 ms | torch zero3 ms |
+|---:|---:|---:|---:|---:|---:|
+| 4096 | 64 | 0.025814 | 0.012474 | 0.022774 | 0.016920 |
+| 4096 | 128 | 0.049537 | 0.018472 | 0.041364 | 0.017144 |
+| 65536 | 64 | 0.450636 | 0.093801 | 0.331100 | 0.061646 |
+| 65536 | 128 | 0.864057 | 0.177412 | 0.640476 | 0.116822 |
+| 262144 | 64 | 1.786637 | 0.343328 | 1.311463 | 0.217341 |
+| 262144 | 128 | 3.441538 | 0.674292 | 2.551896 | 0.424623 |
+
+Validation:
+
+- `python -m py_compile flash_attn/cute/hsa_cached_2d_forward_analysis.py tests/cute/test_hsa_cached_2d_helpers.py`
+  passed.
+- `git diff --check` passed.
+- `PYTHONPATH=. timeout 120s python -m pytest tests/cute/test_hsa_cached_2d_helpers.py::test_cached_torch_contiguous_grad_helper_env_gate tests/cute/test_hsa_cached_2d_helpers.py::test_cached_fused_grad_helper_auto_gate_uses_row_threshold tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_overwrite_gate_requires_all_kv_rows tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_auto_gate_is_small_all_owned_only tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_direct_dq_auto_gate_uses_row_threshold -q`
+  passed: 6 passed in 2.26s.

@@ -529,6 +529,17 @@ def test_cached_fused_grad_helper_auto_gate_uses_row_threshold(monkeypatch):
     assert not cached_2d._use_cached_fused_grad_helper(name, torch.arange(8, dtype=torch.int32))
 
 
+def test_cached_torch_contiguous_grad_helper_env_gate(monkeypatch):
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_TORCH_CONTIG_GRAD_HELPERS", raising=False)
+    assert cached_2d._use_torch_contiguous_grad_helpers()
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_TORCH_CONTIG_GRAD_HELPERS", "0")
+    assert not cached_2d._use_torch_contiguous_grad_helpers()
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_TORCH_CONTIG_GRAD_HELPERS", "1")
+    assert cached_2d._use_torch_contiguous_grad_helpers()
+
+
 def test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload():
     assert not cached_2d._can_use_cached_backward_key_owned_dkdv(None)
 

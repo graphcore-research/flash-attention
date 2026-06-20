@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -312,6 +313,200 @@ def test_synthetic_2d_masked_gather_d128_matches_dense_partial_mask(monkeypatch)
 
     torch.testing.assert_close(out, ref_out, rtol=0, atol=2e-5)
     torch.testing.assert_close(lse, ref_lse, rtol=0, atol=2e-5)
+
+
+def test_explicit_2d_payloads_preserve_long_noncontiguous_q_rows():
+    import flash_attn.cute.hsa_explicit_2d_sparse_analysis as explicit_2d
+
+    packed_out = torch.arange(2 * 4 * 1 * 2, dtype=torch.float32).view(2, 4, 1, 2)
+    q_length = torch.tensor([3, 2], dtype=torch.int32)
+    q_row_idx = torch.tensor(
+        [
+            [65536, 3, 8, -1],
+            [70000, 2, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+
+    scattered = explicit_2d.scatter_explicit_packed_rows(
+        packed_out,
+        q_row_idx,
+        q_length,
+        total_rows=70001,
+    )
+
+    assert scattered.shape == (70001, 1, 2)
+    torch.testing.assert_close(scattered[65536], packed_out[0, 0])
+    torch.testing.assert_close(scattered[3], packed_out[0, 1])
+    torch.testing.assert_close(scattered[8], packed_out[0, 2])
+    torch.testing.assert_close(scattered[70000], packed_out[1, 0])
+    torch.testing.assert_close(scattered[2], packed_out[1, 1])
+
+    q_buf = torch.randn((2, 4, 1, 64), dtype=torch.float32)
+    k_buf = torch.randn((2, 8, 1, 64), dtype=torch.float32)
+    v_buf = torch.randn((2, 8, 1, 64), dtype=torch.float32)
+    mask_bool = torch.zeros((2, 4, 8), dtype=torch.bool)
+    mask_bool[0, 0, [0, 2, 4]] = True
+    mask_bool[0, 1, [1, 3]] = True
+    mask_bool[0, 2, [2, 5]] = True
+    mask_bool[1, 0, [0, 7]] = True
+    mask_bool[1, 1, [3, 6]] = True
+
+    direct_bucket, _ = explicit_2d._build_direct_2d_bucket(
+        q_buf=q_buf,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        mask_bool=mask_bool,
+        q_length=q_length,
+        q_row_idx=q_row_idx,
+    )
+    compact_payload, _ = explicit_2d._build_direct_2d_compact_payload(
+        q_buf=q_buf,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        mask_bool=mask_bool,
+        q_length=q_length,
+        q_row_idx=q_row_idx,
+    )
+
+    assert direct_bucket["total_rows"] == 70001
+    assert compact_payload["total_rows"] == 70001
+    torch.testing.assert_close(compact_payload["q_row_idx"], q_row_idx)
+
+
+def test_synthetic_2d_masked_long_noncontiguous_rows_match_dense(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for long 2D row-index correctness test")
+
+    from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+        _run_synthetic_2d_masked_gather_combine_fwd_kernel,
+        _run_synthetic_2d_masked_gather_fwd_kernel,
+        _run_synthetic_2d_masked_gather_scatter_fwd_kernel,
+    )
+
+    monkeypatch.delenv("FLASH_ATTN_HSA_CACHED_GATHER_MAX_PACKED_K", raising=False)
+    torch.manual_seed(0)
+    rows = 70032
+    heads = 2
+    head_dim = 64
+    groups = 2
+    packed_q = 8
+    packed_k = 32
+    q = torch.randn((rows, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.randn((rows, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    v = torch.randn((rows, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    q_row_idx = torch.tensor(
+        [
+            [65536, 65537, 65539, 42, 69999, -1, -1, -1],
+            [131, 65540, 66000, 70031, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    k_row_idx = torch.tensor(
+        [
+            [65535, 65536, 65537, 65538, 100, 101, 102, 103] + [-1] * 24,
+            [0, 31, 65536, 66001, 70030, 70031, 60000, 40000] + [-1] * 24,
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q_length = torch.tensor([5, 4], dtype=torch.int32, device="cuda")
+    k_length = torch.tensor([8, 8], dtype=torch.int32, device="cuda")
+    mask_words_cpu = torch.zeros((groups, packed_q, (packed_k + 31) // 32), dtype=torch.int32)
+    for group_idx in range(groups):
+        for row_idx in range(int(q_length[group_idx])):
+            for col_idx in range(8):
+                if (col_idx + row_idx + group_idx) % 3 != 1:
+                    mask_words_cpu[group_idx, row_idx, 0] |= 1 << col_idx
+    mask_words = mask_words_cpu.to(device="cuda")
+    scale = 1.0 / math.sqrt(float(head_dim))
+
+    packed_out, packed_lse = _run_synthetic_2d_masked_gather_fwd_kernel(
+        q,
+        k,
+        v,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        softmax_scale=scale,
+        tile_k=32,
+    )
+
+    ref_out = torch.zeros_like(packed_out)
+    ref_lse = torch.full_like(packed_lse, float("-inf"))
+    for group_idx in range(groups):
+        for row_idx in range(int(q_length[group_idx])):
+            q_global = int(q_row_idx[group_idx, row_idx].item())
+            key_rows = [
+                int(k_row_idx[group_idx, col_idx].item())
+                for col_idx in range(int(k_length[group_idx]))
+                if int(mask_words_cpu[group_idx, row_idx, 0]) & (1 << col_idx)
+            ]
+            scores = torch.einsum("hd,khd->hk", q[q_global].float(), k[key_rows].float()) * scale
+            probs = torch.softmax(scores, dim=-1)
+            ref_out[group_idx, row_idx] = torch.einsum("hk,khd->hd", probs, v[key_rows].float())
+            ref_lse[group_idx, row_idx] = torch.logsumexp(scores, dim=-1)
+
+    torch.cuda.synchronize()
+    for group_idx in range(groups):
+        for row_idx in range(int(q_length[group_idx])):
+            torch.testing.assert_close(
+                packed_out[group_idx, row_idx].float(),
+                ref_out[group_idx, row_idx].float(),
+                atol=2e-3,
+                rtol=2e-3,
+            )
+            torch.testing.assert_close(
+                packed_lse[group_idx, row_idx].float(),
+                ref_lse[group_idx, row_idx].float(),
+                atol=2e-3,
+                rtol=2e-3,
+            )
+
+    scattered_out = torch.full((rows, heads, head_dim), -123.0, dtype=torch.float32, device="cuda")
+    scattered_lse = torch.full((rows, heads), float("-inf"), dtype=torch.float32, device="cuda")
+    _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
+        q,
+        k,
+        v,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        scattered_out,
+        scattered_lse,
+        softmax_scale=scale,
+        tile_k=32,
+    )
+    combine_out = torch.zeros((rows, heads, head_dim), dtype=torch.float32, device="cuda")
+    combine_lse = torch.full((rows, heads), float("-inf"), dtype=torch.float32, device="cuda")
+    _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+        q,
+        k,
+        v,
+        q_row_idx,
+        k_row_idx,
+        q_length,
+        k_length,
+        mask_words,
+        combine_out,
+        combine_lse,
+        softmax_scale=scale,
+        tile_k=32,
+    )
+    torch.cuda.synchronize()
+
+    for group_idx in range(groups):
+        for row_idx in range(int(q_length[group_idx])):
+            q_global = int(q_row_idx[group_idx, row_idx].item())
+            torch.testing.assert_close(scattered_out[q_global], ref_out[group_idx, row_idx], atol=2e-3, rtol=2e-3)
+            torch.testing.assert_close(scattered_lse[q_global], ref_lse[group_idx, row_idx], atol=2e-3, rtol=2e-3)
+            torch.testing.assert_close(combine_out[q_global], ref_out[group_idx, row_idx], atol=2e-3, rtol=2e-3)
+            torch.testing.assert_close(combine_lse[q_global], ref_lse[group_idx, row_idx], atol=2e-3, rtol=2e-3)
 
 
 def test_cached_fused_grad_helper_auto_gate_uses_row_threshold(monkeypatch):

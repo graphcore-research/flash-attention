@@ -78,3 +78,62 @@ Helper timing, heads=8:
 | 65536 | 64 | 0.438684 | 0.448818 | 0.658181 | 0.665872 | 0.344756 | 0.368924 | 0.517127 | 0.550675 |
 | 4096 | 128 | 0.057452 | 0.057384 | 0.086161 | 0.084005 | 0.049181 | 0.049206 | 0.073760 | 0.071781 |
 | 65536 | 128 | 0.862198 | 0.887454 | 1.292986 | 1.315329 | 0.680028 | 0.733525 | 1.020104 | 1.091007 |
+
+## 2026-06-20 Long 2D Row Validation
+
+The explicit/direct/compact 2D payloads now preserve `q_row_idx`, derive
+`total_rows` from the max valid row id, validate scatter bounds, and scatter
+compact outputs back to true row ids instead of flattening by valid-row order.
+
+Validation run:
+
+- `python -m py_compile flash_attn/cute/hsa_explicit_2d_sparse_analysis.py tests/cute/test_hsa_cached_2d_helpers.py` passed.
+- `git diff --check` passed.
+- `python -m pytest tests/cute/test_hsa_cached_2d_helpers.py -q` passed: 31 passed, 9 warnings in 9.03s.
+- Small explicit smoke, `seqlen=128`, `heads=2`, `D=64`, `packed_q=8`,
+  `support_k=32`: direct and compact both returned `(2, 128, 64)`,
+  `max_diff=7.152557e-07`, `total_rows=128`.
+
+Low-level long-index probe used sparse row ids above 65536 without constructing
+a dense explicit benchmark:
+
+| rows | q row min | q row max | groups | packed_q | packed_k | heads | D | gather ms | scatter ms | combine ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 70048 | 65547 | 70024 | 16 | 8 | 32 | 8 | 64 | 0.046211 | 0.027021 | 0.026381 |
+
+The full long explicit benchmark construction remains a Python-side blocker:
+the previously observed 65K-row explicit case construction was approximately
+67s. That slow construction path was not rerun here.
+
+## Remaining Fusion Gates
+
+Overlapping residual FP32 online-combine cast-out is blocked. The existing
+support gate still returns `direct_final_online_combine_requires_fp32_accum`
+when overlapping packed/scatter residual rows would require BF16 online
+accumulation. The measured BF16-work-buffer probe changed final BF16 output by
+0.015625 for D64 and 0.0078125 for D128 versus FP32 work plus final cast, so the
+final cast is not safe to fuse by changing the combine destination dtype.
+
+2D backward split/zero/cast helpers are gated. Fused zero/cast helpers remain
+under the auto row threshold, defaulting to <=4096 rows through
+`FLASH_ATTN_HSA_CACHED_FUSED_GRAD_HELPER_MAX_ROWS`; the timing table above shows
+the fused helpers lose at 65536 rows. Direct-DQ backward also stays behind its
+tiny/min-row gates, covered by
+`test_cached_backward_direct_dq_auto_gate_uses_row_threshold`.
+
+D128 direct forward is gated. The TC route is used only for the tested
+`tc16x32`, `packed_q=16`, `tile_k=32`, `support_rows<=128` envelope, and the
+scalar D128 direct path remains capped by
+`FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K`. Coverage:
+`test_synthetic_2d_masked_fwd_gate_allows_k2048_d64_and_caps_d128`,
+`test_synthetic_2d_masked_gather_scatter_tc_d128_matches_scalar`, and
+`test_synthetic_2d_masked_gather_d128_matches_dense_partial_mask`.
+
+AR-HSA DK/DV atomics and payload/schedule construction remain gated. The
+key-owned DK/DV path requires a ready `cached_tc8x8_fused` backward payload with
+`owned_k_row_idx` and all `owned_occurrence_*` tensors, must overwrite all KV
+rows, and auto-enables only up to
+`FLASH_ATTN_HSA_CACHED_GENERALIZED_BWD_KEY_OWNED_MAX_ROWS` (default 128). The
+helper tests cover missing occurrence payloads, all-KV overwrite gating, and
+the small-all-owned auto gate. Broader schedule/payload construction is still a
+separate Python-side build problem, so no small safe win was taken here.

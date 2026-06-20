@@ -163,6 +163,23 @@ def _flatten_valid_packed_rows(packed_out: torch.Tensor, q_length: torch.Tensor)
     return torch.cat(rows, dim=0).permute(1, 0, 2).contiguous()
 
 
+def _total_rows_from_q_row_idx(
+    q_row_idx: torch.Tensor,
+    q_length: torch.Tensor,
+    *,
+    fallback_total_rows: int,
+) -> int:
+    max_row = -1
+    for bucket_idx, q_count in enumerate(q_length.detach().cpu().tolist()):
+        valid_q = int(q_count)
+        if valid_q <= 0:
+            continue
+        valid_rows = q_row_idx[bucket_idx, :valid_q]
+        if int(valid_rows.numel()) > 0:
+            max_row = max(max_row, int(valid_rows.max().item()))
+    return max(int(fallback_total_rows), max_row + 1)
+
+
 def scatter_explicit_packed_rows(
     packed_out: torch.Tensor,
     q_row_idx: torch.Tensor,
@@ -175,12 +192,16 @@ def scatter_explicit_packed_rows(
         dtype=torch.float32,
         device=packed_out.device,
     )
-    for bucket_idx, q_count in enumerate(q_length.detach().cpu().tolist()):
-        valid_q = int(q_count)
-        if valid_q <= 0:
-            continue
-        target_rows = q_row_idx[bucket_idx, :valid_q].long()
-        scattered.index_copy_(0, target_rows, packed_out[bucket_idx, :valid_q].float())
+    if int(packed_out.shape[0]) <= 0 or int(packed_out.shape[1]) <= 0:
+        return scattered
+    slot_valid = torch.arange(int(packed_out.shape[1]), device=q_length.device).unsqueeze(0) < q_length.unsqueeze(1)
+    target_rows = q_row_idx.to(device=packed_out.device)[slot_valid.to(device=packed_out.device)].long()
+    if int(target_rows.numel()) <= 0:
+        return scattered
+    if bool((target_rows < 0).any().item()) or bool((target_rows >= total_rows).any().item()):
+        raise RuntimeError("explicit_2d_q_row_idx_out_of_bounds")
+    source_rows = packed_out[slot_valid.to(device=packed_out.device)].float()
+    scattered.index_copy_(0, target_rows, source_rows)
     return scattered
 
 
@@ -356,7 +377,11 @@ def _build_direct_2d_bucket(
         "custom_q_length": direct_q_length.contiguous(),
         "custom_k_length": direct_k_length.contiguous(),
         "q_row_idx": direct_q_row_idx.contiguous(),
-        "total_rows": int(q_length.sum().item()),
+        "total_rows": _total_rows_from_q_row_idx(
+            q_row_idx,
+            q_length,
+            fallback_total_rows=int(q_length.sum().item()),
+        ),
     }
     avg_union_k = (
         float(direct_k_length.float().mean().item()) if group_count > 0 else 0.0
@@ -386,6 +411,7 @@ def _build_direct_2d_compact_payload(
     v_buf: torch.Tensor,
     mask_bool: torch.Tensor,
     q_length: torch.Tensor,
+    q_row_idx: torch.Tensor,
     tile_k: int = 32,
 ) -> tuple[dict[str, Any], dict[str, float | int]]:
     num_buckets, packed_q, num_heads, head_dim = q_buf.shape
@@ -536,6 +562,12 @@ def _build_direct_2d_compact_payload(
         "total_buckets": num_buckets,
         "packed_q": packed_q,
         "custom_q_length": q_length.contiguous(),
+        "q_row_idx": q_row_idx.contiguous(),
+        "total_rows": _total_rows_from_q_row_idx(
+            q_row_idx,
+            q_length,
+            fallback_total_rows=int(q_length.sum().item()),
+        ),
     }, compact_geometry
 
 
@@ -616,44 +648,40 @@ def build_explicit_2d_sparse_case(
     generator = torch.Generator(device=generator_device)
     generator.manual_seed(seed)
 
-    q_buf = torch.zeros((num_buckets, packed_q, heads, head_dim), dtype=dtype, device=device)
     k_buf = torch.randn((num_buckets, support_k, heads, head_dim), dtype=dtype, device=device, generator=generator)
     v_buf = torch.randn((num_buckets, support_k, heads, head_dim), dtype=dtype, device=device, generator=generator)
-    mask_bool = torch.zeros((num_buckets, packed_q, support_k), dtype=torch.bool, device=device)
-    q_length = torch.zeros((num_buckets,), dtype=torch.int32, device=device)
+    q_buf = torch.randn((num_buckets, packed_q, heads, head_dim), dtype=dtype, device=device, generator=generator)
+    q_length_cpu = torch.full((num_buckets,), packed_q, dtype=torch.int32)
+    tail_q = seqlen - (num_buckets - 1) * packed_q
+    if 0 < tail_q < packed_q:
+        q_length_cpu[-1] = int(tail_q)
+        q_buf[-1, tail_q:] = 0
+    q_length = q_length_cpu.to(device=device)
     k_length = torch.full((num_buckets,), support_k, dtype=torch.int32, device=device)
-    q_row_idx = torch.full((num_buckets, packed_q), -1, dtype=torch.int32, device=device)
+    q_row_idx = torch.arange(num_buckets * packed_q, dtype=torch.int32, device=device).view(num_buckets, packed_q)
+    q_row_idx = q_row_idx.masked_fill(q_row_idx >= seqlen, -1)
 
     live_per_row = min(support_k, islands_per_row * island_width)
-    global_row = 0
-    for bucket_idx in range(num_buckets):
-        valid_q = min(packed_q, seqlen - bucket_idx * packed_q)
-        q_length[bucket_idx] = valid_q
-        for row_idx in range(valid_q):
-            q_buf[bucket_idx, row_idx] = torch.randn(
-                (heads, head_dim),
-                dtype=dtype,
-                device=device,
-                generator=generator,
+    if case_family == "compact_control":
+        width = min(support_k, max(0, live_per_row))
+        global_rows = q_row_idx.to(dtype=torch.int64)
+        row_valid = global_rows >= 0
+        max_start = max(0, support_k - width)
+        starts = (global_rows.clamp_min(0) * max(1, row_shift // 2)) % max(1, max_start + 1)
+        cols = torch.arange(support_k, dtype=torch.int64, device=device).view(1, 1, support_k)
+        mask_bool = row_valid.unsqueeze(-1) & (cols >= starts.unsqueeze(-1)) & (cols < (starts + width).unsqueeze(-1))
+    else:
+        mask_bool_cpu = torch.zeros((num_buckets, packed_q, support_k), dtype=torch.bool)
+        for global_row in range(seqlen):
+            bucket_idx, row_idx = divmod(global_row, packed_q)
+            mask_bool_cpu[bucket_idx, row_idx] = _build_disjoint_confetti_row_mask(
+                support_k=support_k,
+                islands_per_row=islands_per_row,
+                island_width=island_width,
+                row_seed=global_row,
+                row_shift=row_shift,
             )
-            q_row_idx[bucket_idx, row_idx] = global_row
-            if case_family == "disjoint_confetti":
-                row_mask = _build_disjoint_confetti_row_mask(
-                    support_k=support_k,
-                    islands_per_row=islands_per_row,
-                    island_width=island_width,
-                    row_seed=global_row,
-                    row_shift=row_shift,
-                )
-            else:
-                row_mask = _build_compact_control_row_mask(
-                    support_k=support_k,
-                    live_per_row=live_per_row,
-                    row_seed=global_row,
-                    row_shift=max(1, row_shift // 2),
-                )
-            mask_bool[bucket_idx, row_idx] = row_mask.to(device=device)
-            global_row += 1
+        mask_bool = mask_bool_cpu.to(device=device)
 
     mask_words = _encode_mask_rows_to_words(mask_bool.reshape(num_buckets * packed_q, support_k)).view(
         num_buckets,
@@ -671,6 +699,11 @@ def build_explicit_2d_sparse_case(
         "custom_q_length": q_length.contiguous(),
         "custom_k_length": k_length.contiguous(),
         "q_row_idx": q_row_idx.contiguous(),
+        "total_rows": _total_rows_from_q_row_idx(
+            q_row_idx,
+            q_length,
+            fallback_total_rows=seqlen,
+        ),
     }
     geometry = _mask_geometry(mask_bool, q_length)
     geometry.update(
@@ -701,6 +734,7 @@ def build_explicit_2d_sparse_case(
         v_buf=v_buf,
         mask_bool=mask_bool,
         q_length=q_length,
+        q_row_idx=q_row_idx,
     )
     geometry.update(direct_2d_geometry)
     geometry.update(direct_2d_compact_geometry)
@@ -822,6 +856,13 @@ def _run_direct_2d_compact_forward(case_payload: dict[str, Any], *, softmax_scal
     for group in compact_payload["groups"]:
         group_out = _run_direct_2d_packed_forward(group, softmax_scale=softmax_scale).float()
         packed_out.index_copy_(0, group["bucket_indices"].long(), group_out)
+    if "q_row_idx" in compact_payload and "total_rows" in compact_payload:
+        return scatter_explicit_packed_rows(
+            packed_out,
+            compact_payload["q_row_idx"],
+            compact_payload["custom_q_length"],
+            total_rows=int(compact_payload["total_rows"]),
+        ).permute(1, 0, 2).contiguous()
     return _flatten_valid_packed_rows(packed_out, compact_payload["custom_q_length"])
 
 

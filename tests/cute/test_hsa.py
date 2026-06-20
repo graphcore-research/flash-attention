@@ -4696,3 +4696,28 @@ def test_hsa_explicit_2d_sparse_variants_match_dense_oracle(case_family):
     assert report["results"]["custom_masked"]["output_max_diff"] < 0.1
     assert report["results"]["fa4_packed"]["output_max_diff"] < 0.1
     assert report["results"]["direct_2d"]["output_max_diff"] < 0.1
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_hsa_explicit_2d_tc_variant_matches_dense_oracle(head_dim):
+    report = analyze_explicit_2d_sparse_forward(
+        case_family="disjoint_confetti",
+        seqlen=16,
+        heads=2,
+        head_dim=head_dim,
+        packed_q=16,
+        support_k=32,
+        islands_per_row=2,
+        island_width=2,
+        row_shift=5,
+        warmup_iters=0,
+        benchmark_iters=1,
+        variants=("dense", "direct_2d_tc"),
+        device="cuda",
+        dtype=torch.bfloat16,
+        seed=0,
+    )
+
+    assert report["results"]["direct_2d_tc"]["status"] == "measured"
+    assert report["results"]["direct_2d_tc"]["output_max_diff"] < 0.1

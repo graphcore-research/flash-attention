@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from typing import Any
 
@@ -911,6 +912,7 @@ def build_explicit_2d_sparse_case(
         packed_q,
         -1,
     )
+    k_row_idx = torch.arange(num_buckets * support_k, dtype=torch.int32, device=device).view(num_buckets, support_k)
     full_bucket = {
         "packed_q": packed_q,
         "support_rows": support_k,
@@ -922,6 +924,7 @@ def build_explicit_2d_sparse_case(
         "custom_q_length": q_length.contiguous(),
         "custom_k_length": k_length.contiguous(),
         "q_row_idx": q_row_idx.contiguous(),
+        "custom_k_row_idx": k_row_idx.contiguous(),
         "total_rows": seqlen,
     }
     if fast_geometry and case_family == "disjoint_confetti" and _disjoint_confetti_offsets_have_no_overlap(
@@ -1069,6 +1072,45 @@ def _run_direct_2d_packed_forward(bucket: dict[str, Any], *, softmax_scale: floa
     return packed_out
 
 
+def _direct_2d_tc_mode() -> str:
+    value = os.environ.get("FLASH_ATTN_HSA_EXPLICIT_DIRECT_2D_TC", "auto").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return "on"
+    if value in {"0", "false", "no", "off"}:
+        return "off"
+    return "auto"
+
+
+def _can_use_direct_2d_tc_forward(bucket: dict[str, Any]) -> bool:
+    mode = _direct_2d_tc_mode()
+    if mode == "off":
+        return False
+    q_buf = bucket.get("custom_q_buf")
+    k_buf = bucket.get("custom_k_buf")
+    v_buf = bucket.get("custom_v_buf")
+    if not all(isinstance(tensor, torch.Tensor) for tensor in (q_buf, k_buf, v_buf)):
+        return False
+    if not all(tensor.is_cuda for tensor in (q_buf, k_buf, v_buf)):
+        return False
+    head_dim = int(q_buf.shape[-1])
+    support_rows = int(bucket.get("support_rows", 0))
+    return (
+        int(bucket.get("packed_q", 0)) == 16
+        and 0 < support_rows <= 128
+        and head_dim in (64, 128)
+        and int(k_buf.shape[-1]) == head_dim
+        and int(v_buf.shape[-1]) == head_dim
+        and q_buf.dtype in (torch.float16, torch.bfloat16)
+        and k_buf.dtype == q_buf.dtype
+        and v_buf.dtype == q_buf.dtype
+        and isinstance(bucket.get("q_row_idx"), torch.Tensor)
+        and isinstance(bucket.get("custom_k_row_idx"), torch.Tensor)
+        and isinstance(bucket.get("custom_q_length"), torch.Tensor)
+        and isinstance(bucket.get("custom_k_length"), torch.Tensor)
+        and isinstance(bucket.get("custom_mask_words"), torch.Tensor)
+    )
+
+
 def _run_direct_2d_bucket_forward(bucket: dict[str, Any], *, softmax_scale: float) -> torch.Tensor:
     packed_out = _run_direct_2d_packed_forward(bucket, softmax_scale=softmax_scale)
     total_rows = bucket.get("total_rows")
@@ -1091,6 +1133,8 @@ def _run_direct_2d_compact_forward(case_payload: dict[str, Any], *, softmax_scal
         and bool(groups[0].get("is_full_passthrough_order", False))
         and bool(compact_payload.get("q_row_idx_is_contiguous", False))
     ):
+        if _can_use_direct_2d_tc_forward(full_bucket):
+            return _run_direct_2d_tc_forward(full_bucket, softmax_scale=softmax_scale)
         packed_out = _run_direct_2d_packed_forward(groups[0], softmax_scale=softmax_scale).float()
         return _flatten_valid_packed_rows(packed_out, compact_payload["custom_q_length"])
     packed_out = torch.zeros(
@@ -1114,6 +1158,36 @@ def _run_direct_2d_compact_forward(case_payload: dict[str, Any], *, softmax_scal
             total_rows=int(compact_payload["total_rows"]),
         ).permute(1, 0, 2).contiguous()
     return _flatten_valid_packed_rows(packed_out, compact_payload["custom_q_length"])
+
+
+def _run_direct_2d_tc_forward(bucket: dict[str, Any], *, softmax_scale: float) -> torch.Tensor:
+    from flash_attn.cute.flash_hsa_synthetic_grid_sm100 import (
+        _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel,
+    )
+
+    q_buf = bucket["custom_q_buf"]
+    k_buf = bucket["custom_k_buf"]
+    v_buf = bucket["custom_v_buf"]
+    q_flat = q_buf.reshape(-1, q_buf.shape[2], q_buf.shape[3]).contiguous()
+    k_flat = k_buf.reshape(-1, k_buf.shape[2], k_buf.shape[3]).contiguous()
+    v_flat = v_buf.reshape(-1, v_buf.shape[2], v_buf.shape[3]).contiguous()
+    total_rows = int(bucket.get("total_rows", q_flat.shape[0]))
+    out_flat = torch.empty((q_flat.shape[0], q_flat.shape[1], v_flat.shape[2]), dtype=torch.float32, device=q_flat.device)
+    lse_flat = torch.empty((q_flat.shape[0], q_flat.shape[1]), dtype=torch.float32, device=q_flat.device)
+    _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
+        q_flat,
+        k_flat,
+        v_flat,
+        bucket["q_row_idx"],
+        bucket["custom_k_row_idx"],
+        bucket["custom_q_length"],
+        bucket["custom_k_length"],
+        bucket["custom_mask_words"],
+        out_flat,
+        lse_flat,
+        softmax_scale=softmax_scale,
+    )
+    return out_flat[:total_rows].permute(1, 0, 2).contiguous()
 
 
 def _run_explicit_shared_support_forward(case_payload: dict[str, Any], *, softmax_scale: float) -> torch.Tensor:
@@ -1159,7 +1233,15 @@ def analyze_explicit_2d_sparse_forward(
     seed: int = 0,
     check_correctness: bool = True,
 ) -> dict[str, Any]:
-    valid_variants = {"dense", "custom_masked", "fa4_packed", "direct_2d", "direct_2d_compact", "shared_support"}
+    valid_variants = {
+        "dense",
+        "custom_masked",
+        "fa4_packed",
+        "direct_2d",
+        "direct_2d_compact",
+        "direct_2d_tc",
+        "shared_support",
+    }
     if any(variant not in valid_variants for variant in variants):
         unknown = sorted(set(variants) - valid_variants)
         raise ValueError(f"unknown variants {unknown}")
@@ -1209,6 +1291,10 @@ def analyze_explicit_2d_sparse_forward(
         ),
         "direct_2d_compact": lambda: _run_direct_2d_compact_forward(
             case_payload,
+            softmax_scale=softmax_scale,
+        ),
+        "direct_2d_tc": lambda: _run_direct_2d_tc_forward(
+            full_bucket,
             softmax_scale=softmax_scale,
         ),
         "shared_support": lambda: _run_explicit_shared_support_forward(
@@ -1323,7 +1409,7 @@ def summarize_explicit_2d_sparse_forward(report: dict[str, Any]) -> dict[str, An
             "avg_islands_per_row": float(geometry.get("avg_islands_per_row", 0.0)),
             "avg_pairwise_row_jaccard": float(geometry.get("avg_pairwise_row_jaccard", 0.0)),
         }
-    for variant_name in ("direct_2d", "direct_2d_compact"):
+    for variant_name in ("direct_2d", "direct_2d_compact", "direct_2d_tc"):
         variant = results.get(variant_name)
         if not isinstance(variant, dict):
             continue

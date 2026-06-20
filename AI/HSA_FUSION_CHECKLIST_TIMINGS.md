@@ -167,3 +167,46 @@ rows, and auto-enables only up to
 helper tests cover missing occurrence payloads, all-KV overwrite gating, and
 the small-all-owned auto gate. Broader schedule/payload construction is still a
 separate Python-side build problem, so no small safe win was taken here.
+
+## 2026-06-20 Explicit 2D TC Small-Support Selector
+
+The explicit 2D benchmark now exposes `direct_2d_tc` and the
+`direct_2d_compact` full-passthrough path auto-routes to that tensor-core
+gather/scatter kernel for the tested cached-training envelope:
+
+- full-passthrough compact payload with contiguous query rows
+- `packed_q=16`
+- BF16/FP16 Q/K/V
+- `head_dim in {64, 128}`
+- `support_rows <= 128`
+- disabled with `FLASH_ATTN_HSA_EXPLICIT_DIRECT_2D_TC=off`
+
+Correctness:
+
+- `python -m py_compile flash_attn/cute/hsa_explicit_2d_sparse_analysis.py tests/cute/benchmark_hsa_2d_sparse.py tests/cute/test_hsa.py`
+  passed.
+- `git diff --check` passed.
+- `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -m pytest tests/cute/test_hsa.py::test_hsa_explicit_2d_sparse_variants_match_dense_oracle tests/cute/test_hsa.py::test_hsa_explicit_2d_tc_variant_matches_dense_oracle -q`
+  passed: 4 passed in 26.23s.
+- Compact routed correctness smoke:
+  `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 64 --packed-q 16 --support-k 4 --islands-per-row 1 --island-width 4 --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 1 --json`
+  produced `direct2d_compact_ms=0.151`, `direct2d_tc_ms=0.120`,
+  `output_max_diff=9.536743e-07` for both compact and TC.
+
+Cached hot-path timings excluding payload construction:
+
+| seq | H | D | support_k | live keys/query | route | ms |
+|---:|---:|---:|---:|---:|---|---:|
+| 1M | 4 | 64 | 4 | 4 | compact auto TC | 8.607 |
+| 1M | 4 | 64 | 4 | 4 | explicit TC | 8.595 |
+| 1M | 4 | 64 | 4 | 4 | compact with TC off | 19.098 |
+| 256K | 4 | 128 | 32 | 8 | compact auto TC | 9.016 |
+| 256K | 4 | 128 | 32 | 8 | explicit TC | 9.002 |
+| 256K | 8 | 64 | 128 | 32 | compact auto TC | 19.046 |
+| 256K | 8 | 64 | 128 | 32 | explicit TC | 19.032 |
+
+This fixes the small-support/low-live-key explicit 2D path where scalar compact
+was leaving most of the available tensor-core throughput unused. The selector
+is intentionally narrow: non-full-span payloads, overlapping residuals, mixed
+packed+scatter residuals, and wider/unsupported shapes still use the existing
+safe paths and gates.

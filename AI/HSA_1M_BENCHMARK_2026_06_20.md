@@ -141,6 +141,26 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_
 |---:|---:|---:|---:|---:|---:|---:|
 | 1M | 4 | 4 | 0.605 | 19.100 | 969.671 | 50.77x |
 
+Follow-up TC selector run, after routing eligible full-passthrough compact
+payloads through the tensor-core gather/scatter kernel:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 1048576 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 4 --islands-per-row 1 --island-width 4 \
+  --variants direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 3 \
+  --skip-correctness --json
+```
+
+| seq | heads | live keys/query | build_s | direct_2d_compact ms | direct_2d_tc ms | scalar compact with TC off |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1M | 4 | 4 | 0.530 | 8.607 | 8.595 | 19.098 |
+
+Using the prior same-shape FA4-packed timing (`969.671 ms`), the TC-routed
+compact hot path is approximately `112.66x` faster than FA4-packed for this
+normalized sparse workload. The scalar-off control was measured with
+`FLASH_ATTN_HSA_EXPLICIT_DIRECT_2D_TC=off`.
+
 ## Explicit 2D Packed, D128
 
 Enabled correctness command:

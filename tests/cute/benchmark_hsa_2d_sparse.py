@@ -49,7 +49,15 @@ DEFAULT_CASES = (
     },
 )
 
-VALID_VARIANTS = ("dense", "custom_masked", "fa4_packed", "direct_2d", "direct_2d_compact", "shared_support")
+VALID_VARIANTS = (
+    "dense",
+    "custom_masked",
+    "fa4_packed",
+    "direct_2d",
+    "direct_2d_compact",
+    "direct_2d_tc",
+    "shared_support",
+)
 
 
 def _format_ms(payload):
@@ -72,6 +80,7 @@ def _variant_column(variant: str) -> str:
         "fa4_packed": "fa4_ms",
         "direct_2d": "direct2d_ms",
         "direct_2d_compact": "direct2d_compact_ms",
+        "direct_2d_tc": "direct2d_tc_ms",
         "shared_support": "shared_ms",
     }[variant]
 

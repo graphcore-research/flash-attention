@@ -368,3 +368,110 @@ Validation:
 - `git diff --check` passed.
 - `PYTHONPATH=. timeout 120s python -m pytest tests/cute/test_hsa_cached_2d_helpers.py::test_cached_torch_contiguous_grad_helper_env_gate tests/cute/test_hsa_cached_2d_helpers.py::test_cached_fused_grad_helper_auto_gate_uses_row_threshold tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_overwrite_gate_requires_all_kv_rows tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_key_owned_auto_gate_is_small_all_owned_only tests/cute/test_hsa_cached_2d_helpers.py::test_cached_backward_direct_dq_auto_gate_uses_row_threshold -q`
   passed: 6 passed in 2.26s.
+
+## 2026-06-20 AR-HSA Readout Backward and Atomics Headroom
+
+The AR-HSA walk benchmark confirms that the 1M fwd+bwd preallocated hot path is
+readout-backward dominated, not walk/softmax dominated. This pass rechecked the
+current query-warp fused backward, the auto tensor-core QV selector, forced QV
+tensor-core packing, and forward-denominator reuse.
+
+Commands were run with `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=.` from this
+directory, with Torch/custom comparisons disabled:
+
+```bash
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 262144 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --query-warp-fused-bwd \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 1048576 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --query-warp-fused-bwd \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+```
+
+| queries | mode | readout_fwd ms | readout_bwd ms | full_hot_fwd ms | fwd+bwd_prealloc ms |
+|---:|---|---:|---:|---:|---:|
+| 262144 | query-warp fused bwd | 0.2994 | 0.5876 | 0.3140 | 0.9265 |
+| 1048576 | query-warp fused bwd | 0.8274 | 1.8355 | 0.8997 | 2.7249 |
+
+At 1M queries, readout backward is about 67% of the preallocated fwd+bwd hot
+path. The walk/softmax side is already small by comparison.
+
+The auto tensor-core QV path was rechecked on the 262K random-leaf layout:
+
+```bash
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 262144 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --auto-readout-bwd \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 262144 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --auto-readout-bwd --auto-qv-output-util-threshold 0 \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+```
+
+| queries | mode | selected bwd | QV output util | readout_bwd ms | fwd+bwd_prealloc ms |
+|---:|---|---|---:|---:|---:|
+| 262144 | auto | query_warp_fused | 0.0639 | 0.5604 | 0.9437 |
+| 262144 | forced TC QV | tensor_core_query_value_packed_pack_scatter | 0.0639 | 2.5344 | 2.8499 |
+
+The tensor-core QV route remains correctly gated off for this random sparse
+layout. It only fills about 6.4% of the output tile space, and forcing it is
+roughly 4.3x slower for readout backward than query-warp fused.
+
+Forward-denominator reuse is a small positive hot-path optimization but not a
+new default switch here. The benchmark's isolated `readout_bwd_cute_ms` includes
+an extra forward readout when `--reuse-forward-denom` is set, so the fair signal
+is `fwd_bwd_cute_prealloc_ms`.
+
+```bash
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 262144 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --query-warp-fused-bwd --reuse-forward-denom \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+
+timeout 240s python -u tests/cute/benchmark_arhsa_walk.py \
+  --n-queries 1048576 --n-heads 4 --head-dim-v 64 --leaves-per-query 4 \
+  --n-iters 3 --graph-mode level_dag --level-range-kernels --incoming-packed-step \
+  --query-warp-readout --query-warp-fused-bwd --reuse-forward-denom \
+  --skip-torch --skip-custom-fwd-bwd --no-check --no-memory --iters 3 --warmup 1
+```
+
+| queries | baseline fwd+bwd_prealloc ms | reuse-denom fwd+bwd_prealloc ms | delta |
+|---:|---:|---:|---:|
+| 262144 | 0.9265 | 0.8980 | 3.1% faster |
+| 1048576 | 2.7249 | 2.6857 | 1.4% faster |
+
+The denominator-precomputed path is already implemented in
+`run_arhsa_leaf_readout_backward(..., denom_precomputed=True)` and covered by
+the query-warp fused backward test. It should be used when the caller already
+retains the forward denominator; forcing it globally would require retaining an
+extra forward buffer in every production path for a 1-3% hot-path win.
+
+Cached generalized backward DK/DV atomics were inspected again. The default
+route keeps tile-atomic DK/DV in the main cached backward kernel. The key-owned
+non-atomic route is only safe when the backward payload has ready owned
+occurrence tensors and `owned_k_row_idx.numel() == k_flat.shape[0]`; otherwise
+DK/DV rows can be stale or raced. Auto mode also limits this to at most 128 KV
+rows. Those gates live in `_can_use_cached_backward_key_owned_dkdv`,
+`_cached_backward_key_owned_overwrites_all_kv_rows`, and
+`_auto_use_cached_backward_key_owned_dkdv`.
+
+Status:
+
+- Fixed/default: no new code change in this pass.
+- Gated with evidence: tensor-core QV readout backward stays gated by output
+  utilization; forced path is slower on the target random-leaf layout.
+- Gated with evidence: denom reuse remains an explicit path; it is correct and
+  mildly faster only when the forward denom is already retained.
+- Blocked with code evidence: broad non-atomic DK/DV cannot replace tile
+  atomics unless the payload owns and overwrites every KV row. Partial ownership
+  needs zero/finalization or atomics to avoid stale DK/DV rows.

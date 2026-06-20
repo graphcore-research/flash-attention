@@ -937,3 +937,51 @@ This is the expected behavior for a stable training shape: one miss at warmup,
 then hits. If a real training runtime reports miss-per-step for the same shape,
 the schedule or runtime object is being recreated, or the shape/policy key is
 changing.
+
+## 2026-06-20 Duplicate Residual Rows Inside One Group
+
+Direct-final residual dispatch now handles duplicate output rows that appear
+inside a single residual group without falling back to the split/finalize path.
+The support gate builds a serial dispatch plan:
+
+- duplicate rows across groups still use duplicate-free group ranges, for
+  example `[[0, 1], [1, 2]]`;
+- duplicate rows inside one group use duplicate-free column buckets, for
+  example `[[0, 1, [0]], [0, 1, [1]]]`;
+- each bucket is launched through the existing FP32 online-softmax combine
+  kernel, so duplicate updates are still serialized with the same numerical
+  semantics as the previous safe split path.
+
+The range cap remains active. With
+`FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES=1`, a duplicate case
+that needs two serial launches still reports
+`direct_final_duplicate_residual_rows_within_kernel` and falls back.
+
+Validation:
+
+```bash
+python -m py_compile flash_attn/cute/hsa_cached_2d_forward_analysis.py \
+  tests/cute/test_hsa_cached_2d_helpers.py tests/cute/profile_hsa_remaining.py
+
+git diff --check
+
+PYTHONPATH=. timeout 240s pytest -q tests/cute/test_hsa_cached_2d_helpers.py
+
+PYTHONPATH=. timeout 60s python tests/cute/profile_hsa_remaining.py --no-cuda --json
+```
+
+Observed profiler gate after the patch:
+
+| field | value |
+|---|---|
+| `within_group_reason` | `null` |
+| `within_group_serializable` | `true` |
+| `within_group_dispatch_plan` | `[[0, 1, [0]], [0, 1, [1]]]` |
+| `serial_group_reason` | `null` |
+| `range_limited_reason` | `direct_final_duplicate_residual_rows_within_kernel` |
+| status | `fixed_for_cross_group_and_within_group_duplicates_via_serial_dispatch` |
+
+Remaining kernel limitation: this is still serial dispatch, not a true
+single-launch duplicate-row online-softmax reduction. A monolithic version would
+need an in-kernel per-output-row FP32 combine across duplicate q entries before
+writing `out/lse`; direct scatter remains numerically wrong for that case.

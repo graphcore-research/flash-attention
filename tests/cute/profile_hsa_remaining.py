@@ -184,6 +184,12 @@ def _profile_residual_blockers() -> dict[str, Any]:
         "range_scatter_q_length",
         device=torch.device("cpu"),
     )
+    within_group_plan = cached_2d._direct_final_residual_dispatch_plan_without_duplicate_rows(
+        within_group,
+        "range_scatter_q_row_idx",
+        "range_scatter_q_length",
+        device=torch.device("cpu"),
+    )
 
     with _temporary_env({"FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES": "1"}):
         range_limited_reason = _direct_final_reason(serial_groups)
@@ -195,6 +201,11 @@ def _profile_residual_blockers() -> dict[str, Any]:
             within_group,
             torch.device("cpu"),
         ),
+        "within_group_serializable": cached_2d._direct_final_can_serialize_duplicate_residual_rows(
+            within_group,
+            torch.device("cpu"),
+        ),
+        "within_group_dispatch_plan": within_group_plan,
         "serial_group_reason": _direct_final_reason(serial_groups),
         "serial_group_duplicate_detected": cached_2d._direct_final_has_duplicate_residual_rows_within_kernel(
             serial_groups,
@@ -207,9 +218,9 @@ def _profile_residual_blockers() -> dict[str, Any]:
         "serial_group_dispatch_ranges": serial_ranges,
         "range_limited_reason": range_limited_reason,
         "status": (
-            "fixed_for_cross_group_duplicates; blocked_for_duplicate_rows_inside_one_kernel"
+            "fixed_for_cross_group_and_within_group_duplicates_via_serial_dispatch"
             if _direct_final_reason(serial_groups) is None
-            and _direct_final_reason(within_group) == "direct_final_duplicate_residual_rows_within_kernel"
+            and _direct_final_reason(within_group) is None
             else "unexpected_gate_state"
         ),
     }

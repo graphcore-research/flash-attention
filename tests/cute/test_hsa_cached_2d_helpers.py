@@ -1685,7 +1685,7 @@ def test_cached_2d_direct_final_online_combine_cast_mode_gate(monkeypatch):
     assert calls[-1][0] == "indexed"
 
 
-def test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel():
+def test_cached_2d_direct_final_serializes_duplicate_rows_inside_residual_kernel():
     payload = {
         "total_rows": 6,
         "residual_mode": "fused_tail",
@@ -1711,6 +1711,13 @@ def test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel():
         shape = (6, 2, 64)
 
     assert cached_2d._direct_final_has_duplicate_residual_rows_within_kernel(payload, torch.device("cpu"))
+    assert cached_2d._direct_final_can_serialize_duplicate_residual_rows(payload, torch.device("cpu"))
+    assert cached_2d._direct_final_residual_dispatch_plan_without_duplicate_rows(
+        payload,
+        "range_scatter_q_row_idx",
+        "range_scatter_q_length",
+        device=torch.device("cpu"),
+    ) == [(0, 1, (0,)), (0, 1, (1,))]
     assert (
         cached_2d._cached_direct_final_residual_support_reason(
             payload,
@@ -1718,8 +1725,127 @@ def test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel():
             FakeCudaTensor(),
             FakeCudaTensor(),
         )
-        == "direct_final_duplicate_residual_rows_within_kernel"
+        is None
     )
+
+
+def test_cached_2d_direct_final_dispatch_splits_duplicate_rows_inside_residual_kernel(monkeypatch):
+    payload = {
+        "total_rows": 6,
+        "packed_q": 8,
+        "support_rows": 8,
+        "tile_k": 32,
+        "q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_q_row_idx": torch.tensor([[4, 4, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_scatter_k_row_idx": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_scatter_q_length": torch.tensor([2], dtype=torch.int32),
+        "range_scatter_k_length": torch.tensor([2], dtype=torch.int32),
+        "range_scatter_mask_words": torch.tensor([[[11], [22], [0], [0], [0], [0], [0], [0]]], dtype=torch.int32),
+        "range_scatter_row_count": 2,
+        "range_scatter_union_group_count": 1,
+        "range_scatter_union_row_count": 1,
+        "range_packed_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_packed_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_packed_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_packed_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_packed_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_packed_group_count": 0,
+    }
+    q = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    out = torch.empty((6, 2, 64), dtype=torch.float32)
+    lse = torch.empty((6, 2), dtype=torch.float32)
+    calls = []
+
+    def combine(_q, _k, _v, q_row_idx, _k_row_idx, q_length, _k_length, mask_words, *_args, **_kwargs):
+        calls.append((q_row_idx.clone(), q_length.clone(), mask_words.clone()))
+
+    monkeypatch.setattr(cached_2d, "_run_synthetic_2d_masked_gather_combine_fwd_kernel", combine)
+    counts = cached_2d._run_cached_masked_payload_forward(
+        payload,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=1.0,
+        force_combine_scatter=True,
+    )
+
+    assert counts == (0, 0, 1, 1)
+    assert len(calls) == 2
+    assert [call[0].tolist() for call in calls] == [
+        [[4, -1, -1, -1, -1, -1, -1, -1]],
+        [[4, -1, -1, -1, -1, -1, -1, -1]],
+    ]
+    assert [call[1].tolist() for call in calls] == [[1], [1]]
+    assert [int(call[2][0, 0, 0].item()) for call in calls] == [11, 22]
+
+
+def test_cached_2d_direct_final_dispatch_splits_duplicate_rows_inside_packed_residual(monkeypatch):
+    payload = {
+        "total_rows": 6,
+        "packed_q": 8,
+        "support_rows": 8,
+        "tile_k": 32,
+        "q_row_idx": torch.empty((1, 8), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_tc_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_q_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_scatter_k_row_idx": torch.empty((0, 8), dtype=torch.int32),
+        "range_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_scatter_mask_words": torch.empty((0, 8, 1), dtype=torch.int32),
+        "range_scatter_row_count": 0,
+        "range_packed_q_row_idx": torch.tensor([[4, 4, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_packed_k_row_idx": torch.tensor([[0, 1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_packed_q_length": torch.tensor([2], dtype=torch.int32),
+        "range_packed_k_length": torch.tensor([2], dtype=torch.int32),
+        "range_packed_mask_words": torch.tensor([[[11], [22], [0], [0], [0], [0], [0], [0]]], dtype=torch.int32),
+        "range_packed_group_count": 1,
+    }
+    q = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    out = torch.empty((6, 2, 64), dtype=torch.float32)
+    lse = torch.empty((6, 2), dtype=torch.float32)
+    calls = []
+
+    def combine(_q, _k, _v, q_row_idx, _k_row_idx, q_length, _k_length, mask_words, *_args, **_kwargs):
+        calls.append((q_row_idx.clone(), q_length.clone(), mask_words.clone()))
+
+    monkeypatch.setattr(cached_2d, "_can_use_synthetic_2d_masked_fwd", lambda *args, **kwargs: True)
+    monkeypatch.setattr(cached_2d, "_run_synthetic_2d_masked_gather_combine_fwd_kernel", combine)
+    counts = cached_2d._run_cached_masked_payload_forward(
+        payload,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=1.0,
+        force_combine_scatter=True,
+    )
+
+    assert counts == (0, 0, 0, 0)
+    assert len(calls) == 2
+    assert [call[0].tolist() for call in calls] == [
+        [[4, -1, -1, -1, -1, -1, -1, -1]],
+        [[4, -1, -1, -1, -1, -1, -1, -1]],
+    ]
+    assert [call[1].tolist() for call in calls] == [[1], [1]]
+    assert [int(call[2][0, 0, 0].item()) for call in calls] == [11, 22]
 
 
 def test_cached_2d_direct_final_allows_serial_duplicate_residual_groups():

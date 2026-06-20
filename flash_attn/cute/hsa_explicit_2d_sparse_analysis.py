@@ -45,17 +45,15 @@ def _average_pairwise_row_jaccard(mask_rows: torch.Tensor) -> float:
     rows = mask_rows.shape[0]
     if rows <= 1:
         return 0.0
-    total = 0.0
-    count = 0
-    for row_idx in range(rows):
-        left = mask_rows[row_idx]
-        for other_idx in range(row_idx + 1, rows):
-            right = mask_rows[other_idx]
-            intersection = int(torch.logical_and(left, right).sum().item())
-            union = int(torch.logical_or(left, right).sum().item())
-            total += 0.0 if union <= 0 else intersection / union
-            count += 1
-    return total / count if count > 0 else 0.0
+    mask_float = mask_rows.to(dtype=torch.float32)
+    intersection = mask_float @ mask_float.transpose(0, 1)
+    row_live = mask_float.sum(dim=1)
+    union = row_live[:, None] + row_live[None, :] - intersection
+    pair_mask = torch.triu(torch.ones((rows, rows), dtype=torch.bool, device=mask_rows.device), diagonal=1)
+    pair_union = union[pair_mask]
+    pair_intersection = intersection[pair_mask]
+    scores = torch.where(pair_union > 0, pair_intersection / pair_union.clamp_min(1.0), torch.zeros_like(pair_union))
+    return float(scores.mean().item()) if int(scores.numel()) > 0 else 0.0
 
 
 def _mask_geometry(mask_bool: torch.Tensor, q_length: torch.Tensor) -> dict[str, float | int]:

@@ -8,6 +8,31 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import flash_attn.cute.hsa_cached_2d_forward_analysis as cached_2d
+import flash_attn.cute.hsa_explicit_2d_sparse_analysis as explicit_2d
+
+
+def test_explicit_2d_average_pairwise_row_jaccard_matches_manual():
+    mask_rows = torch.tensor(
+        [
+            [1, 1, 0, 0, 0],
+            [1, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0],
+        ],
+        dtype=torch.bool,
+    )
+    expected = []
+    for left_idx in range(mask_rows.shape[0]):
+        for right_idx in range(left_idx + 1, mask_rows.shape[0]):
+            left = mask_rows[left_idx]
+            right = mask_rows[right_idx]
+            intersection = int(torch.logical_and(left, right).sum().item())
+            union = int(torch.logical_or(left, right).sum().item())
+            expected.append(0.0 if union <= 0 else intersection / union)
+
+    assert explicit_2d._average_pairwise_row_jaccard(mask_rows) == pytest.approx(
+        sum(expected) / len(expected)
+    )
 
 
 def test_runtime_payload_cache_reuses_runtime_dict():

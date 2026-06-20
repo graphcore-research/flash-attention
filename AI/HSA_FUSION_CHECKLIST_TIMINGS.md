@@ -272,6 +272,85 @@ that shape (`1.031 ms` vs `0.491 ms`), and scalar compact is still unsupported
 by the D128 packed-k cap. D128 support512 therefore remains gated off by
 default rather than being claimed as a win.
 
+## 2026-06-20 Explicit 2D D128 Wide-Support Routing and Geometry Setup
+
+D128 wide-support TC routing was rechecked with the scalar D128 cap explicitly
+raised for the fallback comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 1024 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 512 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 1024 --islands-per-row 64 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 1024 --islands-per-row 64 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 16384 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants dense,direct_2d_tc --warmup-iters 1 --benchmark-iters 1 \
+  --skip-correctness --json
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 16384 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 1024 --islands-per-row 64 --island-width 4 \
+  --variants dense,direct_2d_tc --warmup-iters 1 --benchmark-iters 1 \
+  --skip-correctness --json
+```
+
+| seq | D | support_k | dense ms | scalar compact ms | TC ms | decision |
+|---:|---:|---:|---:|---:|---:|---|
+| 512 | 128 | 1024 | 0.518 | 0.961 | 2.043 | keep gated |
+| 1024 | 128 | 512 | 0.478 | 0.921 | 0.991 | keep gated |
+| 4096 | 128 | 512 | 1.610 | 2.617 | 2.820 | keep gated |
+| 4096 | 128 | 1024 | 2.163 | 4.994 | 5.486 | keep gated |
+| 16384 | 128 | 512 | 4.159 | not run in same command | 7.577 | keep gated |
+| 16384 | 128 | 1024 | 7.932 | not run in same command | 14.665 | keep gated |
+
+The D128 TC kernel remains correct but is slower than dense at every tested
+shape and slower than scalar compact at the correctness shapes where scalar
+fallback was enabled. No D128 wide-support route was defaulted.
+
+The same pass found a benchmark setup cost that was previously easy to
+misread as payload construction. With correctness enabled, `_mask_geometry`
+spent most of its time in `_average_pairwise_row_jaccard`, which launched tiny
+Torch logical reductions and `.item()` calls for every row pair in every bucket.
+That helper is now vectorized with a per-bucket mask matrix product.
+
+Evidence:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 160s python -m cProfile -s cumulative tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 --json
+
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 160s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 --json
+```
+
+| setup path | build_s | avg_pairwise_row_jaccard |
+|---|---:|---:|
+| old row-pair reductions | 3.726 | 0.14039412199 |
+| vectorized Jaccard | 0.944 | 0.14039412729 |
+
+This is a benchmark/report setup win, not a CUDA hot-path kernel change.
+
 ## 2026-06-20 Online-Combine Cast-Out
 
 The overlapping-residual direct-final path keeps FP32 online softmax combine

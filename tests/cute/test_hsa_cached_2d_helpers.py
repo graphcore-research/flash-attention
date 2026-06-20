@@ -429,6 +429,125 @@ def test_explicit_2d_payloads_preserve_long_noncontiguous_q_rows():
     torch.testing.assert_close(compact_payload["q_row_idx"], q_row_idx)
 
 
+def test_explicit_2d_compact_payload_handles_irregular_union_lengths():
+    q_buf = torch.randn((3, 4, 1, 2), dtype=torch.float32)
+    k_buf = torch.arange(3 * 16 * 1 * 2, dtype=torch.float32).view(3, 16, 1, 2)
+    v_buf = -k_buf
+    q_length = torch.tensor([3, 4, 2], dtype=torch.int32)
+    q_row_idx = torch.tensor(
+        [
+            [0, 1, 2, -1],
+            [10, 11, 12, 13],
+            [20, 21, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    mask_bool = torch.zeros((3, 4, 16), dtype=torch.bool)
+    mask_bool[0, 0, [0, 2]] = True
+    mask_bool[0, 1, [4]] = True
+    mask_bool[0, 3, [15]] = True  # Invalid row; must not expand bucket union.
+    mask_bool[1, 0, [1, 3]] = True
+    mask_bool[1, 1, [5]] = True
+    mask_bool[1, 2, [7]] = True
+    mask_bool[1, 3, [9]] = True
+    mask_bool[2, 0, [0, 1, 2]] = True
+    mask_bool[2, 1, [3, 4, 5, 6]] = True
+
+    compact_payload, geometry = explicit_2d._build_direct_2d_compact_payload(
+        q_buf=q_buf,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        mask_bool=mask_bool,
+        q_length=q_length,
+        q_row_idx=q_row_idx,
+        tile_k=8,
+        total_rows=22,
+    )
+
+    assert geometry["direct_2d_compact_buckets_compacted"] == 3
+    assert geometry["direct_2d_compact_buckets_passthrough"] == 0
+    assert len(compact_payload["groups"]) == 1
+    group = compact_payload["groups"][0]
+    torch.testing.assert_close(group["bucket_indices"], torch.tensor([0, 1, 2]))
+    torch.testing.assert_close(group["custom_k_length"], torch.tensor([3, 5, 7], dtype=torch.int32))
+    assert group["support_rows"] == 7
+
+    for local_idx, bucket_idx in enumerate([0, 1, 2]):
+        valid_rows = int(q_length[bucket_idx].item())
+        union_cols = torch.nonzero(mask_bool[bucket_idx, :valid_rows].any(dim=0), as_tuple=False).flatten()
+        union_k = int(union_cols.numel())
+        torch.testing.assert_close(group["custom_k_buf"][local_idx, :union_k], k_buf[bucket_idx, union_cols])
+        torch.testing.assert_close(group["custom_v_buf"][local_idx, :union_k], v_buf[bucket_idx, union_cols])
+        torch.testing.assert_close(group["custom_mask_bool"][local_idx, :, :union_k], mask_bool[bucket_idx, :, union_cols])
+        assert not bool(group["custom_mask_bool"][local_idx, :, union_k:].any().item())
+        assert bool((group["custom_k_buf"][local_idx, union_k:] == 0).all().item())
+        assert bool((group["custom_v_buf"][local_idx, union_k:] == 0).all().item())
+
+
+def test_explicit_2d_compact_irregular_union_forward_matches_dense():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("CUDA SM100+ required for explicit 2D direct kernel")
+
+    torch.manual_seed(0)
+    num_buckets = 8
+    packed_q = 16
+    support_k = 128
+    heads = 2
+    head_dim = 64
+    q_buf = torch.randn((num_buckets, packed_q, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    k_buf = torch.randn((num_buckets, support_k, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    v_buf = torch.randn((num_buckets, support_k, heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    q_length = torch.full((num_buckets,), packed_q, dtype=torch.int32, device="cuda")
+    q_row_idx = torch.arange(num_buckets * packed_q, dtype=torch.int32, device="cuda").view(num_buckets, packed_q)
+    mask_bool = torch.zeros((num_buckets, packed_q, support_k), dtype=torch.bool, device="cuda")
+    for bucket_idx in range(num_buckets):
+        union_k = 17 + (bucket_idx * 7) % 24
+        for q_slot in range(packed_q):
+            row_live = 1 + (q_slot % 4)
+            start = (q_slot * 3) % max(1, union_k - row_live + 1)
+            mask_bool[bucket_idx, q_slot, start : start + row_live] = True
+
+    mask_words = explicit_2d._encode_mask_rows_to_words(mask_bool.reshape(num_buckets * packed_q, support_k)).view(
+        num_buckets,
+        packed_q,
+        -1,
+    )
+    full_bucket = {
+        "packed_q": packed_q,
+        "support_rows": support_k,
+        "custom_q_buf": q_buf.contiguous(),
+        "custom_k_buf": k_buf.contiguous(),
+        "custom_v_buf": v_buf.contiguous(),
+        "custom_mask_bool": mask_bool.contiguous(),
+        "custom_mask_words": mask_words.contiguous(),
+        "custom_q_length": q_length.contiguous(),
+        "custom_k_length": torch.full((num_buckets,), support_k, dtype=torch.int32, device="cuda"),
+        "q_row_idx": q_row_idx.contiguous(),
+        "total_rows": num_buckets * packed_q,
+    }
+    compact_payload, geometry = explicit_2d._build_direct_2d_compact_payload(
+        q_buf=q_buf,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        mask_bool=mask_bool,
+        q_length=q_length,
+        q_row_idx=q_row_idx,
+        tile_k=64,
+        total_rows=num_buckets * packed_q,
+        contiguous_q_rows=True,
+    )
+    assert geometry["direct_2d_compact_buckets_compacted"] == num_buckets
+    assert geometry["direct_2d_compact_buckets_passthrough"] == 0
+
+    softmax_scale = head_dim ** (-0.5)
+    dense = explicit_2d._run_dense_explicit_bucket_forward(full_bucket, softmax_scale=softmax_scale)
+    compact = explicit_2d._run_direct_2d_compact_forward(
+        {"full_bucket": full_bucket, "direct_2d_compact_payload": compact_payload},
+        softmax_scale=softmax_scale,
+    )
+    torch.testing.assert_close(compact, dense, rtol=0, atol=5e-2)
+
+
 def test_synthetic_2d_masked_long_noncontiguous_rows_match_dense(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for long 2D row-index correctness test")
@@ -1305,6 +1424,63 @@ def test_cached_2d_direct_final_allows_serial_mixed_residual_overlap():
     )
     missing = cached_2d._get_direct_final_missing_init_row_idx(payload, torch.device("cpu"))
     assert missing.tolist() == [4, 5]
+
+
+def test_cached_2d_direct_final_mixed_disjoint_residual_keeps_scatter_direct(monkeypatch):
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32),
+        "q_row_idx": torch.empty((2, 16), dtype=torch.int32),
+        "fused_output_row_count": 4,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 1,
+        "range_packed_group_count": 1,
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.tensor([[4, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_scatter_q_length": torch.tensor([1], dtype=torch.int32),
+        "range_packed_q_row_idx": torch.tensor([[5, -1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32),
+        "range_packed_q_length": torch.tensor([1], dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+    q = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((6, 2, 64), dtype=torch.bfloat16)
+    work = torch.zeros((6, 2, 64), dtype=torch.float32)
+    lse = torch.zeros((6, 2), dtype=torch.float32)
+    calls = []
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_MONOLITHIC_FWD", "1")
+    monkeypatch.setattr(cached_2d, "_cached_direct_final_residual_support_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_get_cached_direct_2d_final_buffers", lambda *args, **kwargs: (work, lse))
+    monkeypatch.setattr(cached_2d, "_run_cached_fused_exact_tail_ranges", lambda *args, **kwargs: (1, 4))
+
+    def masked_payload(*args, **kwargs):
+        calls.append(bool(kwargs["force_combine_scatter"]))
+        return 0, 0, 1, 2
+
+    monkeypatch.setattr(cached_2d, "_run_cached_masked_payload_forward", masked_payload)
+    monkeypatch.setattr(cached_2d, "_record_union_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_exact_dense_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_fused_runtime_geometry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cached_2d, "_record_cached_forward_path", lambda *args, **kwargs: None)
+
+    out = cached_2d._run_cached_direct_final_residual_forward(
+        payload,
+        q,
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        return_lse=False,
+        lse_layout="flat",
+    )
+
+    assert out is work
+    assert calls == [False]
 
 
 def test_cached_2d_direct_final_online_combine_cast_mode_gate(monkeypatch):

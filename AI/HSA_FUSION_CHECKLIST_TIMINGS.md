@@ -471,6 +471,30 @@ Validation:
 - `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 220s pytest -q tests/cute/test_hsa.py::test_hsa_explicit_2d_compact_high_support_d64_routes_to_tc_and_matches_dense`
   passed: 2 passed.
 
+Second pass: the irregular/non-uniform compact path was also vectorized. The
+builder now creates a padded per-bucket union-column matrix and gathers K/V/mask
+payloads for variable `custom_k_length` buckets in one tensor path. Padding is
+zeroed and the per-bucket `custom_k_length` remains authoritative for the
+kernel. This also fixes the union scan to respect `q_length`, matching the old
+valid-row loop semantics when invalid padded query rows contain mask bits.
+
+Irregular setup probe: an inline Python timing script constructed 4096 CUDA
+buckets with `packed_q=16`, `support_k=512`, `H=4`, `D=64`, and variable
+`union_k` inside compact groups. It compared the old per-bucket materialization
+loop (`q_length.item()` plus per-bucket `nonzero`/copy) against the new full
+payload builder.
+
+| buckets | support_k | tile_k | old materialize_s | new payload_s | launch groups | avg union_k | max union_k |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 512 | 64 | 0.849 | 0.0043 | 2 | 43.50 | 67 |
+
+Validation:
+
+- `PYTHONPATH=. timeout 120s pytest -q tests/cute/test_hsa_cached_2d_helpers.py::test_explicit_2d_compact_payload_handles_irregular_union_lengths`
+  passed.
+- `PYTHONPATH=. timeout 180s pytest -q tests/cute/test_hsa_cached_2d_helpers.py::test_explicit_2d_compact_irregular_union_forward_matches_dense`
+  passed on CUDA SM100.
+
 ## 2026-06-20 Online-Combine Cast-Out
 
 The overlapping-residual direct-final path keeps FP32 online softmax combine
@@ -548,6 +572,20 @@ all residual row groups have a full `total_rows` union, including serial overlap
 across scatter and packed groups. It initializes residual-only missing rows and
 uses FP32 online combine when rows overlap across base/residual or across
 residual families.
+
+Second pass: disjoint mixed scatter+packed residuals no longer force scatter
+groups through the online-combine kernel solely because packed residuals are
+present. `force_combine_scatter` now follows the actual overlap requirement
+from `_direct_final_requires_online_combine`. Runtime coverage for mixed
+payloads uses `_direct_final_base_residual_union_row_count`, so packed residual
+rows are counted even when scatter groups direct-write. Overlapping rows still
+use serial FP32 online combine, and duplicate rows inside one residual kernel
+remain blocked.
+
+Validation:
+
+- `PYTHONPATH=. timeout 180s pytest -q tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_allows_serial_mixed_residual_overlap tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_mixed_disjoint_residual_keeps_scatter_direct tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_residual_initializes_missing_mixed_rows tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel`
+  passed: 4 passed.
 
 Still blocked:
 

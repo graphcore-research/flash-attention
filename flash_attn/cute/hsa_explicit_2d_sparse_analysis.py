@@ -550,7 +550,10 @@ def _build_direct_2d_compact_payload(
     device = q_buf.device
     full_tile_span = max(1, math.ceil(support_k / max(1, tile_k)))
     if int(num_buckets) > 0:
-        bucket_has_any = mask_bool.any(dim=1)
+        q_length_i64 = q_length.to(dtype=torch.int64).clamp_min(0)
+        valid_row_mask = torch.arange(packed_q, device=device).view(1, packed_q) < q_length_i64.view(-1, 1)
+        valid_mask_bool = mask_bool & valid_row_mask.unsqueeze(-1)
+        bucket_has_any = valid_mask_bool.any(dim=1)
         bucket_union_k_tensor = bucket_has_any.sum(dim=1).to(dtype=torch.int32)
         valid_bucket = q_length > 0
         bucket_tile_span_tensor = ((bucket_union_k_tensor + int(tile_k) - 1) // max(1, int(tile_k))).clamp_min(1)
@@ -625,9 +628,7 @@ def _build_direct_2d_compact_payload(
                 as_tuple=False,
             ).flatten()
 
-        q_length_i64 = q_length.to(dtype=torch.int64).clamp_min(0)
-        valid_row_mask = torch.arange(packed_q, device=device).view(1, packed_q) < q_length_i64.view(-1, 1)
-        live_pairs_by_bucket = (mask_bool & valid_row_mask.unsqueeze(-1)).sum(dim=(1, 2)).to(dtype=torch.float32)
+        live_pairs_by_bucket = valid_mask_bool.sum(dim=(1, 2)).to(dtype=torch.float32)
         effective_support = torch.where(
             compact_bucket_mask,
             bucket_union_k_tensor.clamp_min(1),
@@ -655,12 +656,20 @@ def _build_direct_2d_compact_payload(
         max_union_k = int(group_union_k.max().item()) if num_group_buckets > 0 else 0
         group_q_buf = q_buf.index_select(0, bucket_index_tensor).contiguous()
         group_q_length = q_length.index_select(0, bucket_index_tensor).contiguous()
-        uniform_union_k = max_union_k > 0 and bool((group_union_k == max_union_k).all().item())
-        if uniform_union_k:
+        if max_union_k > 0:
             selected_has_any = bucket_has_any.index_select(0, bucket_index_tensor)
-            union_col_matrix = torch.nonzero(selected_has_any, as_tuple=False)[:, 1].view(
-                num_group_buckets,
-                max_union_k,
+            selected_has_any_i64 = selected_has_any.to(dtype=torch.int64)
+            union_slot = selected_has_any_i64.cumsum(dim=1) - 1
+            union_col_matrix = torch.zeros((num_group_buckets, max_union_k), dtype=torch.long, device=device)
+            nonzero_pairs = torch.nonzero(selected_has_any, as_tuple=False)
+            if int(nonzero_pairs.numel()) > 0:
+                nz_bucket = nonzero_pairs[:, 0]
+                nz_col = nonzero_pairs[:, 1]
+                nz_slot = union_slot[nz_bucket, nz_col]
+                union_col_matrix[nz_bucket, nz_slot] = nz_col
+            union_valid = torch.arange(max_union_k, dtype=torch.int32, device=device).view(1, max_union_k) < group_union_k.view(
+                -1,
+                1,
             )
             gather_kv_idx = union_col_matrix.view(num_group_buckets, max_union_k, 1, 1).expand(
                 -1,
@@ -670,6 +679,8 @@ def _build_direct_2d_compact_payload(
             )
             group_k_buf = torch.gather(k_buf.index_select(0, bucket_index_tensor), 1, gather_kv_idx).contiguous()
             group_v_buf = torch.gather(v_buf.index_select(0, bucket_index_tensor), 1, gather_kv_idx).contiguous()
+            group_k_buf.masked_fill_(~union_valid.view(num_group_buckets, max_union_k, 1, 1), 0)
+            group_v_buf.masked_fill_(~union_valid.view(num_group_buckets, max_union_k, 1, 1), 0)
             gather_mask_idx = union_col_matrix.view(num_group_buckets, 1, max_union_k).expand(
                 -1,
                 packed_q,
@@ -680,7 +691,8 @@ def _build_direct_2d_compact_payload(
                 2,
                 gather_mask_idx,
             ).contiguous()
-            group_k_length = torch.full((num_group_buckets,), max_union_k, dtype=torch.int32, device=device)
+            group_mask_bool &= union_valid.view(num_group_buckets, 1, max_union_k)
+            group_k_length = group_union_k.contiguous()
         else:
             group_k_buf = torch.zeros(
                 (num_group_buckets, max_union_k, num_heads, head_dim),
@@ -698,16 +710,6 @@ def _build_direct_2d_compact_payload(
                 device=device,
             )
             group_k_length = torch.zeros((num_group_buckets,), dtype=torch.int32, device=device)
-
-            for local_idx, bucket_idx in enumerate(bucket_index_tensor.tolist()):
-                union_cols = torch.nonzero(bucket_has_any[bucket_idx], as_tuple=False).flatten()
-                union_k = int(union_cols.numel())
-                if union_k <= 0:
-                    continue
-                group_k_buf[local_idx, :union_k] = k_buf[bucket_idx, union_cols]
-                group_v_buf[local_idx, :union_k] = v_buf[bucket_idx, union_cols]
-                group_mask_bool[local_idx, :, :union_k] = mask_bool[bucket_idx, :, union_cols]
-                group_k_length[local_idx] = union_k
 
         group_mask_words = _encode_mask_rows_to_words(
             group_mask_bool.reshape(num_group_buckets * packed_q, max_union_k)

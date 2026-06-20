@@ -4558,10 +4558,7 @@ def _run_cached_direct_final_residual_forward(
     )
     packed_group_count = int(payload.get("range_packed_group_count", 0))
     packed_tensor_count = int(getattr(payload.get("range_packed_q_row_idx"), "shape", [0])[0])
-    force_combine_scatter = requires_online_combine or (
-        residual_row_count > 0
-        and (packed_group_count > 0 or packed_tensor_count > 0)
-    )
+    force_combine_scatter = requires_online_combine
     has_packed_residual = packed_group_count > 0 or packed_tensor_count > 0
     base_source = "fused" if int(fused_row_count) > 0 else "exact_dense"
     initialized_residual_rows = 0
@@ -4602,13 +4599,18 @@ def _run_cached_direct_final_residual_forward(
             force_combine_scatter=force_combine_scatter,
         )
     )
-    output_coverage = (
-        int(payload["total_rows"])
-        if needs_missing_init
-        else base_row_count
-        if force_combine_scatter
-        else base_row_count + residual_row_count
-    )
+    if needs_missing_init:
+        output_coverage = int(payload["total_rows"])
+    elif force_combine_scatter:
+        output_coverage = base_row_count
+    elif has_packed_residual:
+        output_coverage = _direct_final_base_residual_union_row_count(
+            payload,
+            out_work_flat.device,
+            base_source=base_source,
+        )
+    else:
+        output_coverage = base_row_count + residual_row_count
     if output_coverage != int(payload["total_rows"]):
         if _is_env_forced_on(env_name):
             raise RuntimeError("cached_direct_final_residual_fwd_incomplete_runtime_coverage")

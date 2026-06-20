@@ -931,6 +931,66 @@ def test_cached_masked_payload_force_combine_for_grouped_scatter(monkeypatch):
     assert calls == ["combine", "combine"]
 
 
+def test_cached_masked_payload_serializes_duplicate_scatter_groups(monkeypatch):
+    calls = []
+
+    def combine(*args, **kwargs):
+        q_row_idx = args[3]
+        calls.append(tuple(q_row_idx.reshape(-1).tolist()))
+
+    monkeypatch.setattr(cached_2d, "_run_synthetic_2d_masked_gather_combine_fwd_kernel", combine)
+
+    payload = {
+        "total_rows": 2,
+        "packed_q": 2,
+        "support_rows": 4,
+        "tile_k": 32,
+        "q_row_idx": torch.empty((3, 2), dtype=torch.int32),
+        "range_tc_scatter_q_row_idx": torch.empty((0, 2), dtype=torch.int32),
+        "range_tc_scatter_k_row_idx": torch.empty((0, 4), dtype=torch.int32),
+        "range_tc_scatter_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_tc_scatter_mask_words": torch.empty((0, 2, 1), dtype=torch.int32),
+        "range_tc_scatter_group_count": 0,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_q_row_idx": torch.tensor([[0, -1], [0, -1], [1, -1]], dtype=torch.int32),
+        "range_scatter_k_row_idx": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32),
+        "range_scatter_q_length": torch.tensor([1, 1, 1], dtype=torch.int32),
+        "range_scatter_k_length": torch.tensor([4, 4, 4], dtype=torch.int32),
+        "range_scatter_mask_words": torch.tensor(
+            [[[0b1111], [0]], [[0b1111], [0]], [[0b1111], [0]]],
+            dtype=torch.int32,
+        ),
+        "range_scatter_union_group_count": 3,
+        "range_scatter_union_row_count": 3,
+        "range_packed_q_row_idx": torch.empty((0, 2), dtype=torch.int32),
+        "range_packed_k_row_idx": torch.empty((0, 4), dtype=torch.int32),
+        "range_packed_q_length": torch.empty((0,), dtype=torch.int32),
+        "range_packed_k_length": torch.empty((0,), dtype=torch.int32),
+        "range_packed_mask_words": torch.empty((0, 2, 1), dtype=torch.int32),
+        "range_packed_q_row_idx_flat": torch.empty((0,), dtype=torch.int32),
+        "range_packed_k_row_idx_flat": torch.empty((0,), dtype=torch.int32),
+    }
+    q = torch.empty((2, 1, 64), dtype=torch.bfloat16)
+    k = torch.empty((4, 1, 64), dtype=torch.bfloat16)
+    v = torch.empty((4, 1, 64), dtype=torch.bfloat16)
+    out = torch.empty((2, 1, 64), dtype=torch.float32)
+    lse = torch.empty((2, 1), dtype=torch.float32)
+
+    cached_2d._run_cached_masked_payload_forward(
+        payload,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=1.0,
+        force_combine_scatter=True,
+    )
+
+    assert calls == [(0, -1), (0, -1, 1, -1)]
+
+
 def test_cached_2d_range_annotation_materializes_kernel_descriptors(monkeypatch):
     q = torch.empty((4, 2, 64), dtype=torch.bfloat16)
     range_execution = [
@@ -1604,6 +1664,93 @@ def test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel():
         shape = (6, 2, 64)
 
     assert cached_2d._direct_final_has_duplicate_residual_rows_within_kernel(payload, torch.device("cpu"))
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        == "direct_final_duplicate_residual_rows_within_kernel"
+    )
+
+
+def test_cached_2d_direct_final_allows_serial_duplicate_residual_groups():
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, 5, -1, -1, -1]], dtype=torch.int32),
+        "q_row_idx": torch.empty((2, 16), dtype=torch.int32),
+        "fused_output_row_count": 5,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 2,
+        "range_packed_group_count": 0,
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.tensor(
+            [
+                [4, -1, -1, -1, -1, -1, -1, -1],
+                [4, -1, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        ),
+        "range_scatter_q_length": torch.tensor([1, 1], dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    assert cached_2d._direct_final_has_duplicate_residual_rows_within_kernel(payload, torch.device("cpu"))
+    assert cached_2d._direct_final_can_serialize_duplicate_residual_rows(payload, torch.device("cpu"))
+    assert (
+        cached_2d._cached_direct_final_residual_support_reason(
+            payload,
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+            FakeCudaTensor(),
+        )
+        is None
+    )
+
+
+def test_cached_2d_direct_final_gates_too_many_duplicate_residual_ranges(monkeypatch):
+    payload = {
+        "total_rows": 6,
+        "residual_mode": "fused_tail",
+        "exact_kernel_family": "tc8x8",
+        "exact_dense_rows_per_range": 8,
+        "exact_dense_keys_per_tile": 8,
+        "fused_q_row_idx": torch.tensor([[0, 1, 2, 3, 5, -1, -1, -1]], dtype=torch.int32),
+        "q_row_idx": torch.empty((2, 16), dtype=torch.int32),
+        "fused_output_row_count": 5,
+        "range_tc_scatter_row_count": 0,
+        "range_scatter_row_count": 2,
+        "range_packed_group_count": 0,
+        "range_tc_scatter_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "range_scatter_q_row_idx": torch.tensor(
+            [
+                [4, -1, -1, -1, -1, -1, -1, -1],
+                [4, -1, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        ),
+        "range_scatter_q_length": torch.tensor([1, 1], dtype=torch.int32),
+        "range_packed_q_row_idx": torch.empty((0, 16), dtype=torch.int32),
+        "geometry": {"fused_total_coverage_frac": 0.8},
+    }
+
+    class FakeCudaTensor:
+        is_cuda = True
+        dtype = torch.bfloat16
+        shape = (6, 2, 64)
+
+    monkeypatch.setenv("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES", "1")
     assert (
         cached_2d._cached_direct_final_residual_support_reason(
             payload,

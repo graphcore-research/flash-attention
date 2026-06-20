@@ -3090,6 +3090,106 @@ def _direct_final_has_duplicate_residual_rows_within_kernel(
     return False
 
 
+def _direct_final_residual_group_ranges_without_duplicate_rows(
+    payload: dict[str, Any],
+    row_key: str,
+    length_key: str,
+    *,
+    device: torch.device,
+    max_ranges: int | None = None,
+) -> list[tuple[int, int]] | None:
+    row_idx = payload.get(row_key)
+    if not isinstance(row_idx, torch.Tensor) or int(row_idx.numel()) == 0:
+        return []
+    if "total_rows" not in payload:
+        return [(0, int(row_idx.shape[0]))]
+    total_rows = int(payload["total_rows"])
+    group_count = int(row_idx.shape[0])
+    if group_count <= 0:
+        return []
+    row_length = payload.get(length_key)
+    row_idx_cpu = row_idx.detach().cpu()
+    row_length_cpu = row_length.detach().cpu() if isinstance(row_length, torch.Tensor) else None
+    width = int(row_idx_cpu.shape[1]) if row_idx_cpu.ndim >= 2 else int(row_idx_cpu.numel())
+    ranges: list[tuple[int, int]] = []
+    current_start = 0
+    current_rows: set[int] = set()
+    for group_idx in range(group_count):
+        valid_len = width
+        if row_length_cpu is not None and int(row_length_cpu.numel()) > group_idx:
+            valid_len = max(0, min(width, int(row_length_cpu[group_idx].item())))
+        group_rows = [
+            int(value)
+            for value in row_idx_cpu[group_idx, :valid_len].reshape(-1).tolist()
+            if 0 <= int(value) < total_rows
+        ]
+        group_row_set = set(group_rows)
+        if len(group_row_set) != len(group_rows):
+            return None
+        if current_rows and not current_rows.isdisjoint(group_row_set):
+            ranges.append((current_start, group_idx))
+            current_start = group_idx
+            current_rows = set(group_row_set)
+        else:
+            current_rows.update(group_row_set)
+    ranges.append((current_start, group_count))
+    ranges = [(start, end) for start, end in ranges if end > start]
+    if max_ranges is not None and len(ranges) > max_ranges:
+        return None
+    return ranges
+
+
+def _direct_final_can_serialize_duplicate_residual_rows(payload: dict[str, Any], device: torch.device) -> bool:
+    try:
+        max_ranges = int(os.environ.get("FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES", "64"))
+    except ValueError:
+        max_ranges = 64
+    max_ranges = max(1, max_ranges)
+    row_entries = [
+        ("range_tc_scatter_q_row_idx", "range_tc_scatter_q_length", "range_tc_scatter_row_count"),
+        ("range_scatter_q_row_idx", "range_scatter_q_length", "range_scatter_row_count"),
+        ("range_packed_q_row_idx", "range_packed_q_length", "range_packed_group_count"),
+    ]
+    for row_key, length_key, count_key in row_entries:
+        if int(payload.get(count_key, 0)) <= 0:
+            continue
+        ranges = _direct_final_residual_group_ranges_without_duplicate_rows(
+            payload,
+            row_key,
+            length_key,
+            device=device,
+            max_ranges=max_ranges,
+        )
+        if ranges is None:
+            return False
+    return True
+
+
+def _direct_final_residual_dispatch_ranges(
+    payload: dict[str, Any],
+    row_key: str,
+    length_key: str,
+    *,
+    device: torch.device,
+    force_combine_scatter: bool,
+) -> list[tuple[int, int]]:
+    row_idx = payload.get(row_key)
+    group_count = int(row_idx.shape[0]) if isinstance(row_idx, torch.Tensor) and row_idx.ndim > 0 else 0
+    if group_count <= 0:
+        return []
+    if not force_combine_scatter:
+        return [(0, group_count)]
+    ranges = _direct_final_residual_group_ranges_without_duplicate_rows(
+        payload,
+        row_key,
+        length_key,
+        device=device,
+    )
+    if ranges is None or not ranges:
+        return [(0, group_count)]
+    return ranges
+
+
 def _get_direct_final_missing_init_row_idx(
     payload: dict[str, Any],
     device: torch.device,
@@ -4191,21 +4291,29 @@ def _run_cached_masked_payload_forward(
     if all(isinstance(payload.get(key), torch.Tensor) for key in grouped_keys):
         tc_q_row_idx = payload["range_tc_scatter_q_row_idx"]
         if int(tc_q_row_idx.shape[0]) > 0:
+            tc_ranges = _direct_final_residual_dispatch_ranges(
+                payload,
+                "range_tc_scatter_q_row_idx",
+                "range_tc_scatter_q_length",
+                device=q_flat.device,
+                force_combine_scatter=force_combine_scatter,
+            )
             if force_combine_scatter:
-                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    tc_q_row_idx,
-                    payload["range_tc_scatter_k_row_idx"],
-                    payload["range_tc_scatter_q_length"],
-                    payload["range_tc_scatter_k_length"],
-                    payload["range_tc_scatter_mask_words"],
-                    out_flat,
-                    lse_flat,
-                    softmax_scale=float(softmax_scale),
-                    tile_k=tile_k,
-                )
+                for group_start, group_end in tc_ranges:
+                    _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                        q_flat,
+                        k_flat,
+                        v_flat,
+                        tc_q_row_idx[group_start:group_end],
+                        payload["range_tc_scatter_k_row_idx"][group_start:group_end],
+                        payload["range_tc_scatter_q_length"][group_start:group_end],
+                        payload["range_tc_scatter_k_length"][group_start:group_end],
+                        payload["range_tc_scatter_mask_words"][group_start:group_end],
+                        out_flat,
+                        lse_flat,
+                        softmax_scale=float(softmax_scale),
+                        tile_k=tile_k,
+                    )
             else:
                 _run_synthetic_2d_masked_gather_scatter_tc_fwd_kernel(
                     q_flat,
@@ -4226,20 +4334,28 @@ def _run_cached_masked_payload_forward(
         scatter_q_row_idx = payload["range_scatter_q_row_idx"]
         if int(scatter_q_row_idx.shape[0]) > 0:
             if force_combine_scatter:
-                _run_synthetic_2d_masked_gather_combine_fwd_kernel(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    scatter_q_row_idx,
-                    payload["range_scatter_k_row_idx"],
-                    payload["range_scatter_q_length"],
-                    payload["range_scatter_k_length"],
-                    payload["range_scatter_mask_words"],
-                    out_flat,
-                    lse_flat,
-                    softmax_scale=float(softmax_scale),
-                    tile_k=tile_k,
+                scatter_ranges = _direct_final_residual_dispatch_ranges(
+                    payload,
+                    "range_scatter_q_row_idx",
+                    "range_scatter_q_length",
+                    device=q_flat.device,
+                    force_combine_scatter=True,
                 )
+                for group_start, group_end in scatter_ranges:
+                    _run_synthetic_2d_masked_gather_combine_fwd_kernel(
+                        q_flat,
+                        k_flat,
+                        v_flat,
+                        scatter_q_row_idx[group_start:group_end],
+                        payload["range_scatter_k_row_idx"][group_start:group_end],
+                        payload["range_scatter_q_length"][group_start:group_end],
+                        payload["range_scatter_k_length"][group_start:group_end],
+                        payload["range_scatter_mask_words"][group_start:group_end],
+                        out_flat,
+                        lse_flat,
+                        softmax_scale=float(softmax_scale),
+                        tile_k=tile_k,
+                    )
             else:
                 _run_synthetic_2d_masked_gather_scatter_fwd_kernel(
                     q_flat,
@@ -4257,15 +4373,38 @@ def _run_cached_masked_payload_forward(
                 )
             union_scalar_group_count += int(payload.get("range_scatter_union_group_count", 0))
             union_scalar_row_count += int(payload.get("range_scatter_union_row_count", 0))
-        _run_grouped_packed(
-            payload["range_packed_q_row_idx"],
-            payload["range_packed_k_row_idx"],
-            payload["range_packed_q_length"],
-            payload["range_packed_k_length"],
-            payload["range_packed_mask_words"],
-            payload["range_packed_q_row_idx_flat"],
-            payload["range_packed_k_row_idx_flat"],
+        packed_q_row_idx = payload["range_packed_q_row_idx"]
+        packed_ranges = _direct_final_residual_dispatch_ranges(
+            payload,
+            "range_packed_q_row_idx",
+            "range_packed_q_length",
+            device=q_flat.device,
+            force_combine_scatter=force_combine_scatter,
         )
+        for group_start, group_end in packed_ranges:
+            _run_grouped_packed(
+                packed_q_row_idx[group_start:group_end],
+                payload["range_packed_k_row_idx"][group_start:group_end],
+                payload["range_packed_q_length"][group_start:group_end],
+                payload["range_packed_k_length"][group_start:group_end],
+                payload["range_packed_mask_words"][group_start:group_end],
+                _slice_cached_flat_row_idx(
+                    payload,
+                    flat_key="range_packed_q_row_idx_flat",
+                    matrix_key="range_packed_q_row_idx",
+                    group_start=group_start,
+                    group_end=group_end,
+                    width=packed_q,
+                ),
+                _slice_cached_flat_row_idx(
+                    payload,
+                    flat_key="range_packed_k_row_idx_flat",
+                    matrix_key="range_packed_k_row_idx",
+                    group_start=group_start,
+                    group_end=group_end,
+                    width=packed_k,
+                ),
+            )
         return union_tc_group_count, union_tc_row_count, union_scalar_group_count, union_scalar_row_count
 
     for range_entry in range_execution:
@@ -4398,7 +4537,10 @@ def _cached_direct_final_residual_support_reason(
             return "missing_grouped_residual_tensors"
     device = _payload_row_device(payload, q_flat)
     base_source = "fused" if int(payload.get("fused_output_row_count", 0)) > 0 else "exact_dense"
-    if _direct_final_has_duplicate_residual_rows_within_kernel(payload, device):
+    if _direct_final_has_duplicate_residual_rows_within_kernel(
+        payload,
+        device,
+    ) and not _direct_final_can_serialize_duplicate_residual_rows(payload, device):
         return "direct_final_duplicate_residual_rows_within_kernel"
     requires_online_combine = _direct_final_requires_online_combine(
         payload,

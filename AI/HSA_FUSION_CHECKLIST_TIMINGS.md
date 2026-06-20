@@ -773,3 +773,49 @@ Status:
 - Blocked with code evidence: broad non-atomic DK/DV cannot replace tile
   atomics unless the payload owns and overwrites every KV row. Partial ownership
   needs zero/finalization or atomics to avoid stale DK/DV rows.
+
+## 2026-06-20 Duplicate Residual Combine Serialization
+
+Residual direct-final now handles one more safe overlap case: duplicate output
+rows that appear across separate residual groups are split into duplicate-free
+dispatch ranges and routed through the existing FP32 online-softmax combine
+kernel. This preserves combine semantics while avoiding the old split/finalize
+fallback for serializable duplicate groups.
+
+The launch-count expansion is bounded by
+`FLASH_ATTN_HSA_CACHED_DIRECT_FINAL_DUP_SERIAL_MAX_RANGES` (default 64). If a
+payload would need more serialized ranges, or if a single residual group
+contains the same output row twice, the support predicate still returns
+`direct_final_duplicate_residual_rows_within_kernel` and uses the safe fallback.
+The single-group case remains blocked because the current gather/combine kernel
+contract assumes one update per output row per launch; duplicate rows within one
+launch would require an in-kernel duplicate-row online-softmax reduction.
+
+Validation:
+
+```bash
+PYTHONPATH=. timeout 240s pytest -q \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_masked_payload_force_combine_for_grouped_scatter \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_masked_payload_serializes_duplicate_scatter_groups \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_allows_serial_mixed_residual_overlap \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_mixed_disjoint_residual_keeps_scatter_direct \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_blocks_duplicate_rows_inside_residual_kernel \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_allows_serial_duplicate_residual_groups \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_gates_too_many_duplicate_residual_ranges \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_cached_2d_direct_final_residual_initializes_missing_mixed_rows
+```
+
+Result: 8 passed in 1.98s.
+
+Bounded cached/direct 2D profile, setup excluded from the measured forward path:
+
+```bash
+PYTHONPATH=. timeout 180s python tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family compact_control --seqlen 16384 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 128 --variants direct_2d_compact,fa4_packed \
+  --warmup-iters 1 --benchmark-iters 3 --skip-correctness --json
+```
+
+| case | payload_s | diagnostic_geometry_s | direct_2d_compact fwd ms | FA4 packed fwd ms | speedup |
+|---|---:|---:|---:|---:|---:|
+| compact_control-16384 | 0.637 | 1.030 | 1.575 | 12.187 | 7.74x |

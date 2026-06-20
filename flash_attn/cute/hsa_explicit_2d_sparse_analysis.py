@@ -925,6 +925,9 @@ def build_explicit_2d_sparse_case(
         "custom_k_row_idx": k_row_idx.contiguous(),
         "total_rows": seqlen,
     }
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    diagnostic_geometry_t0 = time.perf_counter()
     if fast_geometry and case_family == "disjoint_confetti" and _disjoint_confetti_offsets_have_no_overlap(
         support_k=support_k,
         islands_per_row=islands_per_row,
@@ -941,6 +944,9 @@ def build_explicit_2d_sparse_case(
         )
     else:
         geometry = _mask_geometry(mask_bool, q_length)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    diagnostic_geometry_seconds = time.perf_counter() - diagnostic_geometry_t0
     geometry.update(
         {
             "case_family": case_family,
@@ -969,6 +975,7 @@ def build_explicit_2d_sparse_case(
         "dtype": str(dtype).replace("torch.", ""),
         "full_bucket": full_bucket,
         "geometry": geometry,
+        "diagnostic_geometry_seconds": diagnostic_geometry_seconds,
     }
     if "direct_2d" in payload_variant_set:
         direct_2d_bucket, direct_2d_geometry = _build_direct_2d_bucket(
@@ -1273,6 +1280,11 @@ def analyze_explicit_2d_sparse_forward(
     if normalized_device.type == "cuda":
         torch.cuda.synchronize()
     payload_build_seconds = time.perf_counter() - payload_t0
+    diagnostic_geometry_seconds = float(case_payload.get("diagnostic_geometry_seconds", 0.0))
+    payload_build_excluding_diagnostic_geometry_seconds = max(
+        0.0,
+        payload_build_seconds - diagnostic_geometry_seconds,
+    )
     full_bucket = case_payload["full_bucket"]
     softmax_scale = head_dim ** (-0.5)
     dense_out = (
@@ -1384,6 +1396,9 @@ def analyze_explicit_2d_sparse_forward(
         "geometry": case_payload["geometry"],
         "results": results,
         "payload_build_seconds": payload_build_seconds,
+        "payload_build_total_seconds": payload_build_seconds,
+        "payload_build_excluding_diagnostic_geometry_seconds": payload_build_excluding_diagnostic_geometry_seconds,
+        "diagnostic_geometry_seconds": diagnostic_geometry_seconds,
         "check_correctness": bool(check_correctness),
         "go_no_go": go_no_go,
     }

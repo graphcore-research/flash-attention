@@ -188,7 +188,7 @@ def main(argv=None):
     case_payloads = []
 
     metric_columns = [_variant_column(variant) for variant in variants]
-    print(" ".join(["case", "family", "live_pairs", "fill", "build_s", *metric_columns, "best", "go_no_go"]))
+    print(" ".join(["case", "family", "live_pairs", "fill", "payload_s", "geom_s", "build_s", *metric_columns, "best", "go_no_go"]))
     for case_idx, spec in enumerate(case_specs):
         report = analyze_explicit_2d_sparse_forward(
             case_family=spec["case_family"],
@@ -218,6 +218,8 @@ def main(argv=None):
                     spec["case_family"],
                     str(int(geometry["live_pairs"])),
                     f"{float(geometry['fill_rate']):.4f}",
+                    f"{float(report.get('payload_build_excluding_diagnostic_geometry_seconds', float('nan'))):.3f}",
+                    f"{float(report.get('diagnostic_geometry_seconds', float('nan'))):.3f}",
                     f"{float(report.get('payload_build_seconds', float('nan'))):.3f}",
                     *metric_values,
                     _format_best(summary),

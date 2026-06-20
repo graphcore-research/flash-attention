@@ -35,6 +35,36 @@ def test_explicit_2d_average_pairwise_row_jaccard_matches_manual():
     )
 
 
+def test_explicit_2d_report_splits_payload_and_geometry_timing():
+    report = explicit_2d.analyze_explicit_2d_sparse_forward(
+        case_family="disjoint_confetti",
+        seqlen=16,
+        heads=1,
+        head_dim=8,
+        packed_q=4,
+        support_k=16,
+        islands_per_row=2,
+        island_width=2,
+        row_shift=3,
+        warmup_iters=0,
+        benchmark_iters=1,
+        variants=("dense",),
+        device="cpu",
+        dtype=torch.float32,
+        seed=0,
+        check_correctness=True,
+    )
+
+    total = report["payload_build_seconds"]
+    assert report["payload_build_total_seconds"] == total
+    assert report["diagnostic_geometry_seconds"] >= 0.0
+    assert report["payload_build_excluding_diagnostic_geometry_seconds"] >= 0.0
+    assert (
+        report["payload_build_excluding_diagnostic_geometry_seconds"]
+        + report["diagnostic_geometry_seconds"]
+    ) == pytest.approx(total, abs=0.01)
+
+
 def test_runtime_payload_cache_reuses_runtime_dict():
     class Runtime:
         pass

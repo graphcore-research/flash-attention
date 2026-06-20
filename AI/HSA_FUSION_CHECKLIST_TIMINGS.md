@@ -351,6 +351,60 @@ CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHO
 
 This is a benchmark/report setup win, not a CUDA hot-path kernel change.
 
+## 2026-06-20 Explicit 2D Setup Timing Split
+
+The explicit 2D benchmark/report path now separates true payload/setup time
+from diagnostic geometry time. JSON compatibility is preserved:
+`payload_build_seconds` remains the historical total wall time. New fields are:
+
+- `payload_build_total_seconds`: alias for the historical total.
+- `payload_build_excluding_diagnostic_geometry_seconds`: total minus diagnostic
+  geometry timing.
+- `diagnostic_geometry_seconds`: time spent building diagnostic/report geometry.
+
+The CLI table now prints `payload_s`, `geom_s`, and `build_s` where `build_s`
+is still the compatible total.
+
+Validation and smoke commands:
+
+```bash
+python -m py_compile flash_attn/cute/hsa_explicit_2d_sparse_analysis.py \
+  tests/cute/benchmark_hsa_2d_sparse.py tests/cute/test_hsa_cached_2d_helpers.py
+
+git diff --check
+
+PYTHONPATH=. timeout 120s python -m pytest \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_explicit_2d_report_splits_payload_and_geometry_timing \
+  tests/cute/test_hsa_cached_2d_helpers.py::test_explicit_2d_average_pairwise_row_jaccard_matches_manual -q
+
+PYTHONPATH=. timeout 120s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 64 --heads 1 --head-dim 8 \
+  --packed-q 4 --support-k 16 --islands-per-row 2 --island-width 2 \
+  --variants dense --warmup-iters 0 --benchmark-iters 1 --json
+```
+
+CLI smoke output included:
+
+| seq | payload_s | geom_s | build_s |
+|---:|---:|---:|---:|
+| 64 | 0.561 | 0.131 | 0.692 |
+
+Bounded 4K D128/support512 benchmark:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHONPATH=. timeout 160s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 --json
+```
+
+| seq | D | support_k | payload_s | geom_s | build_s | direct2d_compact_ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 128 | 512 | 0.466 | 0.461 | 0.927 | 2.816 |
+
+This prevents future routing/perf decisions from treating diagnostic geometry
+as unavoidable payload setup.
+
 ## 2026-06-20 Online-Combine Cast-Out
 
 The overlapping-residual direct-final path keeps FP32 online softmax combine

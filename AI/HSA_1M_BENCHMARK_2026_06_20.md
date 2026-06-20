@@ -44,6 +44,9 @@ Notes:
   `n_edges=24576`, `n_iters=3`, `leaves_per_query=4`, and scales query count.
 - The hot path scales well to 1M for this AR-HSA walk setup.
 - The sliding FA4 comparator is `window_left=5`, not dense causal FA4.
+- This is not an apples-to-apples comparison with explicit 2D attention:
+  AR-HSA walk measures fixed graph propagation plus leaf readout and does not
+  perform per-query QK dot-product scoring over the selected keys.
 
 ## Cached HSA Primary Long vs FA4/SWA-like Baselines
 
@@ -120,6 +123,23 @@ Notes:
   skips redundant output scatter for contiguous q rows.
 - Kernel time scales roughly linearly and is now decisively faster than
   FA4-packed at 1M for this sparse benchmark.
+- The 1M rows above use `heads=8`, `support_k=128`, and `32` live keys/query.
+  The AR-HSA synthetic walk table uses `heads=4` and `4` leaves/query, so it is
+  much less work per query.
+
+Normalized 1M apples-to-apples forward check against FA4-packed:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 1048576 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 4 --islands-per-row 1 --island-width 4 \
+  --variants direct_2d_compact,fa4_packed --warmup-iters 1 --benchmark-iters 3 \
+  --skip-correctness --json
+```
+
+| seq | heads | live keys/query | build_s | direct_2d_compact ms | FA4-packed ms | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1M | 4 | 4 | 0.605 | 19.100 | 969.671 | 50.77x |
 
 ## Explicit 2D Packed, D128
 

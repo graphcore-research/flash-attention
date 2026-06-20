@@ -149,6 +149,8 @@ def _disjoint_confetti_offsets_have_no_overlap(
     offsets = sorted({(island_idx * stride) % max(1, search_space) for island_idx in range(islands_per_row)})
     if len(offsets) != islands_per_row:
         return False
+    if islands_per_row == 1:
+        return True
     for idx, start in enumerate(offsets):
         next_start = offsets[(idx + 1) % len(offsets)]
         gap = (next_start - start) % search_space

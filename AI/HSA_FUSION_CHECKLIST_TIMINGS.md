@@ -105,6 +105,36 @@ The full long explicit benchmark construction remains a Python-side blocker:
 the previously observed 65K-row explicit case construction was approximately
 67s. That slow construction path was not rerun here.
 
+## 2026-06-20 Explicit 2D Selective Payload Construction
+
+`tests/cute/benchmark_hsa_2d_sparse.py` now passes the requested variant set
+into `build_explicit_2d_sparse_case`, so a `direct_2d_compact`-only benchmark
+does not also build the direct, micro/custom, and shared-support payload
+families. Long perf-only runs can use `--skip-correctness` to skip the dense
+PyTorch oracle and report payload build time explicitly as `build_s`.
+
+Evidence:
+
+- Previously measured all-payload 16K builder: 25.3s. That slow path was not
+  rerun.
+- 4K compact-only correctness run:
+  `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python -u tests/cute/benchmark_hsa_2d_sparse.py --case-family disjoint_confetti --seqlen 4096 --heads 8 --head-dim 64 --packed-q 16 --support-k 64 --islands-per-row 4 --island-width 4 --variants direct_2d_compact --warmup-iters 1 --benchmark-iters 1 --json`
+  produced `build_s=3.338`, `direct2d_compact_ms=0.739`,
+  `output_max_diff=9.536743e-07`, `output_mean_diff=3.113932e-08`.
+- Perf-only compact runs with `--skip-correctness`, `heads=8`, `D=64`,
+  `packed_q=16`, `support_k=128`, `islands_per_row=8`, `island_width=4`:
+
+| seq | build_s | direct2d_compact_ms |
+|---:|---:|---:|
+| 16K | 13.652 | 2.871 |
+| 64K | 50.210 | 9.962 |
+| 256K | 207.657 | 38.469 |
+
+The selective construction patch removes avoidable unrelated payload and dense
+oracle work, but the remaining compact payload construction is still
+Python-side and scales roughly linearly with row count. That is the next
+explicit-2D long-context blocker.
+
 ## Remaining Fusion Gates
 
 Overlapping residual FP32 online-combine cast-out is blocked. The existing

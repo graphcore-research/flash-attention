@@ -162,6 +162,11 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--variants", default="dense,custom_masked,fa4_packed,direct_2d")
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--benchmark-iters", type=int, default=20)
+    parser.add_argument(
+        "--skip-correctness",
+        action="store_true",
+        help="Skip the dense PyTorch oracle and output diff checks for long perf-only runs.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -174,7 +179,7 @@ def main(argv=None):
     case_payloads = []
 
     metric_columns = [_variant_column(variant) for variant in variants]
-    print(" ".join(["case", "family", "live_pairs", "fill", *metric_columns, "best", "go_no_go"]))
+    print(" ".join(["case", "family", "live_pairs", "fill", "build_s", *metric_columns, "best", "go_no_go"]))
     for case_idx, spec in enumerate(case_specs):
         report = analyze_explicit_2d_sparse_forward(
             case_family=spec["case_family"],
@@ -191,6 +196,7 @@ def main(argv=None):
             variants=variants,
             seed=case_idx,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            check_correctness=not args.skip_correctness,
         )
         summary = summarize_explicit_2d_sparse_forward(report)
         geometry = report["geometry"]
@@ -203,6 +209,7 @@ def main(argv=None):
                     spec["case_family"],
                     str(int(geometry["live_pairs"])),
                     f"{float(geometry['fill_rate']):.4f}",
+                    f"{float(report.get('payload_build_seconds', float('nan'))):.3f}",
                     *metric_values,
                     _format_best(summary),
                     str(report["go_no_go"]["status"]),

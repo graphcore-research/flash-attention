@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 import torch
@@ -79,7 +80,7 @@ def _mask_geometry(mask_bool: torch.Tensor, q_length: torch.Tensor) -> dict[str,
                 gap_lengths.append(intervals[interval_idx + 1][0] - intervals[interval_idx][1])
 
     packed_area = max(1, num_buckets * rows_per_bucket * support_width)
-    return {
+    result = {
         "num_buckets": num_buckets,
         "valid_rows": valid_rows,
         "live_pairs": total_live_pairs,
@@ -91,6 +92,7 @@ def _mask_geometry(mask_bool: torch.Tensor, q_length: torch.Tensor) -> dict[str,
         "max_gap": max(gap_lengths) if gap_lengths else 0,
         "avg_pairwise_row_jaccard": float(sum(overlap_scores) / len(overlap_scores)) if overlap_scores else 0.0,
     }
+    return result
 
 
 def _intervals_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
@@ -243,7 +245,7 @@ def _build_micro_bucket(
         2,
         -1,
     )
-    return {
+    result = {
         "packed_q": 2,
         "support_rows": support_k,
         "custom_q_buf": micro_q_buf.contiguous(),
@@ -255,6 +257,7 @@ def _build_micro_bucket(
         "custom_k_length": micro_k_length.contiguous(),
         "q_row_idx": micro_q_row_idx.contiguous(),
     }
+    return result
 
 
 def _partition_packed_rows_by_support(
@@ -557,7 +560,7 @@ def _build_direct_2d_compact_payload(
         "direct_2d_compact_buckets_compacted": sum(len(bucket_indices) for bucket_indices in buckets_by_tile_span.values()),
         "direct_2d_compact_buckets_passthrough": len(full_bucket_indices),
     }
-    return {
+    result = {
         "groups": compact_groups,
         "total_buckets": num_buckets,
         "packed_q": packed_q,
@@ -569,6 +572,7 @@ def _build_direct_2d_compact_payload(
             fallback_total_rows=int(q_length.sum().item()),
         ),
     }, compact_geometry
+    return result
 
 
 def _build_shared_support_buckets(
@@ -633,6 +637,7 @@ def build_explicit_2d_sparse_case(
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
     seed: int = 0,
+    payload_variants: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     if case_family not in {"disjoint_confetti", "compact_control"}:
         raise ValueError(f"unsupported case_family {case_family!r}")
@@ -640,6 +645,15 @@ def build_explicit_2d_sparse_case(
         raise ValueError("seqlen, heads, head_dim, packed_q, and support_k must be positive")
     if islands_per_row <= 0 or island_width <= 0:
         raise ValueError("islands_per_row and island_width must be positive")
+    if payload_variants is None:
+        payload_variant_set = {
+            "custom_masked",
+            "direct_2d",
+            "direct_2d_compact",
+            "shared_support",
+        }
+    else:
+        payload_variant_set = set(payload_variants)
 
     device = _normalize_device(device)
     dtype = _default_dtype_for_device(device) if dtype is None else dtype
@@ -720,25 +734,7 @@ def build_explicit_2d_sparse_case(
             "live_pairs_per_row": live_per_row,
         }
     )
-    direct_2d_bucket, direct_2d_geometry = _build_direct_2d_bucket(
-        q_buf=q_buf,
-        k_buf=k_buf,
-        v_buf=v_buf,
-        mask_bool=mask_bool,
-        q_length=q_length,
-        q_row_idx=q_row_idx,
-    )
-    direct_2d_compact_payload, direct_2d_compact_geometry = _build_direct_2d_compact_payload(
-        q_buf=q_buf,
-        k_buf=k_buf,
-        v_buf=v_buf,
-        mask_bool=mask_bool,
-        q_length=q_length,
-        q_row_idx=q_row_idx,
-    )
-    geometry.update(direct_2d_geometry)
-    geometry.update(direct_2d_compact_geometry)
-    return {
+    result = {
         "case_family": case_family,
         "seqlen": seqlen,
         "heads": heads,
@@ -751,25 +747,48 @@ def build_explicit_2d_sparse_case(
         "device": str(device),
         "dtype": str(dtype).replace("torch.", ""),
         "full_bucket": full_bucket,
-        "direct_2d_bucket": direct_2d_bucket,
-        "direct_2d_compact_payload": direct_2d_compact_payload,
-        "micro_bucket": _build_micro_bucket(
+        "geometry": geometry,
+    }
+    if "direct_2d" in payload_variant_set:
+        direct_2d_bucket, direct_2d_geometry = _build_direct_2d_bucket(
             q_buf=q_buf,
             k_buf=k_buf,
             v_buf=v_buf,
             mask_bool=mask_bool,
             q_length=q_length,
             q_row_idx=q_row_idx,
-        ),
-        "shared_support_buckets": _build_shared_support_buckets(
+        )
+        geometry.update(direct_2d_geometry)
+        result["direct_2d_bucket"] = direct_2d_bucket
+    if "direct_2d_compact" in payload_variant_set:
+        direct_2d_compact_payload, direct_2d_compact_geometry = _build_direct_2d_compact_payload(
             q_buf=q_buf,
             k_buf=k_buf,
             v_buf=v_buf,
             mask_bool=mask_bool,
             q_length=q_length,
-        ),
-        "geometry": geometry,
-    }
+            q_row_idx=q_row_idx,
+        )
+        geometry.update(direct_2d_compact_geometry)
+        result["direct_2d_compact_payload"] = direct_2d_compact_payload
+    if "custom_masked" in payload_variant_set:
+        result["micro_bucket"] = _build_micro_bucket(
+            q_buf=q_buf,
+            k_buf=k_buf,
+            v_buf=v_buf,
+            mask_bool=mask_bool,
+            q_length=q_length,
+            q_row_idx=q_row_idx,
+        )
+    if "shared_support" in payload_variant_set:
+        result["shared_support_buckets"] = _build_shared_support_buckets(
+            q_buf=q_buf,
+            k_buf=k_buf,
+            v_buf=v_buf,
+            mask_bool=mask_bool,
+            q_length=q_length,
+        )
+    return result
 
 
 def _run_dense_explicit_bucket_forward(bucket: dict[str, Any], *, softmax_scale: float) -> torch.Tensor:
@@ -907,12 +926,15 @@ def analyze_explicit_2d_sparse_forward(
     device: str | torch.device | None = None,
     dtype: torch.dtype | None = None,
     seed: int = 0,
+    check_correctness: bool = True,
 ) -> dict[str, Any]:
     valid_variants = {"dense", "custom_masked", "fa4_packed", "direct_2d", "direct_2d_compact", "shared_support"}
     if any(variant not in valid_variants for variant in variants):
         unknown = sorted(set(variants) - valid_variants)
         raise ValueError(f"unknown variants {unknown}")
 
+    normalized_device = _normalize_device(device)
+    payload_t0 = time.perf_counter()
     case_payload = build_explicit_2d_sparse_case(
         case_family=case_family,
         seqlen=seqlen,
@@ -923,13 +945,21 @@ def analyze_explicit_2d_sparse_forward(
         islands_per_row=islands_per_row,
         island_width=island_width,
         row_shift=row_shift,
-        device=device,
+        device=normalized_device,
         dtype=dtype,
         seed=seed,
+        payload_variants=tuple(variants),
     )
+    if normalized_device.type == "cuda":
+        torch.cuda.synchronize()
+    payload_build_seconds = time.perf_counter() - payload_t0
     full_bucket = case_payload["full_bucket"]
     softmax_scale = head_dim ** (-0.5)
-    dense_out = _run_dense_explicit_bucket_forward(full_bucket, softmax_scale=softmax_scale)
+    dense_out = (
+        _run_dense_explicit_bucket_forward(full_bucket, softmax_scale=softmax_scale)
+        if check_correctness
+        else None
+    )
 
     runners = {
         "dense": lambda: _run_dense_explicit_bucket_forward(full_bucket, softmax_scale=softmax_scale),
@@ -960,12 +990,18 @@ def analyze_explicit_2d_sparse_forward(
         runner = runners[variant]
         try:
             out = runner()
-            diff = (dense_out.float() - out.float()).abs()
+            if dense_out is not None:
+                diff = (dense_out.float() - out.float()).abs()
+                output_max_diff = float(diff.max().item()) if diff.numel() > 0 else 0.0
+                output_mean_diff = float(diff.mean().item()) if diff.numel() > 0 else 0.0
+            else:
+                output_max_diff = float("nan")
+                output_mean_diff = float("nan")
             results[variant] = {
                 "status": "measured",
                 "fwd_ms": _measure_ms(runner, warmup_iters, benchmark_iters),
-                "output_max_diff": float(diff.max().item()) if diff.numel() > 0 else 0.0,
-                "output_mean_diff": float(diff.mean().item()) if diff.numel() > 0 else 0.0,
+                "output_max_diff": output_max_diff,
+                "output_mean_diff": output_mean_diff,
             }
         except Exception as exc:  # pragma: no cover - benchmark-only failure path
             results[variant] = {
@@ -1023,6 +1059,8 @@ def analyze_explicit_2d_sparse_forward(
         "variants": list(variants),
         "geometry": case_payload["geometry"],
         "results": results,
+        "payload_build_seconds": payload_build_seconds,
+        "check_correctness": bool(check_correctness),
         "go_no_go": go_no_go,
     }
 

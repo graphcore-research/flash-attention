@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
@@ -1069,6 +1070,62 @@ def _runtime_payload_cache(runtime: Any, name: str) -> dict[Any, dict[str, Any]]
     return cache
 
 
+def _runtime_payload_stats(runtime: Any, name: str) -> dict[str, Any] | None:
+    if runtime is None:
+        return None
+    stats = getattr(runtime, name, None)
+    if stats is None:
+        stats = {}
+        setattr(runtime, name, stats)
+    if not isinstance(stats, dict):
+        return None
+    return stats
+
+
+def _record_cached_direct_2d_payload_cache_event(
+    runtime: Any,
+    *,
+    event: str,
+    cache_size: int,
+    payload: dict[str, Any] | None = None,
+    build_seconds: float = 0.0,
+) -> None:
+    stats = _runtime_payload_stats(runtime, "_cached_direct_2d_forward_payload_stats")
+    if stats is None:
+        return
+    stats["calls"] = int(stats.get("calls", 0)) + 1
+    stats["cache_size"] = int(cache_size)
+    stats["last_event"] = str(event)
+    if event == "hit":
+        stats["hits"] = int(stats.get("hits", 0)) + 1
+    else:
+        stats["misses"] = int(stats.get("misses", 0)) + 1
+        stats["build_seconds_total"] = float(stats.get("build_seconds_total", 0.0)) + float(build_seconds)
+        stats["build_seconds_last"] = float(build_seconds)
+    if isinstance(payload, dict):
+        stats["last_payload_status"] = str(payload.get("status", "unknown"))
+        if "reason" in payload:
+            stats["last_payload_reason"] = str(payload["reason"])
+        geometry = payload.get("geometry")
+        if isinstance(geometry, dict):
+            stats["last_geometry"] = {
+                key: value
+                for key, value in geometry.items()
+                if isinstance(value, (int, float, str, bool))
+            }
+
+
+def get_cached_direct_2d_forward_payload_cache_stats(runtime: Any) -> dict[str, Any]:
+    stats = _runtime_payload_stats(runtime, "_cached_direct_2d_forward_payload_stats")
+    return dict(stats) if isinstance(stats, dict) else {}
+
+
+def reset_cached_direct_2d_forward_payload_cache_stats(runtime: Any) -> None:
+    stats = _runtime_payload_stats(runtime, "_cached_direct_2d_forward_payload_stats")
+    if isinstance(stats, dict):
+        stats.clear()
+
+
 def _cached_payload_shape_key(
     *,
     q_flat: torch.Tensor,
@@ -2096,7 +2153,14 @@ def build_cached_direct_2d_forward_payload(
     if payload_cache is not None:
         cached_payload = payload_cache.get(payload_cache_key)
         if isinstance(cached_payload, dict):
+            _record_cached_direct_2d_payload_cache_event(
+                runtime,
+                event="hit",
+                cache_size=len(payload_cache),
+                payload=cached_payload,
+            )
             return cached_payload
+    build_t0 = time.perf_counter()
     group_q_rows: list[list[int]] = []
     group_k_rows: list[list[int]] = []
     group_mask_words: list[torch.Tensor] = []
@@ -2339,6 +2403,13 @@ def build_cached_direct_2d_forward_payload(
             payload["cached_generalized_backward_payload"] = backward_payload
     if payload_cache is not None:
         payload_cache[payload_cache_key] = payload
+    _record_cached_direct_2d_payload_cache_event(
+        runtime,
+        event="miss",
+        cache_size=len(payload_cache) if payload_cache is not None else 0,
+        payload=payload,
+        build_seconds=time.perf_counter() - build_t0,
+    )
     return payload
 
 

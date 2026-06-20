@@ -867,3 +867,48 @@ payloads in-step, move setup into preprocessing/cache first. If not, the next
 kernel-level target is the duplicate-row in-kernel online-softmax combine,
 because the existing gates show broad DK/DV non-atomic and BF16-combine
 shortcuts remain correctly blocked.
+
+## 2026-06-20 Cached 2D Payload Cache Stats
+
+Added runtime-local cache statistics for
+`build_cached_direct_2d_forward_payload`. The stats live on the same runtime
+object as `_cached_direct_2d_forward_payload_cache` and can be queried with:
+
+```python
+from flash_attn.cute import (
+    get_cached_direct_2d_forward_payload_cache_stats,
+    reset_cached_direct_2d_forward_payload_cache_stats,
+)
+```
+
+The counters report `calls`, `hits`, `misses`, `cache_size`,
+`build_seconds_total`, `build_seconds_last`, `last_event`, `last_payload_status`,
+and scalar `last_geometry`. This is the hook needed to distinguish true in-step
+payload rebuilds from amortized cached setup in training runs.
+
+Smoke / representative probe:
+
+```bash
+PYTHONPATH=. timeout 60s python tests/cute/profile_hsa_remaining.py --no-cuda --json
+
+PYTHONPATH=. timeout 180s python tests/cute/profile_hsa_remaining.py \
+  --seqlens 4096 --benchmark-iters 2 --warmup-iters 1 --json
+```
+
+Observed cache probe in both runs:
+
+| calls | misses | hits | cache_size | second_is_first | last_event | build_seconds_total |
+|---:|---:|---:|---:|---|---|---:|
+| 2 | 1 | 1 | 1 | true | hit | about 0.001-0.0014 |
+
+The 4K representative timing with the updated profiler was:
+
+| seq | payload_s | diagnostic_geometry_s | direct_2d_compact ms | FA4 packed ms | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 4096 | 0.586 | 0.355 | 0.224 | 3.851 | 17.16x |
+
+Status: fixed instrumentation. Next use this on actual training runtimes; if
+`misses` increases every step for a stable shape/policy, payload construction is
+still in the step path and should be moved fully into preprocessing or schedule
+attachment. If `hits` dominate after warmup, the next kernel target remains
+duplicate-row online-softmax combine inside one residual launch.

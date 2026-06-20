@@ -714,6 +714,51 @@ def test_cached_torch_contiguous_grad_helper_env_gate(monkeypatch):
     assert cached_2d._use_torch_contiguous_grad_helpers()
 
 
+def test_cached_direct_2d_payload_cache_stats_record_hit_and_miss():
+    class SyntheticGrid:
+        def __init__(self, direct_plan):
+            self.forward_execution_plan = {"direct_execution_plan": direct_plan}
+
+    class Runtime:
+        def __init__(self, direct_plan):
+            self.forward_synthetic_grid = SyntheticGrid(direct_plan)
+
+    direct_plan = {
+        "bucket_size": [1],
+        "bucket_packed_q": [2],
+        "bucket_packed_k": [4],
+        "bucket_q_row_range": [(0, 2)],
+        "bucket_q_row_idx": torch.tensor([0, 1], dtype=torch.int32),
+        "row_compact_plan": {
+            "bucket_row_k_range": [(0, 8)],
+            "bucket_row_k_length_range": [(0, 2)],
+            "bucket_row_k_cap": [4],
+            "bucket_row_k_row_idx": torch.tensor([0, 1, 2, 3, 1, 2, 3, 4], dtype=torch.int32),
+            "bucket_row_k_length": torch.tensor([4, 4], dtype=torch.int32),
+        },
+    }
+    runtime = Runtime(direct_plan)
+    q = torch.empty((1, 2, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+
+    cached_2d.reset_cached_direct_2d_forward_payload_cache_stats(runtime)
+    first = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    second = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    stats = cached_2d.get_cached_direct_2d_forward_payload_cache_stats(runtime)
+
+    assert first["status"] == "ready"
+    assert second is first
+    assert stats["calls"] == 2
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["cache_size"] == 1
+    assert stats["last_event"] == "hit"
+    assert stats["last_payload_status"] == "ready"
+    assert stats["build_seconds_total"] >= 0.0
+    assert stats["last_geometry"]["cached_direct_2d_groups"] == 1
+
+
 def test_cached_backward_key_owned_dkdv_gate_requires_occurrence_payload():
     assert not cached_2d._can_use_cached_backward_key_owned_dkdv(None)
 

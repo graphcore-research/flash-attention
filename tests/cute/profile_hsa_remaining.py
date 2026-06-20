@@ -67,6 +67,64 @@ def _parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+class _SyntheticGrid:
+    def __init__(self, direct_plan: dict[str, Any]):
+        self.forward_execution_plan = {"direct_execution_plan": direct_plan}
+
+
+class _Runtime:
+    def __init__(self, direct_plan: dict[str, Any]):
+        self.forward_synthetic_grid = _SyntheticGrid(direct_plan)
+
+
+def _make_representative_runtime() -> _Runtime:
+    packed_q = 2
+    row_k_cap = 4
+    direct_plan = {
+        "bucket_size": [1],
+        "bucket_packed_q": [packed_q],
+        "bucket_packed_k": [row_k_cap],
+        "bucket_q_row_range": [(0, packed_q)],
+        "bucket_q_row_idx": torch.tensor([0, 1], dtype=torch.int32),
+        "row_compact_plan": {
+            "bucket_row_k_range": [(0, packed_q * row_k_cap)],
+            "bucket_row_k_length_range": [(0, packed_q)],
+            "bucket_row_k_cap": [row_k_cap],
+            "bucket_row_k_row_idx": torch.tensor(
+                [
+                    0,
+                    1,
+                    2,
+                    3,
+                    1,
+                    2,
+                    3,
+                    4,
+                ],
+                dtype=torch.int32,
+            ),
+            "bucket_row_k_length": torch.tensor([4, 4], dtype=torch.int32),
+        },
+    }
+    return _Runtime(direct_plan)
+
+
+def _profile_cached_payload_cache_probe() -> dict[str, Any]:
+    runtime = _make_representative_runtime()
+    q = torch.empty((1, 2, 2, 64), dtype=torch.bfloat16)
+    k = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+    v = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+    cached_2d.reset_cached_direct_2d_forward_payload_cache_stats(runtime)
+    first = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    second = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    stats = cached_2d.get_cached_direct_2d_forward_payload_cache_stats(runtime)
+    return {
+        "first_status": first.get("status"),
+        "second_is_first": second is first,
+        "stats": stats,
+    }
+
+
 def _base_direct_final_payload() -> dict[str, Any]:
     return {
         "total_rows": 6,
@@ -249,11 +307,13 @@ def _profile_d128_routing(target_head_dims: list[int], support_values: list[int]
 
 
 def _profile_2d_cases(args: argparse.Namespace) -> dict[str, Any]:
+    cache_probe = _profile_cached_payload_cache_probe()
     if args.no_cuda or not torch.cuda.is_available():
         return {
             "point": "2D compact payload construction",
             "status": "skipped_no_cuda",
             "online_payload_build_in_hot_timing": False,
+            "cached_payload_cache_probe": cache_probe,
         }
     cases = []
     for seqlen in _parse_int_list(args.seqlens):
@@ -302,6 +362,7 @@ def _profile_2d_cases(args: argparse.Namespace) -> dict[str, Any]:
         "point": "2D compact payload construction",
         "status": "measured_representative_cases",
         "online_payload_build_in_hot_timing": False,
+        "cached_payload_cache_probe": cache_probe,
         "cases": cases,
     }
 

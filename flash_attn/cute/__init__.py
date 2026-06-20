@@ -60,6 +60,8 @@ from .hsa_cached_2d_forward_analysis import (
     attach_precomputed_cached_generalized_forward_payload,
     build_cached_direct_2d_forward_payload,
     build_cached_generalized_packed_forward_payload,
+    get_cached_direct_2d_forward_payload_cache_stats,
+    reset_cached_direct_2d_forward_payload_cache_stats,
     run_cached_direct_2d_forward,
     run_cached_generalized_packed_forward,
 )
@@ -154,6 +156,8 @@ __all__ = [
     "CachedPackingPolicy",
     "build_cached_direct_2d_forward_payload",
     "build_cached_generalized_packed_forward_payload",
+    "get_cached_direct_2d_forward_payload_cache_stats",
+    "reset_cached_direct_2d_forward_payload_cache_stats",
     "attach_precomputed_cached_generalized_forward_payload",
     "scatter_explicit_packed_rows",
     "run_cached_direct_2d_forward",

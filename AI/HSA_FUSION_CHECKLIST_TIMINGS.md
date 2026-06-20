@@ -211,6 +211,67 @@ is intentionally narrow: non-full-span payloads, overlapping residuals, mixed
 packed+scatter residuals, and wider/unsupported shapes still use the existing
 safe paths and gates.
 
+## 2026-06-20 Explicit 2D TC High-Support D64 Selector
+
+The explicit compact TC selector was too conservative for D64 full-passthrough
+compact payloads. The wrapper can already run the TC gather/scatter kernel at
+larger support widths, and bounded probes showed that support 512/1024 are real
+wins while support 256 is not. The default selector now routes D64
+`direct_2d_compact` through TC when `512 <= support_rows <= 1024`. The upper
+bound is configurable with
+`FLASH_ATTN_HSA_EXPLICIT_DIRECT_2D_TC_HIGH_SUPPORT_MAX`; D128 remains on the
+existing small-support gate.
+
+Correctness and timing probes:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 2048 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 256 --islands-per-row 16 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 16384 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 256 --islands-per-row 16 --island-width 4 \
+  --variants direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 \
+  --skip-correctness --json
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 65536 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 \
+  --skip-correctness --json
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 16384 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 1024 --islands-per-row 64 --island-width 4 \
+  --variants direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 \
+  --skip-correctness --json
+```
+
+| seq | D | support_k | route state | compact/scalar ms | forced/default TC ms | decision |
+|---:|---:|---:|---|---:|---:|---|
+| 2K | 64 | 256 | pre-patch probe | 0.614 | 0.330 | TC wins only at tiny shape |
+| 16K | 64 | 256 | pre-patch probe | 2.522 | 3.282 | keep scalar |
+| 64K | 64 | 512 | pre-patch forced | 18.320 | 9.307 | default TC |
+| 16K | 64 | 1024 | pre-patch forced | 9.331 | 5.403 | default TC |
+| 16K | 64 | 512 | post-patch compact | old scalar 6.355 | 2.742 | default TC active |
+| 16K | 64 | 1024 | post-patch compact | old scalar 9.331 | 5.400 | default TC active |
+
+D128 support512 was also probed with correctness enabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 1024 --heads 4 --head-dim 128 \
+  --packed-q 16 --support-k 512 --islands-per-row 32 --island-width 4 \
+  --variants dense,direct_2d_compact,direct_2d_tc --warmup-iters 1 --benchmark-iters 2 --json
+```
+
+The D128 TC kernel was correct (`max_diff=8.34e-07`) but slower than dense at
+that shape (`1.031 ms` vs `0.491 ms`), and scalar compact is still unsupported
+by the D128 packed-k cap. D128 support512 therefore remains gated off by
+default rather than being claimed as a win.
+
 ## 2026-06-20 Online-Combine Cast-Out
 
 The overlapping-residual direct-final path keeps FP32 online softmax combine

@@ -1094,9 +1094,17 @@ def _can_use_direct_2d_tc_forward(bucket: dict[str, Any]) -> bool:
         return False
     head_dim = int(q_buf.shape[-1])
     support_rows = int(bucket.get("support_rows", 0))
+    tc_support_rows = 0 < support_rows <= 128
+    if head_dim == 64:
+        try:
+            high_support_max = int(os.environ.get("FLASH_ATTN_HSA_EXPLICIT_DIRECT_2D_TC_HIGH_SUPPORT_MAX", "1024"))
+        except ValueError:
+            high_support_max = 1024
+        high_support_max = max(512, min(high_support_max, 2048))
+        tc_support_rows = tc_support_rows or (512 <= support_rows <= high_support_max)
     return (
         int(bucket.get("packed_q", 0)) == 16
-        and 0 < support_rows <= 128
+        and tc_support_rows
         and head_dim in (64, 128)
         and int(k_buf.shape[-1]) == head_dim
         and int(v_buf.shape[-1]) == head_dim

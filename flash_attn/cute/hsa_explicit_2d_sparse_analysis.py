@@ -133,6 +133,110 @@ def _build_disjoint_confetti_row_mask(
     return mask
 
 
+def _disjoint_confetti_offsets_have_no_overlap(
+    *,
+    support_k: int,
+    islands_per_row: int,
+    island_width: int,
+) -> bool:
+    if support_k <= 0 or islands_per_row <= 0 or island_width <= 0:
+        return False
+    if islands_per_row * island_width > support_k:
+        return False
+    max_start = max(0, support_k - island_width)
+    search_space = max_start + 1
+    stride = max(island_width + 1, support_k // max(1, islands_per_row))
+    offsets = sorted({(island_idx * stride) % max(1, search_space) for island_idx in range(islands_per_row)})
+    if len(offsets) != islands_per_row:
+        return False
+    for idx, start in enumerate(offsets):
+        next_start = offsets[(idx + 1) % len(offsets)]
+        gap = (next_start - start) % search_space
+        if gap < island_width:
+            return False
+    return True
+
+
+def _build_disjoint_confetti_mask_vectorized(
+    *,
+    q_row_idx: torch.Tensor,
+    support_k: int,
+    islands_per_row: int,
+    island_width: int,
+    row_shift: int,
+) -> torch.Tensor:
+    if not _disjoint_confetti_offsets_have_no_overlap(
+        support_k=support_k,
+        islands_per_row=islands_per_row,
+        island_width=island_width,
+    ):
+        raise ValueError("disjoint_confetti_vectorized_requires_non_overlapping_offsets")
+    num_buckets, packed_q = q_row_idx.shape
+    flat_rows = q_row_idx.reshape(-1).to(dtype=torch.int64)
+    row_valid = flat_rows >= 0
+    max_start = max(0, support_k - island_width)
+    search_space = max_start + 1
+    stride = max(island_width + 1, support_k // max(1, islands_per_row))
+    base = (flat_rows.clamp_min(0) * max(1, row_shift)) % max(1, search_space)
+    offsets = (
+        torch.arange(islands_per_row, dtype=torch.int64, device=q_row_idx.device)
+        * int(stride)
+    ) % max(1, search_space)
+    starts = (base.unsqueeze(1) + offsets.unsqueeze(0)) % max(1, search_space)
+    cols = starts.unsqueeze(-1) + torch.arange(island_width, dtype=torch.int64, device=q_row_idx.device).view(1, 1, -1)
+    cols = cols.reshape(flat_rows.numel(), islands_per_row * island_width)
+    mask_2d = torch.zeros((flat_rows.numel(), support_k), dtype=torch.bool, device=q_row_idx.device)
+    mask_2d.scatter_(1, cols, True)
+    if bool((~row_valid).any().item()):
+        mask_2d[~row_valid] = False
+    return mask_2d.view(num_buckets, packed_q, support_k).contiguous()
+
+
+def _fast_disjoint_confetti_geometry(
+    *,
+    q_row_idx: torch.Tensor,
+    num_buckets: int,
+    packed_q: int,
+    support_k: int,
+    islands_per_row: int,
+    island_width: int,
+    row_shift: int,
+) -> dict[str, float | int]:
+    flat_rows = q_row_idx.reshape(-1).to(dtype=torch.int64)
+    valid_rows = flat_rows[flat_rows >= 0]
+    valid_row_count = int(valid_rows.numel())
+    live_per_row = min(support_k, islands_per_row * island_width)
+    total_live_pairs = valid_row_count * live_per_row
+    max_start = max(0, support_k - island_width)
+    search_space = max_start + 1
+    stride = max(island_width + 1, support_k // max(1, islands_per_row))
+    if valid_row_count > 0 and islands_per_row > 1:
+        base = (valid_rows * max(1, row_shift)) % max(1, search_space)
+        offsets = (
+            torch.arange(islands_per_row, dtype=torch.int64, device=q_row_idx.device)
+            * int(stride)
+        ) % max(1, search_space)
+        starts = ((base.unsqueeze(1) + offsets.unsqueeze(0)) % max(1, search_space)).sort(dim=1).values
+        gaps = starts[:, 1:] - (starts[:, :-1] + int(island_width))
+        avg_gap = float(gaps.float().mean().item()) if int(gaps.numel()) > 0 else 0.0
+        max_gap = int(gaps.max().item()) if int(gaps.numel()) > 0 else 0
+    else:
+        avg_gap = 0.0
+        max_gap = 0
+    return {
+        "num_buckets": num_buckets,
+        "valid_rows": valid_row_count,
+        "live_pairs": total_live_pairs,
+        "fill_rate": total_live_pairs / max(1, num_buckets * packed_q * support_k),
+        "support_width": support_k,
+        "avg_islands_per_row": float(islands_per_row if valid_row_count > 0 else 0),
+        "max_islands_per_row": int(islands_per_row if valid_row_count > 0 else 0),
+        "avg_gap": avg_gap,
+        "max_gap": max_gap,
+        "avg_pairwise_row_jaccard": -1.0,
+    }
+
+
 def _build_compact_control_row_mask(
     *,
     support_k: int,
@@ -151,6 +255,26 @@ def _build_compact_control_row_mask(
 
 
 def _flatten_valid_packed_rows(packed_out: torch.Tensor, q_length: torch.Tensor) -> torch.Tensor:
+    if int(packed_out.shape[0]) > 0 and int(packed_out.shape[1]) > 0:
+        packed_q = int(packed_out.shape[1])
+        total_rows = int(q_length.sum().item())
+        if total_rows <= int(packed_out.shape[0]) * packed_q:
+            full_rows = total_rows // packed_q
+            tail_rows = total_rows - full_rows * packed_q
+            if (
+                (full_rows == 0 or bool((q_length[:full_rows] == packed_q).all().item()))
+                and (
+                    full_rows >= int(q_length.numel())
+                    or tail_rows == 0
+                    or int(q_length[full_rows].item()) == tail_rows
+                )
+                and (
+                    full_rows + (1 if tail_rows > 0 else 0) >= int(q_length.numel())
+                    or bool((q_length[full_rows + (1 if tail_rows > 0 else 0):] == 0).all().item())
+                )
+            ):
+                flat_rows = packed_out.reshape(-1, packed_out.shape[2], packed_out.shape[3])[:total_rows].float()
+                return flat_rows.permute(1, 0, 2).contiguous()
     rows: list[torch.Tensor] = []
     for bucket_idx, q_count in enumerate(q_length.detach().cpu().tolist()):
         valid_q = int(q_count)
@@ -413,14 +537,82 @@ def _build_direct_2d_compact_payload(
     k_buf: torch.Tensor,
     v_buf: torch.Tensor,
     mask_bool: torch.Tensor,
+    mask_words: torch.Tensor | None = None,
     q_length: torch.Tensor,
     q_row_idx: torch.Tensor,
     tile_k: int = 32,
+    total_rows: int | None = None,
+    contiguous_q_rows: bool = False,
 ) -> tuple[dict[str, Any], dict[str, float | int]]:
     num_buckets, packed_q, num_heads, head_dim = q_buf.shape
     support_k = int(k_buf.shape[1])
     device = q_buf.device
     full_tile_span = max(1, math.ceil(support_k / max(1, tile_k)))
+    if int(num_buckets) > 0:
+        bucket_has_any = mask_bool.any(dim=1)
+        bucket_union_k_tensor = bucket_has_any.sum(dim=1).to(dtype=torch.int32)
+        valid_bucket = q_length > 0
+        bucket_tile_span_tensor = ((bucket_union_k_tensor + int(tile_k) - 1) // max(1, int(tile_k))).clamp_min(1)
+        all_valid_buckets_full_span = bool(
+            ((~valid_bucket) | (bucket_tile_span_tensor >= int(full_tile_span))).all().item()
+        )
+        if all_valid_buckets_full_span:
+            if mask_words is None:
+                mask_words = _encode_mask_rows_to_words(mask_bool.reshape(num_buckets * packed_q, support_k)).view(
+                    num_buckets,
+                    packed_q,
+                    -1,
+                )
+            bucket_index_tensor = torch.arange(num_buckets, dtype=torch.long, device=device)
+            group_k_length = torch.full((num_buckets,), support_k, dtype=torch.int32, device=device)
+            compact_groups = [
+                {
+                    "bucket_indices": bucket_index_tensor,
+                    "packed_q": packed_q,
+                    "support_rows": support_k,
+                    "custom_q_buf": q_buf.contiguous(),
+                    "custom_k_buf": k_buf.contiguous(),
+                    "custom_v_buf": v_buf.contiguous(),
+                    "custom_mask_bool": mask_bool.contiguous(),
+                    "custom_mask_words": mask_words.contiguous(),
+                    "custom_q_length": q_length.contiguous(),
+                    "custom_k_length": group_k_length,
+                    "is_full_passthrough_order": True,
+                }
+            ]
+            valid_union_k = bucket_union_k_tensor[valid_bucket].to(dtype=torch.float32)
+            total_live_pairs = int(mask_bool.sum().item())
+            total_row_area = int(q_length.sum().item()) * support_k
+            resolved_total_rows = (
+                int(total_rows)
+                if total_rows is not None
+                else _total_rows_from_q_row_idx(
+                    q_row_idx,
+                    q_length,
+                    fallback_total_rows=int(q_length.sum().item()),
+                )
+            )
+            compact_geometry = {
+                "direct_2d_compact_launch_groups": 1,
+                "direct_2d_compact_avg_union_k": float(valid_union_k.mean().item()) if int(valid_union_k.numel()) else 0.0,
+                "direct_2d_compact_max_union_k": int(bucket_union_k_tensor[valid_bucket].max().item()) if bool(valid_bucket.any().item()) else 0,
+                "direct_2d_compact_avg_tile_span": float(bucket_tile_span_tensor[valid_bucket].to(dtype=torch.float32).mean().item()) if bool(valid_bucket.any().item()) else 0.0,
+                "direct_2d_compact_avg_group_fill": total_live_pairs / max(1, total_row_area),
+                "direct_2d_compact_case_fill_rate": total_live_pairs / max(1, total_row_area),
+                "direct_2d_compact_buckets_compacted": 0,
+                "direct_2d_compact_buckets_passthrough": int(valid_bucket.sum().item()),
+            }
+            result = {
+                "groups": compact_groups,
+                "total_buckets": num_buckets,
+                "packed_q": packed_q,
+                "custom_q_length": q_length.contiguous(),
+                "q_row_idx": q_row_idx.contiguous(),
+                "total_rows": resolved_total_rows,
+                "q_row_idx_is_contiguous": bool(contiguous_q_rows),
+            }
+            return result, compact_geometry
+
     bucket_union_cols: list[torch.Tensor] = []
     bucket_union_k: list[int] = []
     bucket_tile_spans: list[int] = []
@@ -569,8 +761,9 @@ def _build_direct_2d_compact_payload(
         "total_rows": _total_rows_from_q_row_idx(
             q_row_idx,
             q_length,
-            fallback_total_rows=int(q_length.sum().item()),
+            fallback_total_rows=int(total_rows) if total_rows is not None else int(q_length.sum().item()),
         ),
+        "q_row_idx_is_contiguous": bool(contiguous_q_rows),
     }, compact_geometry
     return result
 
@@ -638,6 +831,7 @@ def build_explicit_2d_sparse_case(
     dtype: torch.dtype | None = None,
     seed: int = 0,
     payload_variants: tuple[str, ...] | None = None,
+    fast_geometry: bool = False,
 ) -> dict[str, Any]:
     if case_family not in {"disjoint_confetti", "compact_control"}:
         raise ValueError(f"unsupported case_family {case_family!r}")
@@ -685,17 +879,30 @@ def build_explicit_2d_sparse_case(
         cols = torch.arange(support_k, dtype=torch.int64, device=device).view(1, 1, support_k)
         mask_bool = row_valid.unsqueeze(-1) & (cols >= starts.unsqueeze(-1)) & (cols < (starts + width).unsqueeze(-1))
     else:
-        mask_bool_cpu = torch.zeros((num_buckets, packed_q, support_k), dtype=torch.bool)
-        for global_row in range(seqlen):
-            bucket_idx, row_idx = divmod(global_row, packed_q)
-            mask_bool_cpu[bucket_idx, row_idx] = _build_disjoint_confetti_row_mask(
+        if _disjoint_confetti_offsets_have_no_overlap(
+            support_k=support_k,
+            islands_per_row=islands_per_row,
+            island_width=island_width,
+        ):
+            mask_bool = _build_disjoint_confetti_mask_vectorized(
+                q_row_idx=q_row_idx,
                 support_k=support_k,
                 islands_per_row=islands_per_row,
                 island_width=island_width,
-                row_seed=global_row,
                 row_shift=row_shift,
             )
-        mask_bool = mask_bool_cpu.to(device=device)
+        else:
+            mask_bool_cpu = torch.zeros((num_buckets, packed_q, support_k), dtype=torch.bool)
+            for global_row in range(seqlen):
+                bucket_idx, row_idx = divmod(global_row, packed_q)
+                mask_bool_cpu[bucket_idx, row_idx] = _build_disjoint_confetti_row_mask(
+                    support_k=support_k,
+                    islands_per_row=islands_per_row,
+                    island_width=island_width,
+                    row_seed=global_row,
+                    row_shift=row_shift,
+                )
+            mask_bool = mask_bool_cpu.to(device=device)
 
     mask_words = _encode_mask_rows_to_words(mask_bool.reshape(num_buckets * packed_q, support_k)).view(
         num_buckets,
@@ -713,13 +920,24 @@ def build_explicit_2d_sparse_case(
         "custom_q_length": q_length.contiguous(),
         "custom_k_length": k_length.contiguous(),
         "q_row_idx": q_row_idx.contiguous(),
-        "total_rows": _total_rows_from_q_row_idx(
-            q_row_idx,
-            q_length,
-            fallback_total_rows=seqlen,
-        ),
+        "total_rows": seqlen,
     }
-    geometry = _mask_geometry(mask_bool, q_length)
+    if fast_geometry and case_family == "disjoint_confetti" and _disjoint_confetti_offsets_have_no_overlap(
+        support_k=support_k,
+        islands_per_row=islands_per_row,
+        island_width=island_width,
+    ):
+        geometry = _fast_disjoint_confetti_geometry(
+            q_row_idx=q_row_idx,
+            num_buckets=num_buckets,
+            packed_q=packed_q,
+            support_k=support_k,
+            islands_per_row=islands_per_row,
+            island_width=island_width,
+            row_shift=row_shift,
+        )
+    else:
+        geometry = _mask_geometry(mask_bool, q_length)
     geometry.update(
         {
             "case_family": case_family,
@@ -766,8 +984,11 @@ def build_explicit_2d_sparse_case(
             k_buf=k_buf,
             v_buf=v_buf,
             mask_bool=mask_bool,
+            mask_words=mask_words,
             q_length=q_length,
             q_row_idx=q_row_idx,
+            total_rows=seqlen,
+            contiguous_q_rows=True,
         )
         geometry.update(direct_2d_compact_geometry)
         result["direct_2d_compact_payload"] = direct_2d_compact_payload
@@ -862,6 +1083,14 @@ def _run_direct_2d_bucket_forward(bucket: dict[str, Any], *, softmax_scale: floa
 def _run_direct_2d_compact_forward(case_payload: dict[str, Any], *, softmax_scale: float) -> torch.Tensor:
     compact_payload = case_payload["direct_2d_compact_payload"]
     full_bucket = case_payload["full_bucket"]
+    groups = compact_payload["groups"]
+    if (
+        len(groups) == 1
+        and bool(groups[0].get("is_full_passthrough_order", False))
+        and bool(compact_payload.get("q_row_idx_is_contiguous", False))
+    ):
+        packed_out = _run_direct_2d_packed_forward(groups[0], softmax_scale=softmax_scale).float()
+        return _flatten_valid_packed_rows(packed_out, compact_payload["custom_q_length"])
     packed_out = torch.zeros(
         (
             int(compact_payload["total_buckets"]),
@@ -872,7 +1101,7 @@ def _run_direct_2d_compact_forward(case_payload: dict[str, Any], *, softmax_scal
         dtype=torch.float32,
         device=full_bucket["custom_q_buf"].device,
     )
-    for group in compact_payload["groups"]:
+    for group in groups:
         group_out = _run_direct_2d_packed_forward(group, softmax_scale=softmax_scale).float()
         packed_out.index_copy_(0, group["bucket_indices"].long(), group_out)
     if "q_row_idx" in compact_payload and "total_rows" in compact_payload:
@@ -949,6 +1178,7 @@ def analyze_explicit_2d_sparse_forward(
         dtype=dtype,
         seed=seed,
         payload_variants=tuple(variants),
+        fast_geometry=not check_correctness,
     )
     if normalized_device.type == "cuda":
         torch.cuda.synchronize()

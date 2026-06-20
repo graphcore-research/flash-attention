@@ -98,18 +98,25 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout <TIMEOUT>s python -u tests/cute/benc
 
 | seq | build_s | direct_2d ms | direct_2d_compact ms | FA4-packed ms | correctness/status |
 |---:|---:|---:|---:|---:|---|
-| 4K | 6.196 | 0.721 | 0.713 | 3.517 | maxdiff `9.54e-07`, mean `3.11e-08` |
-| 16K | 12.958 | - | 2.831 | - | perf-only |
-| 64K | 51.357 | - | 9.986 | - | perf-only |
-| 256K | 189.830 | - | 38.501 | - | perf-only |
-| 1M | - | - | - | - | timed out at 300s during Python payload setup |
+| 4K | 6.004 | 0.734 | 0.540 | 3.527 | maxdiff `9.54e-07`, mean `3.11e-08` |
+| 16K | 0.662 | - | 2.582 | - | perf-only, direct only |
+| 16K | 0.580 | - | 2.576 | 15.102 | perf-only with FA4-packed |
+| 64K | 0.490 | - | 9.449 | - | perf-only, direct only |
+| 256K | 0.485 | - | 36.722 | - | perf-only, direct only |
+| 1M | 0.494 | - | 145.864 | - | perf-only, direct only |
+| 1M | 0.577 | - | 145.805 | 963.336 | perf-only with FA4-packed, `6.61x` faster |
 
 Notes:
 
-- A noisy parallel 16K/64K run produced inflated build times (`48.923s` and
-  `84.188s` respectively); the table records the clean serial reruns.
-- Kernel time scales roughly linearly, but Python payload construction blocks
-  1M.
+- Post-fix build time is flat at about `0.5-0.7s` through 1M for the
+  full-span compact case. Before the fix, 256K took `189.830s` to build and 1M
+  timed out at `300s`.
+- The fix vectorizes disjoint-confetti mask construction, skips exact expensive
+  geometry only for `--skip-correctness` perf runs, reuses full-span compact
+  payload tensors instead of copying Q/K/V, reuses precomputed mask words, and
+  skips redundant output scatter for contiguous q rows.
+- Kernel time scales roughly linearly and is now decisively faster than
+  FA4-packed at 1M for this sparse benchmark.
 
 ## Explicit 2D Packed, D128
 
@@ -146,7 +153,8 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 240s python -u tests/cute/benchmark_
 |---:|---:|---:|---:|---:|---|
 | 4K | 27.936 | 1.022 | 1.010 | 3.038 | maxdiff `7.15e-07`, mean `3.11e-08` |
 | 4K, D128 disabled | 28.035 | unsupported_shape | - | - | `FLASH_ATTN_HSA_CACHED_GATHER_D128=0` gate works |
-| 16K | 12.218 | - | 5.213 | - | perf-only |
+| 16K | 12.218 | - | 5.213 | - | pre-fix perf-only |
+| 1M | 0.534 | - | 293.556 | 1216.928 | post-fix perf-only with FA4-packed, `4.15x` faster |
 
 Code-level route/gate evidence:
 
@@ -166,6 +174,9 @@ Fixed:
 - Current AR-HSA walk hot path scales to 1M and beats the sliding-left-5 FA4
   comparator in this synthetic setup.
 - Explicit 2D D64 and D128 direct paths remain numerically clean at 4K.
+- Explicit 2D D64/D128 full-span compact payload setup no longer wedges at
+  long context. 1M D64 now runs in `145.805 ms` vs FA4-packed `963.336 ms`;
+  1M D128 runs in `293.556 ms` vs FA4-packed `1216.928 ms`.
 
 Gated:
 
@@ -179,17 +190,19 @@ Blocked:
 
 - Cached-HSA primary long fwd+bwd is dominated by old sparse-mask backward and
   times out at 1M. This is not competitive with the AR-HSA walk hot path.
-- Explicit 2D compact kernel time is reasonable through 256K, but Python payload
-  construction is the long-context blocker and times out at 1M.
+- Explicit 2D compact payload construction is fixed for the benchmark full-span
+  passthrough case. Real cached-training payload generation may still need the
+  same vectorization/precompute treatment for non-full-span and overlapping
+  residual payloads.
 - The benchmark surface does not currently expose a clean scalar-vs-TC selector
   for explicit 2D D128, so scalar/TC split timing needs either a script flag or
   a lower-level helper benchmark.
 
 Next optimization target:
 
-1. Move explicit 2D compact payload construction out of Python, or cache/load
-   the compact payload from preprocessing. This is the only blocker preventing
-   1M explicit 2D timing here.
+1. Carry the same no-copy/full-span passthrough and vectorized mask/payload
+   construction pattern into real cached-training payloads, including
+   non-full-span and overlapping residual cases.
 2. Add explicit benchmark flags for direct 2D scalar vs TC routes, especially
    D128, so the routed default can be decomposed without editing code.
 3. Do not spend time on the cached-HSA primary long backward path unless that

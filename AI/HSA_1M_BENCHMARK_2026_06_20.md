@@ -10,6 +10,11 @@ All commands were run from `/workspace/codebases/nanochat/flash-attention` with
 not run at long sequence lengths. Explicit 2D long runs used
 `--skip-correctness`; correctness was checked separately at 4K.
 
+Interpretation note: for explicit 2D HSA training use, payloads are assumed to
+be cached/precomputed. The `build_s` column is setup cost only. Reported
+speedups for explicit 2D HSA versus FA4-packed exclude payload construction and
+compare only timed CUDA hot-path forward kernels.
+
 ## AR-HSA Walk vs Sliding FA4
 
 Command template:
@@ -28,10 +33,10 @@ For 16K the timeout was `180s`; the command first failed without
 
 | seq | AR-HSA full_cute_hot_ms | AR-HSA fwd+bwd prealloc ms | AR-HSA custom fwd+bwd ms | sliding FA4 fwd+bwd ms | FA4 / AR prealloc |
 |---:|---:|---:|---:|---:|---:|
-| 16K | 0.258 | 1.007 | 1.786 | 1.162 | 1.15x |
-| 64K | 0.309 | 1.172 | 1.998 | 1.374 | 1.17x |
-| 256K | 0.428 | 1.153 | 1.783 | 1.550 | 1.34x |
-| 1M | 0.993 | 2.975 | 3.395 | 4.319 | 1.45x |
+| 16K | 0.199 | 0.663 | 1.585 | 0.840 | 1.27x |
+| 64K | 0.243 | 0.708 | 1.604 | 0.874 | 1.23x |
+| 256K | 0.306 | 0.898 | 1.525 | 1.159 | 1.29x |
+| 1M | 0.877 | 2.718 | 2.883 | 3.757 | 1.38x |
 
 Notes:
 
@@ -99,18 +104,16 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout <TIMEOUT>s python -u tests/cute/benc
 | seq | build_s | direct_2d ms | direct_2d_compact ms | FA4-packed ms | correctness/status |
 |---:|---:|---:|---:|---:|---|
 | 4K | 6.004 | 0.734 | 0.540 | 3.527 | maxdiff `9.54e-07`, mean `3.11e-08` |
-| 16K | 0.662 | - | 2.582 | - | perf-only, direct only |
-| 16K | 0.580 | - | 2.576 | 15.102 | perf-only with FA4-packed |
-| 64K | 0.490 | - | 9.449 | - | perf-only, direct only |
-| 256K | 0.485 | - | 36.722 | - | perf-only, direct only |
-| 1M | 0.494 | - | 145.864 | - | perf-only, direct only |
-| 1M | 0.577 | - | 145.805 | 963.336 | perf-only with FA4-packed, `6.61x` faster |
+| 16K | 0.464 | - | 2.546 | 13.710 | cached hot path, `5.39x` faster |
+| 64K | 0.570 | - | 9.325 | 48.402 | cached hot path, `5.19x` faster |
+| 256K | 0.565 | - | 36.624 | 250.736 | cached hot path, `6.85x` faster |
+| 1M | 0.533 | - | 145.843 | 1221.157 | cached hot path, `8.37x` faster |
 
 Notes:
 
-- Post-fix build time is flat at about `0.5-0.7s` through 1M for the
-  full-span compact case. Before the fix, 256K took `189.830s` to build and 1M
-  timed out at `300s`.
+- Post-fix setup time is flat at about `0.5-0.6s` through 1M for the full-span
+  compact case, but setup is not included in the cached-kernel speedup. Before
+  the fix, 256K took `189.830s` to build and 1M timed out at `300s`.
 - The fix vectorizes disjoint-confetti mask construction, skips exact expensive
   geometry only for `--skip-correctness` perf runs, reuses full-span compact
   payload tensors instead of copying Q/K/V, reuses precomputed mask words, and
@@ -175,7 +178,8 @@ Fixed:
   comparator in this synthetic setup.
 - Explicit 2D D64 and D128 direct paths remain numerically clean at 4K.
 - Explicit 2D D64/D128 full-span compact payload setup no longer wedges at
-  long context. 1M D64 now runs in `145.805 ms` vs FA4-packed `963.336 ms`;
+  long context. Excluding cached setup, 1M D64 now runs in `145.843 ms` vs
+  FA4-packed `1221.157 ms`;
   1M D128 runs in `293.556 ms` vs FA4-packed `1216.928 ms`.
 
 Gated:

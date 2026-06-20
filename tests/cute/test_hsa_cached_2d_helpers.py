@@ -745,13 +745,15 @@ def test_cached_direct_2d_payload_cache_stats_record_hit_and_miss():
     cached_2d.reset_cached_direct_2d_forward_payload_cache_stats(runtime)
     first = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
     second = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    third = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
     stats = cached_2d.get_cached_direct_2d_forward_payload_cache_stats(runtime)
 
     assert first["status"] == "ready"
     assert second is first
-    assert stats["calls"] == 2
+    assert third is first
+    assert stats["calls"] == 3
     assert stats["misses"] == 1
-    assert stats["hits"] == 1
+    assert stats["hits"] == 2
     assert stats["cache_size"] == 1
     assert stats["last_event"] == "hit"
     assert stats["last_payload_status"] == "ready"

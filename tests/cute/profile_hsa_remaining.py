@@ -109,18 +109,30 @@ def _make_representative_runtime() -> _Runtime:
     return _Runtime(direct_plan)
 
 
-def _profile_cached_payload_cache_probe() -> dict[str, Any]:
+def _profile_cached_payload_cache_probe(*, steps: int, vary_shapes: bool = False) -> dict[str, Any]:
     runtime = _make_representative_runtime()
-    q = torch.empty((1, 2, 2, 64), dtype=torch.bfloat16)
-    k = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
-    v = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
     cached_2d.reset_cached_direct_2d_forward_payload_cache_stats(runtime)
-    first = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
-    second = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+    steps = max(1, int(steps))
+    payload_ids = []
+    first = None
+    last = None
+    for step_idx in range(steps):
+        q_rows = 2 + (step_idx % 2 if vary_shapes else 0)
+        q = torch.empty((1, q_rows, 2, 64), dtype=torch.bfloat16)
+        k = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+        v = torch.empty((1, 5, 2, 64), dtype=torch.bfloat16)
+        payload = cached_2d.build_cached_direct_2d_forward_payload(runtime, q, k, v)
+        if first is None:
+            first = payload
+        last = payload
+        payload_ids.append(id(payload))
     stats = cached_2d.get_cached_direct_2d_forward_payload_cache_stats(runtime)
     return {
-        "first_status": first.get("status"),
-        "second_is_first": second is first,
+        "steps": steps,
+        "vary_shapes": bool(vary_shapes),
+        "first_status": first.get("status") if isinstance(first, dict) else "missing",
+        "last_is_first": last is first,
+        "unique_payload_objects": len(set(payload_ids)),
         "stats": stats,
     }
 
@@ -307,7 +319,10 @@ def _profile_d128_routing(target_head_dims: list[int], support_values: list[int]
 
 
 def _profile_2d_cases(args: argparse.Namespace) -> dict[str, Any]:
-    cache_probe = _profile_cached_payload_cache_probe()
+    cache_probe = _profile_cached_payload_cache_probe(
+        steps=args.cache_probe_steps,
+        vary_shapes=args.cache_probe_vary_shapes,
+    )
     if args.no_cuda or not torch.cuda.is_available():
         return {
             "point": "2D compact payload construction",
@@ -453,6 +468,8 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check-correctness", action="store_true")
     parser.add_argument("--correctness-max-seqlen", type=int, default=4096)
+    parser.add_argument("--cache-probe-steps", type=int, default=8)
+    parser.add_argument("--cache-probe-vary-shapes", action="store_true")
     parser.add_argument("--target-head-dims", default="64,128")
     parser.add_argument("--target-support-k", default="64,128,512")
     parser.add_argument("--include-arhsa-probe", action="store_true")

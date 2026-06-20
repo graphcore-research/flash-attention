@@ -912,3 +912,28 @@ Status: fixed instrumentation. Next use this on actual training runtimes; if
 still in the step path and should be moved fully into preprocessing or schedule
 attachment. If `hits` dominate after warmup, the next kernel target remains
 duplicate-row online-softmax combine inside one residual launch.
+
+Second pass: `tests/cute/profile_hsa_remaining.py` now supports a step-loop
+cache probe via `--cache-probe-steps` and `--cache-probe-vary-shapes`. This
+exercises the real cached direct-2D runtime cache repeatedly, without requiring
+the full training stack in this repository.
+
+Commands:
+
+```bash
+PYTHONPATH=. timeout 60s python tests/cute/profile_hsa_remaining.py \
+  --no-cuda --cache-probe-steps 8 --json
+
+PYTHONPATH=. timeout 60s python tests/cute/profile_hsa_remaining.py \
+  --no-cuda --cache-probe-steps 8 --cache-probe-vary-shapes --json
+```
+
+| probe | steps | misses | hits | cache_size | unique payloads | interpretation |
+|---|---:|---:|---:|---:|---:|---|
+| stable shape/policy | 8 | 1 | 7 | 1 | 1 | Healthy warmup behavior: one build, then cached. |
+| alternating q shape | 8 | 2 | 6 | 2 | 2 | Counters detect shape churn and separate cache entries. |
+
+This is the expected behavior for a stable training shape: one miss at warmup,
+then hits. If a real training runtime reports miss-per-step for the same shape,
+the schedule or runtime object is being recreated, or the shape/policy key is
+changing.

@@ -4724,6 +4724,33 @@ def test_hsa_explicit_2d_tc_variant_matches_dense_oracle(head_dim):
 
 
 @pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
+def test_hsa_explicit_2d_compact_non_passthrough_matches_dense():
+    report = analyze_explicit_2d_sparse_forward(
+        case_family="disjoint_confetti",
+        seqlen=256,
+        heads=2,
+        head_dim=64,
+        packed_q=16,
+        support_k=128,
+        islands_per_row=1,
+        island_width=4,
+        row_shift=9,
+        warmup_iters=0,
+        benchmark_iters=1,
+        variants=("dense", "direct_2d_compact"),
+        device="cuda",
+        dtype=torch.bfloat16,
+        seed=0,
+    )
+
+    geometry = report["geometry"]
+    assert geometry["direct_2d_compact_buckets_compacted"] > 0
+    assert geometry["direct_2d_compact_buckets_passthrough"] == 0
+    assert report["results"]["direct_2d_compact"]["status"] == "measured"
+    assert report["results"]["direct_2d_compact"]["output_max_diff"] < 0.1
+
+
+@pytest.mark.skipif(not HAS_HSA_SPARSE_FA4, reason="Scheduled sparse HSA path requires CUDA SM100+")
 @pytest.mark.parametrize("support_k,islands_per_row", [(512, 32), (1024, 64)])
 def test_hsa_explicit_2d_compact_high_support_d64_routes_to_tc_and_matches_dense(
     support_k,

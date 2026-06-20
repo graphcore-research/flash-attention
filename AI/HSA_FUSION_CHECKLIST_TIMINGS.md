@@ -405,6 +405,72 @@ CUDA_VISIBLE_DEVICES=1 FLASH_ATTN_HSA_CACHED_GATHER_D128_MAX_PACKED_K=1024 PYTHO
 This prevents future routing/perf decisions from treating diagnostic geometry
 as unavoidable payload setup.
 
+## 2026-06-20 Explicit 2D Non-Passthrough Compact Payload Build
+
+The non-passthrough `direct_2d_compact` builder still had two Python per-bucket
+hot loops after setup/diagnostic timing was split:
+
+- one loop classified compact/full buckets with `q_length.item()` and one
+  `torch.nonzero` per bucket;
+- one loop materialized compact K/V/mask payloads bucket-by-bucket.
+
+This pass vectorizes the common uniform-union compact case. Bucket
+classification, compact fill, tile-span grouping, and group K/V/mask gather are
+now tensor operations. The irregular variable-union path keeps the old safe
+per-bucket fallback. When the caller provides `total_rows`, the compact payload
+also uses that value directly instead of rescanning `q_row_idx`.
+
+Correctness coverage was added for compacted, non-passthrough buckets against a
+dense oracle.
+
+Commands were run with `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=.`:
+
+```bash
+timeout 180s pytest -q \
+  tests/cute/test_hsa.py::test_hsa_explicit_2d_compact_non_passthrough_matches_dense
+
+timeout 160s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 4096 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 512 --islands-per-row 1 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 \
+  --skip-correctness --json
+
+timeout 200s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 16384 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 512 --islands-per-row 1 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 \
+  --skip-correctness --json
+
+timeout 220s python -u tests/cute/benchmark_hsa_2d_sparse.py \
+  --case-family disjoint_confetti --seqlen 65536 --heads 4 --head-dim 64 \
+  --packed-q 16 --support-k 512 --islands-per-row 1 --island-width 4 \
+  --variants direct_2d_compact --warmup-iters 0 --benchmark-iters 1 \
+  --skip-correctness --json
+```
+
+| seq | compact buckets | passthrough buckets | before payload_s | after payload_s | after geom_s | after build_s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 256 | 0 | 0.546 | 0.505 | 0.026 | 0.531 |
+| 16384 | 1024 | 0 | 0.874 | 0.508 | 0.024 | 0.533 |
+| 65536 | 4096 | 0 | 1.244 before classification vectorization | 0.498 | 0.023 | 0.521 |
+
+The 16K isolated profile after the patch showed `_build_direct_2d_compact_payload`
+at 0.119s of 0.394s total process time, down from 0.351s of 0.621s before the
+patch. Remaining setup time is dominated by one-time synthetic/cached payload
+materialization: random Q/K/V allocation, mask construction, mask-word encoding,
+and the compact K/V/mask tensors themselves. That cost is still outside the
+CUDA forward hot path and is intended to be cached.
+
+Validation:
+
+- `python -m py_compile flash_attn/cute/hsa_explicit_2d_sparse_analysis.py tests/cute/test_hsa.py`
+  passed.
+- `git diff --check` passed.
+- `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 180s pytest -q tests/cute/test_hsa.py::test_hsa_explicit_2d_compact_non_passthrough_matches_dense`
+  passed: 1 passed.
+- `CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. timeout 220s pytest -q tests/cute/test_hsa.py::test_hsa_explicit_2d_compact_high_support_d64_routes_to_tc_and_matches_dense`
+  passed: 2 passed.
+
 ## 2026-06-20 Online-Combine Cast-Out
 
 The overlapping-residual direct-final path keeps FP32 online softmax combine

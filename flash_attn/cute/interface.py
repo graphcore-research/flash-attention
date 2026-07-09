@@ -52,6 +52,7 @@ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreproces
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_dq_postprocess import FlashAttentionBackwardDqDensePostprocess
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.output_gate_ops import (
@@ -87,27 +88,6 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     assert t.is_cuda, f"{name} must be on CUDA"
-
-
-def _torch_dq_postprocess_dense(
-    dq_accum: torch.Tensor,
-    dq: torch.Tensor,
-    *,
-    batch_size: int,
-    num_head: int,
-    seqlen_q: int,
-    seqlen_q_rounded: int,
-    head_dim: int,
-    head_dim_rounded: int,
-    softmax_scale: float,
-) -> None:
-    dq_fp32 = dq_accum.view(
-        batch_size,
-        num_head,
-        seqlen_q_rounded,
-        head_dim_rounded,
-    )[:, :, :seqlen_q, :head_dim]
-    dq.copy_((dq_fp32.permute(0, 2, 1, 3) * softmax_scale).to(dtype=dq.dtype))
 
 
 torch2cute_dtype_map = {
@@ -1485,31 +1465,53 @@ def _flash_attn_bwd(
 
     num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    # The SM100 CUTLASS dQ postprocess path is not stable for sigmoid attention
-    # at NVL72 scale. Keep the main 2-CTA backward kernel enabled and only route
-    # the final dense fp32->bf16/fp16 dQ conversion through Torch.
+    # The generic SM100 dQ postprocess path is not stable for sigmoid attention
+    # at NVL72 scale. Keep the main 2-CTA backward kernel enabled and route the
+    # final dense fp32->bf16/fp16 dQ conversion through a simple Cute-DSL kernel.
     use_2cta_dq_postprocess = use_2cta_instrs and not sigmoid_attention
-    use_torch_dq_postprocess = (
+    use_simple_dq_postprocess = (
         arch // 10 in [10, 11]
         and sigmoid_attention
         and cu_seqlens_q is None
         and seqused_q is None
-        and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "torch").lower() != "cute"
+        and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple").lower() != "generic"
     )
-    if use_torch_dq_postprocess:
+    if use_simple_dq_postprocess:
+        compile_key_dq_post = (
+            arch,
+            dtype,
+            head_dim,
+            m_block_size,
+            num_threads,
+            get_broadcast_dims(dq_accum),
+            get_broadcast_dims(dq),
+        )
+        if compile_key_dq_post not in _flash_attn_bwd.compile_cache_dq_post:
+            dq_accum_tensor = to_cute_tensor(dq_accum)
+            dq_tensor = to_cute_tensor(dq)
+            fa_bwd_dq_post = FlashAttentionBackwardDqDensePostprocess(
+                dtype,
+                head_dim,
+                arch,
+                m_block_size,
+                num_threads,
+            )
+            _flash_attn_bwd.compile_cache_dq_post[compile_key_dq_post] = cute.compile(
+                fa_bwd_dq_post,
+                dq_accum_tensor,
+                dq_tensor,
+                softmax_scale,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
         if not is_fake_mode():
-            _torch_dq_postprocess_dense(
+            _flash_attn_bwd.compile_cache_dq_post[compile_key_dq_post](
                 dq_accum,
                 dq,
-                batch_size=batch_size,
-                num_head=num_head,
-                seqlen_q=seqlen_q,
-                seqlen_q_rounded=seqlen_q_rounded,
-                head_dim=head_dim,
-                head_dim_rounded=head_dim_rounded,
-                softmax_scale=softmax_scale,
+                softmax_scale,
+                current_stream,
             )
-        _flash_attn_bwd.torch_dq_postprocess_count += 1
+        _flash_attn_bwd.simple_dq_postprocess_count += 1
     else:
         compile_key_post = (
             arch,
@@ -1663,7 +1665,8 @@ def _flash_attn_bwd(
 _flash_attn_bwd.compile_cache_pre = get_jit_cache("bwd_pre")
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 _flash_attn_bwd.compile_cache_post = get_jit_cache("bwd_post")
-_flash_attn_bwd.torch_dq_postprocess_count = 0
+_flash_attn_bwd.compile_cache_dq_post = get_jit_cache("bwd_dq_post")
+_flash_attn_bwd.simple_dq_postprocess_count = 0
 
 
 class FlashAttnFunc(torch.autograd.Function):

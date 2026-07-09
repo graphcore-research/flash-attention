@@ -1488,9 +1488,7 @@ def _flash_attn_bwd(
         ]
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            # Keep the main 2-CTA backward path enabled; only avoid the SM100 dQ
-            # postprocess remap variant while it faults for sigmoid attention.
-            use_2cta_instrs=use_2cta_instrs and not sigmoid_attention,
+            use_2cta_instrs=use_2cta_instrs,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

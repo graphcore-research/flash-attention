@@ -1464,6 +1464,10 @@ def _flash_attn_bwd(
 
     num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
+    # The SM100 2-CTA dQ postprocess TMEM remap is not stable for sigmoid
+    # attention. Keep the main 2-CTA backward kernel enabled and only use the
+    # stable postprocess variant for the final fp32->bf16 dQ conversion.
+    use_2cta_dq_postprocess = use_2cta_instrs and not sigmoid_attention
     compile_key_post = (
         arch,
         dtype,
@@ -1474,7 +1478,7 @@ def _flash_attn_bwd(
         dQ_swapAB,
         cu_seqlens_q is None,
         seqused_q is None,
-        use_2cta_instrs,
+        use_2cta_dq_postprocess,
         1, # no cluster for tile_m
         get_broadcast_dims(dq_accum),
         get_broadcast_dims(dq),
@@ -1488,7 +1492,7 @@ def _flash_attn_bwd(
         ]
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs,
+            use_2cta_instrs=use_2cta_dq_postprocess,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

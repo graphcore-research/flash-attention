@@ -874,8 +874,6 @@ def _flash_attn_bwd(
             or score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
-            # Sigmoid attention backward currently faults in the 2-CTA dQ postprocess path on SM100.
-            or sigmoid_attention
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
@@ -1490,7 +1488,9 @@ def _flash_attn_bwd(
         ]
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs,
+            # Keep the main 2-CTA backward path enabled; only avoid the SM100 dQ
+            # postprocess remap variant while it faults for sigmoid attention.
+            use_2cta_instrs=use_2cta_instrs and not sigmoid_attention,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

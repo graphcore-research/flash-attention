@@ -870,11 +870,15 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
+        allow_sigmoid_2cta = os.environ.get(
+            "FLASH_ATTN_CUTE_SIGMOID_ALLOW_2CTA", "0"
+        ).lower() in ("1", "true", "yes", "on")
         disable_2cta = (
             local
             or score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
+            or (sigmoid_attention and not allow_sigmoid_2cta)
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
@@ -1465,13 +1469,14 @@ def _flash_attn_bwd(
 
     num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    # The generic SM100 dQ postprocess path is not stable for sigmoid attention
-    # at NVL72 scale. Keep the main 2-CTA backward kernel enabled and route the
-    # final dense fp32->bf16/fp16 dQ conversion through a simple Cute-DSL kernel.
+    # The generic SM100 postprocess path is not stable for sigmoid attention at
+    # NVL72 scale. The simple dense fp32->bf16/fp16 Cute-DSL postprocess assumes
+    # a 1-CTA accumulator layout, so sigmoid 2-CTA is opt-in only above.
     use_2cta_dq_postprocess = use_2cta_instrs and not sigmoid_attention
     use_simple_dq_postprocess = (
         arch // 10 in [10, 11]
         and sigmoid_attention
+        and not use_2cta_instrs
         and cu_seqlens_q is None
         and seqused_q is None
         and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple").lower() != "generic"
@@ -1581,6 +1586,7 @@ def _flash_attn_bwd(
         use_simple_dkv_postprocess = (
             arch // 10 in [10, 11]
             and sigmoid_attention
+            and not use_2cta_instrs
             and cu_seqlens_k is None
             and seqused_k is None
             and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple").lower() != "generic"

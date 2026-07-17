@@ -3152,10 +3152,10 @@ class FlashAttentionBackwardSm100:
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):
                                 # Polynomial (FMA) path
-                                # Match the forward attention path: use the saturating
-                                # odd-form surrogate so the tail stays sparse instead of
-                                # flattening to a constant floor after bias.
-                                p0, p1 = utils.sigmoid_poly_backend_2(
+                                # Match the forward attention path: use the
+                                # cancellation-free D3 exp2 tail after the
+                                # FlashSigmoid -log(n) bias.
+                                p0, p1 = utils.sigmoid_attention_poly_backend_2(
                                     s0,
                                     s1,
                                     backend=self.sigmoid_poly_backend,

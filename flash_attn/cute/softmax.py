@@ -336,10 +336,10 @@ class SoftmaxSm100(Softmax):
                 if cutlass.const_expr(
                     k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                 ):
-                    # Use the saturating odd-form sigmoid surrogate in attention so
-                    # the negative tail does not collapse into a constant floor after
-                    # the FlashSigmoid -log(n) bias is applied.
-                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_poly_backend_2(
+                    # FlashSigmoid's -log(n) bias puts most scores in the negative
+                    # tail, where the centered BF16 form rounds to zero. Use the
+                    # cancellation-free D3 exp2 tail there.
+                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_attention_poly_backend_2(
                         s0,
                         s1,
                         backend=self.sigmoid_poly_backend,

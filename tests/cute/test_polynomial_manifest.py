@@ -12,6 +12,7 @@ from flash_attn.cute.polynomial_manifest import (
     audit_active_polynomials,
     assert_active_polynomials_in_sync,
     evaluate_centered_sigmoid_forward,
+    evaluate_sigmoid_attention_tail_safe,
     evaluate_odd_factorized_derivative,
     evaluate_odd_factorized_forward,
     evaluate_sigmoid_backward_from_probability,
@@ -144,6 +145,25 @@ def test_sigmoid_backward_from_probability_matches_explicit_p_times_one_minus_p(
         grad = evaluate_sigmoid_backward_from_probability(x)
         assert math.isclose(grad, p * (1.0 - p), rel_tol=0.0, abs_tol=1e-12)
         assert 0.0 <= grad <= 0.25
+
+
+def test_sigmoid_attention_tail_safe_preserves_flashsigmoid_negative_tail():
+    sequence_length = 4096
+    bias = -math.log(sequence_length)
+    for qk_score in (-3.0, -1.0, 0.0, 1.0, 3.0):
+        x = qk_score + bias
+        expected = 1.0 / (1.0 + math.exp(-x))
+        actual = evaluate_sigmoid_attention_tail_safe(x)
+        assert actual > 0.0
+        assert math.isclose(actual, expected, rel_tol=0.015, abs_tol=2e-6)
+
+
+def test_sigmoid_attention_tail_safe_is_continuous_at_core_boundary():
+    eps = 1e-6
+    for boundary in (-2.75, 2.75):
+        below = evaluate_sigmoid_attention_tail_safe(boundary - eps)
+        above = evaluate_sigmoid_attention_tail_safe(boundary + eps)
+        assert abs(above - below) < 0.01
 
 
 def test_sigmoid_poly_backward_stays_close_to_algebraic_reference_in_core_region():

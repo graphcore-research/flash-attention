@@ -7,6 +7,15 @@ import re
 from typing import Iterable
 
 
+SIGMOID_ATTENTION_TAIL_THRESHOLD = 2.75
+EXP2_D3_COEFFS = (
+    1.0,
+    0.6951461434364319,
+    0.22756439447402954,
+    0.07711908966302872,
+)
+
+
 @dataclass(frozen=True)
 class PolynomialSpec:
     name: str
@@ -449,6 +458,39 @@ def evaluate_centered_sigmoid_forward(x: float, coeffs: tuple[float, ...], clamp
     for coeff in reversed(coeffs):
         poly = poly * abs(t) + coeff
     return 0.5 + t * poly
+
+
+def evaluate_exp2_d3(x: float) -> float:
+    """Reference for the CuTe D3 exp2 emulation."""
+    x = max(x, -127.0)
+    exponent = math.floor(x)
+    fraction = x - exponent
+    fraction_exp2 = 0.0
+    for coefficient in reversed(EXP2_D3_COEFFS):
+        fraction_exp2 = fraction_exp2 * fraction + coefficient
+    return math.ldexp(fraction_exp2, exponent)
+
+
+def evaluate_sigmoid_attention_tail_safe(
+    x: float,
+    coeffs: tuple[float, ...] = SIGMOID_D3.coeffs,
+    clamp: float = SIGMOID_D3.clamp,
+    tail_threshold: float = SIGMOID_ATTENTION_TAIL_THRESHOLD,
+) -> float:
+    """Evaluate the D3 core with a cancellation-free polynomial tail.
+
+    FlashSigmoid shifts scores by ``-log(sequence_length)``, placing most
+    sequence-4096 scores near -8.3. The centered BF16 D3 form rounds those
+    values to zero. In the tails, approximate ``exp(-abs(x))`` with the
+    register-local D3 exp2 emulation and use the first two terms of
+    ``e / (1 + e) = e - e**2 + ...``. The handoff at 2.75 is where the D3
+    core and tail error curves meet without a material discontinuity.
+    """
+    if abs(x) < tail_threshold:
+        return evaluate_centered_sigmoid_forward(x, coeffs, clamp)
+    exp_neg_abs = evaluate_exp2_d3(-abs(x) * math.log2(math.e))
+    negative_tail = exp_neg_abs * (1.0 - exp_neg_abs)
+    return negative_tail if x < 0.0 else 1.0 - negative_tail
 
 
 def evaluate_even_polynomial(x: float, coeffs: tuple[float, ...], clamp: float) -> float:

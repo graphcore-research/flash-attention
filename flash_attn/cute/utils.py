@@ -22,6 +22,8 @@ from flash_attn.cute.handwritten_spline_ptx import (
     require_device_backend_support,
 )
 from flash_attn.cute.polynomial_manifest import (
+    EXP2_D3_COEFFS,
+    SIGMOID_ATTENTION_TAIL_THRESHOLD,
     get_default_output_gate_coeffs,
     get_sigmoid_forward_spec,
     get_sigmoid_gradient_spec,
@@ -109,10 +111,7 @@ POLY_EX2 = {
         0.330107033252716064453125,
     ),
     3: (
-        1.0,
-        0.695146143436431884765625,
-        0.227564394474029541015625,
-        0.077119089663028717041015625,
+        *EXP2_D3_COEFFS,
     ),
     4: (
         1.0,
@@ -1307,6 +1306,51 @@ def sigmoid_poly_backend_2(
     if const_expr(backend == "device"):
         return _make_sigmoid_device_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
     return _make_sigmoid_cute_pair_fn(int(degree), str(coeff_source))(x, y, loc=loc, ip=ip)
+
+
+def sigmoid_attention_poly_backend_2(
+    x: Float32,
+    y: Float32,
+    backend: cutlass.Constexpr[str] = "cute",
+    degree: cutlass.Constexpr[int] = 3,
+    coeff_source: cutlass.Constexpr[str] = "current",
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Tail-safe sigmoid polynomial for FlashSigmoid score distributions.
+
+    The centered BF16 polynomial loses its small negative-tail result when
+    subtracting from 0.5. Use the existing cancellation-free D3 exp2
+    emulation in the tails while retaining the selected sigmoid polynomial in
+    the core.
+    """
+    core_x, core_y = sigmoid_poly_backend_2(
+        x,
+        y,
+        backend=backend,
+        degree=degree,
+        coeff_source=coeff_source,
+        loc=loc,
+        ip=ip,
+    )
+    abs_x = fabs_f32(x, loc=loc, ip=ip)
+    abs_y = fabs_f32(y, loc=loc, ip=ip)
+    exp_x, exp_y = ex2_emulation_2(
+        -abs_x * Float32(math.log2(math.e)),
+        -abs_y * Float32(math.log2(math.e)),
+        loc=loc,
+        ip=ip,
+    )
+    neg_tail_x = exp_x * (Float32(1.0) - exp_x)
+    neg_tail_y = exp_y * (Float32(1.0) - exp_y)
+    tail_x = select_(x < Float32(0.0), neg_tail_x, Float32(1.0) - neg_tail_x)
+    tail_y = select_(y < Float32(0.0), neg_tail_y, Float32(1.0) - neg_tail_y)
+    threshold = Float32(SIGMOID_ATTENTION_TAIL_THRESHOLD)
+    return (
+        select_(abs_x >= threshold, tail_x, core_x),
+        select_(abs_y >= threshold, tail_y, core_y),
+    )
 
 
 def sigmoid_grad_poly_backend_2(

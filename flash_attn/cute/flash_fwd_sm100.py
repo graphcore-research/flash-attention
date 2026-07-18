@@ -1139,6 +1139,7 @@ class FlashAttentionForwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1207,6 +1208,8 @@ class FlashAttentionForwardSm100:
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     softmax_loop(stage=1, tStS=tStS)
 
+            tmem_alloc_barrier.arrive()
+
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1240,6 +1243,7 @@ class FlashAttentionForwardSm100:
                 TileSchedulerCls,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         return
 

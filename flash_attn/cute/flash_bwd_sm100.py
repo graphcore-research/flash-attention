@@ -1580,6 +1580,7 @@ class FlashAttentionBackwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
         # Compute
@@ -1631,6 +1632,7 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         # Reduce
         # (0, 1, 2, 3) - dQ
@@ -1651,6 +1653,7 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         return
 
@@ -3264,6 +3267,7 @@ class FlashAttentionBackwardSm100:
                     )
 
                 cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if const_expr(not self.tile_hdim == 192):
                     # Signal tmem store P completion with pipeline_S_P

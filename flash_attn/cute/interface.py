@@ -448,13 +448,13 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
-    # hash score and mask mods for compile cache
-    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
-    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
-
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+
+    # Hash after materializing native softcap so it cannot alias plain softmax.
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
 
     is_varlen = (
         cu_seqlens_q is not None
@@ -841,6 +841,16 @@ def _flash_attn_bwd(
         else:
             causal, local = False, True
 
+    # Native softcap is implemented as score-mod callbacks. Materialize them
+    # before selecting the SM100 CTA topology so callback kernels use the same
+    # supported 1-CTA path as explicit polynomial score mods.
+    if softcap != 0.0:
+        assert score_mod is None, "softcap and score_mod are mutually exclusive"
+        assert score_mod_bwd is None, "softcap and score_mod_bwd are mutually exclusive"
+        score_mod = utils.create_softcap_scoremod(softcap)
+        score_mod_bwd = utils.create_softcap_scoremod_bwd_native(softcap)
+        softcap = 0.0
+
     if arch // 10 == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
@@ -1015,12 +1025,6 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-    elif softcap != 0.0:
-        # Native softcap: auto-create score_mod + score_mod_bwd using SFU tanh
-        score_mod = utils.create_softcap_scoremod(softcap)
-        score_mod_bwd = utils.create_softcap_scoremod_bwd_native(softcap)
-        softcap = 0.0  # score_mod handles it now
-
     _validate_attention_poly_configuration(
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,

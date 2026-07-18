@@ -871,7 +871,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         allow_sigmoid_2cta = os.environ.get(
-            "FLASH_ATTN_CUTE_SIGMOID_ALLOW_2CTA", "0"
+            "FLASH_ATTN_CUTE_SIGMOID_ALLOW_2CTA", "1"
         ).lower() in ("1", "true", "yes", "on")
         disable_2cta = (
             local
@@ -881,7 +881,7 @@ def _flash_attn_bwd(
             or (sigmoid_attention and not allow_sigmoid_2cta)
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
-        use_2cta_instrs = cluster_size==2
+        use_2cta_instrs = cluster_size == 2
     if output_gate_activation is not None:
         assert arch // 10 in [10, 11], "CuTe fused output gate requires SM100/SM110"
     if sigmoid_attention and sigmoid_poly_backend == "device":
@@ -1131,7 +1131,10 @@ def _flash_attn_bwd(
         dout_attn = None
         doutput_gate = None
 
-    # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
+    # Dense sigmoid backward uses dS = P * (1 - P) * dP, so it only needs the
+    # dQ accumulator clear. Block-sparse keeps the established stats pipeline.
+    compute_softmax_stats = not (sigmoid_attention and not use_block_sparsity)
+    # Preprocess kernel: compute softmax stats when needed and zero out dq_accum.
     compile_key_pre = (
         arch,
         dtype,
@@ -1144,6 +1147,7 @@ def _flash_attn_bwd(
         output_gate_activation is None,
         output_gate_use_spline,
         doutput_gate is None,
+        compute_softmax_stats,
         get_broadcast_dims(out),
         get_broadcast_dims(dout),
     )
@@ -1157,7 +1161,10 @@ def _flash_attn_bwd(
         ]
         do_attn_tensor = to_cute_tensor(dout_attn) if dout_attn is not None else None
         dgate_tensor = to_cute_tensor(doutput_gate) if doutput_gate is not None else None
-        lse_tensor = to_cute_tensor(lse, assumed_align=4)
+        lse_tensor = (
+            to_cute_tensor(lse, assumed_align=4) if compute_softmax_stats else None
+        )
+        lse_log2_compile_tensor = lse_log2_tensor if compute_softmax_stats else None
         cu_seqlens_q_tensor, seqused_q_tensor = [
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
@@ -1170,6 +1177,7 @@ def _flash_attn_bwd(
             m_block_size,
             num_threads=num_threads,
             output_gate_use_spline=output_gate_use_spline,
+            compute_softmax_stats=compute_softmax_stats,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
@@ -1181,7 +1189,7 @@ def _flash_attn_bwd(
             dgate_tensor,
             dpsum_tensor,
             lse_tensor,
-            lse_log2_tensor,
+            lse_log2_compile_tensor,
             dq_accum_tensor,
             cu_seqlens_q_tensor,
             seqused_q_tensor,
@@ -1196,8 +1204,8 @@ def _flash_attn_bwd(
             dout_attn,
             doutput_gate,
             dpsum,
-            lse,
-            lse_log2,
+            lse if compute_softmax_stats else None,
+            lse_log2 if compute_softmax_stats else None,
             dq_accum,
             cu_seqlens_q,
             seqused_q,
@@ -1469,17 +1477,21 @@ def _flash_attn_bwd(
 
     num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    # The generic SM100 postprocess path is not stable for sigmoid attention at
-    # NVL72 scale. The simple dense fp32->bf16/fp16 Cute-DSL postprocess assumes
-    # a 1-CTA accumulator layout, so sigmoid 2-CTA is opt-in only above.
-    use_2cta_dq_postprocess = use_2cta_instrs and not sigmoid_attention
+    # The sigmoid 2-CTA reducer has a distinct row-bit layout handled by the
+    # dense CuTe postprocess below.
+    use_2cta_dq_postprocess = use_2cta_instrs
     use_simple_dq_postprocess = (
         arch // 10 in [10, 11]
         and sigmoid_attention
-        and not use_2cta_instrs
         and cu_seqlens_q is None
         and seqused_q is None
-        and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple").lower() != "generic"
+        and (
+            use_2cta_instrs
+            or os.environ.get(
+                "FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple"
+            ).lower()
+            != "generic"
+        )
     )
     def _run_simple_dense_postprocess(
         accum: torch.Tensor,
@@ -1487,6 +1499,7 @@ def _flash_attn_bwd(
         post_head_dim: int,
         tile_size: int,
         scale: float,
+        remap_sigmoid_2cta_rows: bool = False,
     ) -> None:
         compile_key_simple_post = (
             arch,
@@ -1494,6 +1507,7 @@ def _flash_attn_bwd(
             post_head_dim,
             tile_size,
             num_threads,
+            remap_sigmoid_2cta_rows,
             get_broadcast_dims(accum),
             get_broadcast_dims(target),
         )
@@ -1506,6 +1520,7 @@ def _flash_attn_bwd(
                 arch,
                 tile_size,
                 num_threads,
+                remap_sigmoid_2cta_rows=remap_sigmoid_2cta_rows,
             )
             _flash_attn_bwd.compile_cache_dq_post[compile_key_simple_post] = cute.compile(
                 fa_bwd_simple_post,
@@ -1530,6 +1545,7 @@ def _flash_attn_bwd(
             head_dim,
             m_block_size,
             softmax_scale,
+            remap_sigmoid_2cta_rows=use_2cta_instrs,
         )
         _flash_attn_bwd.simple_dq_postprocess_count += 1
     else:
@@ -1583,10 +1599,13 @@ def _flash_attn_bwd(
 
     if dKV_postprocess:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
+        # The SM100 GQA reducer writes dense dK/dV accumulators in ordinary
+        # row-major order for both 1-CTA and 2-CTA. The generic MMA-layout
+        # postprocess reinterprets that ordering and corrupts 2-CTA gradients,
+        # so dense sigmoid attention must use the direct CuTe converter.
         use_simple_dkv_postprocess = (
             arch // 10 in [10, 11]
             and sigmoid_attention
-            and not use_2cta_instrs
             and cu_seqlens_k is None
             and seqused_k is None
             and os.environ.get("FLASH_ATTN_CUTE_SIGMOID_DQ_POSTPROCESS", "simple").lower() != "generic"

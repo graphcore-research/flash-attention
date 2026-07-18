@@ -34,6 +34,7 @@ class FlashAttentionBackwardPreprocess:
         m_block_size: int = 128,
         num_threads: int = 128,
         output_gate_use_spline: bool = False,
+        compute_softmax_stats: bool = True,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -56,6 +57,7 @@ class FlashAttentionBackwardPreprocess:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.output_gate_use_spline = output_gate_use_spline
+        self.compute_softmax_stats = compute_softmax_stats
 
     @staticmethod
     def can_implement(dtype, head_dim, m_block_size, num_threads) -> bool:
@@ -375,35 +377,36 @@ class FlashAttentionBackwardPreprocess:
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
             assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
             assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
-            for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
-                # Instead of using tOcO, we using t0OcO and subtract the offset from the limit
-                # (seqlen_q - m_block * kBlockM). This is because the entries of t0OcO are known at compile time.
-                if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
-                    cute.copy(
-                        gmem_thr_copy_O,
-                        tOgO[None, m, None],
-                        tOrO[None, m, None],
-                        pred=tOpO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_v_oob)
-                        else None,
-                    )
-                    cute.copy(
-                        gmem_thr_copy_O,
-                        tOgdO[None, m, None],
-                        tOrdO[None, m, None],
-                        pred=tOpdO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_v_oob)
-                        else None,
-                    )
-                    if cutlass.const_expr(tOgGateAct is not None):
+            if cutlass.const_expr(self.compute_softmax_stats or tOgGateAct is not None):
+                for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                    # Instead of using tOcO, we use t0OcO and subtract the offset from the
+                    # limit because the entries of t0OcO are known at compile time.
+                    if t0OcO[0, m, 0][0] < seqlen_q - m_block * self.m_block_size - tOcO[0][0]:
                         cute.copy(
                             gmem_thr_copy_O,
-                            tOgGateAct[None, m, None],
-                            tOrGateRaw[None, m, None],
+                            tOgO[None, m, None],
+                            tOrO[None, m, None],
                             pred=tOpO[None, m, None]
                             if cutlass.const_expr(self.check_hdim_v_oob)
                             else None,
                         )
+                        cute.copy(
+                            gmem_thr_copy_O,
+                            tOgdO[None, m, None],
+                            tOrdO[None, m, None],
+                            pred=tOpdO[None, m, None]
+                            if cutlass.const_expr(self.check_hdim_v_oob)
+                            else None,
+                        )
+                        if cutlass.const_expr(tOgGateAct is not None):
+                            cute.copy(
+                                gmem_thr_copy_O,
+                                tOgGateAct[None, m, None],
+                                tOrGateRaw[None, m, None],
+                                pred=tOpO[None, m, None]
+                                if cutlass.const_expr(self.check_hdim_v_oob)
+                                else None,
+                            )
             if cutlass.const_expr(tOgGateAct is not None):
                 for i in cutlass.range(0, cute.size(tOrGateAct), 2, unroll_full=True):
                     g0 = Float32(tOrGateRaw[i])
@@ -412,27 +415,30 @@ class FlashAttentionBackwardPreprocess:
                         tOrGateAct[i], tOrGateAct[i + 1] = utils.sigmoid_fast_2(g0, g1)
                     else:
                         tOrGateAct[i], tOrGateAct[i + 1] = utils.sigmoid_native_2(g0, g1)
-            # Sum across the "k" dimension
-            dpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
-                cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
-            )
-            out_vals = tOrO.load().to(Float32)
-            dout_vals = tOrdO.load().to(Float32)
             if cutlass.const_expr(tOgdOAttn is not None):
+                out_vals = tOrO.load().to(Float32)
+                dout_vals = tOrdO.load().to(Float32)
                 dout_attn = (dout_vals * tOrGateAct.load().to(Float32)).to(mO.element_type)
                 tOrdO.store(dout_attn)
             if cutlass.const_expr(tOgdGate is not None):
+                out_vals = tOrO.load().to(Float32)
+                dout_vals = tOrdO.load().to(Float32)
                 dgate = (
                     dout_vals
                     * out_vals
                     * (Float32(1.0) - tOrGateAct.load().to(Float32))
                 ).to(mO.element_type)
                 tOrO.store(dgate)
-            threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
-            assert cute.arch.WARP_SIZE % threads_per_row == 0
-            dpsum = utils.warp_reduce(dpsum, operator.add, width=threads_per_row)
-            dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), Float32)
-            dP_sum.store(dpsum)
+            if cutlass.const_expr(self.compute_softmax_stats):
+                # Softmax needs D = rowsum(O * dO); sigmoid attention does not.
+                dpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
+                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
+                )
+                threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
+                assert cute.arch.WARP_SIZE % threads_per_row == 0
+                dpsum = utils.warp_reduce(dpsum, operator.add, width=threads_per_row)
+                dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), Float32)
+                dP_sum.store(dpsum)
 
             if cutlass.const_expr(tOgdOAttn is not None):
                 for m in cutlass.range(cute.size(tOrdO.shape[1]), unroll_full=True):
@@ -457,13 +463,18 @@ class FlashAttentionBackwardPreprocess:
                             else None,
                         )
 
-            # Write dPsum from rmem -> gmem
-            gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (m_block,))
-            # Only the thread corresponding to column 0 writes out the dPsum to gmem
-            if tOcO[0, 0, 0][1] == 0:
-                for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
-                    row = tOcO[0, m, 0][0]
-                    gdPsum[row] = dP_sum[m] if row < seqlen_q - m_block * self.m_block_size else 0.0
+            if cutlass.const_expr(self.compute_softmax_stats):
+                # Write dPsum from rmem -> gmem
+                gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (m_block,))
+                # Only the thread corresponding to column 0 writes out the dPsum to gmem
+                if tOcO[0, 0, 0][1] == 0:
+                    for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
+                        row = tOcO[0, m, 0][0]
+                        gdPsum[row] = (
+                            dP_sum[m]
+                            if row < seqlen_q - m_block * self.m_block_size
+                            else 0.0
+                        )
 
             # Clear dQaccum
             if cutlass.const_expr(mdQaccum is not None):

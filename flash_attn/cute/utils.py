@@ -22,6 +22,7 @@ from flash_attn.cute.handwritten_spline_ptx import (
     require_device_backend_support,
 )
 from flash_attn.cute.polynomial_manifest import (
+    EXP2_D2_COEFFS,
     EXP2_D3_COEFFS,
     SIGMOID_ATTENTION_TAIL_THRESHOLD,
     get_default_output_gate_coeffs,
@@ -106,9 +107,7 @@ POLY_EX2 = {
         0.922497093677520751953125,
     ),
     2: (
-        1.0,
-        0.6657850742340087890625,
-        0.330107033252716064453125,
+        *EXP2_D2_COEFFS,
     ),
     3: (
         *EXP2_D3_COEFFS,
@@ -1353,6 +1352,40 @@ def sigmoid_attention_poly_backend_2(
     )
 
 
+def flash_sigmoid_exp2_poly_2(
+    score_x: Float32,
+    score_y: Float32,
+    inv_sequence_length: Float32,
+    degree: cutlass.Constexpr[int],
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Bias-aware FlashSigmoid using range-reduced D2/D3 exp2."""
+    if const_expr(degree != 2 and degree != 3):
+        raise ValueError(f"FlashSigmoid exp2 only supports D2/D3, got D{degree}")
+    log2_e = Float32(math.log2(math.e))
+    if const_expr(degree == 2):
+        exp_x, exp_y = e2e_d2_asm2(
+            score_x * log2_e,
+            score_y * log2_e,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        exp_x, exp_y = e2e_asm2(
+            score_x * log2_e,
+            score_y * log2_e,
+            loc=loc,
+            ip=ip,
+        )
+    qx = exp_x * inv_sequence_length
+    qy = exp_y * inv_sequence_length
+    if const_expr(degree == 2):
+        return qx, qy
+    return qx * (Float32(1.0) - qx), qy * (Float32(1.0) - qy)
+
+
 def sigmoid_grad_poly_backend_2(
     x: Float32,
     y: Float32,
@@ -1378,8 +1411,8 @@ def sigmoid_grad_poly_backend_2(
 def sigmoid_native_2(x, y):
     """SFU-based sigmoid: sigmoid(x) = rcp(1 + exp2(-x * log2(e))).
 
-    Uses hardware SFU units (exp2 + rcp_approx). Exact but causes
-    SFU contention when used inside attention (competes with softmax exp2).
+    Uses the hardware exp2 and reciprocal approximation units. B3 has no
+    softmax exp2; this is the exact SFU baseline for sigmoid attention.
     """
     LOG2_E = 1.4426950408889634
     neg_x_log2e = x * Float32(-LOG2_E)
@@ -2152,6 +2185,52 @@ def ex2_emulation_2_pwl8(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[
 @dsl_user_op
 def exp2f_identity_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     return x, y
+
+
+@dsl_user_op
+def e2e_d2_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Packed range-reduced exp2 using a two-FMA quadratic."""
+    out_f32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(x).ir_value(loc=loc, ip=ip), Float32(y, loc=loc, ip=ip).ir_value()],
+        "{\n\t"
+        ".reg .f32 f1, f2, f3, f4, f5, f6;\n\t"
+        ".reg .b64 l1, l2, l3, l4, l5, l7, l8, l9, l10;\n\t"
+        ".reg .s32 r1, r2, r3, r4, r5, r6, r7, r8;\n\t"
+        "max.ftz.f32 f1, $2, 0fC2FE0000;\n\t"
+        "max.ftz.f32 f2, $3, 0fC2FE0000;\n\t"
+        "mov.b64 l1, {f1, f2};\n\t"
+        "mov.f32 f3, 0f4B400000;\n\t"
+        "mov.b64 l2, {f3, f3};\n\t"
+        "add.rm.ftz.f32x2 l7, l1, l2;\n\t"
+        "sub.rn.ftz.f32x2 l8, l7, l2;\n\t"
+        "sub.rn.ftz.f32x2 l9, l1, l8;\n\t"
+        # FLASH_SIGMOID_EXP2_D2_COEFFS in c2, c1, c0 order.
+        "mov.f32 f6, 0f3EAB1DB4;\n\t"
+        "mov.b64 l5, {f6, f6};\n\t"
+        "mov.f32 f5, 0f3F27E206;\n\t"
+        "mov.b64 l4, {f5, f5};\n\t"
+        "mov.f32 f4, 0f3F803DB8;\n\t"
+        "mov.b64 l3, {f4, f4};\n\t"
+        "fma.rn.ftz.f32x2 l10, l9, l5, l4;\n\t"
+        "fma.rn.ftz.f32x2 l10, l10, l9, l3;\n\t"
+        "mov.b64 {r1, r2}, l7;\n\t"
+        "mov.b64 {r3, r4}, l10;\n\t"
+        "shl.b32 r5, r1, 23;\n\t"
+        "add.s32 r7, r5, r3;\n\t"
+        "shl.b32 r6, r2, 23;\n\t"
+        "add.s32 r8, r6, r4;\n\t"
+        "mov.b32 $0, r7;\n\t"
+        "mov.b32 $1, r8;\n\t"
+        "}\n",
+        "=r,=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
+    return out0, out1
 
 
 @dsl_user_op

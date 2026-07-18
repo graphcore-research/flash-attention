@@ -8,6 +8,19 @@ from typing import Iterable
 
 
 SIGMOID_ATTENTION_TAIL_THRESHOLD = 2.75
+EXP2_D2_COEFFS = (
+    1.0,
+    0.6657850742340088,
+    0.33010703325271606,
+)
+# Float32-rounded D2 fit for the sequence-4096 FlashSigmoid probability
+# distribution. Unlike EXP2_D2_COEFFS, this fit absorbs the average sigmoid
+# denominator correction and is returned directly as exp(score) / n.
+FLASH_SIGMOID_EXP2_D2_COEFFS = (
+    1.0018835067749023,
+    0.6557925939559937,
+    0.33421099185943604,
+)
 EXP2_D3_COEFFS = (
     1.0,
     0.6951461434364319,
@@ -471,6 +484,17 @@ def evaluate_exp2_d3(x: float) -> float:
     return math.ldexp(fraction_exp2, exponent)
 
 
+def evaluate_exp2_d2(x: float) -> float:
+    """Reference for the FlashSigmoid-specific two-FMA D2 emulation."""
+    x = max(x, -127.0)
+    exponent = math.floor(x)
+    fraction = x - exponent
+    fraction_exp2 = 0.0
+    for coefficient in reversed(FLASH_SIGMOID_EXP2_D2_COEFFS):
+        fraction_exp2 = fraction_exp2 * fraction + coefficient
+    return math.ldexp(fraction_exp2, exponent)
+
+
 def evaluate_sigmoid_attention_tail_safe(
     x: float,
     coeffs: tuple[float, ...] = SIGMOID_D3.coeffs,
@@ -491,6 +515,19 @@ def evaluate_sigmoid_attention_tail_safe(
     exp_neg_abs = evaluate_exp2_d3(-abs(x) * math.log2(math.e))
     negative_tail = exp_neg_abs * (1.0 - exp_neg_abs)
     return negative_tail if x < 0.0 else 1.0 - negative_tail
+
+
+def evaluate_flash_sigmoid_exp2_poly(
+    score: float,
+    sequence_length: int,
+    degree: int,
+) -> float:
+    """Evaluate the range-reduced D2/D3 FlashSigmoid approximation."""
+    if degree not in (2, 3):
+        raise ValueError(f"FlashSigmoid exp2 only supports D2/D3, got D{degree}")
+    evaluate_exp2 = evaluate_exp2_d2 if degree == 2 else evaluate_exp2_d3
+    q = evaluate_exp2(score * math.log2(math.e)) / sequence_length
+    return q if degree == 2 else q * (1.0 - q)
 
 
 def evaluate_even_polynomial(x: float, coeffs: tuple[float, ...], clamp: float) -> float:
@@ -620,6 +657,30 @@ def audit_polynomial_selection(selections: Iterable[tuple[str, int, str]]) -> tu
     errors: list[str] = []
     audited: list[str] = []
     for family, degree, coeff_source in selections:
+        if family == "flash_sigmoid_exp2":
+            if degree not in (2, 3):
+                errors.append(
+                    f"FlashSigmoid exp2 polynomial only supports D2/D3, got D{degree}"
+                )
+            elif coeff_source != "current":
+                errors.append(
+                    "FlashSigmoid exp2 polynomials only support current coefficients, "
+                    f"got {coeff_source!r}"
+                )
+            else:
+                coefficients = (
+                    FLASH_SIGMOID_EXP2_D2_COEFFS
+                    if degree == 2
+                    else EXP2_D3_COEFFS
+                )
+                if len(coefficients) != degree + 1:
+                    errors.append(
+                        f"FlashSigmoid exp2 polynomial D{degree} has "
+                        f"{len(coefficients)} coefficients"
+                    )
+                else:
+                    audited.append(f"flash_sigmoid_exp2_d{degree}_current")
+            continue
         header_text = current_header_text
         struct_name = _CURRENT_DEFAULT_STRUCTS.get((family, degree))
         if coeff_source == "current" and struct_name is None:

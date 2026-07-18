@@ -23,6 +23,7 @@ class FlashAttentionBackwardDqDensePostprocess:
         arch: Literal[100, 110],
         tile_m: int = 128,
         num_threads: int = 128,
+        remap_sigmoid_2cta_rows: bool = False,
     ):
         self.dtype = dtype
         self.head_dim = head_dim
@@ -31,6 +32,9 @@ class FlashAttentionBackwardDqDensePostprocess:
         self.tile_hdim = int(math.ceil(head_dim / 32) * 32)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
+        self.remap_sigmoid_2cta_rows = remap_sigmoid_2cta_rows
+        if remap_sigmoid_2cta_rows:
+            assert tile_m == 128, "The SM100 2-CTA row remap is defined for 128-row tiles"
 
     def _setup_attributes(self):
         num_copy_elems = 128 // Float32.width
@@ -101,10 +105,27 @@ class FlashAttentionBackwardDqDensePostprocess:
             (self.tile_m * self.tile_hdim,),
             (m_block,),
         )
-        gdQaccum = cute.make_tensor(
-            gdQaccum_flat.iterator,
-            cute.make_layout((self.tile_m, self.tile_hdim), stride=(self.tile_hdim, 1)),
-        )
+        if const_expr(self.remap_sigmoid_2cta_rows):
+            # The sigmoid 2-CTA reducer writes rows with row-coordinate bits 1
+            # and 6 exchanged. Encode the self-inverse transform in the source
+            # layout so the output remains ordinary row-major [M, D].
+            gdQaccum_layout = cute.make_layout(
+                ((2, 2, 16, 2), self.tile_hdim),
+                stride=(
+                    (
+                        self.tile_hdim,
+                        64 * self.tile_hdim,
+                        4 * self.tile_hdim,
+                        2 * self.tile_hdim,
+                    ),
+                    1,
+                ),
+            )
+        else:
+            gdQaccum_layout = cute.make_layout(
+                (self.tile_m, self.tile_hdim), stride=(self.tile_hdim, 1)
+            )
+        gdQaccum = cute.make_tensor(gdQaccum_flat.iterator, gdQaccum_layout)
         gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
         gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)

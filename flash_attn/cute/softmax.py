@@ -176,6 +176,8 @@ class SoftmaxSm100(Softmax):
     sigmoid_sfu_res: cutlass.Constexpr[int] = 0
     # Sigmoid attention bias: b = -log(n) per FlashSigmoid paper (2409.04431)
     sigmoid_bias: Float32 = Float32(0.0)
+    sigmoid_scale: Float32 = Float32(1.0)
+    sigmoid_bias_aware_exp: cutlass.Constexpr[bool] = False
     sigmoid_poly_backend: cutlass.Constexpr[str] = "cute"
     sigmoid_degree: cutlass.Constexpr[int] = 3
     sigmoid_coeff_source: cutlass.Constexpr[str] = "current"
@@ -188,6 +190,8 @@ class SoftmaxSm100(Softmax):
         sigmoid_sfu_freq: cutlass.Constexpr[int] = 16,
         sigmoid_sfu_res: cutlass.Constexpr[int] = 0,
         sigmoid_bias: Float32 = Float32(0.0),
+        sigmoid_scale: Float32 = Float32(1.0),
+        sigmoid_bias_aware_exp: cutlass.Constexpr[bool] = False,
         sigmoid_poly_backend: cutlass.Constexpr[str] = "cute",
         sigmoid_degree: cutlass.Constexpr[int] = 3,
         sigmoid_coeff_source: cutlass.Constexpr[str] = "current",
@@ -207,6 +211,8 @@ class SoftmaxSm100(Softmax):
             sigmoid_sfu_freq=sigmoid_sfu_freq,
             sigmoid_sfu_res=sigmoid_sfu_res,
             sigmoid_bias=sigmoid_bias,
+            sigmoid_scale=sigmoid_scale,
+            sigmoid_bias_aware_exp=sigmoid_bias_aware_exp,
             sigmoid_poly_backend=sigmoid_poly_backend,
             sigmoid_degree=sigmoid_degree,
             sigmoid_coeff_source=sigmoid_coeff_source,
@@ -327,27 +333,47 @@ class SoftmaxSm100(Softmax):
         bias = self.sigmoid_bias  # -log(n) per FlashSigmoid paper
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                # Pack S * scale + bias as fma_packed_f32x2
-                s0, s1 = utils.fma_packed_f32x2(
-                    (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
-                    (sm_scale, sm_scale),
-                    (bias, bias),
-                )
                 if cutlass.const_expr(
                     k % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                 ):
-                    # FlashSigmoid's -log(n) bias puts most scores in the negative
-                    # tail, where the centered BF16 form rounds to zero. Use the
-                    # cancellation-free D3 exp2 tail there.
-                    acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_attention_poly_backend_2(
-                        s0,
-                        s1,
-                        backend=self.sigmoid_poly_backend,
-                        degree=self.sigmoid_degree,
-                        coeff_source=self.sigmoid_coeff_source,
-                    )
+                    if cutlass.const_expr(self.sigmoid_bias_aware_exp):
+                        score0, score1 = utils.fma_packed_f32x2(
+                            (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                            (sm_scale, sm_scale),
+                            (Float32(0.0), Float32(0.0)),
+                        )
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
+                            utils.flash_sigmoid_exp2_poly_2(
+                                score0,
+                                score1,
+                                self.sigmoid_scale,
+                                degree=self.sigmoid_degree,
+                            )
+                        )
+                    else:
+                        # The centered BF16 form loses FlashSigmoid's negative
+                        # tail. D3 uses a cancellation-free exp2 fallback.
+                        s0, s1 = utils.fma_packed_f32x2(
+                            (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                            (sm_scale, sm_scale),
+                            (bias, bias),
+                        )
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
+                            utils.sigmoid_attention_poly_backend_2(
+                                s0,
+                                s1,
+                                backend=self.sigmoid_poly_backend,
+                                degree=self.sigmoid_degree,
+                                coeff_source=self.sigmoid_coeff_source,
+                            )
+                        )
                 else:
                     # SFU path (exp2 + rcp_approx)
+                    s0, s1 = utils.fma_packed_f32x2(
+                        (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                        (sm_scale, sm_scale),
+                        (bias, bias),
+                    )
                     acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.sigmoid_native_2(s0, s1)
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)

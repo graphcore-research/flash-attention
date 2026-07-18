@@ -954,6 +954,9 @@ class FlashAttentionBackwardSm100:
             seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        self.skip_sigmoid_softmax_stats = cutlass.const_expr(
+            self.sigmoid_attention and not self.use_block_sparsity
+        )
 
         if const_expr(self.use_2cta_instrs):
             assert blocksparse_tensors is None, (
@@ -1996,15 +1999,16 @@ class FlashAttentionBackwardSm100:
                         load_Q(first_m_block, producer_state=producer_state_Q_Qt)
                         pipeline_Q.producer_commit(producer_state_Q_Qt)
                         producer_state_Q_Qt.advance()
-                        # LSE
-                        pipeline_LSE.producer_acquire(producer_state_LSE)
-                        with cute.arch.elect_one():
-                            copy_stats(
-                                gLSE[None, first_m_block],
-                                sLSE[None, producer_state_LSE.index],
-                                mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
-                            )
-                        producer_state_LSE.advance()
+                        if const_expr(not self.skip_sigmoid_softmax_stats):
+                            # LSE
+                            pipeline_LSE.producer_acquire(producer_state_LSE)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gLSE[None, first_m_block],
+                                    sLSE[None, producer_state_LSE.index],
+                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                                )
+                            producer_state_LSE.advance()
 
                         # dOt + V, for dP.T = V @ dO.T
                         pipeline_dO.producer_acquire(
@@ -2015,15 +2019,18 @@ class FlashAttentionBackwardSm100:
                         load_dOt(first_m_block, producer_state=producer_state_O_Ot)
                         pipeline_dO.producer_commit(producer_state_O_Ot)
                         producer_state_O_Ot.advance()
-                        # dPsum
-                        pipeline_dPsum.producer_acquire(producer_state_dPsum)
-                        with cute.arch.elect_one():
-                            copy_stats(
-                                gdPsum[None, first_m_block],
-                                sdPsum[None, producer_state_dPsum.index],
-                                mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
-                            )
-                        producer_state_dPsum.advance()
+                        if const_expr(not self.skip_sigmoid_softmax_stats):
+                            # dPsum
+                            pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                            with cute.arch.elect_one():
+                                copy_stats(
+                                    gdPsum[None, first_m_block],
+                                    sdPsum[None, producer_state_dPsum.index],
+                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                        producer_state_dPsum
+                                    ),
+                                )
+                            producer_state_dPsum.advance()
 
                         # Qt, for dK = dS.T @ Q
                         pipeline_Qt.producer_acquire(
@@ -2044,15 +2051,18 @@ class FlashAttentionBackwardSm100:
                         #### Mainloop ####
                         # 2CTA: [lse | Q | dOt | dPsum | Qt | dO]
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
-                            # LSE
-                            pipeline_LSE.producer_acquire(producer_state_LSE)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, m_block],
-                                    sLSE[None, producer_state_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
-                                )
-                            producer_state_LSE.advance()
+                            if const_expr(not self.skip_sigmoid_softmax_stats):
+                                # LSE
+                                pipeline_LSE.producer_acquire(producer_state_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE[None, m_block],
+                                        sLSE[None, producer_state_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                            producer_state_LSE
+                                        ),
+                                    )
+                                producer_state_LSE.advance()
 
                             # Q
                             pipeline_Q.producer_acquire(producer_state_Q_Qt)
@@ -2060,17 +2070,18 @@ class FlashAttentionBackwardSm100:
                             pipeline_Q.producer_commit(producer_state_Q_Qt)
                             producer_state_Q_Qt.advance()
 
-                            # dPsum
-                            pipeline_dPsum.producer_acquire(producer_state_dPsum)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gdPsum[None, m_block],
-                                    sdPsum[None, producer_state_dPsum.index],
-                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                        producer_state_dPsum
-                                    ),
-                                )
-                            producer_state_dPsum.advance()
+                            if const_expr(not self.skip_sigmoid_softmax_stats):
+                                # dPsum
+                                pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum[None, m_block],
+                                        sdPsum[None, producer_state_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                            producer_state_dPsum
+                                        ),
+                                    )
+                                producer_state_dPsum.advance()
 
                             # dOt, for dP.T = V @ dO.T
                             pipeline_dO.producer_acquire(producer_state_O_Ot)
@@ -2103,16 +2114,17 @@ class FlashAttentionBackwardSm100:
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
                             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
-                            # LSE
-                            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, first_m_block],
-                                    sLSE[None, producer_state_Q_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                        producer_state_Q_LSE
-                                    ),
-                                )
+                            if const_expr(not self.skip_sigmoid_softmax_stats):
+                                # LSE shares the Q stage index for the softmax path.
+                                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gLSE[None, first_m_block],
+                                        sLSE[None, producer_state_Q_LSE.index],
+                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                            producer_state_Q_LSE
+                                        ),
+                                    )
                             producer_state_Q_LSE.advance()
 
                         if const_expr(should_load_dO):
@@ -2132,16 +2144,17 @@ class FlashAttentionBackwardSm100:
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
                             pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
-                            # dPsum
-                            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                            with cute.arch.elect_one():
-                                copy_stats(
-                                    gdPsum[None, first_m_block],
-                                    sdPsum[None, producer_state_dO_dPsum.index],
-                                    mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                        producer_state_dO_dPsum
-                                    ),
-                                )
+                            if const_expr(not self.skip_sigmoid_softmax_stats):
+                                # dPsum shares the dO stage index for the softmax path.
+                                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                with cute.arch.elect_one():
+                                    copy_stats(
+                                        gdPsum[None, first_m_block],
+                                        sdPsum[None, producer_state_dO_dPsum.index],
+                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                            producer_state_dO_dPsum
+                                        ),
+                                    )
                             producer_state_dO_dPsum.advance()
 
                         if const_expr(self.use_2cta_instrs):
@@ -2163,16 +2176,17 @@ class FlashAttentionBackwardSm100:
                                 load_Q(m_block, producer_state=producer_state_Q_LSE)
                                 pipeline_Q.producer_commit(producer_state_Q_LSE)
 
-                                # LSE
-                                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                                with cute.arch.elect_one():
-                                    copy_stats(
-                                        gLSE[None, m_block],
-                                        sLSE[None, producer_state_Q_LSE.index],
-                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                            producer_state_Q_LSE
-                                        ),
-                                    )
+                                if const_expr(not self.skip_sigmoid_softmax_stats):
+                                    # LSE
+                                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gLSE[None, m_block],
+                                            sLSE[None, producer_state_Q_LSE.index],
+                                            mbar_ptr=pipeline_LSE.producer_get_barrier(
+                                                producer_state_Q_LSE
+                                            ),
+                                        )
                                 producer_state_Q_LSE.advance()
 
                             if const_expr(should_load_dO):
@@ -2187,16 +2201,17 @@ class FlashAttentionBackwardSm100:
                                     load_dOt(m_block, producer_state=producer_state_dO_dPsum)
                                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
 
-                                # dPsum
-                                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                                with cute.arch.elect_one():
-                                    copy_stats(
-                                        gdPsum[None, m_block],
-                                        sdPsum[None, producer_state_dO_dPsum.index],
-                                        mbar_ptr=pipeline_dPsum.producer_get_barrier(
-                                            producer_state_dO_dPsum
-                                        ),
-                                    )
+                                if const_expr(not self.skip_sigmoid_softmax_stats):
+                                    # dPsum
+                                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                                    with cute.arch.elect_one():
+                                        copy_stats(
+                                            gdPsum[None, m_block],
+                                            sdPsum[None, producer_state_dO_dPsum.index],
+                                            mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                                producer_state_dO_dPsum
+                                            ),
+                                        )
                                 producer_state_dO_dPsum.advance()
 
                         #### Tail ####
@@ -2209,18 +2224,22 @@ class FlashAttentionBackwardSm100:
 
                 if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                     pipeline_Q.producer_tail(producer_state_Q_Qt)
-                    pipeline_LSE.producer_tail(producer_state_LSE)
+                    if const_expr(not self.skip_sigmoid_softmax_stats):
+                        pipeline_LSE.producer_tail(producer_state_LSE)
                     pipeline_dO.producer_tail(producer_state_O_Ot)
-                    pipeline_dPsum.producer_tail(producer_state_dPsum)
+                    if const_expr(not self.skip_sigmoid_softmax_stats):
+                        pipeline_dPsum.producer_tail(producer_state_dPsum)
                 else:
                     if const_expr(should_load_Q):
                         pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
-                        pipeline_LSE.producer_tail(producer_state_Q_LSE)
+                        if const_expr(not self.skip_sigmoid_softmax_stats):
+                            pipeline_LSE.producer_tail(producer_state_Q_LSE)
                         if const_expr(tma_atom_Qt is not None):
                             pipeline_Qt.producer_tail(producer_state_Qt)
                     if const_expr(should_load_dO):
                         pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
-                        pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+                        if const_expr(not self.skip_sigmoid_softmax_stats):
+                            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -3067,10 +3086,15 @@ class FlashAttentionBackwardSm100:
                     m_block = m_block_min + iter_idx
                     m_block_oob = False
                     is_full_block = False
-                # Prefetch 1 stage of LSE
-                pipeline_LSE.consumer_wait(consumer_state_LSE)
+                # Sigmoid attention reconstructs P directly from S and does not consume LSE.
+                if const_expr(not self.skip_sigmoid_softmax_stats):
+                    pipeline_LSE.consumer_wait(consumer_state_LSE)
                 tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
-                if const_expr(prefetch_LSE and not self.shuffle_LSE):
+                if const_expr(
+                    not self.skip_sigmoid_softmax_stats
+                    and prefetch_LSE
+                    and not self.shuffle_LSE
+                ):
                     cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
 
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
@@ -3145,25 +3169,47 @@ class FlashAttentionBackwardSm100:
                             sig_bias = Float32(self.sigmoid_bias)
                         else:
                             sig_bias = -cute.math.log2(Float32(seqlen.seqlen_k), fastmath=True) * LN2
+                        if const_expr(
+                            self.sigmoid_sfu_res < self.sigmoid_sfu_freq
+                            and self.sigmoid_poly_backend == "device"
+                            and self.sigmoid_coeff_source == "current"
+                            and self.sigmoid_degree in (2, 3)
+                            and self.sigmoid_bias is None
+                        ):
+                            sigmoid_scale = cute.arch.rcp_approx(Float32(seqlen.seqlen_k))
+                        else:
+                            sigmoid_scale = Float32(1.0)
                         for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                            s0 = tSrS_cur[2 * v] * sm_scale + sig_bias
-                            s1 = tSrS_cur[2 * v + 1] * sm_scale + sig_bias
+                            score0 = tSrS_cur[2 * v] * sm_scale
+                            score1 = tSrS_cur[2 * v + 1] * sm_scale
                             if const_expr(
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):
                                 # Polynomial (FMA) path
-                                # Match the forward attention path: use the
-                                # cancellation-free D3 exp2 tail after the
-                                # FlashSigmoid -log(n) bias.
-                                p0, p1 = utils.sigmoid_attention_poly_backend_2(
-                                    s0,
-                                    s1,
-                                    backend=self.sigmoid_poly_backend,
-                                    degree=self.sigmoid_degree,
-                                    coeff_source=self.sigmoid_coeff_source,
-                                )
+                                if const_expr(
+                                    self.sigmoid_poly_backend == "device"
+                                    and self.sigmoid_coeff_source == "current"
+                                    and self.sigmoid_degree in (2, 3)
+                                    and self.sigmoid_bias is None
+                                ):
+                                    p0, p1 = utils.flash_sigmoid_exp2_poly_2(
+                                        score0,
+                                        score1,
+                                        sigmoid_scale,
+                                        degree=self.sigmoid_degree,
+                                    )
+                                else:
+                                    s0, s1 = score0 + sig_bias, score1 + sig_bias
+                                    p0, p1 = utils.sigmoid_attention_poly_backend_2(
+                                        s0,
+                                        s1,
+                                        backend=self.sigmoid_poly_backend,
+                                        degree=self.sigmoid_degree,
+                                        coeff_source=self.sigmoid_coeff_source,
+                                    )
                                 tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
                                 if const_expr(self.sigmoid_use_direct_bwd_poly):
+                                    s0, s1 = score0 + sig_bias, score1 + sig_bias
                                     g0, g1 = utils.sigmoid_grad_poly_backend_2(
                                         s0,
                                         s1,
@@ -3175,6 +3221,7 @@ class FlashAttentionBackwardSm100:
                                     tSrSigGrad_cur[2 * v], tSrSigGrad_cur[2 * v + 1] = g0, g1
                             else:
                                 # SFU path (exp2 + rcp_approx)
+                                s0, s1 = score0 + sig_bias, score1 + sig_bias
                                 p0, p1 = utils.sigmoid_native_2(s0, s1)
                                 tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
                                 if const_expr(self.sigmoid_use_direct_bwd_poly):
@@ -3223,12 +3270,14 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
-                pipeline_LSE.consumer_release(consumer_state_LSE)
-                consumer_state_LSE.advance()
+                if const_expr(not self.skip_sigmoid_softmax_stats):
+                    pipeline_LSE.consumer_release(consumer_state_LSE)
+                    consumer_state_LSE.advance()
                 # ---------------------------------------------
                 # dS.T = P.T * (dP.T - D)
                 # ---------------------------------------------
-                pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                if const_expr(not self.skip_sigmoid_softmax_stats):
+                    pipeline_dPsum.consumer_wait(consumer_state_dPsum)
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 ### Now delayed to after loop
@@ -3356,8 +3405,9 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
-                pipeline_dPsum.consumer_release(consumer_state_dPsum)
-                consumer_state_dPsum.advance()
+                if const_expr(not self.skip_sigmoid_softmax_stats):
+                    pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                    consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
                 if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
                     with cute.arch.elect_one():

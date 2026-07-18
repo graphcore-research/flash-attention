@@ -1,4 +1,6 @@
 import math
+import struct
+from pathlib import Path
 
 import flash_attn.cute.polynomial_manifest as polynomial_manifest
 from flash_attn.cute.polynomial_manifest import (
@@ -12,6 +14,7 @@ from flash_attn.cute.polynomial_manifest import (
     audit_active_polynomials,
     assert_active_polynomials_in_sync,
     evaluate_centered_sigmoid_forward,
+    evaluate_flash_sigmoid_exp2_poly,
     evaluate_sigmoid_attention_tail_safe,
     evaluate_odd_factorized_derivative,
     evaluate_odd_factorized_forward,
@@ -113,6 +116,25 @@ def test_selection_audit_current_defaults_does_not_require_sweep_json(tmp_path, 
     assert audited == ("softcap_tanh_d4", "sigmoid_d3", "sigmoid_grad_d3_current")
 
 
+def test_selection_audit_recognizes_bias_aware_flash_sigmoid_exp2_d3():
+    assert audit_polynomial_selection((("flash_sigmoid_exp2", 3, "current"),)) == (
+        "flash_sigmoid_exp2_d3_current",
+    )
+
+
+def test_selection_audit_recognizes_bias_aware_flash_sigmoid_exp2_d2():
+    assert audit_polynomial_selection((("flash_sigmoid_exp2", 2, "current"),)) == (
+        "flash_sigmoid_exp2_d2_current",
+    )
+
+
+def test_flash_sigmoid_exp2_d2_manifest_matches_device_ptx():
+    utils_source = Path(polynomial_manifest.__file__).with_name("utils.py").read_text()
+    for coefficient in polynomial_manifest.FLASH_SIGMOID_EXP2_D2_COEFFS:
+        bits = struct.unpack("<I", struct.pack("<f", coefficient))[0]
+        assert f"0f{bits:08X}" in utils_source
+
+
 def test_default_swish_and_gelu_specs_match_manifest():
     swish_fwd, swish_bwd = get_default_swish_specs()
     gelu_fwd, gelu_bwd = get_default_gelu_specs()
@@ -164,6 +186,54 @@ def test_sigmoid_attention_tail_safe_is_continuous_at_core_boundary():
         below = evaluate_sigmoid_attention_tail_safe(boundary - eps)
         above = evaluate_sigmoid_attention_tail_safe(boundary + eps)
         assert abs(above - below) < 0.01
+
+
+def test_flash_sigmoid_bias_aware_exp2_d3_matches_score_distribution():
+    sequence_length = 4096
+    scores = tuple(-6.0 + 0.025 * index for index in range(481))
+    weights = tuple(math.exp(-0.5 * score * score) for score in scores)
+    expected = tuple(
+        1.0 / (1.0 + math.exp(-(score - math.log(sequence_length))))
+        for score in scores
+    )
+    actual = tuple(
+        evaluate_flash_sigmoid_exp2_poly(score, sequence_length, degree=3)
+        for score in scores
+    )
+    relative_l1 = sum(
+        weight * abs(got - want)
+        for weight, got, want in zip(weights, actual, expected)
+    ) / sum(weight * want for weight, want in zip(weights, expected))
+    gradient_relative_l1 = sum(
+        weight * abs(got * (1.0 - got) - want * (1.0 - want))
+        for weight, got, want in zip(weights, actual, expected)
+    ) / sum(weight * want * (1.0 - want) for weight, want in zip(weights, expected))
+    assert relative_l1 < 0.0001
+    assert gradient_relative_l1 < 0.0001
+
+
+def test_flash_sigmoid_bias_aware_exp2_d2_matches_score_distribution():
+    sequence_length = 4096
+    scores = tuple(-6.0 + 0.025 * index for index in range(481))
+    weights = tuple(math.exp(-0.5 * score * score) for score in scores)
+    expected = tuple(
+        1.0 / (1.0 + math.exp(-(score - math.log(sequence_length))))
+        for score in scores
+    )
+    actual = tuple(
+        evaluate_flash_sigmoid_exp2_poly(score, sequence_length, degree=2)
+        for score in scores
+    )
+    relative_l1 = sum(
+        weight * abs(got - want)
+        for weight, got, want in zip(weights, actual, expected)
+    ) / sum(weight * want for weight, want in zip(weights, expected))
+    gradient_relative_l1 = sum(
+        weight * abs(got * (1.0 - got) - want * (1.0 - want))
+        for weight, got, want in zip(weights, actual, expected)
+    ) / sum(weight * want * (1.0 - want) for weight, want in zip(weights, expected))
+    assert relative_l1 < 0.0014
+    assert gradient_relative_l1 < 0.0014
 
 
 def test_sigmoid_poly_backward_stays_close_to_algebraic_reference_in_core_region():

@@ -1814,6 +1814,12 @@ class FlashAttentionForwardSm100:
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
         s0_s1_sequence_phase = Int32(1 if stage == 0 else 0)
+        skip_sigmoid_scale_writes = const_expr(
+            self.sigmoid_attention
+            and not self.use_block_sparsity
+            and not self.is_split_kv
+            and learnable_sink is None
+        )
 
         # self.warp_scheduler_barrier_init()
 
@@ -1885,8 +1891,21 @@ class FlashAttentionForwardSm100:
                 else:
                     LN2 = 0.6931471805599453
                     sigmoid_bias = -cute.math.log2(Float32(seqlen.seqlen_k), fastmath=True) * LN2
+                sigmoid_bias_aware_exp = const_expr(
+                    self.sigmoid_sfu_res < self.sigmoid_sfu_freq
+                    and self.sigmoid_poly_backend == "device"
+                    and self.sigmoid_coeff_source == "current"
+                    and self.sigmoid_degree in (2, 3)
+                    and self.sigmoid_bias is None
+                )
+                if const_expr(sigmoid_bias_aware_exp):
+                    sigmoid_scale = cute.arch.rcp_approx(Float32(seqlen.seqlen_k))
+                else:
+                    sigmoid_scale = Float32(1.0)
             else:
                 sigmoid_bias = Float32(0.0)
+                sigmoid_scale = Float32(1.0)
+                sigmoid_bias_aware_exp = False
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
@@ -1895,6 +1914,8 @@ class FlashAttentionForwardSm100:
                 sigmoid_sfu_freq=self.sigmoid_sfu_freq,
                 sigmoid_sfu_res=self.sigmoid_sfu_res,
                 sigmoid_bias=sigmoid_bias,
+                sigmoid_scale=sigmoid_scale,
+                sigmoid_bias_aware_exp=sigmoid_bias_aware_exp,
                 sigmoid_poly_backend=self.sigmoid_poly_backend,
                 sigmoid_degree=self.sigmoid_degree,
                 sigmoid_coeff_source=self.sigmoid_coeff_source,
@@ -1939,6 +1960,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                skip_sigmoid_scale_writes=skip_sigmoid_scale_writes,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2052,14 +2074,22 @@ class FlashAttentionForwardSm100:
                             )
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
-                    # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = (
-                        Float32(1.0) if const_expr(self.sigmoid_attention) else softmax.row_sum[0]
-                    )
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = Float32(0.0) if const_expr(self.sigmoid_attention) else softmax.row_max[0]
+                    if not const_expr(skip_sigmoid_scale_writes):
+                        # Dense softmax publishes the final row sum and row max;
+                        # fallback sigmoid modes preserve their identity stats.
+                        sScale[tidx + stage * self.m_block_size] = (
+                            Float32(1.0)
+                            if const_expr(self.sigmoid_attention)
+                            else softmax.row_sum[0]
+                        )
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = (
+                                Float32(0.0)
+                                if const_expr(self.sigmoid_attention)
+                                else softmax.row_max[0]
+                            )
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2125,6 +2155,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        skip_sigmoid_scale_writes: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2178,7 +2209,7 @@ class FlashAttentionForwardSm100:
         else:
             row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
-        if const_expr(not is_first):
+        if const_expr(not is_first and not skip_sigmoid_scale_writes):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
             # tSrScale_r2t[0] = acc_scale
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
@@ -2341,7 +2372,62 @@ class FlashAttentionForwardSm100:
                 total_block_count = n_block_max - n_block_min
                 has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
-            if has_work:
+            if const_expr(
+                self.sigmoid_attention
+                and not self.use_block_sparsity
+                and not self.is_split_kv
+                and learnable_sink is None
+            ):
+                # Preserve the proven stats-barrier ordering contract, but do
+                # not load identity scales, vote on rescaling, or normalize O.
+                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                pipeline_sm_stats.consumer_release_w_index(0)
+                if const_expr(self.q_stage == 2):
+                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                sm_stats_consumer_phase ^= 1
+
+                for _ in cutlass.range(total_block_count - 1, unroll=1):
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+                        pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                    sm_stats_consumer_phase ^= 1
+                if const_expr(self.q_stage == 2):
+                    pipeline_sm_stats.consumer_release_w_index(1)
+
+                for stage in cutlass.range_constexpr(self.q_stage):
+                    sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                    pipeline_sm_stats.consumer_release_w_index(stage)
+                    stats[stage] = (Float32(1.0), Float32(0.0), False)
+                    pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                    if const_expr(not self.use_correction_warps_for_epi):
+                        pipeline_o_epi.producer_acquire_w_index_phase(
+                            stage, corr_epi_producer_phase
+                        )
+                    self.correction_epilogue(
+                        thr_mma_pv,
+                        tOtO[None, None, None, stage],
+                        tidx,
+                        stage,
+                        m_block,
+                        seqlen.seqlen_q,
+                        Float32(1.0),
+                        sO[None, None, stage],
+                        mO_cur,
+                        gO[None, None, stage],
+                        gGateAct[None, None, stage] if const_expr(gGateAct is not None) else None,
+                        gmem_tiled_copy_O,
+                    )
+                    # This arrival protects O until the epilogue has consumed
+                    # it and pre-releases the first P tile of the next work tile.
+                    pipeline_s_p_o.consumer_release_w_index(stage)
+                    if const_expr(not self.use_correction_warps_for_epi):
+                        pipeline_o_epi.producer_commit_w_index(stage)
+
+                o_corr_consumer_phase ^= 1
+                sm_stats_consumer_phase ^= 1
+                corr_epi_producer_phase ^= 1
+            elif has_work:
                 # Ignore first signal from softmax as no correction is required
                 # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
                 sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)

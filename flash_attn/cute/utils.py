@@ -17,6 +17,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 from flash_attn.cute.handwritten_spline_ptx import (
+    audit_handwritten_fast_path,
     get_handwritten_inline_asm,
     handwritten_spline_ptx_provider,
     require_device_backend_support,
@@ -24,7 +25,7 @@ from flash_attn.cute.handwritten_spline_ptx import (
 from flash_attn.cute.polynomial_manifest import (
     EXP2_D2_COEFFS,
     EXP2_D3_COEFFS,
-    SIGMOID_ATTENTION_TAIL_THRESHOLD,
+    FLASH_SIGMOID_DIRECT_CLAMP,
     get_default_output_gate_coeffs,
     get_sigmoid_forward_spec,
     get_sigmoid_gradient_spec,
@@ -97,6 +98,31 @@ def ensure_handwritten_device_backend() -> None:
 
     cute_dsl_ptxas.register_extra_ptx_provider(handwritten_spline_ptx_provider)
     _HANDWRITTEN_PTX_REGISTERED = True
+
+
+def audit_attention_handwritten_fast_path(
+    family: str,
+    degree: int,
+    coeff_source: str = "current",
+) -> str:
+    """Compile and inspect the exact handwritten symbol selected by FA4."""
+    if family == "flash_sigmoid_direct":
+        if degree != 3 or coeff_source != "current":
+            raise ValueError("Direct FlashSigmoid forward supports current D3 only")
+        symbol = "fa4_flash_sigmoid_direct_d3_bf16x2"
+        return audit_handwritten_fast_path(symbol, max_instructions=24)
+    if family == "flash_sigmoid_direct_grad":
+        if degree != 4 or coeff_source != "current":
+            raise ValueError("Direct FlashSigmoid gradient supports current D4 only")
+        symbol = "fa4_flash_sigmoid_direct_grad_d4_bf16x2"
+        return audit_handwritten_fast_path(symbol, max_instructions=24)
+    if family == "flash_sigmoid_direct_with_grad":
+        if degree != 4 or coeff_source != "current":
+            raise ValueError("Fused direct FlashSigmoid D3/D4 supports current coefficients only")
+        symbol = "fa4_flash_sigmoid_direct_d3_grad_d4_bf16x2"
+        return audit_handwritten_fast_path(symbol, max_instructions=36)
+    symbol = _handwritten_symbol(family, degree, coeff_source)
+    return audit_handwritten_fast_path(symbol)
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
@@ -613,13 +639,15 @@ def _make_tanh_device_pair_fn(degree: int, coeff_source: str = "current"):
     ) -> Tuple[Float32, Float32]:
         return call_handwritten_bf16x2_f32x2(x, y, symbol, loc=loc, ip=ip)
 
-    return _annotate_poly_callable(
+    tanh_device_pair = _annotate_poly_callable(
         tanh_device_pair,
         degree=degree,
         backend="device",
         coeff_source=coeff_source,
         family="tanh_fwd",
     )
+    tanh_device_pair.__handwritten_symbol__ = symbol
+    return tanh_device_pair
 
 
 @lru_cache(maxsize=None)
@@ -709,7 +737,7 @@ def _make_tanh_cute_fragment_fn(degree: int, coeff_source: str = "current"):
 
 
 @lru_cache(maxsize=None)
-def _make_tanh_derivative_pair_fn(
+def _make_tanh_derivative_cute_pair_fn(
     degree: int,
     coeff_source: str = "current",
 ):
@@ -741,19 +769,58 @@ def _make_tanh_derivative_pair_fn(
     return _annotate_poly_callable(
         tanh_derivative_pair,
         degree=degree,
-        backend="device",
+        backend="cute",
         coeff_source=coeff_source,
         family="tanh_bwd_analytical",
     )
 
 
 @lru_cache(maxsize=None)
-def _make_tanh_derivative_fragment_fn(
+def _make_tanh_derivative_cute_fragment_fn(
     degree: int,
     coeff_source: str = "current",
 ):
     return _make_fragment_from_pair_fn(
-        _make_tanh_derivative_pair_fn(degree, coeff_source),
+        _make_tanh_derivative_cute_pair_fn(degree, coeff_source),
+        degree=degree,
+        backend="cute",
+        coeff_source=_validate_coeff_source(coeff_source),
+        family="tanh_bwd_analytical",
+    )
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_derivative_device_pair_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    coeff_source = _validate_coeff_source(coeff_source)
+    symbol = _handwritten_symbol("tanh_grad_analytical", degree, coeff_source)
+
+    @dsl_user_op
+    def tanh_derivative_device_pair(
+        x: Float32, y: Float32, *, loc=None, ip=None
+    ) -> Tuple[Float32, Float32]:
+        return call_handwritten_bf16x2_f32x2(x, y, symbol, loc=loc, ip=ip)
+
+    tanh_derivative_device_pair = _annotate_poly_callable(
+        tanh_derivative_device_pair,
+        degree=degree,
+        backend="device",
+        coeff_source=coeff_source,
+        family="tanh_bwd_analytical",
+    )
+    tanh_derivative_device_pair.__handwritten_symbol__ = symbol
+    return tanh_derivative_device_pair
+
+
+@lru_cache(maxsize=None)
+def _make_tanh_derivative_device_fragment_fn(
+    degree: int,
+    coeff_source: str = "current",
+):
+    return _make_fragment_from_pair_fn(
+        _make_tanh_derivative_device_pair_fn(degree, coeff_source),
         degree=degree,
         backend="device",
         coeff_source=_validate_coeff_source(coeff_source),
@@ -982,7 +1049,21 @@ def create_softcap_scoremod_bwd_backend(
     inv_softcap = 1.0 / softcap_val
 
     if backward_mode == "analytical":
-        derivative_fn = _make_tanh_derivative_fragment_fn(degree, coeff_source)
+        if backend == "device":
+            ensure_handwritten_device_backend()
+            derivative_fn = _make_tanh_derivative_device_fragment_fn(
+                degree,
+                coeff_source,
+            )
+        elif backend == "cute":
+            derivative_fn = _make_tanh_derivative_cute_fragment_fn(
+                degree,
+                coeff_source,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported analytical softcap backward for backend={backend!r}"
+            )
 
         @cute.jit
         def scoremod_bwd_fn(grad, acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -1317,14 +1398,8 @@ def sigmoid_attention_poly_backend_2(
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32]:
-    """Tail-safe sigmoid polynomial for FlashSigmoid score distributions.
-
-    The centered BF16 polynomial loses its small negative-tail result when
-    subtracting from 0.5. Use the existing cancellation-free D3 exp2
-    emulation in the tails while retaining the selected sigmoid polynomial in
-    the core.
-    """
-    core_x, core_y = sigmoid_poly_backend_2(
+    """Evaluate the complete sigmoid with the selected polynomial backend."""
+    return sigmoid_poly_backend_2(
         x,
         y,
         backend=backend,
@@ -1332,23 +1407,6 @@ def sigmoid_attention_poly_backend_2(
         coeff_source=coeff_source,
         loc=loc,
         ip=ip,
-    )
-    abs_x = fabs_f32(x, loc=loc, ip=ip)
-    abs_y = fabs_f32(y, loc=loc, ip=ip)
-    exp_x, exp_y = ex2_emulation_2(
-        -abs_x * Float32(math.log2(math.e)),
-        -abs_y * Float32(math.log2(math.e)),
-        loc=loc,
-        ip=ip,
-    )
-    neg_tail_x = exp_x * (Float32(1.0) - exp_x)
-    neg_tail_y = exp_y * (Float32(1.0) - exp_y)
-    tail_x = select_(x < Float32(0.0), neg_tail_x, Float32(1.0) - neg_tail_x)
-    tail_y = select_(y < Float32(0.0), neg_tail_y, Float32(1.0) - neg_tail_y)
-    threshold = Float32(SIGMOID_ATTENTION_TAIL_THRESHOLD)
-    return (
-        select_(abs_x >= threshold, tail_x, core_x),
-        select_(abs_y >= threshold, tail_y, core_y),
     )
 
 
@@ -1361,29 +1419,108 @@ def flash_sigmoid_exp2_poly_2(
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Float32]:
-    """Bias-aware FlashSigmoid using range-reduced D2/D3 exp2."""
+    """Evaluate auto-biased FlashSigmoid without materializing the bias.
+
+    D2 is the legacy range-reduced exp2 experiment. D3 evaluates a direct
+    polynomial fit of ``n * sigmoid(score - log(n))`` and scales by ``1/n``.
+    """
     if const_expr(degree != 2 and degree != 3):
-        raise ValueError(f"FlashSigmoid exp2 only supports D2/D3, got D{degree}")
+        raise ValueError(f"Auto-biased FlashSigmoid only supports D2/D3, got D{degree}")
+    if const_expr(degree == 3):
+        scaled_x, scaled_y = call_handwritten_bf16x2_f32x2(
+            score_x,
+            score_y,
+            "fa4_flash_sigmoid_direct_d3_bf16x2",
+            loc=loc,
+            ip=ip,
+        )
+        return scaled_x * inv_sequence_length, scaled_y * inv_sequence_length
+
     log2_e = Float32(math.log2(math.e))
-    if const_expr(degree == 2):
-        exp_x, exp_y = e2e_d2_asm2(
-            score_x * log2_e,
-            score_y * log2_e,
-            loc=loc,
-            ip=ip,
-        )
-    else:
-        exp_x, exp_y = e2e_asm2(
-            score_x * log2_e,
-            score_y * log2_e,
-            loc=loc,
-            ip=ip,
-        )
+    exp_x, exp_y = e2e_d2_asm2(
+        score_x * log2_e,
+        score_y * log2_e,
+        loc=loc,
+        ip=ip,
+    )
     qx = exp_x * inv_sequence_length
     qy = exp_y * inv_sequence_length
-    if const_expr(degree == 2):
-        return qx, qy
-    return qx * (Float32(1.0) - qx), qy * (Float32(1.0) - qy)
+    return qx, qy
+
+
+def flash_sigmoid_direct_grad_poly_2(
+    score_x: Float32,
+    score_y: Float32,
+    inv_sequence_length: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Direct D4 fit of the auto-biased FlashSigmoid score derivative."""
+    scaled_x, scaled_y = call_handwritten_bf16x2_f32x2(
+        score_x,
+        score_y,
+        "fa4_flash_sigmoid_direct_grad_d4_bf16x2",
+        loc=loc,
+        ip=ip,
+    )
+    zero = Float32(0.0)
+    lower = Float32(-FLASH_SIGMOID_DIRECT_CLAMP)
+    return (
+        select_(score_x >= lower, scaled_x * inv_sequence_length, zero),
+        select_(score_y >= lower, scaled_y * inv_sequence_length, zero),
+    )
+
+
+@dsl_user_op
+def flash_sigmoid_direct_with_grad_poly_2(
+    score_x: Float32,
+    score_y: Float32,
+    inv_sequence_length: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Fused direct D3 probability and D4 score derivative."""
+    asm = get_handwritten_inline_asm(
+        "fa4_flash_sigmoid_direct_d3_grad_d4_bf16x2"
+    )
+    packed_pair = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Float32(score_x).ir_value(loc=loc, ip=ip),
+            Float32(score_y).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    packed_probability = cutlass.Int32(
+        llvm.extractvalue(T.i32(), packed_pair, [0], loc=loc, ip=ip)
+    )
+    packed_gradient = cutlass.Int32(
+        llvm.extractvalue(T.i32(), packed_pair, [1], loc=loc, ip=ip)
+    )
+    probability_x, probability_y = unpack_bf16x2_f32(
+        packed_probability, loc=loc, ip=ip
+    )
+    gradient_x, gradient_y = unpack_bf16x2_f32(
+        packed_gradient, loc=loc, ip=ip
+    )
+    probability_x *= inv_sequence_length
+    probability_y *= inv_sequence_length
+    gradient_x *= inv_sequence_length
+    gradient_y *= inv_sequence_length
+    zero = Float32(0.0)
+    lower = Float32(-FLASH_SIGMOID_DIRECT_CLAMP)
+    return (
+        probability_x,
+        probability_y,
+        select_(score_x >= lower, gradient_x, zero),
+        select_(score_y >= lower, gradient_y, zero),
+    )
 
 
 def sigmoid_grad_poly_backend_2(

@@ -41,6 +41,9 @@ from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.polynomial_manifest import (
+    FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
+)
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
@@ -1903,7 +1906,18 @@ class FlashAttentionForwardSm100:
                     and self.sigmoid_bias is None
                 )
                 if const_expr(sigmoid_bias_aware_exp):
-                    sigmoid_scale = cute.arch.rcp_approx(Float32(seqlen.seqlen_k))
+                    if const_expr(
+                        self.sigmoid_degree == 3
+                        and self.sigmoid_coeff_source == "current"
+                        and self.sigmoid_bias is None
+                    ):
+                        sigmoid_scale = Float32(
+                            1.0 / FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH
+                        )
+                    else:
+                        sigmoid_scale = cute.arch.rcp_approx(
+                            Float32(seqlen.seqlen_k)
+                        )
                 else:
                     sigmoid_scale = Float32(1.0)
             else:

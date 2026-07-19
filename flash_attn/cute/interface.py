@@ -43,6 +43,9 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
+from flash_attn.cute.polynomial_manifest import (
+    FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
+)
 from flash_attn.cute.cute_dsl_utils import (
     to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
 )
@@ -141,6 +144,50 @@ def _validate_attention_poly_configuration(
             raise ValueError(
                 f"Sollya softcap attention fits are device-only; {label} uses backend={backend!r}."
             )
+
+
+def _validate_sigmoid_runtime_configuration(
+    *,
+    sigmoid_attention: bool,
+    sigmoid_sfu_freq: int,
+    sigmoid_sfu_res: int,
+    sigmoid_bias: Optional[float],
+    sigmoid_poly_backend: str,
+    sigmoid_degree: int,
+    sigmoid_coeff_source: str,
+    seqlen_k: int,
+    variable_length: bool,
+) -> None:
+    if not sigmoid_attention:
+        return
+    if sigmoid_sfu_freq <= 0:
+        raise ValueError(
+            f"sigmoid_sfu_freq must be positive, got {sigmoid_sfu_freq}"
+        )
+    if sigmoid_sfu_res < 0 or sigmoid_sfu_res > sigmoid_sfu_freq:
+        raise ValueError(
+            "sigmoid_sfu_res must be in [0, sigmoid_sfu_freq], got "
+            f"{sigmoid_sfu_res} for {sigmoid_sfu_freq}"
+        )
+    uses_direct_fit = (
+        sigmoid_sfu_res < sigmoid_sfu_freq
+        and sigmoid_bias is None
+        and sigmoid_poly_backend == "device"
+        and sigmoid_degree == 3
+        and sigmoid_coeff_source == "current"
+    )
+    if not uses_direct_fit:
+        return
+    if variable_length:
+        raise ValueError(
+            "The direct B3 D3 sigmoid polynomial only supports fixed-length "
+            f"sequences of length {FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH}."
+        )
+    if seqlen_k != FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH:
+        raise ValueError(
+            "The direct B3 D3 sigmoid polynomial is fitted for key sequence "
+            f"length {FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH}, got {seqlen_k}."
+        )
 
 
 def _prepare_output_gate(
@@ -295,6 +342,24 @@ def _flash_attn_fwd(
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
+
+    _validate_sigmoid_runtime_configuration(
+        sigmoid_attention=sigmoid_attention,
+        sigmoid_sfu_freq=sigmoid_sfu_freq,
+        sigmoid_sfu_res=sigmoid_sfu_res,
+        sigmoid_bias=sigmoid_bias,
+        sigmoid_poly_backend=sigmoid_poly_backend,
+        sigmoid_degree=sigmoid_degree,
+        sigmoid_coeff_source=sigmoid_coeff_source,
+        seqlen_k=seqlen_k,
+        variable_length=(
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+            or page_table is not None
+        ),
+    )
 
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), (
@@ -818,6 +883,7 @@ def _flash_attn_bwd(
     sigmoid_use_direct_bwd_poly: bool = False,
     sigmoid_poly_backend: str = "cute",
     sigmoid_degree: int = 3,
+    sigmoid_gradient_degree: Optional[int] = None,
     sigmoid_coeff_source: str = "current",
     output_gate_activation: Optional[torch.Tensor] = None,
     output_gate_use_spline: bool = False,
@@ -825,6 +891,8 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    if sigmoid_gradient_degree is None:
+        sigmoid_gradient_degree = sigmoid_degree
 
     num_head, head_dim = q.shape[-2:]
 
@@ -928,6 +996,23 @@ def _flash_attn_bwd(
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
+
+    _validate_sigmoid_runtime_configuration(
+        sigmoid_attention=sigmoid_attention,
+        sigmoid_sfu_freq=sigmoid_sfu_freq,
+        sigmoid_sfu_res=sigmoid_sfu_res,
+        sigmoid_bias=sigmoid_bias,
+        sigmoid_poly_backend=sigmoid_poly_backend,
+        sigmoid_degree=sigmoid_degree,
+        sigmoid_coeff_source=sigmoid_coeff_source,
+        seqlen_k=seqlen_k,
+        variable_length=(
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        ),
+    )
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
@@ -1320,6 +1405,7 @@ def _flash_attn_bwd(
             sigmoid_use_direct_bwd_poly,
             sigmoid_poly_backend,
             sigmoid_degree,
+            sigmoid_gradient_degree,
             sigmoid_coeff_source,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
@@ -1416,6 +1502,7 @@ def _flash_attn_bwd(
                 sigmoid_use_direct_bwd_poly=sigmoid_use_direct_bwd_poly,
                 sigmoid_poly_backend=sigmoid_poly_backend,
                 sigmoid_degree=sigmoid_degree,
+                sigmoid_gradient_degree=sigmoid_gradient_degree,
                 sigmoid_coeff_source=sigmoid_coeff_source,
             )
 

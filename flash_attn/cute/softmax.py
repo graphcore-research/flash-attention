@@ -351,8 +351,8 @@ class SoftmaxSm100(Softmax):
                             )
                         )
                     else:
-                        # The centered BF16 form loses FlashSigmoid's negative
-                        # tail. D3 uses a cancellation-free exp2 fallback.
+                        # Evaluate the complete biased sigmoid with the selected
+                        # compact polynomial; no exp2 path is used here.
                         s0, s1 = utils.fma_packed_f32x2(
                             (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
                             (sm_scale, sm_scale),

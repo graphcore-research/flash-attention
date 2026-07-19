@@ -28,6 +28,23 @@ EXP2_D3_COEFFS = (
     0.07711908966302872,
 )
 
+# Direct B3 fits for n * sigmoid(score - log(n)) and its derivative at n=4096.
+# The runtime multiplies by 1/n after the packed polynomial, preserving the
+# small FlashSigmoid tail without cancellation. The two rows cover [-6, 1.25]
+# and [1.25, 6] in raw score coordinates. Coefficients are BF16-quantized and
+# weighted for RMS-normalized attention scores.
+FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH = 4096
+FLASH_SIGMOID_DIRECT_CLAMP = 6.0
+FLASH_SIGMOID_DIRECT_SPLIT = 1.25
+FLASH_SIGMOID_DIRECT_MIDPOINTS = (0.0, 0.0)
+FLASH_SIGMOID_DIRECT_D3_COEFFS = (
+    (1.0, 1.0546875, 0.53515625, 0.11328125),
+    (-8.5625, 17.5, -9.0625, 2.140625),
+)
+FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS = (
+    (0.9921875, 1.0078125, 0.53125, 0.162109375, 0.0203857421875),
+    (6.5625, -11.0, 10.125, -3.3125, 0.55078125),
+)
 
 @dataclass(frozen=True)
 class PolynomialSpec:

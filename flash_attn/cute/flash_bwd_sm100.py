@@ -36,6 +36,9 @@ from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.polynomial_manifest import (
+    FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
+)
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
@@ -89,6 +92,7 @@ class FlashAttentionBackwardSm100:
         sigmoid_use_direct_bwd_poly: bool = False,
         sigmoid_poly_backend: str = "cute",
         sigmoid_degree: int = 3,
+        sigmoid_gradient_degree: int | None = None,
         sigmoid_coeff_source: str = "current",
     ):
         # padding head_dim to a multiple of 16 as k_block_size
@@ -156,6 +160,9 @@ class FlashAttentionBackwardSm100:
         self.sigmoid_use_direct_bwd_poly = sigmoid_use_direct_bwd_poly
         self.sigmoid_poly_backend = sigmoid_poly_backend
         self.sigmoid_degree = sigmoid_degree
+        self.sigmoid_gradient_degree = (
+            sigmoid_degree if sigmoid_gradient_degree is None else sigmoid_gradient_degree
+        )
         self.sigmoid_coeff_source = sigmoid_coeff_source
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
@@ -3179,9 +3186,24 @@ class FlashAttentionBackwardSm100:
                             and self.sigmoid_degree in (2, 3)
                             and self.sigmoid_bias is None
                         ):
-                            sigmoid_scale = cute.arch.rcp_approx(Float32(seqlen.seqlen_k))
+                            if const_expr(self.sigmoid_degree == 3):
+                                sigmoid_scale = Float32(
+                                    1.0 / FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH
+                                )
+                            else:
+                                sigmoid_scale = cute.arch.rcp_approx(
+                                    Float32(seqlen.seqlen_k)
+                                )
                         else:
                             sigmoid_scale = Float32(1.0)
+                        sigmoid_fused_direct_pair = const_expr(
+                            self.sigmoid_use_direct_bwd_poly
+                            and self.sigmoid_poly_backend == "device"
+                            and self.sigmoid_coeff_source == "current"
+                            and self.sigmoid_degree == 3
+                            and self.sigmoid_gradient_degree == 4
+                            and self.sigmoid_bias is None
+                        )
                         for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
                             score0 = tSrS_cur[2 * v] * sm_scale
                             score1 = tSrS_cur[2 * v + 1] * sm_scale
@@ -3189,7 +3211,15 @@ class FlashAttentionBackwardSm100:
                                 v % self.sigmoid_sfu_freq < self.sigmoid_sfu_freq - self.sigmoid_sfu_res
                             ):
                                 # Polynomial (FMA) path
-                                if const_expr(
+                                if const_expr(sigmoid_fused_direct_pair):
+                                    p0, p1, g0, g1 = (
+                                        utils.flash_sigmoid_direct_with_grad_poly_2(
+                                            score0,
+                                            score1,
+                                            sigmoid_scale,
+                                        )
+                                    )
+                                elif const_expr(
                                     self.sigmoid_poly_backend == "device"
                                     and self.sigmoid_coeff_source == "current"
                                     and self.sigmoid_degree in (2, 3)
@@ -3212,15 +3242,30 @@ class FlashAttentionBackwardSm100:
                                     )
                                 tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = p0, p1
                                 if const_expr(self.sigmoid_use_direct_bwd_poly):
-                                    s0, s1 = score0 + sig_bias, score1 + sig_bias
-                                    g0, g1 = utils.sigmoid_grad_poly_backend_2(
-                                        s0,
-                                        s1,
-                                        self.q_dtype,
-                                        backend=self.sigmoid_poly_backend,
-                                        degree=self.sigmoid_degree,
-                                        coeff_source=self.sigmoid_coeff_source,
-                                    )
+                                    if const_expr(sigmoid_fused_direct_pair):
+                                        pass
+                                    elif const_expr(
+                                        self.sigmoid_poly_backend == "device"
+                                        and self.sigmoid_coeff_source == "current"
+                                        and self.sigmoid_degree == 3
+                                        and self.sigmoid_gradient_degree == 4
+                                        and self.sigmoid_bias is None
+                                    ):
+                                        g0, g1 = utils.flash_sigmoid_direct_grad_poly_2(
+                                            score0,
+                                            score1,
+                                            sigmoid_scale,
+                                        )
+                                    else:
+                                        s0, s1 = score0 + sig_bias, score1 + sig_bias
+                                        g0, g1 = utils.sigmoid_grad_poly_backend_2(
+                                            s0,
+                                            s1,
+                                            self.q_dtype,
+                                            backend=self.sigmoid_poly_backend,
+                                            degree=self.sigmoid_gradient_degree,
+                                            coeff_source=self.sigmoid_coeff_source,
+                                        )
                                     tSrSigGrad_cur[2 * v], tSrSigGrad_cur[2 * v + 1] = g0, g1
                             else:
                                 # SFU path (exp2 + rcp_approx)

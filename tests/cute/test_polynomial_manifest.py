@@ -2,6 +2,8 @@ import math
 import struct
 from pathlib import Path
 
+import pytest
+
 import flash_attn.cute.polynomial_manifest as polynomial_manifest
 from flash_attn.cute.polynomial_manifest import (
     GELU_BWD_D5_BF16,
@@ -14,6 +16,8 @@ from flash_attn.cute.polynomial_manifest import (
     audit_active_polynomials,
     assert_active_polynomials_in_sync,
     evaluate_centered_sigmoid_forward,
+    evaluate_flash_sigmoid_direct_d3,
+    evaluate_flash_sigmoid_direct_d4_gradient,
     evaluate_flash_sigmoid_exp2_poly,
     evaluate_sigmoid_attention_tail_safe,
     evaluate_odd_factorized_derivative,
@@ -234,6 +238,42 @@ def test_flash_sigmoid_bias_aware_exp2_d2_matches_score_distribution():
     ) / sum(weight * want * (1.0 - want) for weight, want in zip(weights, expected))
     assert relative_l1 < 0.0014
     assert gradient_relative_l1 < 0.0014
+
+
+def test_flash_sigmoid_direct_d3_d4_matches_score_distribution():
+    sequence_length = polynomial_manifest.FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH
+    scores = tuple(-6.0 + 0.025 * index for index in range(481))
+    weights = tuple(math.exp(-0.5 * score * score) for score in scores)
+    expected = tuple(
+        1.0 / (1.0 + math.exp(-(score - math.log(sequence_length))))
+        for score in scores
+    )
+    expected_gradient = tuple(value * (1.0 - value) for value in expected)
+    actual = tuple(evaluate_flash_sigmoid_direct_d3(score) for score in scores)
+    actual_gradient = tuple(
+        evaluate_flash_sigmoid_direct_d4_gradient(score) for score in scores
+    )
+
+    relative_l1 = sum(
+        weight * abs(got - want)
+        for weight, got, want in zip(weights, actual, expected)
+    ) / sum(weight * want for weight, want in zip(weights, expected))
+    gradient_relative_l1 = sum(
+        weight * abs(got - want)
+        for weight, got, want in zip(weights, actual_gradient, expected_gradient)
+    ) / sum(
+        weight * want for weight, want in zip(weights, expected_gradient)
+    )
+
+    assert relative_l1 < 0.014
+    assert gradient_relative_l1 < 0.014
+    assert min(actual) >= 0.0
+    assert min(actual_gradient) >= 0.0
+
+
+def test_flash_sigmoid_direct_fit_rejects_other_sequence_lengths():
+    with pytest.raises(ValueError, match="only supports sequence length 4096"):
+        evaluate_flash_sigmoid_direct_d3(0.0, sequence_length=2048)
 
 
 def test_sigmoid_poly_backward_stays_close_to_algebraic_reference_in_core_region():

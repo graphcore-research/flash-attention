@@ -10,7 +10,9 @@ from flash_attn.cute.polynomial_manifest import (
     FLASH_SIGMOID_DIRECT_D3_COEFFS,
     FLASH_SIGMOID_DIRECT_CLAMP,
     FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS,
+    FLASH_SIGMOID_DIRECT_GRAD_D4_FACTOR,
     FLASH_SIGMOID_DIRECT_MIDPOINTS,
+    FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
     FLASH_SIGMOID_DIRECT_SPLIT,
     get_softcap_tanh_analytical_backward_coeffs,
     get_softcap_tanh_forward_spec,
@@ -71,9 +73,11 @@ def _bf16x2_bits(value: float) -> int:
     return (bf16 << 16) | bf16
 
 
-def _f32_ptx_literal(value: float) -> str:
-    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
-    return f"0f{bits:08x}"
+def _scaled_direct_rows(
+    rows: tuple[tuple[float, ...], ...],
+) -> tuple[tuple[float, ...], ...]:
+    scale = 1.0 / FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH
+    return tuple(tuple(coefficient * scale for coefficient in row) for row in rows)
 
 
 def _tanh_analytical_wrapper_source(degree: int, source: str) -> str:
@@ -111,7 +115,7 @@ extern "C" __device__ __noinline__ unsigned int {symbol}(float x, float y) {{
 
 
 def _direct_sigmoid_wrapper_source(*, gradient: bool) -> str:
-    coeffs = (
+    coeffs = _scaled_direct_rows(
         FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS
         if gradient
         else FLASH_SIGMOID_DIRECT_D3_COEFFS
@@ -147,6 +151,14 @@ def _direct_sigmoid_wrapper_source(*, gradient: bool) -> str:
         horner.append(
             f"    value = __hfma2(z, value, c{coefficient});"
         )
+    active_mask = ""
+    if gradient:
+        active_mask = f"""
+    const unsigned int active = __hge2_mask(
+        input, {_bf16x2_literal(-FLASH_SIGMOID_DIRECT_CLAMP)}
+    );
+    value = fa4_select_bf16x2(active, value, zero);
+"""
     return f"""
 extern "C" __device__ __noinline__ unsigned int {symbol}(float x, float y) {{
     const __nv_bfloat162 input = fa4_pack_bf16x2(x, y);
@@ -159,14 +171,16 @@ extern "C" __device__ __noinline__ unsigned int {symbol}(float x, float y) {{
     );
     const __nv_bfloat162 z = __hsub2(clamped, midpoint);
 {chr(10).join(horner)}
-    return fa4_pack_bits(__hmax2(zero, value));
+    value = __hmax2(zero, value);
+{active_mask}
+    return fa4_pack_bits(value);
 }}
 """
 
 
 def _direct_sigmoid_inline_asm(*, gradient: bool) -> str:
     """Minimal packed-BF16 PTX for the production FlashSigmoid fits."""
-    rows = (
+    rows = _scaled_direct_rows(
         FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS
         if gradient
         else FLASH_SIGMOID_DIRECT_D3_COEFFS
@@ -174,18 +188,14 @@ def _direct_sigmoid_inline_asm(*, gradient: bool) -> str:
     degree = len(rows[0]) - 1
     registers = (
         "%fa4_input, %fa4_mask_lo, %fa4_mask_hi, %fa4_mask, "
-        "%fa4_clamped, %fa4_value"
+        "%fa4_clamped, %fa4_value, %fa4_active"
     )
     lines = [
         "{",
-        "\t.reg .pred %fa4_pos_lo, %fa4_pos_hi;",
         f"\t.reg .b32 {registers};",
         "\tcvt.rn.bf16x2.f32 %fa4_input, $2, $1;",
-        f"\tsetp.ge.f32 %fa4_pos_lo, $1, {_f32_ptx_literal(FLASH_SIGMOID_DIRECT_SPLIT)};",
-        f"\tsetp.ge.f32 %fa4_pos_hi, $2, {_f32_ptx_literal(FLASH_SIGMOID_DIRECT_SPLIT)};",
-        "\tselp.b32 %fa4_mask_lo, 0x0000ffff, 0, %fa4_pos_lo;",
-        "\tselp.b32 %fa4_mask_hi, 0xffff0000, 0, %fa4_pos_hi;",
-        "\tor.b32 %fa4_mask, %fa4_mask_lo, %fa4_mask_hi;",
+        f"\tmov.b32 %fa4_mask_lo, 0x{_bf16x2_bits(FLASH_SIGMOID_DIRECT_SPLIT):08x};",
+        "\tset.ge.u32.bf16x2 %fa4_mask, %fa4_input, %fa4_mask_lo;",
     ]
     lines.extend(
         [
@@ -212,59 +222,76 @@ def _direct_sigmoid_inline_asm(*, gradient: bool) -> str:
         [
             "\tmov.b32 %fa4_mask_lo, 0;",
             "\tmax.bf16x2 %fa4_value, %fa4_value, %fa4_mask_lo;",
-            "\tmov.b32 $0, %fa4_value;",
-            "}",
         ]
     )
+    if gradient:
+        lines.extend(
+            [
+                f"\tmov.b32 %fa4_mask_lo, 0x{_bf16x2_bits(-FLASH_SIGMOID_DIRECT_CLAMP):08x};",
+                "\tset.ge.u32.bf16x2 %fa4_active, %fa4_input, %fa4_mask_lo;",
+                "\tand.b32 %fa4_value, %fa4_value, %fa4_active;",
+            ]
+        )
+    lines.extend(["\tmov.b32 $0, %fa4_value;", "}"])
     return "\n".join(lines) + "\n"
 
 
 def _direct_sigmoid_with_grad_inline_asm() -> str:
-    """Evaluate production D3 sigmoid and D4 derivative with shared setup."""
-    forward_rows = FLASH_SIGMOID_DIRECT_D3_COEFFS
-    gradient_rows = FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS
+    """Evaluate production D3 sigmoid and its coupled D4 derivative."""
+    forward_rows = _scaled_direct_rows(FLASH_SIGMOID_DIRECT_D3_COEFFS)
+    gradient_factor = FLASH_SIGMOID_DIRECT_GRAD_D4_FACTOR
     lines = [
         "{",
-        "\t.reg .pred %fa4_pos_lo, %fa4_pos_hi;",
         "\t.reg .b32 %fa4_input, %fa4_mask_lo, %fa4_mask_hi, %fa4_mask, "
         "%fa4_clamped, %fa4_value, %fa4_grad;",
         "\tcvt.rn.bf16x2.f32 %fa4_input, $3, $2;",
-        f"\tsetp.ge.f32 %fa4_pos_lo, $2, {_f32_ptx_literal(FLASH_SIGMOID_DIRECT_SPLIT)};",
-        f"\tsetp.ge.f32 %fa4_pos_hi, $3, {_f32_ptx_literal(FLASH_SIGMOID_DIRECT_SPLIT)};",
-        "\tselp.b32 %fa4_mask_lo, 0x0000ffff, 0, %fa4_pos_lo;",
-        "\tselp.b32 %fa4_mask_hi, 0xffff0000, 0, %fa4_pos_hi;",
-        "\tor.b32 %fa4_mask, %fa4_mask_lo, %fa4_mask_hi;",
+        f"\tmov.b32 %fa4_mask_lo, 0x{_bf16x2_bits(FLASH_SIGMOID_DIRECT_SPLIT):08x};",
+        "\tset.ge.u32.bf16x2 %fa4_mask, %fa4_input, %fa4_mask_lo;",
         f"\tmov.b32 %fa4_mask_lo, 0x{_bf16x2_bits(FLASH_SIGMOID_DIRECT_CLAMP):08x};",
         "\tmin.bf16x2 %fa4_clamped, %fa4_input, %fa4_mask_lo;",
         f"\tmov.b32 %fa4_mask_lo, 0x{_bf16x2_bits(-FLASH_SIGMOID_DIRECT_CLAMP):08x};",
         "\tmax.bf16x2 %fa4_clamped, %fa4_clamped, %fa4_mask_lo;",
     ]
 
-    def append_horner(rows, output: str) -> None:
+    def append_horner_initial(rows, output: str) -> None:
         degree = len(rows[0]) - 1
         lines.append(
             f"\tlop3.b32 {output}, %fa4_mask, "
             f"0x{_bf16x2_bits(rows[1][degree]):08x}, "
             f"0x{_bf16x2_bits(rows[0][degree]):08x}, 0xca;"
         )
-        for idx in range(degree - 1, -1, -1):
-            lines.extend(
-                [
-                    f"\tlop3.b32 %fa4_mask_hi, %fa4_mask, "
-                    f"0x{_bf16x2_bits(rows[1][idx]):08x}, "
-                    f"0x{_bf16x2_bits(rows[0][idx]):08x}, 0xca;",
-                    f"\tfma.rn.bf16x2 {output}, %fa4_clamped, "
-                    f"{output}, %fa4_mask_hi;",
-                ]
-            )
 
-    append_horner(forward_rows, "%fa4_value")
-    append_horner(gradient_rows, "%fa4_grad")
+    def append_horner_step(rows, output: str, idx: int) -> None:
+        lines.extend(
+            [
+                f"\tlop3.b32 %fa4_mask_hi, %fa4_mask, "
+                f"0x{_bf16x2_bits(rows[1][idx]):08x}, "
+                f"0x{_bf16x2_bits(rows[0][idx]):08x}, 0xca;",
+                f"\tfma.rn.bf16x2 {output}, %fa4_clamped, "
+                f"{output}, %fa4_mask_hi;",
+            ]
+        )
+
+    append_horner_initial(forward_rows, "%fa4_value")
+    for step in range(len(forward_rows[0]) - 2, -1, -1):
+        append_horner_step(forward_rows, "%fa4_value", step)
     lines.extend(
         [
             "\tmov.b32 %fa4_mask_lo, 0;",
             "\tmax.bf16x2 %fa4_value, %fa4_value, %fa4_mask_lo;",
-            "\tmax.bf16x2 %fa4_grad, %fa4_grad, %fa4_mask_lo;",
+            f"\tlop3.b32 %fa4_mask_hi, %fa4_mask, "
+            f"0x{_bf16x2_bits(gradient_factor[1][1]):08x}, "
+            f"0x{_bf16x2_bits(gradient_factor[0][1]):08x}, 0xca;",
+            f"\tlop3.b32 %fa4_mask_lo, %fa4_mask, "
+            f"0x{_bf16x2_bits(gradient_factor[1][0]):08x}, "
+            f"0x{_bf16x2_bits(gradient_factor[0][0]):08x}, 0xca;",
+            "\tfma.rn.bf16x2 %fa4_grad, %fa4_clamped, "
+            "%fa4_mask_hi, %fa4_mask_lo;",
+            "\tmul.rn.bf16x2 %fa4_grad, %fa4_value, %fa4_grad;",
+        ]
+    )
+    lines.extend(
+        [
             "\tmov.b32 $0, %fa4_value;",
             "\tmov.b32 $1, %fa4_grad;",
             "}",
@@ -522,7 +549,11 @@ def get_handwritten_inline_asm(symbol: str) -> str:
     return _translate_body_to_inline_asm(body, symbol)
 
 
-def audit_handwritten_fast_path(symbol: str, max_instructions: int = 72) -> str:
+def audit_handwritten_fast_path(
+    symbol: str,
+    max_instructions: int = 72,
+    max_packed_fma: int | None = None,
+) -> str:
     """Fail closed if a supposedly compact polynomial wrapper regresses."""
     asm = get_handwritten_inline_asm(symbol)
     instructions = []
@@ -549,4 +580,9 @@ def audit_handwritten_fast_path(symbol: str, max_instructions: int = 72) -> str:
     fma_count = sum("fma.rn.bf16x2" in line for line in instructions)
     if fma_count == 0:
         raise RuntimeError(f"Handwritten polynomial {symbol} contains no packed BF16 FMA")
+    if max_packed_fma is not None and fma_count > max_packed_fma:
+        raise RuntimeError(
+            f"Handwritten polynomial {symbol} expanded to {fma_count} packed BF16 "
+            f"FMAs (budget {max_packed_fma})"
+        )
     return f"{symbol}[{len(instructions)} PTX instructions,{fma_count} packed FMA]"

@@ -29,10 +29,10 @@ EXP2_D3_COEFFS = (
 )
 
 # Direct B3 fits for n * sigmoid(score - log(n)) and its derivative at n=4096.
-# The runtime multiplies by 1/n after the packed polynomial, preserving the
-# small FlashSigmoid tail without cancellation. The two rows cover [-6, 1.25]
-# and [1.25, 6] in raw score coordinates. Coefficients are BF16-quantized and
-# weighted for RMS-normalized attention scores.
+# PTX generation scales the coefficients by 1/n, preserving the small
+# FlashSigmoid tail without a separate runtime multiply. The two rows cover
+# [-6, 1.25] and [1.25, 6] in raw score coordinates. Coefficients are
+# BF16-quantized and weighted for RMS-normalized attention scores.
 FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH = 4096
 FLASH_SIGMOID_DIRECT_CLAMP = 6.0
 FLASH_SIGMOID_DIRECT_SPLIT = 1.25
@@ -45,6 +45,14 @@ FLASH_SIGMOID_DIRECT_GRAD_D4_COEFFS = (
     (0.9921875, 1.0078125, 0.53125, 0.162109375, 0.0203857421875),
     (6.5625, -11.0, 10.125, -3.3125, 0.55078125),
 )
+# Coupled D4 gradient used by the fused backward evaluator.  Each row factors
+# as D3(score) * (a + b * score), preserving a true piecewise-D4 polynomial
+# while sharing the complete forward Horner chain.
+FLASH_SIGMOID_DIRECT_GRAD_D4_FACTOR = (
+    (1.0, -0.0087890625),
+    (1.0078125, -0.0028076171875),
+)
+
 
 @dataclass(frozen=True)
 class PolynomialSpec:
@@ -545,6 +553,45 @@ def evaluate_flash_sigmoid_exp2_poly(
     evaluate_exp2 = evaluate_exp2_d2 if degree == 2 else evaluate_exp2_d3
     q = evaluate_exp2(score * math.log2(math.e)) / sequence_length
     return q if degree == 2 else q * (1.0 - q)
+
+
+def evaluate_flash_sigmoid_direct_d3(
+    score: float,
+    sequence_length: int = FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
+) -> float:
+    """Reference for the production piecewise-D3 FlashSigmoid evaluator."""
+    if sequence_length != FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH:
+        raise ValueError(
+            "The direct D3 FlashSigmoid fit only supports sequence length "
+            f"{FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH}, got {sequence_length}"
+        )
+    clamped = min(
+        max(score, -FLASH_SIGMOID_DIRECT_CLAMP), FLASH_SIGMOID_DIRECT_CLAMP
+    )
+    row = FLASH_SIGMOID_DIRECT_D3_COEFFS[
+        int(score >= FLASH_SIGMOID_DIRECT_SPLIT)
+    ]
+    value = 0.0
+    for coefficient in reversed(row):
+        value = value * clamped + coefficient
+    return max(value, 0.0) / sequence_length
+
+
+def evaluate_flash_sigmoid_direct_d4_gradient(
+    score: float,
+    sequence_length: int = FLASH_SIGMOID_DIRECT_SEQUENCE_LENGTH,
+) -> float:
+    """Reference for the fused factored-D4 FlashSigmoid derivative."""
+    if score < -FLASH_SIGMOID_DIRECT_CLAMP:
+        return 0.0
+    probability = evaluate_flash_sigmoid_direct_d3(score, sequence_length)
+    clamped = min(
+        max(score, -FLASH_SIGMOID_DIRECT_CLAMP), FLASH_SIGMOID_DIRECT_CLAMP
+    )
+    intercept, slope = FLASH_SIGMOID_DIRECT_GRAD_D4_FACTOR[
+        int(score >= FLASH_SIGMOID_DIRECT_SPLIT)
+    ]
+    return probability * (intercept + slope * clamped)
 
 
 def evaluate_even_polynomial(x: float, coeffs: tuple[float, ...], clamp: float) -> float:

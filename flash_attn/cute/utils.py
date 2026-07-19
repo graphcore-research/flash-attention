@@ -25,7 +25,6 @@ from flash_attn.cute.handwritten_spline_ptx import (
 from flash_attn.cute.polynomial_manifest import (
     EXP2_D2_COEFFS,
     EXP2_D3_COEFFS,
-    FLASH_SIGMOID_DIRECT_CLAMP,
     get_default_output_gate_coeffs,
     get_sigmoid_forward_spec,
     get_sigmoid_gradient_spec,
@@ -110,17 +109,23 @@ def audit_attention_handwritten_fast_path(
         if degree != 3 or coeff_source != "current":
             raise ValueError("Direct FlashSigmoid forward supports current D3 only")
         symbol = "fa4_flash_sigmoid_direct_d3_bf16x2"
-        return audit_handwritten_fast_path(symbol, max_instructions=24)
+        return audit_handwritten_fast_path(
+            symbol, max_instructions=24, max_packed_fma=3
+        )
     if family == "flash_sigmoid_direct_grad":
         if degree != 4 or coeff_source != "current":
             raise ValueError("Direct FlashSigmoid gradient supports current D4 only")
         symbol = "fa4_flash_sigmoid_direct_grad_d4_bf16x2"
-        return audit_handwritten_fast_path(symbol, max_instructions=24)
+        return audit_handwritten_fast_path(
+            symbol, max_instructions=24, max_packed_fma=4
+        )
     if family == "flash_sigmoid_direct_with_grad":
         if degree != 4 or coeff_source != "current":
             raise ValueError("Fused direct FlashSigmoid D3/D4 supports current coefficients only")
         symbol = "fa4_flash_sigmoid_direct_d3_grad_d4_bf16x2"
-        return audit_handwritten_fast_path(symbol, max_instructions=36)
+        return audit_handwritten_fast_path(
+            symbol, max_instructions=24, max_packed_fma=4
+        )
     symbol = _handwritten_symbol(family, degree, coeff_source)
     return audit_handwritten_fast_path(symbol)
 
@@ -1422,19 +1427,18 @@ def flash_sigmoid_exp2_poly_2(
     """Evaluate auto-biased FlashSigmoid without materializing the bias.
 
     D2 is the legacy range-reduced exp2 experiment. D3 evaluates a direct
-    polynomial fit of ``n * sigmoid(score - log(n))`` and scales by ``1/n``.
+    polynomial fit of ``sigmoid(score - log(n))`` with pre-scaled coefficients.
     """
     if const_expr(degree != 2 and degree != 3):
         raise ValueError(f"Auto-biased FlashSigmoid only supports D2/D3, got D{degree}")
     if const_expr(degree == 3):
-        scaled_x, scaled_y = call_handwritten_bf16x2_f32x2(
+        return call_handwritten_bf16x2_f32x2(
             score_x,
             score_y,
             "fa4_flash_sigmoid_direct_d3_bf16x2",
             loc=loc,
             ip=ip,
         )
-        return scaled_x * inv_sequence_length, scaled_y * inv_sequence_length
 
     log2_e = Float32(math.log2(math.e))
     exp_x, exp_y = e2e_d2_asm2(
@@ -1457,18 +1461,12 @@ def flash_sigmoid_direct_grad_poly_2(
     ip=None,
 ) -> Tuple[Float32, Float32]:
     """Direct D4 fit of the auto-biased FlashSigmoid score derivative."""
-    scaled_x, scaled_y = call_handwritten_bf16x2_f32x2(
+    return call_handwritten_bf16x2_f32x2(
         score_x,
         score_y,
         "fa4_flash_sigmoid_direct_grad_d4_bf16x2",
         loc=loc,
         ip=ip,
-    )
-    zero = Float32(0.0)
-    lower = Float32(-FLASH_SIGMOID_DIRECT_CLAMP)
-    return (
-        select_(score_x >= lower, scaled_x * inv_sequence_length, zero),
-        select_(score_y >= lower, scaled_y * inv_sequence_length, zero),
     )
 
 
@@ -1509,17 +1507,11 @@ def flash_sigmoid_direct_with_grad_poly_2(
     gradient_x, gradient_y = unpack_bf16x2_f32(
         packed_gradient, loc=loc, ip=ip
     )
-    probability_x *= inv_sequence_length
-    probability_y *= inv_sequence_length
-    gradient_x *= inv_sequence_length
-    gradient_y *= inv_sequence_length
-    zero = Float32(0.0)
-    lower = Float32(-FLASH_SIGMOID_DIRECT_CLAMP)
     return (
         probability_x,
         probability_y,
-        select_(score_x >= lower, gradient_x, zero),
-        select_(score_y >= lower, gradient_y, zero),
+        gradient_x,
+        gradient_y,
     )
 
 

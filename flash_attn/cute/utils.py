@@ -2019,6 +2019,29 @@ def unpack_bf16x2_f32(src: cutlass.Int32, *, loc=None, ip=None) -> Tuple[Float32
 
 
 @dsl_user_op
+def unpack_f16x2_f32(src: cutlass.Int32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    out_f32x2 = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [cutlass.Int32(src).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 r0;\n\t"
+        ".reg .b16 h0, h1;\n\t"
+        "mov.b32 r0, $2;\n\t"
+        "mov.b32 {h0, h1}, r0;\n\t"
+        "cvt.f32.f16 $0, h0;\n\t"
+        "cvt.f32.f16 $1, h1;\n\t"
+        "}\n",
+        "=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
+    out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
+    return out0, out1
+
+
+@dsl_user_op
 def call_handwritten_bf16x2_f32x2(
     x: Float32, y: Float32, symbol: cutlass.Constexpr[str], *, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
@@ -2035,6 +2058,25 @@ def call_handwritten_bf16x2_f32x2(
         )
     )
     return unpack_bf16x2_f32(packed, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def call_handwritten_f16x2_f32x2(
+    x: Float32, y: Float32, symbol: cutlass.Constexpr[str], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    asm = get_handwritten_inline_asm(str(symbol))
+    packed = cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip), Float32(y).ir_value(loc=loc, ip=ip)],
+            asm,
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+    return unpack_f16x2_f32(packed, loc=loc, ip=ip)
 
 
 @overload
@@ -2220,6 +2262,347 @@ def ex2_emulation_2_linear(x: Float32, y: Float32, *, loc=None, ip=None) -> Tupl
     x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2_x, loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2_y, loc=loc, ip=ip)
     return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_hinge(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """exp2 via a continuous two-piece linear hinge fit.
+
+    Writing the spline as ``c0 + c1*f + dc1*max(f - 0.5, 0)`` avoids four
+    scalar coefficient selects. The approximation uses two packed FP32 FMAs
+    after the same exact range reduction as ``ex2_emulation_2``. Its maximum
+    relative error over one fractional period is about 1.06%.
+    """
+    c1 = 0.82085254
+    c0 = 0.98946118
+    c1_delta = 0.34246067
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    hinge = (
+        cute.arch.fmax(xy_frac[0] - 0.5, 0.0),
+        cute.arch.fmax(xy_frac[1] - 0.5, 0.0),
+    )
+    frac_ex2 = fma_packed_f32x2(xy_frac, (c1, c1), (c0, c0))
+    frac_ex2 = fma_packed_f32x2(
+        hinge, (c1_delta, c1_delta), frac_ex2
+    )
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_hinge_softmax(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Two-piece exp2 fit that preserves the softmax range-reduction invariants.
+
+    The fitted midpoint is 1.399025665451782, while the endpoint constraints
+    p(0)=1 and p(1)=2 determine both segment slopes. This retains the same two
+    packed FMA hinge form as ``ex2_emulation_2_linear_hinge`` but guarantees
+    that a row maximum contributes exactly one and that adjacent exponent
+    intervals meet continuously.
+    """
+    c1 = 0.7980513309035642
+    c1_delta = 0.40389733819287166
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    hinge = (
+        cute.arch.fmax(xy_frac[0] - 0.5, 0.0),
+        cute.arch.fmax(xy_frac[1] - 0.5, 0.0),
+    )
+    frac_ex2 = fma_packed_f32x2(xy_frac, (c1, c1), (1.0, 1.0))
+    frac_ex2 = fma_packed_f32x2(
+        hinge, (c1_delta, c1_delta), frac_ex2
+    )
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_quadratic_softmax(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-constrained quadratic exp2 approximation for online softmax.
+
+    For fractional ``f`` in [0, 1], evaluate
+    ``1 + f * (c1 + c2 * f)``. The coefficients minimize maximum relative
+    error subject to p(0)=1 and p(1)=2. The fractional approximation needs
+    two packed FP32 FMAs and no branch, select, or hinge operation.
+    """
+    c1 = 0.6602339719000094
+    c2 = 0.33976602809999057
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+
+    inner = fma_packed_f32x2(xy_frac, (c2, c2), (c1, c1))
+    frac_ex2 = fma_packed_f32x2(xy_frac, inner, (1.0, 1.0))
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_quadratic_softmax_noclamp(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe D2 exp2 for finite live logits known to exceed -127.
+
+    FA4 keeps masked edge fragments on the SFU path. This experimental
+    forward backend removes the lower clamp for fully valid fragments; it
+    must not be used where either input can be masked or below -127.
+    """
+    c1 = 0.6602339719000094
+    c2 = 0.33976602809999057
+
+    fp32_round_int = float(2**23 + 2**22)
+    xy_input = (x, y)
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_input, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_input, xy_rounded_back)
+
+    inner = fma_packed_f32x2(xy_frac, (c2, c2), (c1, c1))
+    frac_ex2 = fma_packed_f32x2(xy_frac, inner, (1.0, 1.0))
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_hinge_f16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Two-piece FP16x2 fractional exp2 with exact FP32 range reduction."""
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_f16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_pwl2_hinge_f16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_softmax(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe affine exp2 with one packed FP32 fractional FMA.
+
+    The endpoint constraints p(0)=1 and p(1)=2 uniquely give p(f)=1+f.
+    Exact FP32 range reduction and exponent reconstruction are unchanged.
+    """
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = fma_packed_f32x2(xy_frac, (1.0, 1.0), (1.0, 1.0))
+
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_softmax_f16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe affine exp2 with one packed FP16 fractional FMA."""
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_f16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_pwl1_safe_f16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_hinge_softmax_f16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe two-piece exp2 with packed FP16 fractional evaluation."""
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_f16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_pwl2_safe_f16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_linear_hinge_softmax_bf16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe two-piece exp2 with packed BF16 fractional evaluation."""
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_bf16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_pwl2_safe_bf16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_quadratic_softmax_f16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe D2 exp2 with packed FP16 fractional evaluation.
+
+    Range reduction and exponent reconstruction remain FP32. The rounded
+    coefficients sum to one, preserving p(0)=1 and p(1)=2 in FP16.
+    """
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_f16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_d2_safe_f16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_2_quadratic_softmax_bf16(
+    x: Float32, y: Float32, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    """Endpoint-safe D2 exp2 with packed BF16 fractional evaluation."""
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
+    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    frac_ex2 = call_handwritten_bf16x2_f32x2(
+        xy_frac[0],
+        xy_frac[1],
+        "fa4_exp2_fractional_d2_safe_bf16x2",
+        loc=loc,
+        ip=ip,
+    )
+    x_out = combine_int_frac_ex2(xy_rounded[0], frac_ex2[0], loc=loc, ip=ip)
+    y_out = combine_int_frac_ex2(xy_rounded[1], frac_ex2[1], loc=loc, ip=ip)
+    return x_out, y_out
+
+
+@dsl_user_op
+def ex2_emulation_backend_2(
+    x: Float32,
+    y: Float32,
+    backend: cutlass.Constexpr[str] = "d3",
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Dispatch a compile-time-selected packed exp2 emulation backend."""
+    if const_expr(backend == "d3"):
+        return ex2_emulation_2(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl2"):
+        return ex2_emulation_2_linear_hinge(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl1_safe"):
+        return ex2_emulation_2_linear_softmax(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl1_safe_f16"):
+        return ex2_emulation_2_linear_softmax_f16(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl2_safe"):
+        return ex2_emulation_2_linear_hinge_softmax(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl2_safe_f16"):
+        return ex2_emulation_2_linear_hinge_softmax_f16(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl2_safe_bf16"):
+        return ex2_emulation_2_linear_hinge_softmax_bf16(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "d2_safe"):
+        return ex2_emulation_2_quadratic_softmax(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "d2_safe_noclamp"):
+        return ex2_emulation_2_quadratic_softmax_noclamp(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "d2_safe_f16"):
+        return ex2_emulation_2_quadratic_softmax_f16(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "d2_safe_bf16"):
+        return ex2_emulation_2_quadratic_softmax_bf16(x, y, loc=loc, ip=ip)
+    if const_expr(backend == "pwl2_f16"):
+        return ex2_emulation_2_linear_hinge_f16(x, y, loc=loc, ip=ip)
+    raise ValueError(f"Unsupported exp2 emulation backend: {backend!r}")
 
 
 def _select_pwl_coeffs(frac: Float32, slopes: Tuple[float, ...], intercepts: Tuple[float, ...]):

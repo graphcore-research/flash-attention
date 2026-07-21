@@ -49,6 +49,12 @@ _HANDWRITTEN_SYMBOLS = {
     "fa4_flash_sigmoid_direct_d3_bf16x2",
     "fa4_flash_sigmoid_direct_grad_d4_bf16x2",
     "fa4_flash_sigmoid_direct_d3_grad_d4_bf16x2",
+    "fa4_exp2_fractional_pwl2_hinge_f16x2",
+    "fa4_exp2_fractional_pwl1_safe_f16x2",
+    "fa4_exp2_fractional_pwl2_safe_f16x2",
+    "fa4_exp2_fractional_pwl2_safe_bf16x2",
+    "fa4_exp2_fractional_d2_safe_f16x2",
+    "fa4_exp2_fractional_d2_safe_bf16x2",
 }
 
 
@@ -71,6 +77,122 @@ def _bf16x2_bits(value: float) -> int:
     bits += 0x7FFF + ((bits >> 16) & 1)
     bf16 = (bits >> 16) & 0xFFFF
     return (bf16 << 16) | bf16
+
+
+def _f16x2_bits(value: float) -> int:
+    f16 = struct.unpack("<H", struct.pack("<e", float(value)))[0]
+    return (f16 << 16) | f16
+
+
+def _exp2_fractional_pwl2_hinge_f16x2_inline_asm() -> str:
+    """Two continuous linear pieces for 2**x on x in [0, 1)."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_hinge, %fa4_value, %fa4_coeff;",
+        "\tcvt.rn.f16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.5):08x};",
+        "\tsub.rn.f16x2 %fa4_hinge, %fa4_input, %fa4_coeff;",
+        "\tmov.b32 %fa4_coeff, 0;",
+        "\tmax.f16x2 %fa4_hinge, %fa4_hinge, %fa4_coeff;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.82080078125):08x};",
+        f"\tmov.b32 %fa4_value, 0x{_f16x2_bits(0.9892578125):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_input, %fa4_coeff, %fa4_value;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.342529296875):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_hinge, %fa4_coeff, %fa4_value;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _exp2_fractional_pwl1_safe_f16x2_inline_asm() -> str:
+    """Endpoint-constrained affine 2**x approximation in packed FP16."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_value, %fa4_one;",
+        "\tcvt.rn.f16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_one, 0x{_f16x2_bits(1.0):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_input, %fa4_one, %fa4_one;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _exp2_fractional_pwl2_safe_f16x2_inline_asm() -> str:
+    """Endpoint-constrained two-piece linear fit in packed FP16."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_hinge, %fa4_value, %fa4_coeff;",
+        "\tcvt.rn.f16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.5):08x};",
+        "\tsub.rn.f16x2 %fa4_hinge, %fa4_input, %fa4_coeff;",
+        "\tmov.b32 %fa4_coeff, 0;",
+        "\tmax.f16x2 %fa4_hinge, %fa4_hinge, %fa4_coeff;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.7978515625):08x};",
+        f"\tmov.b32 %fa4_value, 0x{_f16x2_bits(1.0):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_input, %fa4_coeff, %fa4_value;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.40380859375):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_hinge, %fa4_coeff, %fa4_value;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _exp2_fractional_pwl2_safe_bf16x2_inline_asm() -> str:
+    """Endpoint-constrained two-piece linear fit in packed BF16."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_hinge, %fa4_value, %fa4_coeff;",
+        "\tcvt.rn.bf16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_coeff, 0x{_bf16x2_bits(0.5):08x};",
+        "\tsub.rn.bf16x2 %fa4_hinge, %fa4_input, %fa4_coeff;",
+        "\tmov.b32 %fa4_coeff, 0;",
+        "\tmax.bf16x2 %fa4_hinge, %fa4_hinge, %fa4_coeff;",
+        f"\tmov.b32 %fa4_coeff, 0x{_bf16x2_bits(0.796875):08x};",
+        f"\tmov.b32 %fa4_value, 0x{_bf16x2_bits(1.0):08x};",
+        "\tfma.rn.bf16x2 %fa4_value, %fa4_input, %fa4_coeff, %fa4_value;",
+        f"\tmov.b32 %fa4_coeff, 0x{_bf16x2_bits(0.404296875):08x};",
+        "\tfma.rn.bf16x2 %fa4_value, %fa4_hinge, %fa4_coeff, %fa4_value;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _exp2_fractional_d2_safe_f16x2_inline_asm() -> str:
+    """Endpoint-constrained quadratic for 2**x on x in [0, 1)."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_value, %fa4_coeff;",
+        "\tcvt.rn.f16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(0.33984375):08x};",
+        f"\tmov.b32 %fa4_value, 0x{_f16x2_bits(0.66015625):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_input, %fa4_coeff, %fa4_value;",
+        f"\tmov.b32 %fa4_coeff, 0x{_f16x2_bits(1.0):08x};",
+        "\tfma.rn.f16x2 %fa4_value, %fa4_input, %fa4_value, %fa4_coeff;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _exp2_fractional_d2_safe_bf16x2_inline_asm() -> str:
+    """Endpoint-constrained quadratic in packed BF16."""
+    lines = [
+        "{",
+        "\t.reg .b32 %fa4_input, %fa4_value, %fa4_coeff;",
+        "\tcvt.rn.bf16x2.f32 %fa4_input, $2, $1;",
+        f"\tmov.b32 %fa4_coeff, 0x{_bf16x2_bits(0.33984375):08x};",
+        f"\tmov.b32 %fa4_value, 0x{_bf16x2_bits(0.66015625):08x};",
+        "\tfma.rn.bf16x2 %fa4_value, %fa4_input, %fa4_coeff, %fa4_value;",
+        f"\tmov.b32 %fa4_coeff, 0x{_bf16x2_bits(1.0):08x};",
+        "\tfma.rn.bf16x2 %fa4_value, %fa4_input, %fa4_value, %fa4_coeff;",
+        "\tmov.b32 $0, %fa4_value;",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _scaled_direct_rows(
@@ -544,6 +666,18 @@ def get_handwritten_inline_asm(symbol: str) -> str:
         return _direct_sigmoid_inline_asm(gradient=True)
     if symbol == "fa4_flash_sigmoid_direct_d3_grad_d4_bf16x2":
         return _direct_sigmoid_with_grad_inline_asm()
+    if symbol == "fa4_exp2_fractional_pwl2_hinge_f16x2":
+        return _exp2_fractional_pwl2_hinge_f16x2_inline_asm()
+    if symbol == "fa4_exp2_fractional_pwl1_safe_f16x2":
+        return _exp2_fractional_pwl1_safe_f16x2_inline_asm()
+    if symbol == "fa4_exp2_fractional_pwl2_safe_f16x2":
+        return _exp2_fractional_pwl2_safe_f16x2_inline_asm()
+    if symbol == "fa4_exp2_fractional_pwl2_safe_bf16x2":
+        return _exp2_fractional_pwl2_safe_bf16x2_inline_asm()
+    if symbol == "fa4_exp2_fractional_d2_safe_f16x2":
+        return _exp2_fractional_d2_safe_f16x2_inline_asm()
+    if symbol == "fa4_exp2_fractional_d2_safe_bf16x2":
+        return _exp2_fractional_d2_safe_bf16x2_inline_asm()
     ptx = get_handwritten_spline_ptx()
     body = _extract_function_body(ptx, symbol)
     return _translate_body_to_inline_asm(body, symbol)
@@ -577,12 +711,15 @@ def audit_handwritten_fast_path(
             f"Handwritten polynomial {symbol} expanded to {len(instructions)} PTX "
             f"instructions (budget {max_instructions})"
         )
-    fma_count = sum("fma.rn.bf16x2" in line for line in instructions)
+    fma_count = sum(
+        "fma.rn.bf16x2" in line or "fma.rn.f16x2" in line
+        for line in instructions
+    )
     if fma_count == 0:
-        raise RuntimeError(f"Handwritten polynomial {symbol} contains no packed BF16 FMA")
+        raise RuntimeError(f"Handwritten polynomial {symbol} contains no packed FMA")
     if max_packed_fma is not None and fma_count > max_packed_fma:
         raise RuntimeError(
-            f"Handwritten polynomial {symbol} expanded to {fma_count} packed BF16 "
+            f"Handwritten polynomial {symbol} expanded to {fma_count} packed "
             f"FMAs (budget {max_packed_fma})"
         )
     return f"{symbol}[{len(instructions)} PTX instructions,{fma_count} packed FMA]"

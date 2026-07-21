@@ -284,6 +284,8 @@ def _flash_attn_fwd(
     sigmoid_poly_backend: str = "cute",
     sigmoid_degree: int = 3,
     sigmoid_coeff_source: str = "current",
+    exp2_emu_backend: str = "d3",
+    exp2_emu_freq: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -308,6 +310,29 @@ def _flash_attn_fwd(
         sigmoid_poly_backend=sigmoid_poly_backend,
         sigmoid_coeff_source=sigmoid_coeff_source,
     )
+    if exp2_emu_backend not in (
+        "d3",
+        "pwl2",
+        "pwl1_safe",
+        "pwl1_safe_f16",
+        "pwl2_safe",
+        "pwl2_safe_f16",
+        "pwl2_safe_bf16",
+        "d2_safe",
+        "d2_safe_noclamp",
+        "d2_safe_f16",
+        "d2_safe_bf16",
+        "pwl2_f16",
+    ):
+        raise ValueError(f"Unsupported exp2_emu_backend={exp2_emu_backend!r}")
+    if exp2_emu_freq is not None and (
+        exp2_emu_freq < 0
+        or (exp2_emu_freq != 0 and (exp2_emu_freq < 4 or exp2_emu_freq % 2))
+    ):
+        raise ValueError(
+            "exp2_emu_freq must be 0 or an even integer >= 4, "
+            f"got {exp2_emu_freq}"
+        )
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -612,6 +637,8 @@ def _flash_attn_fwd(
         sigmoid_poly_backend,
         sigmoid_degree,
         sigmoid_coeff_source,
+        exp2_emu_backend,
+        exp2_emu_freq,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -723,6 +750,8 @@ def _flash_attn_fwd(
                 sigmoid_poly_backend=sigmoid_poly_backend,
                 sigmoid_degree=sigmoid_degree,
                 sigmoid_coeff_source=sigmoid_coeff_source,
+                ex2_emu_backend=exp2_emu_backend,
+                ex2_emu_freq_override=exp2_emu_freq,
             )
         else:
             raise ValueError(
@@ -888,11 +917,40 @@ def _flash_attn_bwd(
     output_gate_activation: Optional[torch.Tensor] = None,
     output_gate_use_spline: bool = False,
     return_output_gate_grad: bool = False,
+    exp2_emu_backend: str = "d3",
+    exp2_emu_freq: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
     if sigmoid_gradient_degree is None:
         sigmoid_gradient_degree = sigmoid_degree
+    if exp2_emu_backend not in (
+        "d3",
+        "pwl2",
+        "pwl1_safe",
+        "pwl1_safe_f16",
+        "pwl2_safe",
+        "pwl2_safe_f16",
+        "pwl2_safe_bf16",
+        "d2_safe",
+        "d2_safe_noclamp",
+        "d2_safe_f16",
+        "d2_safe_bf16",
+        "pwl2_f16",
+    ):
+        raise ValueError(f"Unsupported exp2_emu_backend={exp2_emu_backend!r}")
+    if exp2_emu_freq < 0 or (
+        exp2_emu_freq != 0 and (exp2_emu_freq < 4 or exp2_emu_freq % 2)
+    ):
+        raise ValueError(
+            "exp2_emu_freq must be 0 or an even integer >= 4, "
+            f"got {exp2_emu_freq}"
+        )
+    if exp2_emu_backend == "d2_safe_noclamp" and exp2_emu_freq != 0:
+        raise ValueError(
+            "d2_safe_noclamp is restricted to forward live fragments; "
+            "backward exp2 emulation must remain disabled"
+        )
 
     num_head, head_dim = q.shape[-2:]
 
@@ -1407,6 +1465,8 @@ def _flash_attn_bwd(
             sigmoid_degree,
             sigmoid_gradient_degree,
             sigmoid_coeff_source,
+            exp2_emu_backend,
+            exp2_emu_freq,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1504,6 +1564,8 @@ def _flash_attn_bwd(
                 sigmoid_degree=sigmoid_degree,
                 sigmoid_gradient_degree=sigmoid_gradient_degree,
                 sigmoid_coeff_source=sigmoid_coeff_source,
+                ex2_emu_backend=exp2_emu_backend,
+                ex2_emu_freq=exp2_emu_freq,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).

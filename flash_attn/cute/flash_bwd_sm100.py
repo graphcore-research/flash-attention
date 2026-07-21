@@ -94,6 +94,8 @@ class FlashAttentionBackwardSm100:
         sigmoid_degree: int = 3,
         sigmoid_gradient_degree: int | None = None,
         sigmoid_coeff_source: str = "current",
+        ex2_emu_freq: int = 0,
+        ex2_emu_backend: str = "d3",
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -164,6 +166,8 @@ class FlashAttentionBackwardSm100:
             sigmoid_degree if sigmoid_gradient_degree is None else sigmoid_gradient_degree
         )
         self.sigmoid_coeff_source = sigmoid_coeff_source
+        self.ex2_emu_freq = ex2_emu_freq
+        self.ex2_emu_backend = ex2_emu_backend
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -3297,8 +3301,26 @@ class FlashAttentionBackwardSm100:
                                 (softmax_scale_log2, softmax_scale_log2),
                                 (-lse_pair[0], -lse_pair[1]),
                             )
-                            tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
-                            tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                            if const_expr(
+                                self.ex2_emu_freq == 0
+                                or (2 * v) % self.ex2_emu_freq
+                                < self.ex2_emu_freq - 4
+                            ):
+                                tSrS_cur[2 * v] = cute.math.exp2(
+                                    tSrS_cur[2 * v], fastmath=True
+                                )
+                                tSrS_cur[2 * v + 1] = cute.math.exp2(
+                                    tSrS_cur[2 * v + 1], fastmath=True
+                                )
+                            else:
+                                (
+                                    tSrS_cur[2 * v],
+                                    tSrS_cur[2 * v + 1],
+                                ) = utils.ex2_emulation_backend_2(
+                                    tSrS_cur[2 * v],
+                                    tSrS_cur[2 * v + 1],
+                                    backend=self.ex2_emu_backend,
+                                )
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()

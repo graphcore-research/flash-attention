@@ -5,6 +5,10 @@ from pathlib import Path
 import pytest
 
 import flash_attn.cute.polynomial_manifest as polynomial_manifest
+from flash_attn.cute.handwritten_spline_ptx import (
+    audit_handwritten_fast_path,
+    get_handwritten_inline_asm,
+)
 from flash_attn.cute.polynomial_manifest import (
     GELU_BWD_D5_BF16,
     GELU_FWD_D5_BF16,
@@ -60,6 +64,101 @@ def test_polynomial_coefficient_audit_reports_all_active_defaults():
         "gelu_bwd_d5_bf16",
         "swish_d3_composed",
     )
+
+
+def test_exp2_pwl2_hinge_keeps_compact_f16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_pwl2_hinge_f16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.f16x2") == 2
+    assert "max.f16x2" in asm
+    assert not any(op in asm for op in ("ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=11,
+        max_packed_fma=2,
+    ) == f"{symbol}[11 PTX instructions,2 packed FMA]"
+
+
+def test_exp2_pwl1_safe_keeps_single_fma_f16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_pwl1_safe_f16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.f16x2") == 1
+    assert "0x3c003c00" in asm
+    assert not any(op in asm for op in ("max.", "ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=4,
+        max_packed_fma=1,
+    ) == f"{symbol}[4 PTX instructions,1 packed FMA]"
+
+
+def test_exp2_pwl2_safe_keeps_compact_f16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_pwl2_safe_f16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.f16x2") == 2
+    assert "max.f16x2" in asm
+    assert "0x3a623a62" in asm
+    assert "0x36763676" in asm
+    assert "0x3c003c00" in asm
+    assert not any(op in asm for op in ("ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=11,
+        max_packed_fma=2,
+    ) == f"{symbol}[11 PTX instructions,2 packed FMA]"
+
+
+def test_exp2_pwl2_safe_keeps_compact_bf16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_pwl2_safe_bf16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.bf16x2") == 2
+    assert "max.bf16x2" in asm
+    assert "0x3f4c3f4c" in asm
+    assert "0x3ecf3ecf" in asm
+    assert "0x3f803f80" in asm
+    assert not any(op in asm for op in ("ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=11,
+        max_packed_fma=2,
+    ) == f"{symbol}[11 PTX instructions,2 packed FMA]"
+
+
+def test_exp2_d2_safe_keeps_compact_f16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_d2_safe_f16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.f16x2") == 2
+    assert "0x35703570" in asm
+    assert "0x39483948" in asm
+    assert "0x3c003c00" in asm
+    assert "max.f16x2" not in asm
+    assert not any(op in asm for op in ("ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=7,
+        max_packed_fma=2,
+    ) == f"{symbol}[7 PTX instructions,2 packed FMA]"
+
+
+def test_exp2_d2_safe_keeps_compact_bf16x2_instruction_shape():
+    symbol = "fa4_exp2_fractional_d2_safe_bf16x2"
+    asm = get_handwritten_inline_asm(symbol)
+
+    assert asm.count("fma.rn.bf16x2") == 2
+    assert "0x3eae3eae" in asm
+    assert "0x3f293f29" in asm
+    assert "0x3f803f80" in asm
+    assert not any(op in asm for op in ("ex2.", "rcp.", "lg2.", "tanh"))
+    assert audit_handwritten_fast_path(
+        symbol,
+        max_instructions=7,
+        max_packed_fma=2,
+    ) == f"{symbol}[7 PTX instructions,2 packed FMA]"
 
 
 def test_source_aware_lookup_defaults_and_sollya_rows():

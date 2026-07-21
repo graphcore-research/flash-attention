@@ -128,6 +128,8 @@ class FlashAttentionForwardSm100:
         sigmoid_poly_backend: str = "cute",
         sigmoid_degree: int = 3,
         sigmoid_coeff_source: str = "current",
+        ex2_emu_freq_override: int | None = None,
+        ex2_emu_backend: str = "d3",
     ):
         self.output_gate_use_spline = output_gate_use_spline
         self.sigmoid_attention = sigmoid_attention
@@ -137,6 +139,8 @@ class FlashAttentionForwardSm100:
         self.sigmoid_poly_backend = sigmoid_poly_backend
         self.sigmoid_degree = sigmoid_degree
         self.sigmoid_coeff_source = sigmoid_coeff_source
+        self.ex2_emu_freq_override = ex2_emu_freq_override
+        self.ex2_emu_backend = ex2_emu_backend
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -433,6 +437,8 @@ class FlashAttentionForwardSm100:
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
             if const_expr(self.head_dim_padded > 64 and self.is_causal):
                 self.ex2_emu_freq = 10
+        if const_expr(self.ex2_emu_freq_override is not None):
+            self.ex2_emu_freq = self.ex2_emu_freq_override
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
@@ -2260,6 +2266,7 @@ class FlashAttentionForwardSm100:
                 tSrP_r2t,
                 ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
                 ex2_emu_start_frg=self.ex2_emu_start_frg,
+                ex2_emu_backend=self.ex2_emu_backend,
             )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

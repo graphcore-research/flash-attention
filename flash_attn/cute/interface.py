@@ -94,7 +94,10 @@ try:
     from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
     from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
     from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-    from flash_attn.cute.fp4_flash_bwd_sm100 import FlashAttentionBackwardSm100 as FP4FlashAttentionBackwardSm100
+    from flash_attn.cute.fp4_flash_bwd_sm100 import (
+        FP4_BWD_DS_QUANT_BOOST,
+        FlashAttentionBackwardSm100 as FP4FlashAttentionBackwardSm100,
+    )
     from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
     from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
     _flash_bwd_import_error = None
@@ -104,6 +107,7 @@ except Exception as exc:
     FlashAttentionBackwardSm90 = None
     FlashAttentionBackwardSm100 = None
     FP4FlashAttentionBackwardSm100 = None
+    FP4_BWD_DS_QUANT_BOOST = None
     FlashAttentionBackwardSm120 = None
     FlashAttentionBackwardPostprocess = None
     _flash_bwd_import_error = exc
@@ -611,6 +615,60 @@ def _quantize_nvfp4_transpose_from_bf16(x: torch.Tensor) -> Tuple[torch.Tensor, 
     return packed, scale
 
 
+def _quantize_mxfp4_transpose_from_bf16(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build vec32 MXFP4 column metadata for the mixed FP8-dS x FP4-Q/K MMA.
+
+    MX scale factors are powers of two encoded as E8M0.  Rounding the scale up
+    keeps every normalized value within the finite E2M1 range.  The mixed
+    instruction's unpacking TMA path requires its contiguous FP4 dimension to
+    be aligned to 128 elements, so the returned sequence dimension retains
+    zero padding to that boundary.
+    """
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"Expected BF16/FP16 input, got {x.dtype}")
+    batch_size, seqlen, num_heads, head_dim = x.shape
+    seqlen_padded = math.ceil(seqlen / 128) * 128
+    seqlen_groups = seqlen_padded // 32
+    if is_fake_mode():
+        return (
+            torch.empty(
+                batch_size,
+                head_dim,
+                num_heads,
+                seqlen_padded // 2,
+                device=x.device,
+                dtype=torch.uint8,
+            ),
+            torch.empty(
+                batch_size,
+                head_dim,
+                num_heads,
+                seqlen_groups,
+                device=x.device,
+                dtype=torch.float8_e8m0fnu,
+            ),
+        )
+
+    x_t = x.permute(0, 2, 3, 1).contiguous().to(torch.float32)  # (B, H, D, S)
+    if seqlen_padded != seqlen:
+        x_t = torch.nn.functional.pad(x_t, (0, seqlen_padded - seqlen))
+    groups = x_t.view(batch_size, num_heads, head_dim, seqlen_groups, 32)
+    amax = groups.abs().amax(dim=-1)
+    raw_scale = amax / 6.0
+    safe_raw_scale = torch.where(amax == 0, torch.ones_like(raw_scale), raw_scale)
+    scale_exp = torch.ceil(torch.log2(safe_raw_scale)).clamp(-127, 127)
+    scale_f32 = torch.exp2(scale_exp)
+    norm = groups / scale_f32.unsqueeze(-1)
+    fp4_grid = FP4_DECODE_TABLE.to(device=x.device, dtype=torch.float32).view(
+        1, 1, 1, 1, 1, 16
+    )
+    indices = (norm.unsqueeze(-1) - fp4_grid).abs().argmin(dim=-1).to(torch.uint8)
+    pairs = indices.view(batch_size, num_heads, head_dim, seqlen_padded // 2, 2)
+    packed = (pairs[..., 0] | (pairs[..., 1] << 4)).permute(0, 2, 1, 3).contiguous()
+    scale = scale_f32.to(torch.float8_e8m0fnu).permute(0, 2, 1, 3).contiguous()
+    return packed, scale
+
+
 def _quantize_nvfp4_transpose_scale_from_bf16(x: torch.Tensor) -> torch.Tensor:
     """Build only the kernel-friendly transpose FP4 scales from BF16/FP16 Q or K."""
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -821,8 +879,13 @@ def _validate_fp4_bwd_qk_inputs(
     mask_mod: Optional[Callable],
     aux_tensors: Optional[list[torch.Tensor]],
     arch: int,
+    col_sf_vec_size: Optional[int] = None,
+    col_sf_dtype: Optional[torch.dtype] = None,
+    col_seqlen_alignment: int = 1,
 ) -> Tuple[int, int]:
     _, sf_vec_size, sf_dtype = _get_fp4_qk_config(fp4_qk_format)
+    col_sf_vec_size = sf_vec_size if col_sf_vec_size is None else col_sf_vec_size
+    col_sf_dtype = sf_dtype if col_sf_dtype is None else col_sf_dtype
     if fp4_qk_format != "nvfp4":
         raise NotImplementedError(
             "Experimental FP4 backward Q/K currently only supports fp4_qk_format='nvfp4'."
@@ -869,8 +932,8 @@ def _validate_fp4_bwd_qk_inputs(
     for tensor_name, scale_tensor in (("q_col_scale", q_col_scale), ("k_col_scale", k_col_scale)):
         if scale_tensor is None:
             raise ValueError(f"Experimental FP4 backward Q/K requires {tensor_name}.")
-        if scale_tensor.dtype != sf_dtype:
-            raise TypeError(f"{tensor_name} must have dtype {sf_dtype}.")
+        if scale_tensor.dtype != col_sf_dtype:
+            raise TypeError(f"{tensor_name} must have dtype {col_sf_dtype}.")
 
     if q_packed.ndim != 4 or k_packed.ndim != 4:
         raise ValueError("Experimental FP4 backward Q/K expects dense 4D Q/K tensors.")
@@ -895,10 +958,14 @@ def _validate_fp4_bwd_qk_inputs(
 
     expected_q_scale_shape = (batch_size, seqlen_q, num_head, head_dim // sf_vec_size)
     expected_k_scale_shape = (batch_size, seqlen_k, num_head_kv, head_dim // sf_vec_size)
-    expected_q_col_packed_shape = (batch_size, head_dim, num_head, math.ceil(seqlen_q / 2))
-    expected_k_col_packed_shape = (batch_size, head_dim, num_head_kv, math.ceil(seqlen_k / 2))
-    expected_q_col_scale_shape = (batch_size, head_dim, num_head, math.ceil(seqlen_q / sf_vec_size))
-    expected_k_col_scale_shape = (batch_size, head_dim, num_head_kv, math.ceil(seqlen_k / sf_vec_size))
+    if col_seqlen_alignment <= 0:
+        raise ValueError("col_seqlen_alignment must be positive.")
+    q_col_seqlen = math.ceil(seqlen_q / col_seqlen_alignment) * col_seqlen_alignment
+    k_col_seqlen = math.ceil(seqlen_k / col_seqlen_alignment) * col_seqlen_alignment
+    expected_q_col_packed_shape = (batch_size, head_dim, num_head, math.ceil(q_col_seqlen / 2))
+    expected_k_col_packed_shape = (batch_size, head_dim, num_head_kv, math.ceil(k_col_seqlen / 2))
+    expected_q_col_scale_shape = (batch_size, head_dim, num_head, math.ceil(q_col_seqlen / col_sf_vec_size))
+    expected_k_col_scale_shape = (batch_size, head_dim, num_head_kv, math.ceil(k_col_seqlen / col_sf_vec_size))
     if q_scale.shape != expected_q_scale_shape:
         raise ValueError(
             f"q_scale shape {tuple(q_scale.shape)} != expected {expected_q_scale_shape} for FP4 backward."
@@ -988,9 +1055,39 @@ def _flash_attn_bwd_fp4_qk(
     The default path keeps backward stable and simple: dequantize rowwise Q/K to
     BF16 and reuse the existing backward kernel plumbing. The native FP4 dQ/dK
     kernel is still available for bring-up behind the internal
-    FLASH_ATTN_FP4_BWD_ENABLE_NATIVE override.
+    FLASH_ATTN_FP4_BWD_ENABLE_NATIVE override.  Its FP8-dS lane consumes
+    prebuilt MXFP4 column metadata so backward does not hide a Q/K requantization
+    pass in its hot path.
     """
     arch = _get_device_arch()
+    request_fp8_ds = bool(_get_env_optional_bool("FLASH_ATTN_FP4_BWD_DS_FP8"))
+    enable_native_fp4_bwd = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE")
+    force_reference_bridge = bool(
+        _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_REFERENCE")
+    )
+    requested_head_dim = q_packed.shape[-1] * 2 if q_packed.ndim == 4 else 0
+    use_fp8_ds = bool(
+        request_fp8_ds
+        and enable_native_fp4_bwd
+        and not force_reference_bridge
+        and requested_head_dim == 64
+    )
+    has_mx_col_metadata = (
+        q_col_scale is not None
+        and k_col_scale is not None
+        and q_col_scale.dtype == torch.float8_e8m0fnu
+        and k_col_scale.dtype == torch.float8_e8m0fnu
+    )
+    allow_synth_mx_metadata = bool(
+        _get_env_optional_bool("FLASH_ATTN_FP4_BWD_SYNTHESIZE_MX_METADATA")
+    )
+    synthesize_mx_metadata = use_fp8_ds and not has_mx_col_metadata
+    if synthesize_mx_metadata and not allow_synth_mx_metadata:
+        raise ValueError(
+            "The FP8-dS lane requires prebuilt MXFP4 q/k column metadata "
+            "(packed E2M1 values with torch.float8_e8m0fnu vec32 scales). "
+            "Set FLASH_ATTN_FP4_BWD_SYNTHESIZE_MX_METADATA=1 only for diagnostics."
+        )
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
@@ -1027,6 +1124,9 @@ def _flash_attn_bwd_fp4_qk(
         mask_mod=mask_mod,
         aux_tensors=aux_tensors,
         arch=arch,
+        col_sf_vec_size=32 if has_mx_col_metadata and use_fp8_ds else None,
+        col_sf_dtype=torch.float8_e8m0fnu if has_mx_col_metadata and use_fp8_ds else None,
+        col_seqlen_alignment=128 if has_mx_col_metadata and use_fp8_ds else 1,
     )
     q_packed, k_packed, q_scale, k_scale, q_sg, k_sg, q_col_packed, k_col_packed, q_col_scale, k_col_scale = [
         maybe_contiguous(t)
@@ -1039,15 +1139,14 @@ def _flash_attn_bwd_fp4_qk(
     k = _dequantize_nvfp4_rowwise(k_packed, k_scale, sf_vec_size, k_sg).to(torch.bfloat16)
     ref_dq_scale_tensor = torch.ones_like(k_sg)
     ref_dk_scale_tensor = torch.ones_like(q_sg)
-    enable_native_fp4_bwd = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ENABLE_NATIVE")
-    allow_unsafe_native_d128 = _get_env_optional_bool("FLASH_ATTN_FP4_BWD_ALLOW_UNSAFE_D128")
-    # Native FP4 backward d128 is still under bring-up. Keep the stable BF16 bridge as the
-    # default there until the 2-CTA native lane is verified, while allowing an internal
-    # override for kernel debugging.
+    # Native FP4 backward D128 currently uses a 2-CTA schedule that can fail to
+    # make progress.  Never dispatch it from the public wrapper: an environment
+    # override must not be able to turn a supported API call into a GPU hang.
+    # Keep D128 on the verified BF16 bridge until that schedule is repaired.
     use_reference_bridge = (
-        _get_env_optional_bool("FLASH_ATTN_FP4_BWD_FORCE_REFERENCE")
+        force_reference_bridge
         or not enable_native_fp4_bwd
-        or (head_dim >= 128 and not allow_unsafe_native_d128)
+        or head_dim >= 128
     )
     if use_reference_bridge:
         return _flash_attn_bwd(
@@ -1084,7 +1183,18 @@ def _flash_attn_bwd_fp4_qk(
     native_k_col_scale = k_col_scale
     native_dq_scale_tensor = k_sg
     native_dk_scale_tensor = q_sg
-    if not use_external_col_metadata:
+    if use_fp8_ds:
+        # MXF8F6F4 fixes both scale operands to E8M0/vec32.  The incoming
+        # NVFP4 E4M3/vec16 column metadata therefore cannot be reinterpreted.
+        # Production callers provide the MXFP4 columns directly; synthesis is
+        # deliberately restricted to an explicit diagnostic fallback so it is
+        # never hidden in the measured backward hot path.
+        native_dq_scale_tensor = torch.ones_like(k_sg)
+        native_dk_scale_tensor = torch.ones_like(q_sg)
+        if synthesize_mx_metadata:
+            native_q_col_packed, native_q_col_scale = _quantize_mxfp4_transpose_from_bf16(q)
+            native_k_col_packed, native_k_col_scale = _quantize_mxfp4_transpose_from_bf16(k)
+    elif not use_external_col_metadata:
         native_dq_scale_tensor = torch.ones_like(k_sg)
         native_dk_scale_tensor = torch.ones_like(q_sg)
         if is_fake_mode():
@@ -1131,6 +1241,7 @@ def _flash_attn_bwd_fp4_qk(
         q_col_scale_fp4=native_q_col_scale,
         k_col_scale_fp4=native_k_col_scale,
         fp4_bwd_qk_format=fp4_qk_format,
+        fp4_bwd_ds_fp8=use_fp8_ds,
     )
 
 
@@ -2395,6 +2506,7 @@ def _flash_attn_bwd(
     q_col_scale_fp4: Optional[torch.Tensor] = None,
     k_col_scale_fp4: Optional[torch.Tensor] = None,
     fp4_bwd_qk_format: Optional[Literal["nvfp4", "mxfp4"]] = None,
+    fp4_bwd_ds_fp8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -2516,8 +2628,47 @@ def _flash_attn_bwd(
             raise ValueError("FP4 backward Q/K requires q/k column tensors and scale tensors together.")
         if fp4_bwd_qk_format != "nvfp4":
             raise NotImplementedError("Native FP4 backward Q/K currently only supports fp4_bwd_qk_format='nvfp4'.")
+        if fp4_bwd_ds_fp8:
+            if q_col_scale_fp4.dtype != torch.float8_e8m0fnu or k_col_scale_fp4.dtype != torch.float8_e8m0fnu:
+                raise TypeError("The FP8-dS hybrid lane requires E8M0 Q/K column scales.")
+            # The mixed FP8 x FP4 instruction uses TMA's 4-bit-to-8-bit unpack
+            # format.  Its contiguous FP4 dimension must be 128-element
+            # aligned; retaining this padding in both value and scale metadata
+            # prevents an invalid tensor-map instruction on sequence tails.
+            q_col_seqlen_padded = math.ceil(seqlen_q / 128) * 128
+            k_col_seqlen_padded = math.ceil(seqlen_k / 128) * 128
+            expected_q_packed = q_col_seqlen_padded // 2
+            expected_k_packed = k_col_seqlen_padded // 2
+            if q_col_packed_fp4.shape[-1] != expected_q_packed:
+                raise ValueError(
+                    f"FP8-dS Q column values need {expected_q_packed} packed bytes "
+                    f"({q_col_seqlen_padded} padded elements), got {q_col_packed_fp4.shape[-1]}."
+                )
+            if k_col_packed_fp4.shape[-1] != expected_k_packed:
+                raise ValueError(
+                    f"FP8-dS K column values need {expected_k_packed} packed bytes "
+                    f"({k_col_seqlen_padded} padded elements), got {k_col_packed_fp4.shape[-1]}."
+                )
+            expected_q_groups = q_col_seqlen_padded // 32
+            expected_k_groups = k_col_seqlen_padded // 32
+            if q_col_scale_fp4.shape[-1] != expected_q_groups:
+                raise ValueError(
+                    f"FP8-dS Q column scales need {expected_q_groups} vec32 groups, "
+                    f"got {q_col_scale_fp4.shape[-1]}."
+                )
+            if k_col_scale_fp4.shape[-1] != expected_k_groups:
+                raise ValueError(
+                    f"FP8-dS K column scales need {expected_k_groups} vec32 groups, "
+                    f"got {k_col_scale_fp4.shape[-1]}."
+                )
         if arch // 10 not in [10, 11]:
             raise NotImplementedError("Native FP4 backward Q/K currently only supports SM100/SM110.")
+        if head_dim >= 128:
+            raise NotImplementedError(
+                "Native FP4 backward Q/K D128 is disabled because its SM100 "
+                "2-CTA schedule can fail to make progress; use "
+                "_flash_attn_bwd_fp4_qk for the verified BF16 bridge."
+            )
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -2860,6 +3011,7 @@ def _flash_attn_bwd(
             seqused_k is None,
             use_fp4_bwd_qk,
             fp4_bwd_qk_format if use_fp4_bwd_qk else None,
+            fp4_bwd_ds_fp8 if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_dk if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_dq if use_fp4_bwd_qk else None,
             fp4_bwd_native_skip_ds_store if use_fp4_bwd_qk else None,
@@ -2959,7 +3111,10 @@ def _flash_attn_bwd(
             )
         else:
             if use_fp4_bwd_qk:
-                fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_bwd_qk_format)
+                if fp4_bwd_ds_fp8:
+                    fp4_sf_dtype, fp4_sf_vec_size = "e8m0", 32
+                else:
+                    fp4_sf_dtype, fp4_sf_vec_size, _ = _get_fp4_qk_config(fp4_bwd_qk_format)
                 fa_bwd_obj = FP4FlashAttentionBackwardSm100(
                     head_dim,
                     head_dim_v,
@@ -2977,6 +3132,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     subtile_factor=subtile_factor,
                     use_fp4_bwd_qk=use_fp4_bwd_qk,
+                    fp4_bwd_ds_fp8=fp4_bwd_ds_fp8,
                     fp4_bwd_native_skip_dk=fp4_bwd_native_skip_dk,
                     fp4_bwd_native_skip_dq=fp4_bwd_native_skip_dq,
                     fp4_bwd_native_skip_ds_store=fp4_bwd_native_skip_ds_store,
@@ -3052,8 +3208,16 @@ def _flash_attn_bwd(
             print({"phase": "bwd_launch_start"}, flush=True)
         q_col_runtime = to_tvm_ffi_fp4x2_tensor(q_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
         k_col_runtime = to_tvm_ffi_fp4x2_tensor(k_col_packed_fp4.detach()) if use_fp4_bwd_qk else None
-        q_col_scale_runtime = q_col_scale_fp4.detach().view(torch.uint8).contiguous() if use_fp4_bwd_qk else None
-        k_col_scale_runtime = k_col_scale_fp4.detach().view(torch.uint8).contiguous() if use_fp4_bwd_qk else None
+        if use_fp4_bwd_qk:
+            # TVM FFI accepts the legacy E4M3 scale ABI through raw bytes, but
+            # E8M0 has a first-class runtime dtype and must retain it.
+            q_col_scale_runtime = q_col_scale_fp4.detach().contiguous()
+            k_col_scale_runtime = k_col_scale_fp4.detach().contiguous()
+            if not fp4_bwd_ds_fp8:
+                q_col_scale_runtime = q_col_scale_runtime.view(torch.uint8)
+                k_col_scale_runtime = k_col_scale_runtime.view(torch.uint8)
+        else:
+            q_col_scale_runtime = k_col_scale_runtime = None
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
             k.detach(),
@@ -3093,8 +3257,13 @@ def _flash_attn_bwd(
         num_threads_post = 256 if arch // 10 == 9 else 128
 
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
+    dq_postprocess_scale = (
+        softmax_scale / FP4_BWD_DS_QUANT_BOOST
+        if use_fp4_bwd_qk
+        else softmax_scale
+    )
     _bwd_postprocess_convert(
-        dq_accum, dq, softmax_scale,
+        dq_accum, dq, dq_postprocess_scale,
         dq_scale_tensor,
         cu_seqlens_q, seqused_q,
         arch, dtype, head_dim, m_block_size, num_threads_post,

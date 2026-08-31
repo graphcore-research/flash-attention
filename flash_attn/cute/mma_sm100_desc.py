@@ -83,11 +83,18 @@ def to_UMMA_format(cutlass_type) -> int:
     # TensorFloat-32 (8-bit exponent, 10-bit mantissa packed in 19 bits)
     if cutlass_type is cutlass.TFloat32:
         return F16F32Format.TF32
-    # Float-8 / Float-6 / Float-4 – add whenever CUTLASS exposes them
-    if cutlass_type is cutlass.FloatE4M3FN:
+    # Float-8 / Float-6 / Float-4.  The SM100 MXF8F6F4 descriptor uses
+    # independent three-bit encodings for A and B.
+    if cutlass_type is cutlass.Float8E4M3FN:
         return MXF8F6F4Format.E4M3
-    if cutlass_type is cutlass.FloatE5M2:
+    if cutlass_type is cutlass.Float8E5M2:
         return MXF8F6F4Format.E5M2
+    if cutlass_type is cutlass.Float6E2M3FN:
+        return MXF8F6F4Format.E2M3
+    if cutlass_type is cutlass.Float6E3M2FN:
+        return MXF8F6F4Format.E3M2
+    if cutlass_type is cutlass.Float4E2M1FN:
+        return MXF8F6F4Format.E2M1
     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
 
 
@@ -194,6 +201,10 @@ def make_block_scaled_instr_desc(
     scale_type: BlockScaledScaleType = BlockScaledScaleType.E4M3,
     scale_factor_id: int = 0,  # 0 or 2 for NVFP4; 0,1,2,3 for MXFP8
     is_fp4: bool = True,       # True for E2M1, False for E4M3 (MXFP8)
+    a_format: int | None = None,
+    b_format: int | None = None,
+    a_major: Major = Major.K,
+    b_major: Major = Major.K,
 ) -> int:
     """
     Build the 32-bit instruction descriptor for Blackwell block-scaled MMA.
@@ -201,15 +212,14 @@ def make_block_scaled_instr_desc(
 
     The bit layout is DIFFERENT from standard MMA idesc:
     - Bits 4-5:   B scale_factor_id
-    - Bits 7-9:   A format (E2M1=0b001 for FP4, E4M3=0b000 for FP8)
-    - Bits 10-11: B format (E2M1=0b01, E4M3=0b00)
+    - Bits 7-9:   A format (MXF4 E2M1=1; MXF8F6F4 E2M1=5, E4M3=0)
+    - Bits 10-12: B format (same encoding as A)
     - Bit 13:     A negate
     - Bit 14:     B negate
-    - Bits 15-16: transpose A/B (always 0 for block-scaled)
+    - Bits 15-16: A/B major mode (0=K, 1=MN)
     - Bits 17-22: N >> 3
     - Bit 23:     scale_type (0=E4M3, 1=E8M0)
-    - Bits 24-26: SBZ
-    - Bits 27-28: M >> 7  (NOT M >> 4 like standard!)
+    - Bits 24-28: M >> 4
     - Bits 29-30: A scale_factor_id
     - Bit 31:     K select (0=K64 for FP4)
 
@@ -222,22 +232,23 @@ def make_block_scaled_instr_desc(
     desc |= (scale_factor_id & 0x3) << 4            # B scale factor ID
     desc |= 0b0 << 6                                # SBZ
 
-    if is_fp4:
-        desc |= 0b001 << 7                          # A format: E2M1
-        desc |= 0b01 << 10                          # B format: E2M1
-        desc |= 0b0 << 12                           # SBZ
-    else:
-        desc |= 0b000 << 7                          # A format: E4M3
-        desc |= 0b000 << 10                         # B format: E4M3
+    # The dedicated MXF4/NVFP4 instruction encodes E2M1 as 1, whereas the
+    # mixed MXF8F6F4 instruction encodes E2M1 as 5.  Explicit formats let the
+    # latter describe FP8 x FP4 without perturbing existing callers.
+    if a_format is None:
+        a_format = 1 if is_fp4 else 0
+    if b_format is None:
+        b_format = 1 if is_fp4 else 0
+    desc |= (int(a_format) & 0x7) << 7
+    desc |= (int(b_format) & 0x7) << 10
 
     desc |= (int(a_neg) & 0x1) << 13                # A negate
     desc |= (int(b_neg) & 0x1) << 14                # B negate
-    desc |= 0b0 << 15                               # A transpose (always 0)
-    desc |= 0b0 << 16                               # B transpose (always 0)
+    desc |= (int(a_major) & 0x1) << 15              # A major mode
+    desc |= (int(b_major) & 0x1) << 16              # B major mode
     desc |= ((N >> 3) & 0x3F) << 17                 # N dimension
     desc |= (int(scale_type) & 0x1) << 23           # scale type
-    desc |= 0b000 << 24                             # SBZ
-    desc |= ((M >> 7) & 0x3) << 27                  # M dimension (M>>7!)
+    desc |= ((M >> 4) & 0x1F) << 24                 # M dimension
     desc |= (scale_factor_id & 0x3) << 29           # A scale factor ID
     desc |= 0b0 << 31                               # K select (0 = K=64 for FP4)
 
@@ -249,7 +260,14 @@ def mma_op_to_idesc_block_scaled(
     scale_factor_id: int = 0,
 ):
     """Convert a block-scaled MMA op to its instruction descriptor."""
-    is_fp4 = hasattr(op, 'a_dtype') and op.a_dtype is cutlass.Float4E2M1FN
+    is_mxf4 = (
+        hasattr(op, "a_dtype")
+        and op.a_dtype is cutlass.Float4E2M1FN
+        and op.b_dtype is cutlass.Float4E2M1FN
+        and op.shape_mnk[2] == 64
+    )
+    a_format = None if is_mxf4 else to_UMMA_format(op.a_dtype)
+    b_format = None if is_mxf4 else to_UMMA_format(op.b_dtype)
 
     # Determine scale type from sf_dtype
     if hasattr(op, 'sf_dtype'):
@@ -267,7 +285,11 @@ def mma_op_to_idesc_block_scaled(
         N=op.shape_mnk[1],
         scale_type=scale_type,
         scale_factor_id=scale_factor_id,
-        is_fp4=is_fp4,
+        is_fp4=is_mxf4,
+        a_format=a_format,
+        b_format=b_format,
+        a_major=Major.MN if op.a_major_mode == cute.nvgpu.OperandMajorMode.MN else Major.K,
+        b_major=Major.MN if op.b_major_mode == cute.nvgpu.OperandMajorMode.MN else Major.K,
     )
 
 

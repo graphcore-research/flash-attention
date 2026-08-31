@@ -9,6 +9,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Float4E2M1FN, Float8E4M3FN, Float8E8M0FNU, Int32, Int64, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -45,15 +47,299 @@ from flash_attn.cute.block_sparse_utils import (
     get_m_block_from_iter_bwd,
     produce_block_sparse_q_loads_bwd_sm100,
 )
-from flash_attn.cute.fp4_flash_fwd_sm100 import float_to_ue4m3_byte, pack_float8_to_e2m1_word
+from flash_attn.cute.fp4_flash_fwd_sm100 import (
+    float_to_ue4m3_byte,
+    pack_float8_to_e2m1_word,
+)
 
 
-def tile_atom_to_shape_sf_mn(shape, sf_vec_size: int):
-    step = tuple([2, 1] + list(range(3, cute.rank(shape) + 1)))
-    return cute.tile_to_shape(
-        bs_layout.BlockScaledBasicChunk(sf_vec_size, tcgen05.OperandMajorMode.MN).layout,
-        shape,
-        step,
+# dS values are commonly too small for an E4M3 block scale.  Quantize dS * boost
+# and undo the boost exactly once in the dQ/dK output scaling.  This is part of
+# the native NVFP4 backward numerical contract and is intentionally shared with
+# the PyTorch postprocess wrapper in interface.py.
+FP4_BWD_DS_QUANT_BOOST = 4096.0
+
+
+@dsl_user_op
+def float_to_ue8m0_byte(x: Float32, *, loc=None, ip=None):
+    """Round a positive FP32 scale up to its finite E8M0 byte encoding."""
+    packed_i16 = llvm.inline_asm(
+        T.i16(),
+        [Float32(x).ir_value(loc=loc, ip=ip), Float32(0.0).ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b16 out;\n\t"
+        "cvt.rp.satfinite.ue8m0x2.f32 out, $2, $1;\n\t"
+        "mov.b16 $0, out;\n\t"
+        "}\n",
+        "=h,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint8(
+        llvm.trunc(T.i8(), packed_i16, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def ue8m0_byte_to_float(x: cutlass.Uint8, *, loc=None, ip=None):
+    """Decode a finite E8M0 byte without a transcendental exp2 operation."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Uint32(x).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .b32 bits;\n\t"
+            ".reg .pred is_min;\n\t"
+            "shl.b32 bits, $1, 23;\n\t"
+            "setp.eq.u32 is_min, $1, 0;\n\t"
+            "@is_min mov.b32 bits, 0x00400000;\n\t"
+            "mov.b32 $0, bits;\n\t"
+            "}\n",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def pack_float4_to_e4m3_word(
+    f0: Float32,
+    f1: Float32,
+    f2: Float32,
+    f3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Pack four E4M3 values with two native x2 conversions."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(f0).ir_value(loc=loc, ip=ip),
+                Float32(f1).ir_value(loc=loc, ip=ip),
+                Float32(f2).ir_value(loc=loc, ip=ip),
+                Float32(f3).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .b16 lo;\n\t"
+            ".reg .b16 hi;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n\t"
+            "mov.b32 $0, {lo, hi};\n\t"
+            "}\n",
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_or_shared_u32(value, ptr, *, loc=None, ip=None) -> None:
+    """Atomically merge one or more packed FP4 nibbles into a shared word."""
+    nvvm.atomicrmw(
+        res=T.i32(),
+        op=nvvm.AtomicOpKind.OR,
+        ptr=ptr.llvm_ptr,
+        a=cutlass.Uint32(value).ir_value(loc=loc, ip=ip),
+    )
+
+
+@cute.jit
+def gemm_ptx_fp4_block_scaled_partial_k_scales(
+    op,
+    acc_tmem_addr: Int32,
+    tCrA: cute.Tensor,
+    tCrB: cute.Tensor,
+    sB: cute.Tensor,
+    tmem_sa_addr: Int32,
+    tmem_sb_addr: Int32,
+    tSFA_layout: cute.Layout,
+    tSFB_layout: cute.Layout,
+    scale_factor_id: int = 0,
+    scale_vec: str = "4X",
+    mma_kind: str = "mxf4nvf4",
+    zero_init: bool | cutlass.Boolean = False,
+    tA_addr: Optional[Int32] = None,
+    cta_group: int = 1,
+) -> None:
+    """Emit TMEM-A/SMEM-B narrow MMAs with per-K-block scale pointers.
+
+    The instruction consumes K64 for MXF4/NVFP4 and K32 for MXF8F6F4.  Unlike
+    the value operands, scale-factor TMEM addresses are not advanced by the
+    instruction, so every unrolled block explicitly selects its SFA/SFB view.
+    """
+    assert op.a_src == tcgen05.OperandSource.TMEM
+
+    sB_layout = sB.layout
+    sB_swizzle = sB.iterator.type.swizzle_type
+    idesc: int = const_expr(sm100_desc.mma_op_to_idesc_block_scaled(op, scale_factor_id))
+    smem_desc_base_b: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
+            sB_swizzle,
+            sm100_desc.Major.K
+            if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K)
+            else sm100_desc.Major.MN,
+        )
+    )
+    smem_desc_base_b_lo, smem_desc_b_hi = sm100_utils.i64_to_i32x2(smem_desc_base_b)
+    smem_desc_base_b_lo = const_expr(smem_desc_base_b_lo)
+    smem_desc_b_hi = const_expr(smem_desc_b_hi)
+
+    tCrA_layout = sm100_utils.canonicalize_mma_k_layout(
+        cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
+    )
+    tCrB_layout = sm100_utils.canonicalize_mma_k_layout(tCrB.layout)
+    num_k_blocks = cute.size(tCrA, mode=[2])
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_blocks)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_blocks)]
+    # MXF8F6F4 does not advance through K32 scale groups as ordinary TMEM
+    # columns.  Bits 31:30 of each scale pointer select one of the four scale
+    # slots, and the same slot id must be repeated in the instruction
+    # descriptor.  CuTe's typed emitter performs this encoding when lowering a
+    # scale-layout iterator; reproduce it explicitly here.  The dedicated
+    # MXF4/NVFP4 instructions retain their existing physical-column offsets.
+    if const_expr(mma_kind == "mxf8f6f4"):
+        offset_sa = [k << 30 for k in range(num_k_blocks)]
+        offset_sb = [k << 30 for k in range(num_k_blocks)]
+        idesc_by_k = [
+            const_expr(sm100_desc.mma_op_to_idesc_block_scaled(op, k))
+            for k in range(num_k_blocks)
+        ]
+    else:
+        # Scale layouts are expressed in FP8 elements, while the PTX TMEM
+        # operand is addressed in 32-bit columns.  Recast before extracting
+        # offsets (four FP8 scales share one physical TMEM cell).
+        tSFA_i32_layout = cute.recast_layout(32, 8, tSFA_layout)
+        tSFB_i32_layout = cute.recast_layout(32, 8, tSFB_layout)
+        offset_sa = [cute.crd2idx((0, 0, k), tSFA_i32_layout) for k in range(num_k_blocks)]
+        offset_sb = [cute.crd2idx((0, 0, k), tSFB_i32_layout) for k in range(num_k_blocks)]
+        idesc_by_k = [idesc for _ in range(num_k_blocks)]
+    smem_desc_start_b_lo = Int32(
+        smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator)
+    )
+    tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
+    pred_str = "p" if isinstance(zero_init, cutlass.Boolean) else "0" if zero_init else "1"
+    ptx_kind = f"kind::{mma_kind}.block_scale.scale_vec::{scale_vec}"
+
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_sa_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_sb_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 idesc;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 tmem_a;\n\t"
+        ".reg .b32 tmem_sa, tmem_sb;\n\t"
+        ".reg .b32 smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_b_lo;\n\t"
+        ".reg .b32 smem_desc_b_hi;\n\t"
+        ".reg .b64 smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 idesc, {hex(idesc)};\n\t"
+        "mov.b32 tmem_a, $0;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+        "mov.b32 tmem_acc, $3;\n\t"
+        "mov.b32 tmem_sa, $4;\n\t"
+        "mov.b32 tmem_sb, $5;\n\t"
+        f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+        "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
+        "setp.ne.b32 p, $2, 0;\n\t"
+        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} "
+        f"[tmem_acc], [tmem_a], smem_desc_b, idesc, "
+        f"[tmem_sa], [tmem_sb], {pred_str};\n\t"
+        + "".join(
+            (
+                f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
+                f"mov.b32 idesc, {hex(idesc_by_k[k])};\n\t"
+                f"@leader_thread tcgen05.mma.cta_group::{cta_group}.{ptx_kind} "
+                f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, "
+                f"[tmem_sa + {hex(offset_sa[k])}], [tmem_sb + {hex(offset_sb[k])}], 1;\n\t"
+            )
+            for k in range(1, num_k_blocks)
+        )
+        + "}\n",
+        "r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_cute_block_scaled_partial_k_scales(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    tCrA: cute.Tensor,
+    tSFA: cute.Tensor,
+    tSFB: cute.Tensor,
+    tCrB: cute.Tensor,
+    _sB: cute.Tensor,
+    zero_init: bool | cutlass.Boolean = False,
+) -> None:
+    """Issue one CuTe mixed MMA per K32 block with matching scale views.
+
+    Keeping the FP8-dS bring-up on CuTe's typed emitter avoids duplicating the
+    mixed-format descriptor and SMEM address rules in inline PTX.  The explicit
+    loop is still required so SFA/SFB advance with each reduction block.
+    """
+    mma_atom = cute.make_mma_atom(tiled_mma.op)
+    num_k_blocks = cute.size(tCrA, mode=[2])
+    for kblock_idx in cutlass.range_constexpr(num_k_blocks):
+        mma_atom.set(
+            tcgen05.Field.SFA,
+            tSFA[None, None, kblock_idx].iterator,
+        )
+        mma_atom.set(
+            tcgen05.Field.SFB,
+            tSFB[None, None, kblock_idx].iterator,
+        )
+        mma_atom.set(
+            tcgen05.Field.ACCUMULATE,
+            not zero_init or kblock_idx != 0,
+        )
+        cute.gemm(
+            mma_atom,
+            acc,
+            tCrA[None, None, kblock_idx],
+            tCrB[None, None, kblock_idx],
+            acc,
+        )
+
+
+def make_public_fp4_col_scale_tensor(mScale: cute.Tensor, sf_vec_size: int):
+    """Expand contiguous (B, D, H, K/sf) metadata to logical (D, K, H, B)."""
+    return cute.make_tensor(
+        mScale.iterator,
+        cute.make_layout(
+            (
+                mScale.shape[1],
+                (sf_vec_size, mScale.shape[3]),
+                mScale.shape[2],
+                mScale.shape[0],
+            ),
+            stride=(
+                mScale.stride[1],
+                (0, mScale.stride[3]),
+                mScale.stride[2],
+                mScale.stride[0],
+            ),
+        ),
     )
 
 
@@ -87,6 +373,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         use_fp4_bwd_qk: cutlass.Constexpr[bool] = False,
+        fp4_bwd_ds_fp8: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_dk: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_dq: cutlass.Constexpr[bool] = False,
         fp4_bwd_native_skip_ds_store: cutlass.Constexpr[bool] = False,
@@ -110,9 +397,13 @@ class FlashAttentionBackwardSm100:
 
         self.tile_m = tile_m
         self.tile_n = tile_n
+        self.fp4_bwd_ds_fp8 = bool(use_fp4_bwd_qk and fp4_bwd_ds_fp8)
 
         assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
         assert self.tile_hdimv <= 128
+        if self.fp4_bwd_ds_fp8:
+            assert self.tile_hdim == 64, "The FP8-dS hybrid bring-up lane is D64-only"
+            assert fp4_sf_dtype == "e8m0" and fp4_sf_vec_size == 32
 
         self.use_2cta_instrs = bool(
             use_2cta_instrs
@@ -151,6 +442,11 @@ class FlashAttentionBackwardSm100:
         )
         self.fp4_bwd_native_skip_dq_reduce = bool(
             use_fp4_bwd_qk and fp4_bwd_native_skip_dq_reduce
+        )
+        self.fp4_ds_quant_boost = (
+            FP4_BWD_DS_QUANT_BOOST
+            if use_fp4_bwd_qk
+            else 1.0
         )
 
         # CTA tiler
@@ -192,6 +488,16 @@ class FlashAttentionBackwardSm100:
         self.qk_acc_dtype = Float32
         self.use_fp4_bwd_qk = use_fp4_bwd_qk
         self.fp4_qk_dtype = Float4E2M1FN if const_expr(self.use_fp4_bwd_qk) else None
+        # MXF8F6F4 uses the architecture's "mix-8bit" TMA path.  Sub-byte
+        # operands retain their FP4 global type, but are staged through an
+        # 8-bit SMEM carrier layout/allocation before the MMA descriptor reads
+        # them.  This mirrors CUTLASS's Element{A,B}Mma_SmemAllocType rule.
+        self.fp4_qk_smem_dtype = (
+            cutlass.Uint8 if const_expr(self.fp4_bwd_ds_fp8) else self.fp4_qk_dtype
+        )
+        self.fp4_ds_dtype = (
+            Float8E4M3FN if const_expr(self.fp4_bwd_ds_fp8) else self.fp4_qk_dtype
+        )
         self.fp4_sf_dtype = (
             Float8E4M3FN if fp4_sf_dtype == "e4m3" else Float8E8M0FNU
         ) if const_expr(self.use_fp4_bwd_qk) else None
@@ -269,6 +575,20 @@ class FlashAttentionBackwardSm100:
             self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
             self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
+        # NVFP4 MMA operands are unconditionally K-major (the CuTe constructor
+        # ignores the requested leading modes for MmaMXF4NVF4Op).  dK consumes
+        # dS.T while dQ consumes dS, so the two MMAs cannot reinterpret one
+        # physical FP4 tile as opposite major modes like the BF16 path does.
+        # Both low-precision orientations fit in the 128-column dP region once
+        # dP has been consumed (16 columns each for FP4, 32 each for FP8).
+        self.tmem_dS_tile_cols = (
+            self.tile_n * self.tile_m * self.fp4_ds_dtype.width // (8 * 512)
+            if self.use_fp4_bwd_qk
+            else self.tile_n * self.tile_m * 16 // (8 * 512)
+        )
+        self.tmem_dS_dQ_offset = self.tmem_dS_offset + self.tmem_dS_tile_cols
+        assert self.tmem_dS_dQ_offset + self.tmem_dS_tile_cols <= self.tmem_dP_offset + self.tile_m
+
         self.fp4_disjoint_dq_tmem = bool(
             self.use_fp4_bwd_qk and not self.use_2cta_instrs and self.tile_hdim < self.tile_m
         )
@@ -287,25 +607,43 @@ class FlashAttentionBackwardSm100:
         )
 
         if const_expr(self.use_fp4_bwd_qk):
+            # A scale tensor uses four physical TMEM columns per 128 MN rows
+            # and per instruction K block.  Its FP8 layout reports a
+            # 16-element stride between K blocks; recasting to the 32-bit TMEM
+            # address space turns that into four columns.
             sf_atom_mn = 128
             mma_inst_tile_k = 4
-            self.tmem_sfdK_a_cols = (self.mma_tiler_dsq[0] // sf_atom_mn) * mma_inst_tile_k
-            self.tmem_sfQcol_cols = (max(self.mma_tiler_dsq[1], 128) // sf_atom_mn) * mma_inst_tile_k
-            self.tmem_sfdQ_a_cols = (self.mma_tiler_dsk[0] // sf_atom_mn) * mma_inst_tile_k
-            self.tmem_sfKcol_cols = (max(self.mma_tiler_dsk[1], 128) // sf_atom_mn) * mma_inst_tile_k
-            # In the 2-CTA path, dQ does not live in the reused dP/dS region, so we can stage
-            # FP4 scale factors there after dP has been consumed. In the 1-CTA d64 path, dQ
-            # shares that region but there is enough spare TMEM at the tail to keep scales
-            # disjoint. The 1-CTA d128 path has no spare tail capacity, so keep the existing
-            # overlap until that slice is moved onto the 2-CTA/native layout.
-            self.tmem_sfdK_a_offset = (
-                self.tmem_dP_offset
-                if (self.use_2cta_instrs or self.tile_hdim >= self.tile_m)
-                else self.tmem_cols_end
-            )
-            self.tmem_sfQcol_offset = self.tmem_sfdK_a_offset + self.tmem_sfdK_a_cols
-            self.tmem_sfdQ_a_offset = self.tmem_sfQcol_offset + self.tmem_sfQcol_cols
-            self.tmem_sfKcol_offset = self.tmem_sfdQ_a_offset + self.tmem_sfdQ_a_cols
+            mma_inst_k = 32 if self.fp4_bwd_ds_fp8 else 64
+            dsq_k_blocks = self.mma_tiler_dsq[2] // mma_inst_k
+            dsk_k_blocks = self.mma_tiler_dsk[2] // mma_inst_k
+            self.tmem_sfdK_a_cols = (
+                self.mma_tiler_dsq[0] // sf_atom_mn
+            ) * mma_inst_tile_k * dsq_k_blocks
+            self.tmem_sfQcol_cols = (
+                max(self.mma_tiler_dsq[1], 128) // sf_atom_mn
+            ) * mma_inst_tile_k * dsq_k_blocks
+            self.tmem_sfdQ_a_cols = (
+                self.mma_tiler_dsk[0] // sf_atom_mn
+            ) * mma_inst_tile_k * dsk_k_blocks
+            self.tmem_sfKcol_cols = (
+                max(self.mma_tiler_dsk[1], 128) // sf_atom_mn
+            ) * mma_inst_tile_k * dsk_k_blocks
+
+            scale_reuse_base = self.tmem_dS_dQ_offset + self.tmem_dS_tile_cols
+            if not self.use_2cta_instrs and self.tile_hdim < self.tile_m:
+                # D64 leaves 96 columns in the consumed dP region after the two
+                # dS orientations.  Place three scale tensors there
+                # and the fourth after dQ, keeping all live data disjoint.
+                self.tmem_sfdK_a_offset = scale_reuse_base
+                self.tmem_sfQcol_offset = self.tmem_sfdK_a_offset + self.tmem_sfdK_a_cols
+                self.tmem_sfdQ_a_offset = self.tmem_sfQcol_offset + self.tmem_sfQcol_cols
+                assert self.tmem_sfdQ_a_offset + self.tmem_sfdQ_a_cols <= self.tmem_dP_offset + self.tile_m
+                self.tmem_sfKcol_offset = self.tmem_cols_end
+            else:
+                self.tmem_sfdK_a_offset = scale_reuse_base
+                self.tmem_sfQcol_offset = self.tmem_sfdK_a_offset + self.tmem_sfdK_a_cols
+                self.tmem_sfdQ_a_offset = self.tmem_sfQcol_offset + self.tmem_sfQcol_cols
+                self.tmem_sfKcol_offset = self.tmem_sfdQ_a_offset + self.tmem_sfdQ_a_cols
             scale_cols_end = self.tmem_sfKcol_offset + self.tmem_sfKcol_cols
             if scale_cols_end > self.tmem_cols_end:
                 self.tmem_cols_end = scale_cols_end
@@ -426,9 +764,10 @@ class FlashAttentionBackwardSm100:
             mma_dK_a_src = tcgen05.OperandSource.TMEM
         if const_expr(self.use_fp4_bwd_qk):
             tiled_mma_dK = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.fp4_ds_dtype,
                 self.fp4_qk_dtype,
-                tcgen05.OperandMajorMode.K,  # dS_major_mode
-                tcgen05.OperandMajorMode.MN,  # Q_major_mode
+                tcgen05.OperandMajorMode.K,  # dS is explicitly materialized K-major
+                tcgen05.OperandMajorMode.K,  # packed Q is explicitly materialized K-major
                 self.fp4_sf_dtype,
                 self.fp4_sf_vec_size,
                 self.cta_group,
@@ -448,9 +787,10 @@ class FlashAttentionBackwardSm100:
         # dQ = dS @ K
         if const_expr(self.use_fp4_bwd_qk):
             tiled_mma_dQ = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.fp4_ds_dtype,
                 self.fp4_qk_dtype,
-                tcgen05.OperandMajorMode.MN,  # dS_major_mode
-                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+                tcgen05.OperandMajorMode.K,  # second dS orientation is K-major
+                tcgen05.OperandMajorMode.K,  # packed K is explicitly materialized K-major
                 self.fp4_sf_dtype,
                 self.fp4_sf_vec_size,
                 self.cta_group,
@@ -469,7 +809,7 @@ class FlashAttentionBackwardSm100:
         return tiled_mma_S, tiled_mma_dP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
     def _setup_smem_layout(self):
-        ds_mma_dtype = self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.ds_dtype
+        ds_mma_dtype = self.fp4_ds_dtype if const_expr(self.use_fp4_bwd_qk) else self.ds_dtype
         q_mma_dtype = self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype
         k_mma_dtype = self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype
         # S.T = K @ Q.T
@@ -540,7 +880,7 @@ class FlashAttentionBackwardSm100:
         self.sQt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dK,
             self.mma_tiler_dsq,
-            q_mma_dtype,
+            self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else q_mma_dtype,
             self.Q_stage,
         )
         # dQ = dS @ K
@@ -554,16 +894,18 @@ class FlashAttentionBackwardSm100:
         sKt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
-            k_mma_dtype,
+            self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else k_mma_dtype,
             1,
         )
         self.sKt_layout = sKt_layout if const_expr(self.use_fp4_bwd_qk) else cute.slice_(sKt_layout, (None, None, None, 0))
         self.sdS_xchg_layout = cute.make_layout(shape=(self.tile_n, self.tile_m // 2))
 
         if const_expr(self.use_fp4_bwd_qk):
-            fp4_dq_scale_tiler = (
-                self.mma_tiler_dsq if const_expr(self.use_2cta_instrs) else self.mma_tiler_dsk
-            )
+            # dQ always consumes dS as an MxK tile.  On 2-CTA, K grows to the
+            # cluster-wide 2 * tile_n extent; using the transposed dK tiler here
+            # builds a 256x128 scale layout and leaves half of the dQ reduction
+            # scales unrepresented.
+            fp4_dq_scale_tiler = self.mma_tiler_dsk
             sfdK_a_layout = bs_layout.make_smem_layout_sfa(
                 self.tiled_mma_dK, self.mma_tiler_dsq, self.fp4_sf_vec_size, 1
             )
@@ -656,21 +998,50 @@ class FlashAttentionBackwardSm100:
             self.sdV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
 
     @cute.jit
-    def load_scale_stage_layout(self, gScale: cute.Tensor, sScale: cute.Tensor):
+    def load_scale_stage_layout(
+        self,
+        gScale: cute.Tensor,
+        sScale: cute.Tensor,
+        valid_k: Int32,
+    ):
+        """Load public column-oriented B scales into the padded SFB tile."""
         lane_idx = cute.arch.lane_idx()
-        gScale = cute.filter_zeros(gScale)
-        sScale = cute.filter_zeros(sScale)
-        gScale = cute.group_modes(gScale, 0, cute.rank(gScale))
-        sScale = cute.group_modes(sScale, 0, cute.rank(sScale))
-        num_src = cute.size(gScale.shape)
-        num_dst = cute.size(sScale.shape)
-        num_copy = min(num_src, num_dst)
-        for idx in cutlass.range(lane_idx, num_copy, cute.arch.WARP_SIZE, unroll=1):
-            sScale[idx] = gScale[idx]
-        if num_dst > num_copy:
-            one = self.fp4_sf_dtype(1.0)
-            for idx in cutlass.range(lane_idx + num_copy, num_dst, cute.arch.WARP_SIZE, unroll=1):
-                sScale[idx] = one
+        b_n = self.tile_hdim
+        b_k = self.tile_m
+        b_n_padded = cute.round_up(b_n, 128)
+        groups_per_row = b_k // self.fp4_sf_vec_size
+        one = self.fp4_sf_dtype(1.0)
+        sScale_logical = cute.make_tensor(
+            sScale.iterator,
+            bs_layout.tile_atom_to_shape_SF(
+                (b_n_padded, b_k, 1),
+                self.fp4_sf_vec_size,
+            ),
+        )
+        for idx in cutlass.range(
+            lane_idx,
+            b_n * groups_per_row,
+            cute.arch.WARP_SIZE,
+            unroll=1,
+        ):
+            n_coord = idx // groups_per_row
+            k_coord = (idx % groups_per_row) * self.fp4_sf_vec_size
+            if k_coord < valid_k:
+                sScale_logical[n_coord, k_coord, 0] = gScale[n_coord, k_coord]
+            else:
+                # TMA zero-fills the corresponding packed values.  Avoid an
+                # ordinary out-of-bounds scale load and use a neutral scale for
+                # the padded reduction group.
+                sScale_logical[n_coord, k_coord, 0] = one
+        for idx in cutlass.range(
+            lane_idx,
+            (b_n_padded - b_n) * groups_per_row,
+            cute.arch.WARP_SIZE,
+            unroll=1,
+        ):
+            n_coord = b_n + idx // groups_per_row
+            k_coord = (idx % groups_per_row) * self.fp4_sf_vec_size
+            sScale_logical[n_coord, k_coord, 0] = one
         cute.arch.sync_warp()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
@@ -726,14 +1097,27 @@ class FlashAttentionBackwardSm100:
         tCtfQcol_compact_s2t: cute.Tensor,
         B_idx: Int32,
     ):
+        # Cp4x32x128b partitions a 2-CTA source differently from the 1-CTA
+        # stage.  Collapse the cluster modes so the source presents the same
+        # logical mode-1 extent as the TMEM destination.
+        sfdK_a_src = (
+            cute.group_modes(tCsfdK_a_compact_s2t, 1, 3)
+            if const_expr(self.use_2cta_instrs)
+            else tCsfdK_a_compact_s2t[(None, None, None, None, 0)]
+        )
+        sfQcol_src = (
+            cute.group_modes(tCsfQcol_compact_s2t, 1, 3)
+            if const_expr(self.use_2cta_instrs)
+            else tCsfQcol_compact_s2t[(None, None, None, None, B_idx)]
+        )
         cute.copy(
             tiled_copy_s2t_sfdK_a,
-            tCsfdK_a_compact_s2t[(None, None, None, None, 0)],
+            sfdK_a_src,
             tCtfdK_a_compact_s2t,
         )
         cute.copy(
             tiled_copy_s2t_sfQcol,
-            tCsfQcol_compact_s2t[(None, None, None, None, B_idx)],
+            sfQcol_src,
             tCtfQcol_compact_s2t,
         )
 
@@ -747,15 +1131,545 @@ class FlashAttentionBackwardSm100:
         tCsfKcol_compact_s2t: cute.Tensor,
         tCtfKcol_compact_s2t: cute.Tensor,
     ):
+        # dQ's dS scale tensor has its cluster/reduction modes in the opposite
+        # order.  Select that order before grouping the 2-CTA partition.
+        sfdQ_a_src_local = (
+            cute.group_modes(
+                layout_utils.select(tCsfdQ_a_compact_s2t, mode=[0, 1, 3, 2, 4]),
+                1,
+                3,
+            )
+            if const_expr(self.use_2cta_instrs)
+            else tCsfdQ_a_compact_s2t[(None, None, None, None, 0)]
+        )
+        # The dQ reduction K tile spans both CTAs. Cp4x32x128b.cta_group::2
+        # reads the same local SMEM address from each CTA, so model the cluster
+        # half as a zero-stride source mode. This gives the copy's logical
+        # source the same two-half extent as its distributed TMEM destination.
+        sfdQ_a_src = (
+            cute.group_modes(
+                cute.make_tensor(
+                    sfdQ_a_src_local.iterator,
+                    cute.append(sfdQ_a_src_local.layout, cute.make_layout(2, stride=0)),
+                ),
+                3,
+                5,
+            )
+            if const_expr(self.use_2cta_instrs)
+            else sfdQ_a_src_local
+        )
+        sfKcol_src = (
+            cute.group_modes(tCsfKcol_compact_s2t, 1, 3)
+            if const_expr(self.use_2cta_instrs)
+            else tCsfKcol_compact_s2t[(None, None, None, None, 0)]
+        )
         cute.copy(
             tiled_copy_s2t_sfdQ_a,
-            tCsfdQ_a_compact_s2t[(None, None, None, None, 0)],
+            sfdQ_a_src,
             tCtfdQ_a_compact_s2t,
         )
         cute.copy(
             tiled_copy_s2t_sfKcol,
-            tCsfKcol_compact_s2t[(None, None, None, None, 0)],
+            sfKcol_src,
             tCtfKcol_compact_s2t,
+        )
+
+    @cute.jit
+    def materialize_dS_orientation_to_fp8(
+        self,
+        src_f32: cute.Tensor,
+        src_coords: cute.Tensor,
+        dst_storage_f32: cute.Tensor,
+        scratch_smem: cute.Tensor,
+        compute_tidx: Int32,
+        scale_stage: cute.Tensor,
+        transpose: cutlass.Constexpr[bool],
+        use_unit_scale: cutlass.Constexpr[bool] = False,
+        synchronize_after_read: cutlass.Constexpr[bool] = True,
+    ):
+        """Quantize one D64 dS orientation to MXFP8 E4M3 with vec32 E8M0 scales."""
+        tile_rows = self.tile_m if const_expr(transpose) else self.tile_n
+        tile_k = self.tile_n if const_expr(transpose) else self.tile_m
+        assert tile_rows == 128 and tile_k == 128
+        assert not self.use_2cta_instrs
+
+        num_compute_threads = len(self.compute_warp_ids) * cute.arch.WARP_SIZE
+        assert num_compute_threads == 256
+        scratch_ptr = cute.make_ptr(
+            cutlass.Uint32,
+            scratch_smem.iterator.toint(),
+            mem_space=cute.AddressSpace.smem,
+            assumed_align=16,
+        )
+        scale_tiler = self.mma_tiler_dsk if const_expr(transpose) else self.mma_tiler_dsq
+        logical_scale = cute.make_tensor(
+            scale_stage.iterator,
+            bs_layout.tile_atom_to_shape_SF(
+                (scale_tiler[0], scale_tiler[2], 1),
+                self.fp4_sf_vec_size,
+            ),
+        )
+        logical_scale_u8 = cute.make_tensor(
+            cute.recast_ptr(logical_scale.iterator, dtype=cutlass.Uint8),
+            logical_scale.layout,
+        )
+        src_flat = cute.flatten(src_f32)
+        coord_flat = cute.flatten(src_coords)
+        assert cute.size(src_flat) == 64
+        dst_words = cute.make_tensor(
+            cute.recast_ptr(dst_storage_f32.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((cute.size(src_flat) // 4,)),
+        )
+        packed_words_per_row = tile_k // 4
+        packed_full_words = tile_rows * packed_words_per_row
+        assert packed_full_words * 4 <= self.tile_m * self.tile_n
+        packed_smem = cute.make_tensor(
+            scratch_ptr,
+            cute.make_layout((packed_full_words,)),
+        )
+
+        quant_boost = Float32(self.fp4_ds_quant_boost)
+        diagnostic_scale = Float32(32.0)
+        fp8_max = Float32(448.0)
+        lane_idx = cute.arch.lane_idx()
+        quad_mask = cutlass.Int32(0xF) << (lane_idx & 0x1C)
+        warp_in_group = (compute_tidx // cute.arch.WARP_SIZE) % 4
+        wg_idx = compute_tidx // (4 * cute.arch.WARP_SIZE)
+        dst_row = warp_in_group * cute.arch.WARP_SIZE + lane_idx
+
+        if const_expr(not transpose):
+            # Two local 32-value chunks form complete MX scale groups.
+            for group_idx in cutlass.range_constexpr(2):
+                vi_base = group_idx * self.fp4_sf_vec_size
+                amax0 = Float32(0.0)
+                amax1 = Float32(0.0)
+                amax2 = Float32(0.0)
+                amax3 = Float32(0.0)
+                for word_idx in cutlass.range_constexpr(self.fp4_sf_vec_size // 4):
+                    value_idx = vi_base + word_idx * 4
+                    value0 = src_flat[value_idx + 0]
+                    value1 = src_flat[value_idx + 1]
+                    value2 = src_flat[value_idx + 2]
+                    value3 = src_flat[value_idx + 3]
+                    amax0 = cute.arch.fmax(
+                        amax0, value0 if value0 >= Float32(0.0) else -value0
+                    )
+                    amax1 = cute.arch.fmax(
+                        amax1, value1 if value1 >= Float32(0.0) else -value1
+                    )
+                    amax2 = cute.arch.fmax(
+                        amax2, value2 if value2 >= Float32(0.0) else -value2
+                    )
+                    amax3 = cute.arch.fmax(
+                        amax3, value3 if value3 >= Float32(0.0) else -value3
+                    )
+                group_amax = cute.arch.fmax(
+                    cute.arch.fmax(amax0, amax1),
+                    cute.arch.fmax(amax2, amax3),
+                )
+                raw_scale = (
+                    Float32(1.0)
+                    if group_amax == Float32(0.0)
+                    else group_amax * quant_boost / fp8_max
+                )
+                scale_code = float_to_ue8m0_byte(
+                    diagnostic_scale if const_expr(use_unit_scale) else raw_scale
+                )
+                scale_f32 = (
+                    diagnostic_scale
+                    if const_expr(use_unit_scale)
+                    else ue8m0_byte_to_float(scale_code)
+                )
+                coord = coord_flat[vi_base]
+                row_coord = Int32(coord[0])
+                k_coord = Int32(coord[1])
+                logical_scale_u8[row_coord, k_coord, 0] = scale_code
+                quant_multiplier = (
+                    quant_boost / diagnostic_scale
+                    if const_expr(use_unit_scale)
+                    else (
+                        Float32(0.0)
+                        if group_amax == Float32(0.0)
+                        else quant_boost / scale_f32
+                    )
+                )
+                for word_idx in cutlass.range_constexpr(self.fp4_sf_vec_size // 4):
+                    value_idx = vi_base + word_idx * 4
+                    packed_smem[
+                        row_coord * packed_words_per_row + (k_coord >> 2) + word_idx
+                    ] = pack_float4_to_e4m3_word(
+                        src_flat[value_idx + 0] * quant_multiplier,
+                        src_flat[value_idx + 1] * quant_multiplier,
+                        src_flat[value_idx + 2] * quant_multiplier,
+                        src_flat[value_idx + 3] * quant_multiplier,
+                    )
+        else:
+            # A whole warp supplies each transposed vec32 scale group.  Four
+            # neighboring lanes then form one packed E4M3 carrier word.
+            for vi in cutlass.range_constexpr(cute.size(src_flat)):
+                value = src_flat[vi]
+                group_amax = cute.arch.warp_redux_sync(
+                    value,
+                    "fmax",
+                    abs=True,
+                )
+                raw_scale = (
+                    Float32(1.0)
+                    if group_amax == Float32(0.0)
+                    else group_amax * quant_boost / fp8_max
+                )
+                scale_code = float_to_ue8m0_byte(
+                    diagnostic_scale if const_expr(use_unit_scale) else raw_scale
+                )
+                scale_f32 = (
+                    diagnostic_scale
+                    if const_expr(use_unit_scale)
+                    else ue8m0_byte_to_float(scale_code)
+                )
+                coord = coord_flat[vi]
+                row_coord = Int32(coord[1])
+                k_coord = Int32(coord[0])
+                if lane_idx == 0:
+                    logical_scale_u8[row_coord, k_coord, 0] = scale_code
+                quant_value = (
+                    value * quant_boost / diagnostic_scale
+                    if const_expr(use_unit_scale)
+                    else (
+                        Float32(0.0)
+                        if group_amax == Float32(0.0)
+                        else value * quant_boost / scale_f32
+                    )
+                )
+                fp8_code = cutlass.Uint32(float_to_ue4m3_byte(quant_value))
+                packed_word = fp8_code << ((lane_idx & 3) << 3)
+                packed_word = cute.arch.warp_redux_sync(
+                    packed_word,
+                    "or",
+                    mask_and_clamp=quad_mask,
+                )
+                if (lane_idx & 3) == 0:
+                    packed_smem[
+                        row_coord * packed_words_per_row + (k_coord >> 2)
+                    ] = packed_word
+
+        self.compute_sync_barrier.arrive_and_wait()
+        for wi in cutlass.range_constexpr(cute.size(dst_words)):
+            dst_words[wi] = packed_smem[
+                dst_row * packed_words_per_row + wg_idx * cute.size(dst_words) + wi
+            ]
+        if const_expr(synchronize_after_read):
+            self.compute_sync_barrier.arrive_and_wait()
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
+
+    @cute.jit
+    def materialize_dS_orientation_to_fp4(
+        self,
+        src_f32: cute.Tensor,
+        src_coords: cute.Tensor,
+        dst_storage_f32: cute.Tensor,
+        scratch_smem: cute.Tensor,
+        compute_tidx: Int32,
+        scale_stage: cute.Tensor,
+        transpose: cutlass.Constexpr[bool],
+        use_unit_scale: cutlass.Constexpr[bool] = False,
+        synchronize_after_read: cutlass.Constexpr[bool] = True,
+    ):
+        """Block-quantize one K-major dS orientation and pack it for TMEM."""
+        tile_rows = self.tile_m if const_expr(transpose) else self.tile_n
+        tile_k = self.tile_n if const_expr(transpose) else self.tile_m
+        assert tile_rows == 128 and tile_k == 128
+
+        num_compute_threads = len(self.compute_warp_ids) * cute.arch.WARP_SIZE
+        num_scale_slots = tile_rows * tile_k // self.fp4_sf_vec_size
+        packed_half_words = tile_rows * (tile_k // 2) // 8
+        assert (num_scale_slots + packed_half_words) * 4 <= self.tile_m * self.tile_n // 2
+
+        scratch_ptr = cute.make_ptr(
+            cutlass.Uint32,
+            scratch_smem.iterator.toint(),
+            mem_space=cute.AddressSpace.smem,
+            assumed_align=16,
+        )
+        scale_tiler = self.mma_tiler_dsk if const_expr(transpose) else self.mma_tiler_dsq
+        logical_scale = cute.make_tensor(
+            scale_stage.iterator,
+            bs_layout.tile_atom_to_shape_SF(
+                (scale_tiler[0], scale_tiler[2], 1),
+                self.fp4_sf_vec_size,
+            ),
+        )
+        logical_scale_u8 = cute.make_tensor(
+            cute.recast_ptr(logical_scale.iterator, dtype=cutlass.Uint8),
+            logical_scale.layout,
+        )
+        src_flat = cute.flatten(src_f32)
+        coord_flat = cute.flatten(src_coords)
+        dst_words = cute.make_tensor(
+            cute.recast_ptr(dst_storage_f32.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((cute.size(src_flat) // 8,)),
+        )
+        quant_boost = Float32(self.fp4_ds_quant_boost)
+        diagnostic_scale = Float32(32.0)
+        lane_idx = cute.arch.lane_idx()
+        warp_in_group = (compute_tidx // cute.arch.WARP_SIZE) % 4
+        wg_idx = compute_tidx // (4 * cute.arch.WARP_SIZE)
+        dst_row = warp_in_group * cute.arch.WARP_SIZE + lane_idx
+        if const_expr(not self.use_2cta_instrs):
+            # Ld32x32b distributes the 128x128 accumulator tile regularly over
+            # the eight compute warps.  Each thread owns one logical n row and
+            # four contiguous 16-value m groups.  The transposed view aligns a
+            # 16-value n group with a half warp.  Exploit that mapping directly:
+            # no CTA atomics are needed for either maxima or packed nibbles.
+            assert num_compute_threads == 256
+            assert cute.size(src_flat) == 64
+            packed_words_per_row = tile_k // 8
+            packed_full_words = tile_rows * packed_words_per_row
+            assert packed_full_words * 4 <= self.tile_m * self.tile_n // 2
+            packed_smem = cute.make_tensor(
+                scratch_ptr,
+                cute.make_layout((packed_full_words,)),
+            )
+
+            if const_expr(not transpose):
+                # Each local group is already one complete NVFP4 scale group.
+                for group_idx in cutlass.range_constexpr(4):
+                    vi_base = group_idx * self.fp4_sf_vec_size
+                    group_amax = Float32(0.0)
+                    for ei in cutlass.range_constexpr(self.fp4_sf_vec_size):
+                        value = src_flat[vi_base + ei]
+                        abs_value = value if value >= Float32(0.0) else -value
+                        group_amax = cute.arch.fmax(group_amax, abs_value)
+                    scale_f32 = (
+                        diagnostic_scale
+                        if const_expr(use_unit_scale)
+                        else group_amax * quant_boost / Float32(6.0)
+                    )
+                    coord = coord_flat[vi_base]
+                    row_coord = Int32(coord[0])
+                    k_coord = Int32(coord[1])
+                    logical_scale_u8[row_coord, k_coord, 0] = float_to_ue4m3_byte(
+                        scale_f32
+                    )
+                    quant_multiplier = (
+                        quant_boost / diagnostic_scale
+                        if const_expr(use_unit_scale)
+                        else (
+                            Float32(0.0)
+                            if group_amax == Float32(0.0)
+                            else Float32(6.0) / group_amax
+                        )
+                    )
+                    packed_smem[row_coord * packed_words_per_row + (k_coord >> 3)] = (
+                        pack_float8_to_e2m1_word(
+                            src_flat[vi_base + 0] * quant_multiplier,
+                            src_flat[vi_base + 1] * quant_multiplier,
+                            src_flat[vi_base + 2] * quant_multiplier,
+                            src_flat[vi_base + 3] * quant_multiplier,
+                            src_flat[vi_base + 4] * quant_multiplier,
+                            src_flat[vi_base + 5] * quant_multiplier,
+                            src_flat[vi_base + 6] * quant_multiplier,
+                            src_flat[vi_base + 7] * quant_multiplier,
+                        )
+                    )
+                    packed_smem[row_coord * packed_words_per_row + (k_coord >> 3) + 1] = (
+                        pack_float8_to_e2m1_word(
+                            src_flat[vi_base + 8] * quant_multiplier,
+                            src_flat[vi_base + 9] * quant_multiplier,
+                            src_flat[vi_base + 10] * quant_multiplier,
+                            src_flat[vi_base + 11] * quant_multiplier,
+                            src_flat[vi_base + 12] * quant_multiplier,
+                            src_flat[vi_base + 13] * quant_multiplier,
+                            src_flat[vi_base + 14] * quant_multiplier,
+                            src_flat[vi_base + 15] * quant_multiplier,
+                        )
+                    )
+            else:
+                # For dS (rather than dS.T), peers in each half warp form one
+                # scale group.  Butterfly reductions stay inside each 16-lane
+                # subgroup; an 8-lane butterfly OR forms each packed word.
+                for vi in cutlass.range_constexpr(cute.size(src_flat)):
+                    value = src_flat[vi]
+                    group_amax = value if value >= Float32(0.0) else -value
+                    group_amax = cute.arch.fmax(
+                        group_amax, cute.arch.shuffle_sync_bfly(group_amax, offset=1)
+                    )
+                    group_amax = cute.arch.fmax(
+                        group_amax, cute.arch.shuffle_sync_bfly(group_amax, offset=2)
+                    )
+                    group_amax = cute.arch.fmax(
+                        group_amax, cute.arch.shuffle_sync_bfly(group_amax, offset=4)
+                    )
+                    group_amax = cute.arch.fmax(
+                        group_amax, cute.arch.shuffle_sync_bfly(group_amax, offset=8)
+                    )
+                    scale_f32 = (
+                        diagnostic_scale
+                        if const_expr(use_unit_scale)
+                        else group_amax * quant_boost / Float32(6.0)
+                    )
+                    coord = coord_flat[vi]
+                    row_coord = Int32(coord[1])
+                    k_coord = Int32(coord[0])
+                    if (lane_idx & 15) == 0:
+                        logical_scale_u8[row_coord, k_coord, 0] = float_to_ue4m3_byte(
+                            scale_f32
+                        )
+                    quant_value = (
+                        value * quant_boost / diagnostic_scale
+                        if const_expr(use_unit_scale)
+                        else (
+                            Float32(0.0)
+                            if group_amax == Float32(0.0)
+                            else value * Float32(6.0) / group_amax
+                        )
+                    )
+                    fp4_code = pack_float8_to_e2m1_word(
+                        quant_value,
+                        Float32(0.0),
+                        Float32(0.0),
+                        Float32(0.0),
+                        Float32(0.0),
+                        Float32(0.0),
+                        Float32(0.0),
+                        Float32(0.0),
+                    ) & cutlass.Uint32(0xF)
+                    packed_word = fp4_code << ((lane_idx & 7) << 2)
+                    packed_word = packed_word | cute.arch.shuffle_sync_bfly(
+                        packed_word, offset=1
+                    )
+                    packed_word = packed_word | cute.arch.shuffle_sync_bfly(
+                        packed_word, offset=2
+                    )
+                    packed_word = packed_word | cute.arch.shuffle_sync_bfly(
+                        packed_word, offset=4
+                    )
+                    if (lane_idx & 7) == 0:
+                        packed_smem[
+                            row_coord * packed_words_per_row + (k_coord >> 3)
+                        ] = packed_word
+
+            self.compute_sync_barrier.arrive_and_wait()
+            for wi in cutlass.range_constexpr(cute.size(dst_words)):
+                dst_words[wi] = packed_smem[
+                    dst_row * packed_words_per_row
+                    + wg_idx * cute.size(dst_words)
+                    + wi
+                ]
+            if const_expr(synchronize_after_read):
+                self.compute_sync_barrier.arrive_and_wait()
+        else:
+            # Correctness fallback for the disabled 2-CTA bring-up lane.  Its
+            # register mapping is cluster-distributed, so retain CTA atomics
+            # until that schedule is redesigned.
+            amax_smem = cute.make_tensor(
+                cute.recast_ptr(scratch_ptr, dtype=Float32),
+                cute.make_layout((num_scale_slots,)),
+            )
+            packed_smem = cute.make_tensor(
+                scratch_ptr + num_scale_slots,
+                cute.make_layout((packed_half_words,)),
+            )
+            for si in cutlass.range_constexpr(num_scale_slots // num_compute_threads):
+                amax_smem[compute_tidx + si * num_compute_threads] = Float32(0.0)
+            self.compute_sync_barrier.arrive_and_wait()
+
+            for vi in cutlass.range_constexpr(cute.size(src_flat)):
+                coord = coord_flat[vi]
+                n_coord = Int32(coord[0])
+                m_coord = Int32(coord[1])
+                row_coord = m_coord if const_expr(transpose) else n_coord
+                k_coord = n_coord if const_expr(transpose) else m_coord
+                scale_slot = row_coord * (tile_k // self.fp4_sf_vec_size) + (
+                    k_coord // self.fp4_sf_vec_size
+                )
+                value = src_flat[vi]
+                abs_value = value if value >= Float32(0.0) else -value
+                cute.arch.atomic_fmax(
+                    amax_smem.iterator + scale_slot,
+                    abs_value,
+                    sign_bit=False,
+                    scope="cta",
+                )
+            self.compute_sync_barrier.arrive_and_wait()
+
+            for vi in cutlass.range_constexpr(cute.size(src_flat)):
+                coord = coord_flat[vi]
+                n_coord = Int32(coord[0])
+                m_coord = Int32(coord[1])
+                row_coord = m_coord if const_expr(transpose) else n_coord
+                k_coord = n_coord if const_expr(transpose) else m_coord
+                scale_slot = row_coord * (tile_k // self.fp4_sf_vec_size) + (
+                    k_coord // self.fp4_sf_vec_size
+                )
+                group_amax = amax_smem[scale_slot]
+                scale_f32 = (
+                    diagnostic_scale
+                    if const_expr(use_unit_scale)
+                    else group_amax * quant_boost / Float32(6.0)
+                )
+                logical_scale_u8[row_coord, k_coord, 0] = float_to_ue4m3_byte(
+                    scale_f32
+                )
+            self.compute_sync_barrier.arrive_and_wait()
+
+            words_per_thread = packed_half_words // num_compute_threads
+            for half in cutlass.range_constexpr(2):
+                for wi in cutlass.range_constexpr(words_per_thread):
+                    packed_smem[compute_tidx + wi * num_compute_threads] = cutlass.Uint32(0)
+                self.compute_sync_barrier.arrive_and_wait()
+
+                for vi in cutlass.range_constexpr(cute.size(src_flat)):
+                    coord = coord_flat[vi]
+                    n_coord = Int32(coord[0])
+                    m_coord = Int32(coord[1])
+                    row_coord = m_coord if const_expr(transpose) else n_coord
+                    k_coord = n_coord if const_expr(transpose) else m_coord
+                    if k_coord // (tile_k // 2) == half:
+                        scale_slot = row_coord * (tile_k // self.fp4_sf_vec_size) + (
+                            k_coord // self.fp4_sf_vec_size
+                        )
+                        group_amax = amax_smem[scale_slot]
+                        quant_value = (
+                            src_flat[vi] * quant_boost / diagnostic_scale
+                            if const_expr(use_unit_scale)
+                            else (
+                                Float32(0.0)
+                                if group_amax == Float32(0.0)
+                                else src_flat[vi] * Float32(6.0) / group_amax
+                            )
+                        )
+                        fp4_code = pack_float8_to_e2m1_word(
+                            quant_value,
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                            Float32(0.0),
+                        ) & cutlass.Uint32(0xF)
+                        k_in_half = k_coord % (tile_k // 2)
+                        packed_word = row_coord * (tile_k // 16) + (k_in_half >> 3)
+                        packed_shift = (k_in_half & 7) << 2
+                        atomic_or_shared_u32(
+                            fp4_code << packed_shift,
+                            packed_smem.iterator + packed_word,
+                        )
+                self.compute_sync_barrier.arrive_and_wait()
+
+                if wg_idx == half:
+                    for wi in cutlass.range_constexpr(cute.size(dst_words)):
+                        dst_words[wi] = packed_smem[
+                            dst_row * (tile_k // 16) + wi
+                        ]
+                self.compute_sync_barrier.arrive_and_wait()
+
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
         )
 
     @cute.jit
@@ -763,97 +1677,62 @@ class FlashAttentionBackwardSm100:
         self,
         src_f32: cute.Tensor,
         dst_storage_f32: cute.Tensor,
+        dst_transpose_storage_f32: cute.Tensor,
         src_coords: cute.Tensor,
+        transpose_smem: cute.Tensor,
+        compute_tidx: Int32,
         sfdK_a_stage: cute.Tensor,
         sfdQ_a_stage: cute.Tensor,
         use_unit_scale: cutlass.Constexpr[bool] = False,
     ):
-        """Quantize a dS fragment to FP4 and materialize SFA layouts for both dK and dQ views."""
-        src_flat = cute.group_modes(src_f32, 0, cute.rank(src_f32))
-        src_coord_flat = cute.group_modes(src_coords, 0, cute.rank(src_coords))
-        logical_sfdK_a = cute.make_tensor(
-            sfdK_a_stage.iterator,
-            bs_layout.tile_atom_to_shape_SF(
-                (self.mma_tiler_dsq[0], self.mma_tiler_dsq[2], 1),
-                self.fp4_sf_vec_size,
-            ),
-        )
-        fp4_dq_scale_tiler = (
-            self.mma_tiler_dsq if const_expr(self.use_2cta_instrs) else self.mma_tiler_dsk
-        )
-        logical_sfdQ_a = cute.make_tensor(
-            sfdQ_a_stage.iterator,
-            bs_layout.tile_atom_to_shape_SF(
-                (fp4_dq_scale_tiler[0], fp4_dq_scale_tiler[2], 1),
-                self.fp4_sf_vec_size,
-            ),
-        )
-        logical_sfdK_a_u8 = cute.make_tensor(
-            cute.recast_ptr(logical_sfdK_a.iterator, dtype=cutlass.Uint8),
-            logical_sfdK_a.layout,
-        )
-        logical_sfdQ_a_u8 = cute.make_tensor(
-            cute.recast_ptr(logical_sfdQ_a.iterator, dtype=cutlass.Uint8),
-            logical_sfdQ_a.layout,
-        )
-        words_per_scale_group = self.fp4_sf_vec_size // 8
-        num_scale_groups = cute.size(src_flat.shape) // self.fp4_sf_vec_size
-        dst_words = cute.make_tensor(
-            cute.recast_ptr(dst_storage_f32.iterator, dtype=cutlass.Uint32),
-            cute.make_layout((num_scale_groups * words_per_scale_group,)),
-        )
-        zero_f32 = Float32(0.0)
-        one_f32 = Float32(1.0)
-        fp4_max = Float32(6.0)
-        one_scale_u8 = float_to_ue4m3_byte(one_f32)
-        for gi in cutlass.range_constexpr(num_scale_groups):
-            group_offset = gi * self.fp4_sf_vec_size
-            coord = src_coord_flat[group_offset]
-            n_coord = coord[0]
-            m_coord = coord[1]
-            if const_expr(use_unit_scale):
-                logical_sfdK_a_u8[n_coord, m_coord, 0] = one_scale_u8
-                logical_sfdQ_a_u8[m_coord, n_coord, 0] = one_scale_u8
-                for wi in cutlass.range_constexpr(words_per_scale_group):
-                    base = group_offset + wi * 8
-                    dst_words[gi * words_per_scale_group + wi] = pack_float8_to_e2m1_word(
-                        src_flat[base + 0],
-                        src_flat[base + 1],
-                        src_flat[base + 2],
-                        src_flat[base + 3],
-                        src_flat[base + 4],
-                        src_flat[base + 5],
-                        src_flat[base + 6],
-                        src_flat[base + 7],
-                    )
-                continue
-            group_amax = zero_f32
-            for ei in cutlass.range_constexpr(self.fp4_sf_vec_size):
-                value = src_flat[group_offset + ei]
-                abs_value = value if value >= zero_f32 else -value
-                group_amax = cute.arch.fmax(group_amax, abs_value)
-            is_zero_group = group_amax == zero_f32
-            scale_f32 = one_f32 if is_zero_group else group_amax / fp4_max
-            inv_scale_f32 = zero_f32 if is_zero_group else one_f32 / scale_f32
-            logical_sfdK_a_u8[n_coord, m_coord, 0] = float_to_ue4m3_byte(scale_f32)
-            logical_sfdQ_a_u8[m_coord, n_coord, 0] = float_to_ue4m3_byte(scale_f32)
-            for wi in cutlass.range_constexpr(words_per_scale_group):
-                base = group_offset + wi * 8
-                dst_words[gi * words_per_scale_group + wi] = pack_float8_to_e2m1_word(
-                    zero_f32 if is_zero_group else src_flat[base + 0] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 1] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 2] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 3] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 4] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 5] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 6] * inv_scale_f32,
-                    zero_f32 if is_zero_group else src_flat[base + 7] * inv_scale_f32,
-                )
-        cute.arch.sync_warp()
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        """Quantize dS.T and dS to the selected independent low-precision views."""
+        if const_expr(self.fp4_bwd_ds_fp8):
+            self.materialize_dS_orientation_to_fp8(
+                src_f32,
+                src_coords,
+                dst_storage_f32,
+                transpose_smem,
+                compute_tidx,
+                sfdK_a_stage,
+                transpose=False,
+                use_unit_scale=use_unit_scale,
+                synchronize_after_read=True,
+            )
+            self.materialize_dS_orientation_to_fp8(
+                src_f32,
+                src_coords,
+                dst_transpose_storage_f32,
+                transpose_smem,
+                compute_tidx,
+                sfdQ_a_stage,
+                transpose=True,
+                use_unit_scale=use_unit_scale,
+                synchronize_after_read=False,
+            )
+        else:
+            self.materialize_dS_orientation_to_fp4(
+                src_f32,
+                src_coords,
+                dst_storage_f32,
+                transpose_smem,
+                compute_tidx,
+                sfdK_a_stage,
+                transpose=False,
+                use_unit_scale=use_unit_scale,
+                synchronize_after_read=True,
+            )
+            self.materialize_dS_orientation_to_fp4(
+                src_f32,
+                src_coords,
+                dst_transpose_storage_f32,
+                transpose_smem,
+                compute_tidx,
+                sfdQ_a_stage,
+                transpose=True,
+                use_unit_scale=use_unit_scale,
+                # A later compute-wide barrier precedes the next scratch reuse.
+                synchronize_after_read=False,
+            )
 
     @cute.jit
     def __call__(
@@ -896,7 +1775,7 @@ class FlashAttentionBackwardSm100:
         self.dqaccum_dtype = mdQaccum.element_type
         self.dk_dtype = mdK.element_type
         self.dv_dtype = mdV.element_type
-        self.ds_dtype = self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype
+        self.ds_dtype = self.fp4_ds_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
@@ -946,19 +1825,11 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_fp4_bwd_qk):
             mQ_col = make_public_fp4_col_tensor(mQ_col)
             mK_col = make_public_fp4_col_tensor(mK_col)
-            mQ_col_scale = cute.make_tensor(
-                mQ_col_scale.iterator,
-                tile_atom_to_shape_sf_mn(
-                    (mQ_col_scale.shape[1], mQ_col_scale.shape[3] * self.fp4_sf_vec_size, mQ_col_scale.shape[2], mQ_col_scale.shape[0]),
-                    self.fp4_sf_vec_size,
-                ),
+            mQ_col_scale = make_public_fp4_col_scale_tensor(
+                mQ_col_scale, self.fp4_sf_vec_size
             )
-            mK_col_scale = cute.make_tensor(
-                mK_col_scale.iterator,
-                tile_atom_to_shape_sf_mn(
-                    (mK_col_scale.shape[1], mK_col_scale.shape[3] * self.fp4_sf_vec_size, mK_col_scale.shape[2], mK_col_scale.shape[0]),
-                    self.fp4_sf_vec_size,
-                ),
+            mK_col_scale = make_public_fp4_col_scale_tensor(
+                mK_col_scale, self.fp4_sf_vec_size
             )
 
         # (b, n, block, stage) -> (block, stage, n, b)
@@ -1114,6 +1985,7 @@ class FlashAttentionBackwardSm100:
                 self.mma_tiler_dsq,
                 self.tiled_mma_dK,
                 self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint8 if const_expr(self.fp4_bwd_ds_fp8) else None,
             )
         elif const_expr(self.use_2cta_instrs):
             tma_atom_Qt, tma_tensor_Qt = cute.nvgpu.make_tiled_tma_atom_B(
@@ -1137,6 +2009,7 @@ class FlashAttentionBackwardSm100:
                 self.mma_tiler_dsk,
                 self.tiled_mma_dQ,
                 self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Uint8 if const_expr(self.fp4_bwd_ds_fp8) else None,
             )
         elif const_expr(self.use_2cta_instrs):
             Kt_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
@@ -1290,7 +2163,7 @@ class FlashAttentionBackwardSm100:
                 ]
                 sQt: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
+                        self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
                         sQt_size,
                     ],
                     self.buffer_align_bytes,
@@ -1305,7 +2178,7 @@ class FlashAttentionBackwardSm100:
                 ]
                 sKt: cute.struct.Align[
                     cute.struct.MemRange[
-                        self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype,
+                        self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype,
                         sKt_size,
                     ],
                     self.buffer_align_bytes,
@@ -1376,11 +2249,11 @@ class FlashAttentionBackwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sQt: cute.struct.Align[
-                    cute.struct.MemRange[self.fp4_qk_dtype, sQt_size],
+                    cute.struct.MemRange[self.fp4_qk_smem_dtype, sQt_size],
                     self.buffer_align_bytes,
                 ]
                 sKt: cute.struct.Align[
-                    cute.struct.MemRange[self.fp4_qk_dtype, sKt_size],
+                    cute.struct.MemRange[self.fp4_qk_smem_dtype, sKt_size],
                     self.buffer_align_bytes,
                 ]
                 sV: cute.struct.Align[
@@ -1914,14 +2787,14 @@ class FlashAttentionBackwardSm100:
             sQt = storage.sQt.get_tensor(
                 sQt_layout.outer,
                 swizzle=sQt_layout.inner,
-                dtype=self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
+                dtype=self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
             )
         else:
             sQt = cute.make_tensor(
                 cute.recast_ptr(
                     sQ.iterator,
                     sQt_layout.inner,
-                    dtype=self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
+                    dtype=self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else self.q_dtype,
                 ),
                 sQt_layout.outer,
             )
@@ -1930,7 +2803,7 @@ class FlashAttentionBackwardSm100:
             sKt = storage.sKt.get_tensor(
                 sKt_layout.outer,
                 swizzle=sKt_layout.inner,
-                dtype=self.fp4_qk_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype,
+                dtype=self.fp4_qk_smem_dtype if const_expr(self.use_fp4_bwd_qk) else self.k_dtype,
             )
         else:
             sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
@@ -2021,11 +2894,19 @@ class FlashAttentionBackwardSm100:
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
         tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)
         tdKtdK = cute.make_tensor(tmem_ptr + self.tmem_dK_offset, tdKtdK.layout)
+        # These TMEM views must carry the MMA operand type.  The typed
+        # TMEM-fragment builder only keeps the layout; its physical column
+        # offset is restored below after fragment partitioning.
+        dS_tmem_dtype = (
+            self.fp4_ds_dtype if const_expr(self.use_fp4_bwd_qk) else self.ds_dtype
+        )
         tdS = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_layout.outer
+            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=dS_tmem_dtype),
+            tdS_layout.outer,
         )
         tdS_dQ = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_dq_layout.outer
+            cute.recast_ptr(tmem_ptr + self.tmem_dS_dQ_offset, dtype=dS_tmem_dtype),
+            tdS_dq_layout.outer,
         )
         # dQ
         thr_mma_dQ = tiled_mma_dQ.get_slice(mma_tile_coord_v)
@@ -2829,6 +3710,8 @@ class FlashAttentionBackwardSm100:
                                             (0, n_block_cta_group),
                                         ),
                                         sfKcol[None, None, None, producer_state_Kt.index],
+                                        seqlen.seqlen_k
+                                        - n_block_cta_group * self.mma_tiler_dsk[2],
                                     )
                                 pipeline_Kt.producer_commit(producer_state_Kt)
                                 producer_state_Kt.advance()
@@ -2847,6 +3730,8 @@ class FlashAttentionBackwardSm100:
                                                     (0, m_block - 1),
                                                 ),
                                                 sfQcol[None, None, None, producer_state_Qt.index],
+                                                seqlen.seqlen_q
+                                                - (m_block - 1) * self.tile_m,
                                             )
                                         pipeline_Qt.producer_commit(producer_state_Qt)
                                         producer_state_Qt.advance()
@@ -2906,6 +3791,8 @@ class FlashAttentionBackwardSm100:
                                                 (0, m_block_max - 1),
                                             ),
                                             sfQcol[None, None, None, producer_state_Qt.index],
+                                            seqlen.seqlen_q
+                                            - (m_block_max - 1) * self.tile_m,
                                         )
                                     pipeline_Qt.producer_commit(producer_state_Qt)
                                     producer_state_Qt.advance()
@@ -2999,7 +3886,25 @@ class FlashAttentionBackwardSm100:
             tdKrdS = tiled_mma_dK.make_fragment_A(tdS)  # From TMEM
         tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
         # dQ = dS @ K
-        tdQrdS = tiled_mma_dQ.make_fragment_A(tdS_dQ) if const_expr(self.use_fp4_bwd_qk) else tiled_mma_dQ.make_fragment_A(sdS)
+        tdQrdS = (
+            tiled_mma_dQ.make_fragment_A(tdS_dQ)
+            if const_expr(self.use_fp4_bwd_qk)
+            else tiled_mma_dQ.make_fragment_A(sdS)
+        )
+        if const_expr(self.fp4_bwd_ds_fp8):
+            # make_fragment_A(TMEM) returns a zero-based fragment.  TMEM
+            # offsets are counted in FP32 columns, whereas iterator arithmetic
+            # is counted in operand elements, so restore each packed-dS base
+            # with the corresponding width ratio (as in the forward P path).
+            dS_width_ratio = Float32.width // self.fp4_ds_dtype.width
+            tdKrdS = cute.make_tensor(
+                tdKrdS.iterator + self.tmem_dS_offset * dS_width_ratio,
+                tdKrdS.layout,
+            )
+            tdQrdS = cute.make_tensor(
+                tdQrdS.iterator + self.tmem_dS_dQ_offset * dS_width_ratio,
+                tdQrdS.layout,
+            )
         tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
         # dV = P @ dO.T
         tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
@@ -3065,28 +3970,62 @@ class FlashAttentionBackwardSm100:
                 tCtfKcol_compact_s2t,
             ) = self.scale_s2t_copy_and_partition(sfKcol, tfKcol)
 
-            fp4_scale_vec = "4X" if self.fp4_sf_vec_size == 16 else "2X"
-            mma_dsq_fn = partial(
-                sm100_utils.gemm_ptx_fp4_block_scaled_partial,
-                tiled_mma_dK.op,
-                Int32(tdKtdK.iterator.toint()),
-                tdKrdS,
-                tmem_sa_addr=Int32(self.tmem_sfdK_a_offset),
-                tmem_sb_addr=Int32(self.tmem_sfQcol_offset),
-                scale_vec=fp4_scale_vec,
-                cta_group=self.cta_group_size,
+            block_scale_vec = (
+                "1X"
+                if self.fp4_bwd_ds_fp8
+                else "4X" if self.fp4_sf_vec_size == 16 else "2X"
             )
-            mma_dsk_fn = partial(
-                sm100_utils.gemm_ptx_fp4_block_scaled_partial,
-                tiled_mma_dQ.op,
-                Int32(tdQtdQ.iterator.toint()),
-                tdQrdS,
-                sB=sKt[None, None, None, 0],
-                tmem_sa_addr=Int32(self.tmem_sfdQ_a_offset),
-                tmem_sb_addr=Int32(self.tmem_sfKcol_offset),
-                scale_vec=fp4_scale_vec,
-                cta_group=self.cta_group_size,
+            block_mma_kind = "mxf8f6f4" if self.fp4_bwd_ds_fp8 else (
+                "mxf4nvf4" if self.fp4_sf_vec_size == 16 else "mxf4"
             )
+            if const_expr(self.fp4_bwd_ds_fp8):
+                mma_dsq_fn = partial(
+                    gemm_cute_block_scaled_partial_k_scales,
+                    tiled_mma_dK,
+                    tdKtdK,
+                    tdKrdS,
+                    tfdK_a,
+                    tfQcol,
+                )
+                mma_dsk_fn = partial(
+                    gemm_cute_block_scaled_partial_k_scales,
+                    tiled_mma_dQ,
+                    tdQtdQ,
+                    tdQrdS,
+                    tfdQ_a,
+                    tfKcol,
+                    _sB=sKt[None, None, None, 0],
+                )
+            else:
+                mma_dsq_fn = partial(
+                    gemm_ptx_fp4_block_scaled_partial_k_scales,
+                    tiled_mma_dK.op,
+                    Int32(tdKtdK.iterator.toint()),
+                    tdKrdS,
+                    tmem_sa_addr=Int32(self.tmem_sfdK_a_offset),
+                    tmem_sb_addr=Int32(self.tmem_sfQcol_offset),
+                    tSFA_layout=tfdK_a.layout,
+                    tSFB_layout=tfQcol.layout,
+                    tA_addr=Int32(self.tmem_dS_offset),
+                    scale_vec=block_scale_vec,
+                    mma_kind=block_mma_kind,
+                    cta_group=self.cta_group_size,
+                )
+                mma_dsk_fn = partial(
+                    gemm_ptx_fp4_block_scaled_partial_k_scales,
+                    tiled_mma_dQ.op,
+                    Int32(tdQtdQ.iterator.toint()),
+                    tdQrdS,
+                    sB=sKt[None, None, None, 0],
+                    tmem_sa_addr=Int32(self.tmem_sfdQ_a_offset),
+                    tmem_sb_addr=Int32(self.tmem_sfKcol_offset),
+                    tSFA_layout=tfdQ_a.layout,
+                    tSFB_layout=tfKcol.layout,
+                    tA_addr=Int32(self.tmem_dS_dQ_offset),
+                    scale_vec=block_scale_vec,
+                    mma_kind=block_mma_kind,
+                    cta_group=self.cta_group_size,
+                )
         else:
             num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
             mma_dsk_fn = partial(
@@ -3134,10 +4073,16 @@ class FlashAttentionBackwardSm100:
         )
         producer_phase_dKV = Int32(1)
         cta_group = pipeline_S_P.cta_group
-        # On the FP4 2-CTA hdim128 path, pipeline_dS is the dQ-side handoff for
-        # the TMEM-loaded dS tile. When dQ is skipped, the producer side is
-        # intentionally suppressed, so the consumer side must be suppressed too.
-        need_fp4_dS_consumer = not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)
+        # The 1-CTA FP4 path uses pipeline_dS to hand the quantized dS tile to
+        # both native consumers.  The 2-CTA path keeps dK on pipeline_dP and
+        # uses pipeline_dS only for dQ.  Keep the handoff live for a dK-only
+        # 1-CTA launch; otherwise Qt fills without a consumer and the load warp
+        # blocks in its tail.
+        need_fp4_dS_consumer = not (
+            self.use_fp4_bwd_qk
+            and self.fp4_bwd_native_skip_dq
+            and (self.use_2cta_instrs or self.fp4_bwd_native_skip_dk)
+        )
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         dS_cluster_phase = Int32(0)
@@ -3993,6 +4938,7 @@ class FlashAttentionBackwardSm100:
         # 1: [128...256]
 
         tileP_f32_like = self.cta_tiler[1] // 32 * self.v_dtype.width
+        tile_dS_f32_like = self.cta_tiler[1] // 32 * self.ds_dtype.width
         # tStS has shape ((128, 128), 1, 1), tStP has shape ((128, 64), 1, 1)
         # tP overlap with tS
         tStP = cute.composition(tStS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
@@ -4000,11 +4946,27 @@ class FlashAttentionBackwardSm100:
         tScS = thr_mma_S.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
         tScP = cute.composition(tScS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
         # tdS overlap with tdP
-        tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        tdPtdS = cute.composition(
+            tdPtdP,
+            (cute.make_layout((self.tile_n, tile_dS_f32_like)), 1, 1),
+        )
+        tdPtdP_dQ = cute.make_tensor(
+            tdPtdP.iterator + self.tmem_dS_tile_cols,
+            tdPtdP.layout,
+        )
+        tdPtdS_dQ = cute.composition(
+            tdPtdP_dQ,
+            (cute.make_layout((self.tile_n, tile_dS_f32_like)), 1, 1),
+        )
         tdPcdP = thr_mma_dP.partition_C(cute.make_identity_tensor(self.mma_tiler_vdo[:2]))
-        tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        tdPcdS = cute.composition(
+            tdPcdP,
+            (cute.make_layout((self.tile_n, tile_dS_f32_like)), 1, 1),
+        )
 
-        # 2-CTA assumes: repetiton should always be 32 & 16
+        # P remains BF16 and uses repetition 16.  Native FP4 dS packs both
+        # halves into one 8 KiB tile and therefore needs a distinct repetition-8
+        # store copy instead of inheriting P's carrier layout.
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
         )
@@ -4025,8 +4987,21 @@ class FlashAttentionBackwardSm100:
         thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
         tScP_r2t = thr_copy_r2t.partition_S(tScP)
         tStP_r2t = thr_copy_r2t.partition_D(tStP)
-        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
-        tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
+        if const_expr(self.use_fp4_bwd_qk):
+            tmem_store_atom_dS = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(
+                    tcgen05.copy.Repetition(16 if self.fp4_bwd_ds_fp8 else 8)
+                ),
+                Float32,
+            )
+            thr_copy_r2t_dS = copy_utils.make_tmem_copy(
+                tmem_store_atom_dS, num_wg
+            ).get_slice(tidx)
+        else:
+            thr_copy_r2t_dS = thr_copy_r2t
+        tdPcdS_r2t = thr_copy_r2t_dS.partition_S(tdPcdS)
+        tdPtdS_r2t = thr_copy_r2t_dS.partition_D(tdPtdS)
+        tdPtdS_dQ_r2t = thr_copy_r2t_dS.partition_D(tdPtdS_dQ)
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
         copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
@@ -4054,10 +5029,13 @@ class FlashAttentionBackwardSm100:
         dS_cluster_empty_phase = Int32(1)
         # 2-CTA: CTA 0 exchanges stage 1 (bottom half), CTA 1 exchanges stage 0 (top half)
         exchange_stage = cta_rank_in_cluster ^ 1 if const_expr(self.use_2cta_instrs) else Int32(0)
-        # On the FP4 2-CTA hdim128 path, pipeline_dS is the dQ-side handoff for
-        # staged dS availability. Once the leader dK path is kept on the reference
-        # pipeline_dP -> dS contract, skip_dq can disable this pipeline again.
-        need_fp4_dS_pipeline = not (self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dq)
+        # Match the MMA-side contract above: 1-CTA dK consumes this handoff,
+        # while 2-CTA dK is synchronized through pipeline_dP.
+        need_fp4_dS_pipeline = not (
+            self.use_fp4_bwd_qk
+            and self.fp4_bwd_native_skip_dq
+            and (self.use_2cta_instrs or self.fp4_bwd_native_skip_dk)
+        )
         consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
@@ -4274,6 +5252,40 @@ class FlashAttentionBackwardSm100:
                 # consumer_phase_S_P_dP ^= 1
 
                 ##### dS.T = P.T * (dP.T - Psum)
+                if const_expr(self.use_fp4_bwd_qk and self.use_2cta_instrs):
+                    # Clear padding/replicated coordinates before the compact
+                    # 2-CTA fallback writes the active scale slots.  A missing
+                    # distributed slot must contribute zero rather than amplify
+                    # dS with stale shared-memory bytes.  The 1-CTA fast path
+                    # writes every logical slot and needs neither this fill nor
+                    # its CTA barrier.
+                    if warp_idx == self.compute_warp_ids[0]:
+                        scale_init = (
+                            Float32(32.0)
+                            if const_expr(self.fp4_bwd_native_skip_ds_quant)
+                            else Float32(0.0)
+                        )
+                        self.fill_scale_stage_constant(
+                            sfdK_a[None, None, None, 0], scale_init
+                        )
+                        self.fill_scale_stage_constant(
+                            sfdQ_a[None, None, None, 0], scale_init
+                        )
+                    self.compute_sync_barrier.arrive_and_wait()
+                skip_fp4_ds_materialization = (
+                    self.use_fp4_bwd_qk
+                    and self.fp4_bwd_native_skip_dk
+                    and self.fp4_bwd_native_skip_dq
+                    and self.fp4_bwd_native_skip_ds_store
+                )
+                tdPrdS_r2t_f32 = None
+                tdPrdS_dQ_r2t_f32 = None
+                if const_expr(self.use_fp4_bwd_qk and not skip_fp4_ds_materialization):
+                    # One carrier fragment holds the packed values for both dS
+                    # halves.  The TCGen05 conversion interleaves those halves
+                    # before packing, so they cannot be materialized separately.
+                    tdPrdS_r2t_f32 = cute.make_fragment(tdPcdS_r2t.shape, Float32)
+                    tdPrdS_dQ_r2t_f32 = cute.make_fragment(tdPcdS_r2t.shape, Float32)
                 for stage in cutlass.range_constexpr(num_stages):
                     tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
@@ -4332,28 +5344,10 @@ class FlashAttentionBackwardSm100:
                             kv_idx = tScS_idx_cur[i][0]
                             tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
 
-                    tdPrdS_r2t_f32 = None
                     tdPrdS_cvt = None
                     if const_expr(self.use_fp4_bwd_qk):
-                        skip_fp4_ds_materialization = (
-                            self.fp4_bwd_native_skip_dk
-                            and self.fp4_bwd_native_skip_dq
-                            and self.fp4_bwd_native_skip_ds_store
-                        )
                         if const_expr(not skip_fp4_ds_materialization):
-                            tdPrdS_r2t_f32 = cute.make_fragment(
-                                tdPcdS_r2t[None, stage, 0, 0].shape, Float32
-                            )
-                            assert sfdK_a is not None and sfdQ_a is not None
-                            self.quantize_dS_fragment_to_fp4(
-                                tdPrdP_cur,
-                                tdPrdS_r2t_f32,
-                                tScS_t2r[None, stage, 0, 0],
-                                sfdK_a[None, None, None, 0],
-                                sfdQ_a[None, None, None, 0],
-                                use_unit_scale=self.fp4_bwd_native_skip_ds_quant,
-                            )
-                            tdPrdS_cvt = cute.recast_tensor(tdPrdS_r2t_f32, self.ds_dtype)
+                            cute.autovec_copy(tdPrdP_cur, tSrS_cur)
                     else:
                         tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
                         utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
@@ -4365,12 +5359,9 @@ class FlashAttentionBackwardSm100:
 
                     # RMEM->TMEM: always write to TMEM for MMA
                     if const_expr(not self.use_smem_dS_for_mma_dK or self.use_2cta_instrs):
-                        if const_expr(self.use_fp4_bwd_qk):
-                            if const_expr(not self.fp4_bwd_native_skip_ds_store):
-                                cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
-                        else:
+                        if const_expr(not self.use_fp4_bwd_qk):
                             tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
-                            cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
+                            cute.copy(thr_copy_r2t_dS, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
 
                     # RMEM->SMEM: For 2-CTA, keep exchange stage in registers, write non-exchange to sdS
                     if const_expr(self.use_2cta_instrs):
@@ -4381,6 +5372,36 @@ class FlashAttentionBackwardSm100:
                             cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
                     elif const_expr(not self.use_fp4_bwd_qk):
                         cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
+
+                if const_expr(self.use_fp4_bwd_qk and not skip_fp4_ds_materialization):
+                    assert tdPrdS_r2t_f32 is not None
+                    assert tdPrdS_dQ_r2t_f32 is not None
+                    assert sfdK_a is not None and sfdQ_a is not None
+                    # Drop the zero-stride tail mode and move the two-stage mode
+                    # to the final position expected by the conversion helper:
+                    #   ((32, 1), 1, 2):((1, 0), 0, 32)
+                    tdPrdS_quant_src = layout_utils.select(
+                        tSrS_t2r[(None, None, None, 0)],
+                        mode=[0, 2, 1],
+                    )
+                    tdPrdS_quant_coords = layout_utils.select(
+                        tScS_t2r[(None, None, None, 0)],
+                        mode=[0, 2, 1],
+                    )
+                    self.quantize_dS_fragment_to_fp4(
+                        tdPrdS_quant_src,
+                        tdPrdS_r2t_f32,
+                        tdPrdS_dQ_r2t_f32,
+                        tdPrdS_quant_coords,
+                        sdS,
+                        tidx,
+                        sfdK_a[None, None, None, 0],
+                        sfdQ_a[None, None, None, 0],
+                        use_unit_scale=self.fp4_bwd_native_skip_ds_quant,
+                    )
+                    if const_expr(not self.fp4_bwd_native_skip_ds_store):
+                        cute.copy(thr_copy_r2t_dS, tdPrdS_r2t_f32, tdPtdS_r2t)
+                        cute.copy(thr_copy_r2t_dS, tdPrdS_dQ_r2t_f32, tdPtdS_dQ_r2t)
 
                 if const_expr(not self.use_smem_dS_for_mma_dK and not self.fp4_bwd_native_skip_ds_store):
                     cute.arch.fence_view_async_tmem_store()
@@ -4410,9 +5431,10 @@ class FlashAttentionBackwardSm100:
                 consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
                 if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
-                    with cute.arch.elect_one():
-                        pipeline_dS.producer_commit(producer_state_dS)
-                    producer_state_dS.advance()
+                    if const_expr(need_fp4_dS_pipeline):
+                        with cute.arch.elect_one():
+                            pipeline_dS.producer_commit(producer_state_dS)
+                        producer_state_dS.advance()
                 elif const_expr(self.use_fp4_bwd_qk):
                     with cute.arch.elect_one():
                         # The FP4 path keeps dS local, but the relay warp still advances the
@@ -4456,6 +5478,9 @@ class FlashAttentionBackwardSm100:
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
             if process_tile:
+                dK_output_scale = softmax_scale
+                if const_expr(self.use_fp4_bwd_qk):
+                    dK_output_scale = softmax_scale / Float32(self.fp4_ds_quant_boost)
                 if const_expr(self.use_fp4_bwd_qk and self.fp4_bwd_native_skip_dkv_epilogue):
                     pass
                 elif const_expr(not self.use_tma_store):
@@ -4474,7 +5499,7 @@ class FlashAttentionBackwardSm100:
                         mdK,
                         pipeline_dKV,
                         consumer_state_dKV,
-                        softmax_scale,
+                        dK_output_scale,
                     )
                 else:
                     thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
@@ -4513,7 +5538,7 @@ class FlashAttentionBackwardSm100:
                         thr_copy_r2s_dKV,
                         pipeline_dKV,
                         consumer_state_dKV,
-                        softmax_scale if const_expr(not self.dKV_postprocess) else None,
+                        dK_output_scale if const_expr(not self.dKV_postprocess) else None,
                         int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
                         mdK_semaphore,
                         "K",
